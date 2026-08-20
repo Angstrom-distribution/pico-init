@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+#
+# Based on systemd's own .clang-format (github.com/systemd/systemd), trimmed
+# down: dropped the ForEachMacros and IncludeCategories lists tailored to
+# systemd's own codebase, since none of those macros/headers exist here yet.
+# Extend this file as real code grows, don't front-load it with rules for
+# code that doesn't exist.
+#
+# Run: git ls-files 'src/*.[ch]' | xargs clang-format -i -style=file
+
+AccessModifierOffset: -4
+AlignAfterOpenBracket: AlwaysBreak
+AlignArrayOfStructures: Right
+AlignEscapedNewlines: Left
+AlignOperands: false
+AllowShortFunctionsOnASingleLine: None
+AlwaysBreakBeforeMultilineStrings: true
+BinPackArguments: false
+BinPackParameters: false
+BraceWrapping:
+  AfterEnum: false
+  SplitEmptyFunction: false
+  SplitEmptyRecord: false
+  SplitEmptyNamespace: false
+BreakBeforeBraces: Custom
+BreakBeforeTernaryOperators: false
+BreakStringLiterals: false
+ColumnLimit: 109
+ContinuationIndentWidth: 16
+Cpp11BracedListStyle: false
+IndentPPDirectives: AfterHash
+IndentWidth: 8
+IndentWrappedFunctionNames: true
+MaxEmptyLinesToKeep: 2
+PenaltyBreakAssignment: 65
+PenaltyBreakBeforeFirstCallParameter: 16
+PenaltyBreakComment: 320
+PenaltyBreakString: 0
+PenaltyExcessCharacter: 10
+PenaltyReturnTypeOnItsOwnLine: 100
+PointerAlignment: Right
+SpaceAfterCStyleCast: true
+SpaceAroundPointerQualifiers: Both
+SpaceBeforeParens: ControlStatementsExceptForEachMacros
+SpacesInAngles: true
+TabWidth: 8
+UseCRLF: false
+UseTab: Never

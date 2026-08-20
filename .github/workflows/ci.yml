@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Three small, fast ubuntu-latest jobs -- no matrix, no macOS/Windows
+# runners, everything finishes in well under a minute. Keeps this
+# comfortably inside GitHub Free's private-repo Actions minutes even on
+# every push and every PR update.
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install meson and ninja
+        run: sudo apt-get update && sudo apt-get install -y meson ninja-build
+      - name: Configure
+        run: meson setup build
+      - name: Build
+        run: ninja -C build
+      - name: Test
+        run: meson test -C build --print-errorlogs
+
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang-format
+        run: sudo apt-get update && sudo apt-get install -y clang-format
+      - name: Check formatting
+        run: |
+          find src -name '*.c' -o -name '*.h' | xargs -r clang-format --dry-run --Werror
+
+  reuse:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: REUSE license compliance
+        uses: fsfe/reuse-action@v5

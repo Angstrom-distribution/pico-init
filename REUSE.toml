@@ -1,0 +1,16 @@
+version = 1
+
+[[annotations]]
+path = [
+  "README.md",
+  "CONTRIBUTING.md",
+  "SECURITY.md",
+  "CODE_OF_CONDUCT.md",
+  "LICENSE",
+  "LICENSES/**",
+  ".github/**",
+  ".gitignore",
+  ".clang-format",
+]
+SPDX-FileCopyrightText = "Koen Kooi"
+SPDX-License-Identifier = "LGPL-2.1-or-later"

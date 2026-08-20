@@ -1,0 +1,33 @@
+name: Bug report
+description: Something in pico-init doesn't behave the way it should
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this. This project is
+        pre-release, so "doesn't work at all yet" for something not in the
+        README's scope list is expected, not a bug -- please check there
+        first.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what actually happened.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Minimal steps to reproduce, if you have them.
+  - type: input
+    id: component
+    attributes:
+      label: Component
+      description: PID1 core, netd, journal reader, build system, etc.
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Target hardware/kernel, meson version, compiler, host OS.

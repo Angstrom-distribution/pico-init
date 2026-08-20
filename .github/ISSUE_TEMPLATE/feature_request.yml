@@ -1,0 +1,24 @@
+name: Feature request
+description: Propose a new feature or behavior change
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Scope changes (what gets quarried from systemd vs. written fresh,
+        which behaviors get kept or dropped) are design decisions, not just
+        features -- see CONTRIBUTING.md. Expect a discussion before a PR.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed approach
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
