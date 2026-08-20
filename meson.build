@@ -1,3 +1,4 @@
+# SPDX-FileCopyrightText: 2026 Koen Kooi
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
 project(
@@ -12,12 +13,12 @@ project(
   meson_version: '>= 0.62.0',
 )
 
-# Scaffold only -- no real PID1 logic yet. See the angstrom-pico project's
-# TODO for the scoping decisions (quarry systemd's unit parser/dependency
-# engine/service state machine, cgroups v2, a from-scratch netd built on
-# sd-dhcp/sd-netlink, journald's format + a slim reader, meson as the build
-# system). This target exists so CI has something real to build and test
-# from the very first commit.
+# Scaffold only -- no real PID1 logic yet. See README.md for the scoping
+# decisions (quarry systemd's unit parser/dependency engine/service state
+# machine, cgroups v2, a from-scratch netd built on sd-dhcp/sd-netlink,
+# journald's format + a slim reader, meson as the build system). This
+# target exists so CI has something real to build and test from the very
+# first commit.
 pico_init_exe = executable(
   'pico-init',
   'src/main.c',

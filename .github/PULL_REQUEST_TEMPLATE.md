@@ -5,7 +5,7 @@
 ## Checklist
 
 - [ ] Every new/modified source file has an SPDX license identifier
-      (see `LICENSES/README.md`)
+      (see `LICENSES/`)
 - [ ] `meson test -C build` passes locally
 - [ ] `clang-format --dry-run --Werror` passes on changed files
 - [ ] Scope changes were discussed in an issue first (if applicable)

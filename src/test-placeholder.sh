@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-FileCopyrightText: 2026 Koen Kooi
 # SPDX-License-Identifier: LGPL-2.1-or-later
 #
 # Placeholder test so `meson test` has something real to run from the first

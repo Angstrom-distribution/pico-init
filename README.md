@@ -24,8 +24,8 @@ something real to exercise from the first commit. No PID1 logic exists yet.
 The real design decisions — what gets quarried from systemd, cgroups v1 vs
 v2, where the network stack comes from, how much of journald survives, the
 DHCP-timezone story — were made against a 2011-era-systemd feasibility study
-and recorded in the `angstrom-pico` project's own TODO, not duplicated here
-yet. Summary, once this repository has its own design doc it will move here:
+and a scoping dialog with the maintainer. A proper design doc belongs in
+this repository once real implementation work starts; for now, the summary:
 
 - **PID1 core**: quarried from systemd's ~2011-era unit parser, dependency
   engine, and service state machine — not a literal fork, not written from
@@ -44,8 +44,9 @@ yet. Summary, once this repository has its own design doc it will move here:
 
 LGPL-2.1-or-later, matching systemd itself — required, not just preferred,
 since PID1-core code is planned to be quarried directly from systemd's
-LGPL-2.1-or-later source. See [`LICENSES/README.md`](LICENSES/README.md) for
-the full scheme.
+LGPL-2.1-or-later source. Every source file carries an
+[SPDX license identifier](https://spdx.dev/learn/handling-license-info/);
+full license text lives in [`LICENSES/`](LICENSES/).
 
 ## Contributing
 

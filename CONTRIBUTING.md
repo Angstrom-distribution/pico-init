@@ -16,7 +16,7 @@ feature requests; pick whichever fits, or open a blank issue if neither does.
    for what changed and why.
 2. Every new or modified source file needs an
    [SPDX license identifier](https://spdx.dev/learn/handling-license-info/)
-   on its first line — see [`LICENSES/README.md`](LICENSES/README.md).
+   on its first line — see [`LICENSES/`](LICENSES/).
    `reuse lint` runs in CI and will fail the build if one is missing.
 3. Keep commits scoped to one logical change. Commit messages should explain
    *why*, not restate the diff.
