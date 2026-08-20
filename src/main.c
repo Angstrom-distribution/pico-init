@@ -1,5 +1,5 @@
 /* SPDX-FileCopyrightText: 2026 Koen Kooi */
-/* SPDX-License-Identifier: LGPL-2.1-or-later */
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
  * pico-init: a small systemd-inspired PID1 for angstrom-pico

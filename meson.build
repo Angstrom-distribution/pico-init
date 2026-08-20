@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: 2026 Koen Kooi
-# SPDX-License-Identifier: LGPL-2.1-or-later
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 project(
   'pico-init', 'c',
   version: '0.0.0',
-  license: 'LGPL-2.1-or-later',
+  license: 'GPL-2.0-or-later',
   default_options: [
     'c_std=gnu17',
     'warning_level=3',

@@ -42,9 +42,21 @@ this repository once real implementation work starts; for now, the summary:
 
 ## License
 
-LGPL-2.1-or-later, matching systemd itself — required, not just preferred,
-since PID1-core code is planned to be quarried directly from systemd's
-LGPL-2.1-or-later source. Every source file carries an
+**GPL-2.0-or-later**, not required-by-preference but required-by-fact:
+systemd was GPL-2.0-or-later until its 2012 relicensing to
+LGPL-2.1-or-later, and the PID1 core here is planned to be quarried from
+~2011-era systemd source — code that predates that relicensing. Quarrying
+GPL-2.0-or-later source makes the resulting work GPL-2.0-or-later as a
+whole (GPL terms propagate; there's no picking a more permissive license for
+the combined work). `netd`'s planned `sd-dhcp`/`sd-netlink` lifts come from
+*modern* systemd instead (post-relicense, LGPL-2.1-or-later) — those files
+will carry their own `SPDX-License-Identifier: LGPL-2.1-or-later` tags per
+the file-level exception pattern in [`REUSE.toml`](REUSE.toml)/[`LICENSES/`](LICENSES/),
+same idea as systemd's own per-file licensing scheme, simplified. GPL-2.0-or-later
+code linking against LGPL-2.1-or-later code is fine; the reverse wouldn't
+be.
+
+Every source file carries an
 [SPDX license identifier](https://spdx.dev/learn/handling-license-info/);
 full license text lives in [`LICENSES/`](LICENSES/).
 
