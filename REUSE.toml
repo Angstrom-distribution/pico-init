@@ -10,7 +10,6 @@ path = [
   "LICENSES/**",
   ".github/**",
   ".gitignore",
-  ".clang-format",
 ]
 SPDX-FileCopyrightText = "Koen Kooi"
 SPDX-License-Identifier = "GPL-2.0-or-later"

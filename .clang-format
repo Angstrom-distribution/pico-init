@@ -1,4 +1,5 @@
-# SPDX-License-Identifier: LGPL-2.1-or-later
+# SPDX-FileCopyrightText: 2026 Koen Kooi
+# SPDX-License-Identifier: GPL-2.0-or-later
 #
 # Based on systemd's own .clang-format (github.com/systemd/systemd), trimmed
 # down: dropped the ForEachMacros and IncludeCategories lists tailored to

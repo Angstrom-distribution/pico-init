@@ -50,7 +50,7 @@ GPL-2.0-or-later source makes the resulting work GPL-2.0-or-later as a
 whole (GPL terms propagate; there's no picking a more permissive license for
 the combined work). `netd`'s planned `sd-dhcp`/`sd-netlink` lifts come from
 *modern* systemd instead (post-relicense, LGPL-2.1-or-later) — those files
-will carry their own `SPDX-License-Identifier: LGPL-2.1-or-later` tags per
+will carry their own per-file LGPL-2.1-or-later license tag, following
 the file-level exception pattern in [`REUSE.toml`](REUSE.toml)/[`LICENSES/`](LICENSES/),
 same idea as systemd's own per-file licensing scheme, simplified. GPL-2.0-or-later
 code linking against LGPL-2.1-or-later code is fine; the reverse wouldn't
