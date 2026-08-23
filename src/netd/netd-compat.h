@@ -412,9 +412,14 @@ static inline void netd_strv_freep(char ***p) {
 /*
  * Both loop variables must have the same declared type for the for-init to be
  * legal C, hence the derived end pointer rather than upstream's shape.
+ *
+ * __typeof__, not typeof: only the double-underscore spelling is in the
+ * implementation-reserved namespace, so it cannot collide with a translation
+ * unit that uses `typeof` as an ordinary identifier, and clang does not count
+ * it against -Wlanguage-extension-token under -Wpedantic.
  */
 #define FOREACH_ARRAY(i, array, num) \
-        for (typeof(&(array)[0]) i = (array), i##_end_ = (array) + (num); i < i##_end_; i++)
+        for (__typeof__(&(array)[0]) i = (array), i##_end_ = (array) + (num); i < i##_end_; i++)
 
 #define FOREACH_ELEMENT(i, array) FOREACH_ARRAY(i, array, ELEMENTSOF(array))
 

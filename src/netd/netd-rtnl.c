@@ -337,6 +337,17 @@ static int nl_execute(NetdRtnl *rtnl, struct nl_request *req) {
                 m = (struct nlmsghdr *) buf;
                 rem = (int) len;
 
+                /*
+                 * rem stays int -- NLMSG_NEXT subtracts from it, and the
+                 * kernel's own iteration idiom needs that to go negative on a
+                 * truncated tail. clang's sign-compare inside NLMSG_OK is a
+                 * false positive: the macro's first clause has already
+                 * established rem >= sizeof(struct nlmsghdr) before the
+                 * unsigned comparison, so the promotion is value-preserving.
+                 * gcc suppresses it as system-header-originated; clang blames
+                 * the expansion site. Same at the loops in
+                 * netd_rtnl_enumerate_links() and netd_rtnl_process().
+                 */
                 for (; NLMSG_OK(m, rem); m = NLMSG_NEXT(m, rem)) {
                         int result;
 
@@ -671,6 +682,7 @@ int netd_rtnl_enumerate_links(NetdRtnl *rtnl) {
                         m = (struct nlmsghdr *) buf;
                         rem = (int) len;
 
+                        /* int rem, NLMSG_OK sign-compare: see nl_execute(). */
                         for (; NLMSG_OK(m, rem); m = NLMSG_NEXT(m, rem)) {
                                 if (m->nlmsg_seq != seq)
                                         continue;
@@ -729,6 +741,7 @@ int netd_rtnl_process(NetdRtnl *rtnl) {
                 m = (struct nlmsghdr *) buf;
                 rem = (int) len;
 
+                /* int rem, NLMSG_OK sign-compare: see nl_execute(). */
                 for (; NLMSG_OK(m, rem); m = NLMSG_NEXT(m, rem)) {
                         switch (m->nlmsg_type) {
 

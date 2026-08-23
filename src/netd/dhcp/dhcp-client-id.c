@@ -15,6 +15,10 @@
  * NETD_TEST_MODE=1 in the environment as netd's equivalent of upstream's
  * network_test_mode_enabled(), which this lift does not otherwise carry.
  *
+ * The offsetof() calls below say __typeof__ where upstream says typeof.
+ * Same operator, reserved spelling -- clang counts the bare one as a
+ * -Wlanguage-extension-token, which this project builds with -Werror.
+ *
  * sd_dhcp_duid_set_llt()'s time_from_2000y is a uint16_t despite writing
  * into a 32-bit wire field -- verified against the real v261.2 source
  * (sd-dhcp-duid.c:113-124): this is upstream's own code, not a lift
@@ -56,7 +60,7 @@ int dhcp_client_id_get(const DhcpClientId *client_id, uint8_t *ret_type, const v
 
         *ret_type = client_id->id.type;
         *ret_data = client_id->id.data;
-        *ret_size = client_id->size - offsetof(typeof(client_id->id), data);
+        *ret_size = client_id->size - offsetof(__typeof__(client_id->id), data);
         return 0;
 }
 
@@ -80,7 +84,7 @@ int dhcp_client_id_set(DhcpClientId *client_id, uint8_t type, const void *data, 
         client_id->id.type = type;
         memcpy(client_id->id.data, data, data_size);
 
-        client_id->size = offsetof(typeof(client_id->id), data) + data_size;
+        client_id->size = offsetof(__typeof__(client_id->id), data) + data_size;
         return 0;
 }
 
@@ -105,7 +109,7 @@ int dhcp_client_id_set_iaid_duid(DhcpClientId *client_id, uint32_t iaid, const D
         unaligned_write_be32(&client_id->id.ns.iaid, iaid);
         memcpy(&client_id->id.ns.duid, &duid->duid, duid->size);
 
-        client_id->size = offsetof(typeof(client_id->id), ns.duid) + duid->size;
+        client_id->size = offsetof(__typeof__(client_id->id), ns.duid) + duid->size;
         return 0;
 }
 
@@ -117,7 +121,7 @@ int dhcp_client_id_to_string(const DhcpClientId *client_id, char **ret) {
         assert_return(dhcp_client_id_is_set(client_id), -EINVAL);
         assert_return(ret, -EINVAL);
 
-        len = client_id->size - offsetof(typeof(client_id->id), data);
+        len = client_id->size - offsetof(__typeof__(client_id->id), data);
 
         switch (client_id->id.type) {
         case 0:
