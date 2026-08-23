@@ -100,6 +100,25 @@ struct Link {
 
         struct in_addr gateway;
         bool gateway_configured;
+
+        /*
+         * Reentrancy guard. Set for the duration of link_apply_lease(), which
+         * upstream's own history warns is reachable from inside a DHCP
+         * client/server callback still on the call stack (sd-dhcp-server.c
+         * has no DONT_DESTROY guard around its callbacks the way
+         * sd-dhcp-client.c does -- plan §2.2's history-review finding).
+         * link_apply_lease() never itself calls link_configure()/
+         * link_reconfigure()/link_deconfigure() -- only address/route/
+         * resolv.conf/lease-file/time state -- so today's call graph cannot
+         * actually re-enter through this flag. It exists so a future mistake
+         * (a DHCP callback calling into the reconfigure path directly, or
+         * link_apply_lease growing such a call) becomes a logged -EBUSY
+         * instead of a use-after-free: link_configure() and
+         * link_deconfigure() both refuse to run while this is set, rather
+         * than mutate or free kernel/lease state a still-running callback may
+         * depend on. See the report on this milestone for the full reasoning.
+         */
+        bool applying_lease;
 };
 
 /* --- netd-link.c --- */
@@ -163,9 +182,17 @@ int link_deconfigure(Link *l);
  * when UseNTP=/UseTimezone= allow it -- option 42's NTP servers and option
  * 101's timezone handed to netd-sntp.c and netd-time.c by direct call.
  *
- * Replaces any previous lease atomically from the caller's point of view: the
- * new address is added before the old one is removed, so a renewal to the
- * same address never has a window with no address on the interface.
+ * A renewal to the *same* address is a single in-place NLM_F_REPLACE
+ * (lifetime refresh only), so it never has a window with no address on the
+ * interface. A renewal to a genuinely *different* address removes the old
+ * one before adding the new one -- the reverse of what an "atomic" renewal
+ * suggests, and deliberately so: adding the new address first, while both
+ * addresses share a subnet (the common case), makes it "secondary", and the
+ * kernel cascades a primary-address delete into deleting every secondary in
+ * that subnet too (net.ipv4.conf.*.promote_secondaries defaults to 0) --
+ * reproduced directly while building N1's own end-to-end test. Add-then-
+ * remove would silently lose both addresses at once instead of leaving a
+ * brief gap.
  *
  * 0 or -errno.
  */

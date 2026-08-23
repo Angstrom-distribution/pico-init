@@ -2,7 +2,11 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * N1's acceptance test: the hand-rolled rtnetlink layer.
+ * N1's acceptance tests: the hand-rolled rtnetlink layer, and the milestone's
+ * real done-when criterion from plan §2.10 -- "test-netd-rtnl passes in a
+ * netns and a static .network file end-to-end configures a dummy interface,
+ * reconfiguring on SIGHUP." The first half (test_netns_rtnl()) was already
+ * here; test_netns_static_network_and_sighup() below is the second half.
  *
  * Real network-namespace test (plan §2.8): unshare(CLONE_NEWUSER|CLONE_NEWNET)
  * -- a bare unshare(CLONE_NEWNET) fails here with EPERM, there is no
@@ -11,7 +15,11 @@
  * same unshare() call is owned by it, so CAP_NET_ADMIN is available there
  * too. Failing to set up the namespace is fatal (exit(1) with a message),
  * never a silent pass: a test that cannot prove it ran isolated must not
- * report success.
+ * report success. Each netns-using test function calls enter_test_netns()
+ * itself (nested unshare()s are fine: each grants a fresh, independent user
+ * and net namespace owned by the caller, who is root inside the one it is
+ * already running in), so the test functions stay independent of each
+ * other's ordering in main().
  *
  * `dummy` interfaces are not available in this environment (no
  * /lib/modules), so every case that would use one uses a veth pair instead,
@@ -42,8 +50,10 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <limits.h>
 #include <net/if.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,7 +62,10 @@
 #include <unistd.h>
 
 #include "../test-util.h"
+#include "netd-link.h"
+#include "netd-network.h"
 #include "netd-rtnl.h"
+#include "netd.h"
 
 /* Every event kind has a name; nothing falls through to "invalid". A missing
  * table entry is a NULL deref in a log call on a board, which is a miserable
@@ -287,10 +300,186 @@ static void test_netns_rtnl(void) {
         printf("test-netd-rtnl: netns subtest ok\n");
 }
 
+/* --- N1's real done-when criterion (plan §2.10) ---
+ *
+ * A static .network file end-to-end configures an interface, and SIGHUP
+ * reconfigures it. This drives the whole N1 stack through its real public
+ * entry points -- netd_new()/netd_startup()/netd_loop_dispatch_signal()/the
+ * reload handler -- against a temporary tree (netd's settable paths exist
+ * exactly so a test never touches the container's real /etc, /run, /var),
+ * inside the same kind of fresh netns as test_netns_rtnl() above, with a
+ * veth pair standing in for the unavailable `dummy` interface.
+ */
+
+static void write_network_file(
+                const char *dir,
+                const char *name,
+                const char *ifname,
+                const char *address,
+                const char *gateway,
+                const char *dns) {
+        char content[512];
+        int len;
+
+        len = snprintf(content,
+                       sizeof(content),
+                       "[Match]\nName=%s\n\n[Network]\nAddress=%s\nGateway=%s\nDNS=%s\n",
+                       ifname,
+                       address,
+                       gateway,
+                       dns);
+        if (len < 0 || (size_t) len >= sizeof(content)) {
+                fprintf(stderr, "test-netd-rtnl: network file content too long\n");
+                exit(1);
+        }
+
+        if (test_write_file(dir, name, content) < 0) {
+                fprintf(stderr, "test-netd-rtnl: failed to write %s/%s: %s\n", dir, name, strerror(errno));
+                exit(1);
+        }
+}
+
+static void read_file_into(const char *path, char *buf, size_t bufsz) {
+        FILE *f = fopen(path, "re");
+        size_t n;
+
+        if (!f) {
+                fprintf(stderr, "test-netd-rtnl: cannot open %s: %s\n", path, strerror(errno));
+                exit(1);
+        }
+
+        n = fread(buf, 1, bufsz - 1, f);
+        buf[n] = '\0';
+        fclose(f);
+}
+
+static void test_netns_static_network_and_sighup(void) {
+        char *tmp;
+        char netdir[PATH_MAX], rundir[PATH_MAX], statedir[PATH_MAX], resolv[PATH_MAX];
+        const char *netpath[2];
+        Netd *n = NULL;
+        Link *l;
+        char buf[4096];
+        int r, signo;
+
+        enter_test_netns();
+
+        tmp = test_tmpdir_new();
+        ASSERT_TRUE(tmp != NULL);
+
+        ASSERT_TRUE(test_mkdir(tmp, "network") == 0);
+        ASSERT_TRUE(test_mkdir(tmp, "run") == 0);
+        ASSERT_TRUE(test_mkdir(tmp, "state") == 0);
+
+        snprintf(netdir, sizeof(netdir), "%s/network", tmp);
+        snprintf(rundir, sizeof(rundir), "%s/run", tmp);
+        snprintf(statedir, sizeof(statedir), "%s/state", tmp);
+        snprintf(resolv, sizeof(resolv), "%s/resolv.conf", tmp);
+
+        write_network_file(
+                        netdir, "10-nettest.network", "nettest0", "10.252.0.5/24", "10.252.0.254", "10.252.0.1");
+
+        /* The interface exists before netd_startup() runs, exercising the
+         * enumeration-dump path (live-event ordering is test_netns_rtnl()'s
+         * job above). */
+        run_ip("link add name nettest0 type veth peer name nettest1");
+
+        r = netd_new(&n);
+        ASSERT_TRUE(r == 0);
+        ASSERT_TRUE(n != NULL);
+
+        netpath[0] = netdir;
+        netpath[1] = NULL;
+        ASSERT_TRUE(netd_set_network_path(n, netpath) == 0);
+        ASSERT_TRUE(netd_set_runtime_dir(n, rundir) == 0);
+        ASSERT_TRUE(netd_set_state_dir(n, statedir) == 0);
+        ASSERT_TRUE(netd_set_resolv_conf(n, resolv) == 0);
+
+        r = netd_startup(n);
+        ASSERT_TRUE(r == 0);
+
+        /* lo is netd's own job, independent of any .network match. A fresh
+         * netns's lo starts administratively down -- grep -w UP matches the
+         * IFF_UP flag inside the <...,UP,...> bracket regardless of the
+         * separately-reported (and, for loopback, always UNKNOWN) operstate. */
+        run_shell("ip link show lo | grep -qw UP");
+
+        l = netd_find_link_by_name(n, "nettest0");
+        ASSERT_TRUE(l != NULL);
+        ASSERT_EQ_INT(l->state, LINK_CONFIGURED);
+        ASSERT_TRUE(l->address_configured);
+        ASSERT_TRUE(l->gateway_configured);
+
+        run_shell("ip -4 addr show dev nettest0 | grep -q '10\\.252\\.0\\.5/24'");
+        run_shell("ip route show default dev nettest0 | grep -q '10\\.252\\.0\\.254'");
+
+        read_file_into(resolv, buf, sizeof(buf));
+        ASSERT_TRUE(strstr(buf, "nameserver 10.252.0.1") != NULL);
+
+        /* --- SIGHUP: rewrite the .network file and reconfigure --- */
+
+        write_network_file(
+                        netdir, "10-nettest.network", "nettest0", "10.252.0.9/24", "10.252.0.253", "10.252.0.2");
+
+        ASSERT_TRUE(raise(SIGHUP) == 0);
+
+        /* Mirrors netd_loop_run()'s own two steps for a signalfd-ready event
+         * followed by a post-batch reload -- driven directly here so the test
+         * does not need to block in epoll_wait(). */
+        r = pico_signal_read(n->signal, &signo);
+        ASSERT_TRUE(r == 0);
+        ASSERT_EQ_INT(signo, SIGHUP);
+
+        r = netd_loop_dispatch_signal(n, signo);
+        ASSERT_TRUE(r == 0);
+        ASSERT_TRUE(n->reload_requested);
+
+        ASSERT_TRUE(n->reload_handler != NULL);
+        r = n->reload_handler(n);
+        ASSERT_TRUE(r == 0);
+        n->reload_requested = false;
+
+        l = netd_find_link_by_name(n, "nettest0");
+        ASSERT_TRUE(l != NULL);
+        ASSERT_EQ_INT(l->state, LINK_CONFIGURED);
+
+        run_shell("ip -4 addr show dev nettest0 | grep -q '10\\.252\\.0\\.9/24'");
+        run_shell("! ip -4 addr show dev nettest0 | grep -q '10\\.252\\.0\\.5/24'");
+        run_shell("ip route show default dev nettest0 | grep -q '10\\.252\\.0\\.253'");
+        run_shell("! ip route show default dev nettest0 | grep -q '10\\.252\\.0\\.254'");
+
+        read_file_into(resolv, buf, sizeof(buf));
+        ASSERT_TRUE(strstr(buf, "nameserver 10.252.0.2") != NULL);
+
+        /* A second reload with nothing changed on disk must leave a working
+         * interface strictly alone (netd-link.h on link_reconfigure()), not
+         * merely succeed. */
+        r = n->reload_handler(n);
+        ASSERT_TRUE(r == 0);
+        run_shell("ip -4 addr show dev nettest0 | grep -q '10\\.252\\.0\\.9/24'");
+
+        run_ip("link del nettest0");
+
+        /* Let netd see the REMOVED event before tearing down, the way it
+         * would in real operation -- otherwise netd_free()'s own teardown
+         * tries to remove kernel state for an interface already gone and
+         * logs a harmless but confusing "No such device" warning. */
+        r = netd_rtnl_process(n->rtnl);
+        ASSERT_TRUE(r >= 1);
+        ASSERT_TRUE(netd_find_link_by_name(n, "nettest0") == NULL);
+
+        netd_free(n);
+        test_rm_rf(tmp);
+        free(tmp);
+
+        printf("test-netd-rtnl: static .network + SIGHUP subtest ok\n");
+}
+
 int main(void) {
         test_event_names();
         test_link_snapshot_shape();
         test_netns_rtnl();
+        test_netns_static_network_and_sighup();
 
         printf("test-netd-rtnl: ok\n");
         return EXIT_SUCCESS;

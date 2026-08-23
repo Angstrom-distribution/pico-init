@@ -2,33 +2,495 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * netd's epoll loop. Real rather than stubbed, for the same reason M0's
- * timer.c and signal.c were: at this size a stub is no less code than the
- * implementation, and every later milestone registers against it.
+ * netd's epoll loop, and -- since this file was built to review this
+ * comment carefully -- the Netd object's whole lifecycle: allocation, the
+ * settable paths, netd_startup()/netd_reload()/netd_bring_up_loopback(), and
+ * netd_runtime_path(). All of that used to live in netd.c, next to main().
+ * It moved here for a build-graph reason, not a design change:
+ * meson.build's netd_core static_library() links netd_own_sources (this
+ * file among them) into every netd test binary, but deliberately never
+ * links netd.c itself -- the same exclusion main.c gets from
+ * pico-init-core, so a test executable never ends up with two main()s. A
+ * symbol that exists only in netd.c is therefore invisible to every test,
+ * including this milestone's own end-to-end static-.network-plus-SIGHUP
+ * test in test-netd-rtnl.c, which needs netd_new()/netd_startup()/
+ * netd_set_*()/netd_free() to drive the real entry points rather than
+ * reach into a hand-built Netd. netd.c itself now holds only main(), and
+ * every declaration below still lives in netd.h exactly where it always
+ * did -- a caller never needs to know which .c file defines it. This is
+ * the same manager.c/main.c split M0-M5's PID 1 core already uses, for the
+ * same reason: the real object lives in the library the tests link, and
+ * main() stays a thin driver that nothing links but the real binary.
  *
- * The one thing that is not obvious: a reload is acted on *after* the whole
- * epoll batch is dispatched, never inside it. netd_reload() frees every
- * Network, and a callback still holding the borrowed Network* its Link points
- * at would be reading freed memory. This is the same class of bug M5 found in
- * PID 1's run queue, and it is cheaper to design out than to debug on a
- * board.
+ * The loop itself: one thing about it is not obvious. A reload is acted on
+ * *after* the whole epoll batch is dispatched, never inside it.
+ * netd_reload() frees every Network, and a callback still holding the
+ * borrowed Network* its Link points at would be reading freed memory. This
+ * is the same class of bug M5 found in PID 1's run queue, and it is cheaper
+ * to design out than to debug on a board. netd_loop_run() reaches
+ * netd_reload() through Netd.reload_handler rather than calling it by name,
+ * which by now is not a link-time necessity (both live in this file) but is
+ * kept anyway: it lets a test install a spy, or nothing at all, without
+ * netd_loop_run() ever needing to know that.
  */
 
 #include "netd-loop.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <signal.h>
 #include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "../signal.h"
 #include "../timer.h"
 #include "../util.h"
+#include "netd-link.h"
+#include "netd-network.h"
+#include "netd-resolv.h"
+#include "netd-rtnl.h"
+#include "netd-sntp.h"
+#include "netd-time.h"
 #include "netd.h"
 
 #define NETD_EPOLL_MAX_EVENTS 16
+
+/* --- Netd object lifecycle (moved from netd.c; see this file's header) --- */
+
+static const char * const default_network_path[] = {
+        NETD_NETWORK_DIR,
+        NETD_RUNTIME_NETWORK_DIR,
+        NETD_PACKAGED_NETWORK_DIR,
+        NULL,
+};
+
+/* Replace *field with an owned copy of `value`. 0 or -errno. */
+static int set_string(char **field, const char *value) {
+        char *copy;
+
+        if (!field || !value)
+                return -EINVAL;
+
+        copy = pico_strdup(value);
+        if (!copy)
+                return -ENOMEM;
+
+        free(*field);
+        *field = copy;
+        return 0;
+}
+
+int netd_new(Netd **ret) {
+        Netd *n;
+        int r;
+
+        if (!ret)
+                return -EINVAL;
+
+        n = calloc(1, sizeof(*n));
+        if (!n)
+                return -ENOMEM;
+
+        n->epoll_fd = -1;
+        n->objective = NETD_RUNNING;
+        /* See netd-loop.h's comment on netd_reload_handler_t: this is the
+         * real thing, wired here so main()'s netd_new()/netd_loop_run()
+         * pair works without knowing this indirection exists. A test that
+         * wants different (or no) reload behaviour can overwrite this field
+         * after netd_new() returns. */
+        n->reload_handler = netd_reload;
+
+        r = netd_set_network_path(n, default_network_path);
+        if (r < 0)
+                goto fail;
+
+        r = set_string(&n->runtime_dir, NETD_RUNTIME_DIR);
+        if (r < 0)
+                goto fail;
+
+        r = set_string(&n->state_dir, NETD_STATE_DIR);
+        if (r < 0)
+                goto fail;
+
+        r = set_string(&n->resolv_conf, NETD_RESOLV_CONF);
+        if (r < 0)
+                goto fail;
+
+        r = set_string(&n->zoneinfo_dir, NETD_ZONEINFO_DIR);
+        if (r < 0)
+                goto fail;
+
+        r = set_string(&n->localtime_path, NETD_LOCALTIME_PATH);
+        if (r < 0)
+                goto fail;
+
+        r = pico_signal_new(&n->signal);
+        if (r < 0)
+                goto fail;
+
+        r = pico_timer_new(&n->timer);
+        if (r < 0)
+                goto fail;
+
+        r = netd_loop_setup(n);
+        if (r < 0)
+                goto fail;
+
+        *ret = n;
+        return 0;
+
+fail:
+        netd_free(n);
+        return r;
+}
+
+Netd *netd_free(Netd *n) {
+        if (!n)
+                return NULL;
+
+        /* Links first: each one deregisters its own epoll entries and removes
+         * what it put in the kernel, and both need the rtnl socket and the
+         * epoll fd to still be open. */
+        while (n->n_links > 0)
+                (void) link_free(n->links[n->n_links - 1]);
+        free(n->links);
+
+        n->sntp = netd_sntp_free(n->sntp);
+
+        network_free_all(n);
+        n->network_path = pico_strv_free(n->network_path);
+
+        n->rtnl = netd_rtnl_free(n->rtnl);
+        n->timer = pico_timer_free(n->timer);
+        n->signal = pico_signal_free(n->signal);
+
+        if (n->epoll_fd >= 0)
+                (void) close(n->epoll_fd);
+
+        free(n->runtime_dir);
+        free(n->state_dir);
+        free(n->resolv_conf);
+        free(n->zoneinfo_dir);
+        free(n->localtime_path);
+
+        free(n);
+        return NULL;
+}
+
+int netd_set_network_path(Netd *n, const char * const *path) {
+        char **copy = NULL;
+        int r;
+
+        if (!n || !path)
+                return -EINVAL;
+
+        for (size_t i = 0; path[i]; i++) {
+                r = pico_strv_extend(&copy, path[i]);
+                if (r < 0) {
+                        pico_strv_free(copy);
+                        return r;
+                }
+        }
+
+        pico_strv_free(n->network_path);
+        n->network_path = copy;
+        return 0;
+}
+
+int netd_set_runtime_dir(Netd *n, const char *dir) {
+        return n ? set_string(&n->runtime_dir, dir) : -EINVAL;
+}
+
+int netd_set_state_dir(Netd *n, const char *dir) {
+        return n ? set_string(&n->state_dir, dir) : -EINVAL;
+}
+
+int netd_set_resolv_conf(Netd *n, const char *path) {
+        return n ? set_string(&n->resolv_conf, path) : -EINVAL;
+}
+
+int netd_set_zoneinfo_dir(Netd *n, const char *dir) {
+        return n ? set_string(&n->zoneinfo_dir, dir) : -EINVAL;
+}
+
+int netd_set_localtime_path(Netd *n, const char *path) {
+        return n ? set_string(&n->localtime_path, path) : -EINVAL;
+}
+
+int netd_runtime_path(Netd *n, const char *subdir, const char *name, bool mkdir_parent, char **ret) {
+        char dir[PATH_MAX], path[PATH_MAX];
+        char *copy;
+        int len;
+
+        if (!n || !n->runtime_dir || !ret)
+                return -EINVAL;
+
+        if (subdir)
+                len = snprintf(dir, sizeof(dir), "%s/%s", n->runtime_dir, subdir);
+        else
+                len = snprintf(dir, sizeof(dir), "%s", n->runtime_dir);
+        if (len < 0 || (size_t) len >= sizeof(dir))
+                return -ENAMETOOLONG;
+
+        if (mkdir_parent) {
+                /* The runtime directory itself may be missing too, so create
+                 * both levels rather than assuming a tmpfiles.d dropped one
+                 * in: netd is the only thing that writes here. */
+                if (subdir && mkdir(n->runtime_dir, 0755) < 0 && errno != EEXIST)
+                        return -errno;
+
+                if (mkdir(dir, 0755) < 0 && errno != EEXIST)
+                        return -errno;
+        }
+
+        if (name)
+                len = snprintf(path, sizeof(path), "%s/%s", dir, name);
+        else
+                len = snprintf(path, sizeof(path), "%s", dir);
+        if (len < 0 || (size_t) len >= sizeof(path))
+                return -ENAMETOOLONG;
+
+        copy = pico_strdup(path);
+        if (!copy)
+                return -ENOMEM;
+
+        *ret = copy;
+        return 0;
+}
+
+/* --- startup / reload sequencing (moved from netd.c; see this file's header) --- */
+
+/*
+ * Enumerate links, deferring per-link configuration until the dump itself
+ * has fully drained. See Netd.rtnl_dump_in_progress (netd.h) and
+ * netd_link_rtnl_handler()'s comment (netd-link.c) for why: configuring
+ * inline from inside the dump's own ADDED callback would issue a
+ * synchronous rtnl request/ACK on the very same private socket the dump is
+ * still mid-read on, and the reply-matching loop in netd-rtnl.c's
+ * nl_execute() would silently swallow the dump's remaining messages --
+ * including the terminating NLMSG_DONE -- hanging this function forever.
+ * Used both by netd_startup() and by dispatch_rtnl_source()'s ENOBUFS
+ * recovery (netd-rtnl.h: the only way back to a correct link table after
+ * the event socket overruns is a fresh dump).
+ */
+static int netd_rtnl_reenumerate(Netd *n) {
+        int r;
+
+        n->rtnl_dump_in_progress = true;
+        r = netd_rtnl_enumerate_links(n->rtnl);
+        n->rtnl_dump_in_progress = false;
+
+        if (r < 0)
+                return r;
+
+        for (size_t i = 0; i < n->n_links; i++) {
+                int rr = link_configure(n->links[i]);
+
+                if (rr < 0)
+                        pico_log(PICO_LOG_WARNING,
+                                 "netd: %s: configure failed: %s",
+                                 n->links[i]->ifname,
+                                 strerror(-rr));
+        }
+
+        return 0;
+}
+
+static int dispatch_rtnl_source(Netd *n, struct netd_epoll_tag *tag, uint32_t revents) {
+        int r;
+
+        (void) tag;
+        (void) revents;
+
+        r = netd_rtnl_process(n->rtnl);
+        if (r == -ENOBUFS) {
+                pico_log(PICO_LOG_WARNING, "netd: rtnl: event socket overran, re-enumerating");
+                return netd_rtnl_reenumerate(n);
+        }
+
+        return r < 0 ? r : 0;
+}
+
+/*
+ * [Network] NTP=, across every loaded .network file (netd-sntp.h: "Called
+ * from netd_startup() with [Network] NTP= and from link_apply_lease() with
+ * DHCP option 42, so the two sources cannot accumulate stale entries across a
+ * lease change"). There is exactly one NetdSntp on Netd, not one per link --
+ * a single daemon-wide server list, rebuilt from scratch each time this
+ * runs so a reload can't leave a stale entry from a file that no longer
+ * lists it. Best-effort throughout: a board with no NTP configured anywhere
+ * is not a startup failure.
+ */
+static void netd_apply_static_ntp(Netd *n) {
+        struct in_addr servers[NETD_SNTP_MAX_SERVERS];
+        size_t count = 0;
+
+        for (size_t i = 0; i < n->n_networks && count < NETD_SNTP_MAX_SERVERS; i++) {
+                Network *nw = n->networks[i];
+
+                for (size_t j = 0; j < nw->n_ntp && count < NETD_SNTP_MAX_SERVERS; j++) {
+                        bool dup = false;
+
+                        for (size_t k = 0; k < count; k++)
+                                if (servers[k].s_addr == nw->ntp[j].s_addr) {
+                                        dup = true;
+                                        break;
+                                }
+
+                        if (!dup)
+                                servers[count++] = nw->ntp[j];
+                }
+        }
+
+        if (count == 0)
+                return;
+
+        if (!n->sntp) {
+                int r = netd_sntp_new(n, &n->sntp);
+
+                if (r < 0) {
+                        pico_log(PICO_LOG_WARNING, "netd: static NTP=: failed to start sntp: %s", strerror(-r));
+                        return;
+                }
+        }
+
+        (void) netd_sntp_set_servers(n->sntp, servers, count);
+        (void) netd_sntp_start(n->sntp);
+}
+
+int netd_startup(Netd *n) {
+        int r;
+
+        if (!n)
+                return -EINVAL;
+
+        /*
+         * 1. Clock floor, before anything timestamps anything (netd.h). Never
+         * fatal: an RTC-less board with no clock file yet still has
+         * NETD_TIME_EPOCH_SEC as a floor (netd-time.h), and a failure here
+         * is a reason to log, not to refuse to bring the network up.
+         */
+        r = netd_time_clock_floor_apply(n);
+        if (r < 0)
+                pico_log(PICO_LOG_WARNING, "netd: startup: clock floor: %s", strerror(-r));
+
+        /* 2. Load every .network file in the search path. */
+        r = network_load_all(n);
+        if (r < 0) {
+                pico_log(PICO_LOG_ERR, "netd: startup: failed to load .network files: %s", strerror(-r));
+                return r;
+        }
+
+        /*
+         * 3. Open rtnetlink and *subscribe* before enumerating -- the
+         * load-bearing part of this whole function (netd.h): an interface
+         * that appears between the dump and the subscription would be missed
+         * forever, and netd has no After=eudev.service to fall back on.
+         */
+        r = netd_rtnl_new(&n->rtnl);
+        if (r < 0) {
+                pico_log(PICO_LOG_ERR, "netd: startup: rtnl: %s", strerror(-r));
+                return r;
+        }
+
+        netd_rtnl_set_link_handler(n->rtnl, netd_link_rtnl_handler, n);
+
+        r = netd_loop_add_io(
+                        n,
+                        &n->rtnl_tag,
+                        netd_rtnl_event_fd(n->rtnl),
+                        EPOLLIN,
+                        NETD_EPOLL_RTNL,
+                        dispatch_rtnl_source,
+                        n);
+        if (r < 0) {
+                pico_log(PICO_LOG_ERR, "netd: startup: failed to register rtnl in the loop: %s", strerror(-r));
+                return r;
+        }
+
+        /*
+         * Loopback: netd's job explicitly, upstream leaves it to PID 1 and
+         * pico-init deliberately does not do it (netd.h). Bringing it up
+         * here, before enumeration, keeps it independent of whether any
+         * .network file happens to match "lo" (none is expected to).
+         */
+        r = netd_bring_up_loopback(n);
+        if (r < 0)
+                pico_log(PICO_LOG_WARNING, "netd: startup: failed to bring lo up: %s", strerror(-r));
+
+        /* 4. Only now enumerate -- every link already seen gets ADDED, and
+         * netd_link_rtnl_handler() (subscribed above) has already been live
+         * for anything that shows up in between. Configuration itself is
+         * deferred until the dump drains; see netd_rtnl_reenumerate(). */
+        r = netd_rtnl_reenumerate(n);
+        if (r < 0) {
+                pico_log(PICO_LOG_ERR, "netd: startup: link enumeration failed: %s", strerror(-r));
+                return r;
+        }
+
+        netd_apply_static_ntp(n);
+
+        return 0;
+}
+
+int netd_reload(Netd *n) {
+        int r;
+
+        if (!n)
+                return -EINVAL;
+
+        /*
+         * network_load_all() replaces n->networks wholesale on success, which
+         * frees every Network a Link may be pointing at -- every Link->network
+         * is dangling from this line until link_reconfigure() re-matches it
+         * below. Safe because netd_reload() only ever runs from
+         * netd_loop_run()'s post-batch check (via n->reload_handler), never
+         * nested inside a callback still holding a borrowed Network*
+         * (netd-loop.h's whole reason for deferring the reload).
+         */
+        r = network_load_all(n);
+        if (r < 0) {
+                pico_log(PICO_LOG_ERR, "netd: reload: failed to load .network files: %s", strerror(-r));
+                return r;
+        }
+
+        for (size_t i = 0; i < n->n_links; i++) {
+                int rr = link_reconfigure(n->links[i]);
+
+                if (rr < 0)
+                        pico_log(PICO_LOG_WARNING,
+                                 "netd: reload: %s: reconfigure failed: %s",
+                                 n->links[i]->ifname,
+                                 strerror(-rr));
+        }
+
+        netd_apply_static_ntp(n);
+
+        return 0;
+}
+
+int netd_bring_up_loopback(Netd *n) {
+        if (!n)
+                return -EINVAL;
+
+        if (!n->rtnl)
+                return -EINVAL;
+
+        /*
+         * Loopback is always ifindex 1 on Linux -- upstream's own convention.
+         * This bypasses the .network match path on purpose: "lo" is netd's
+         * job explicitly (netd.h), not something any [Match] Name= is
+         * expected to name, so it never goes through link_configure().
+         */
+        return netd_rtnl_link_up(n->rtnl, 1);
+}
+
+/* --- the epoll loop --- */
 
 static int dispatch_signal_source(Netd *n, struct netd_epoll_tag *tag, uint32_t revents) {
         int r;
@@ -106,16 +568,20 @@ int netd_loop_add_io(
         if (!n || !tag || !callback || fd < 0 || n->epoll_fd < 0)
                 return -EINVAL;
 
-        /* A tag that still names an fd was never removed. Re-registering it
+        /* A tag still marked registered was never removed. Re-registering it
          * would leak the old epoll entry, which keeps firing for whatever
-         * that descriptor number becomes next. */
-        if (tag->fd >= 0)
+         * that descriptor number becomes next. Keyed off `registered`, not
+         * `fd >= 0`: every tag lives inside a calloc()'d/new0()'d owner, so a
+         * freshly allocated tag has fd == 0 (a valid descriptor number) and
+         * only `registered` is guaranteed zero -- see netd-loop.h. */
+        if (tag->registered)
                 return -EBUSY;
 
         tag->source = source;
         tag->fd = fd;
         tag->callback = callback;
         tag->userdata = userdata;
+        tag->registered = true;
 
         memset(&ev, 0, sizeof(ev));
         ev.events = events;
@@ -123,6 +589,7 @@ int netd_loop_add_io(
 
         if (epoll_ctl(n->epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0) {
                 tag->fd = -1;
+                tag->registered = false;
                 return -errno;
         }
 
@@ -151,7 +618,7 @@ int netd_loop_remove_io(Netd *n, struct netd_epoll_tag *tag) {
 
         /* Not an error: teardown of a half-configured link should not have to
          * remember how far configuration got. */
-        if (tag->fd < 0)
+        if (!tag->registered)
                 return 0;
 
         if (n->epoll_fd >= 0 && epoll_ctl(n->epoll_fd, EPOLL_CTL_DEL, tag->fd, NULL) < 0 &&
@@ -159,6 +626,7 @@ int netd_loop_remove_io(Netd *n, struct netd_epoll_tag *tag) {
                 return -errno;
 
         tag->fd = -1;
+        tag->registered = false;
         tag->callback = NULL;
         tag->userdata = NULL;
         return 0;
@@ -216,7 +684,7 @@ int netd_loop_run(Netd *n) {
                          * by an earlier callback in the same batch can still
                          * appear later in it, and its tag is then cleared.
                          */
-                        if (!tag || !tag->callback || tag->fd < 0)
+                        if (!tag || !tag->callback || !tag->registered)
                                 continue;
 
                         r = tag->callback(n, tag, events[i].events);
@@ -228,13 +696,14 @@ int netd_loop_run(Netd *n) {
                 }
 
                 if (n->reload_requested) {
-                        int r;
-
                         n->reload_requested = false;
 
-                        r = netd_reload(n);
-                        if (r < 0)
-                                pico_log(PICO_LOG_ERR, "netd: reload failed: %s", strerror(-r));
+                        if (n->reload_handler) {
+                                int r = n->reload_handler(n);
+
+                                if (r < 0)
+                                        pico_log(PICO_LOG_ERR, "netd: reload failed: %s", strerror(-r));
+                        }
                 }
         }
 

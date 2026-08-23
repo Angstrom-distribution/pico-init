@@ -79,6 +79,23 @@ struct Netd {
         struct netd_epoll_tag rtnl_tag;
 
         /*
+         * True for the duration of a netd_rtnl_enumerate_links() call
+         * (netd-loop.c). netd_link_rtnl_handler() (netd-link.c) checks this
+         * and, while it is set, only builds/updates the Link table --
+         * link_configure() is deferred until the dump has fully drained.
+         * Configuring inline from inside the dump's own ADDED callback would
+         * issue a synchronous rtnl request/ACK on the very same private
+         * socket the dump is still mid-read on (netd-rtnl.h: dump and writes
+         * share one request socket by design), and nl_execute()'s own
+         * recv loop would silently swallow the dump's remaining messages --
+         * including the terminating NLMSG_DONE -- hanging the dump forever
+         * waiting for a message that already went by. Reproduced live: a
+         * static Address=/Gateway= link discovered by the startup dump hung
+         * netd_startup() indefinitely before this flag existed.
+         */
+        bool rtnl_dump_in_progress;
+
+        /*
          * --- configuration (netd-network.c) ---
          *
          * `networks` is the resolved set after shadowing, sorted
@@ -120,10 +137,27 @@ struct Netd {
          */
         bool reload_requested;
 
+        /*
+         * Installed by netd_new() to netd_reload(). netd_loop_run() calls
+         * through this rather than netd_reload() directly, so a test can
+         * observe or replace reload behaviour, or skip it, without
+         * netd_loop_run() itself ever needing to know. See netd-loop.h's
+         * netd_reload_handler_t.
+         */
+        netd_reload_handler_t reload_handler;
+
         NetdObjective objective;
 };
 
-/* --- netd.c --- */
+/*
+ * Every function below is declared here (the contract callers compile
+ * against) but implemented in netd-loop.c, not netd.c -- meson.build links
+ * netd-loop.c into netd_core, which every netd test executable links, and
+ * deliberately never links netd.c itself (the same exclusion main.c gets
+ * from pico-init-core). netd.c holds only main(); see netd-loop.c's header
+ * comment for the full reasoning. A caller never needs to know this --
+ * #include "netd.h" and link netd-core, as every test already does.
+ */
 
 /* Allocate, create epoll/signalfd/timerfd, install the default paths. 0 or -errno. */
 int netd_new(Netd **ret);

@@ -26,6 +26,7 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 
 typedef struct Netd Netd;
@@ -57,13 +58,40 @@ typedef int (*netd_io_callback_t)(Netd *n, struct netd_epoll_tag *tag, uint32_t 
  * the signal/timer/rtnl sources, the DHCP client/server object for theirs) --
  * never heap-allocated separately, so its lifetime is exactly its owner's and
  * there is nothing to leak. `userdata` is normally the containing object.
+ *
+ * `registered` is the authoritative "is this tag live" flag, checked instead
+ * of `fd`'s sign. Every owner of a tag is allocated with calloc()/new0() (this
+ * project's universal convention), which zero-initializes `fd` to 0 -- a
+ * perfectly valid descriptor number -- rather than -1. A sentinel keyed off
+ * `fd >= 0` therefore reads a freshly calloc()'d, never-registered tag as
+ * already busy, and every registration attempt on it fails -EBUSY forever.
+ * Keying the sentinel off a separately-zeroed bool instead makes the correct
+ * initial state the zero state, so no allocator path has to remember to set
+ * `fd = -1` by hand. `fd` itself is still maintained (-1 when not
+ * registered) purely for logging.
  */
 struct netd_epoll_tag {
         NetdEpollSource source;
-        int fd; /* -1 when not registered */
+        int fd;          /* -1 when not registered; see `registered` above */
+        bool registered; /* authoritative; false is calloc()'s own default */
         netd_io_callback_t callback;
         void *userdata;
 };
+
+/*
+ * The reload callback netd.c installs on the Netd object (netd_new()) and
+ * netd_loop_run() invokes instead of calling netd_reload() directly.
+ *
+ * netd_reload() is defined in netd.c, which meson.build deliberately never
+ * links into netd-core or any test executable -- a second main() would
+ * collide with every test's own, exactly the reason pico-init-core excludes
+ * main.c. A direct call from here would leave every netd-core-linked test
+ * program with an unresolved symbol at link time. This indirection is what
+ * lets a test drive netd_loop_run() with its own reload handler, or leave
+ * the field NULL to skip reload handling entirely -- while keeping the
+ * deferred-until-after-the-batch contract below entirely inside this file.
+ */
+typedef int (*netd_reload_handler_t)(Netd *n);
 
 /* --- netd-loop.c --- */
 
