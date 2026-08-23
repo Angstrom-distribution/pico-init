@@ -66,9 +66,16 @@ test(
 # Shared test scaffolding: temp unit trees, fixture writing, assertions.
 pico_test_sources = files('src/test-util.c')
 
-# Each entry becomes a test program linked against the core library.
+# Each entry becomes a test program linked against the core library. Every
+# milestone's test is registered here up front, placeholder or not, so that
+# adding one never means editing this file while another milestone is also
+# editing it.
 pico_tests = [
   'test-unit-dependency',
+  'test-job',
+  'test-boot-root',
+  'test-service',
+  'test-timer-cgroup',
 ]
 
 foreach t : pico_tests
