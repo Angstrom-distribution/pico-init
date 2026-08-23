@@ -24,6 +24,7 @@ pico_init_core_sources = files(
   'src/mount-setup.c',
   'src/unit.c',
   'src/unit-load.c',
+  'src/conf-scan.c',
   'src/unit-parse.c',
   'src/unit-dependency.c',
   'src/unit-enable.c',
@@ -180,12 +181,23 @@ netd_exe = executable(
   install_dir: get_option('sbindir'),
 )
 
-# All four of netd's tests, registered up front and placeholder-bodied, for
-# exactly the reason the PID 1 list above gives: N1 through N4 are independent
-# of each other, and none of them should have to touch this file.
+# All of netd's tests, registered up front and placeholder-bodied, for exactly
+# the reason the PID 1 list above gives: N1 through N4 are independent of each
+# other, and none of them should have to touch this file.
+#
+# test-netd-codec is a fifth program where the plan (section 2.8) named four,
+# and the split is deliberate. That section asks for golden-byte codec tests
+# "so client and server can't silently share a mirrored wire-format bug", and
+# folding them into test-netd-dhcp would put the codec, the client and the
+# server in one file owned by three different implementers working in
+# parallel -- the precise file-collision shape the previous milestone's
+# retrospective asked to design out. test-netd-codec covers the wire format
+# against fixed bytes; test-netd-dhcp stays the end-to-end client-vs-server
+# pairing over a veth pair.
 netd_tests = [
   'test-netd-network',
   'test-netd-rtnl',
+  'test-netd-codec',
   'test-netd-dhcp',
   'test-netd-sntp',
 ]
