@@ -59,6 +59,10 @@
  *  - abaf5edd08 -- the reason service_cgroup_empty_event() never invents an
  *    exit status: systemd reverted a whole feature over this. See the
  *    SIGCHLD-vs-cgroup-empty ordering note above service_sigchld_event().
+ *  - v30's own sigchld_code_to_string() and its log_full() severity split,
+ *    both dropped by the original quarry while its log line kept the
+ *    arguments that needed them. Restored, not diverged from: see
+ *    sigchld_code_to_string() and format_exit_status().
  *
  * Not backported: ExecStop=/ExecStopPost=/ExecReload=, ExecCondition=,
  * Type=forking/dbus/notify/idle, socket activation, the watchdog, cgroup
@@ -588,6 +592,44 @@ int service_stop(Service *s) {
 }
 
 /*
+ * Naming the (si_code, si_status) pair, because printing it raw is actively
+ * misleading. si_code is CLD_EXITED/CLD_KILLED/CLD_DUMPED, whose values are
+ * 1/2/3 -- so a clean `exit 0` logged as "code=1 status=0, result=success"
+ * reads as an exit status of 1 sitting next to a success verdict. si_status
+ * is worse: it is an exit status under CLD_EXITED and a *signal number*
+ * otherwise, so a SIGTERM at shutdown logs as "status=15". Both halves get
+ * named here, giving systemd's own "code=exited, status=0" shape.
+ *
+ * v30 had sigchld_code_to_string() and this file's quarry dropped it while
+ * keeping its arguments; this restores the upstream behaviour rather than
+ * diverging from it.
+ */
+static const char *sigchld_code_to_string(int code) {
+        switch (code) {
+        case CLD_EXITED:
+                return "exited";
+        case CLD_KILLED:
+                return "killed";
+        case CLD_DUMPED:
+                return "dumped";
+        default:
+                return "unknown";
+        }
+}
+
+static void format_exit_status(char *buf, size_t size, int code, int status) {
+        const char *name;
+
+        if (code == CLD_EXITED) {
+                (void) snprintf(buf, size, "%d", status);
+                return;
+        }
+
+        name = strsignal(status);
+        (void) snprintf(buf, size, "%d/%s", status, name ? name : "unknown signal");
+}
+
+/*
  * SIGCHLD vs cgroup-empty -- the ordering hazard.
  *
  * SIGCHLD carries an exit status; cgroup-empty does not. That asymmetry is
@@ -603,6 +645,7 @@ int service_stop(Service *s) {
  * relies on that ordering rather than re-deriving it.
  */
 void service_sigchld_event(Service *s, pid_t pid, int code, int status) {
+        char statusbuf[64];
         bool is_main, is_control;
         PicoExitClean clean;
         ServiceResult f;
@@ -643,12 +686,22 @@ void service_sigchld_event(Service *s, pid_t pid, int code, int status) {
         if (s->result == SERVICE_SUCCESS)
                 s->result = f;
 
-        pico_log(PICO_LOG_DEBUG,
-                 "%s: %s process exited, code=%d status=%d, result=%s",
+        /* v30 logged this through log_full() at NOTICE when the unit failed
+         * and DEBUG when it did not; the quarry collapsed both to DEBUG, so a
+         * service failing on a board whose only output is a serial console
+         * announced itself at the same level as every routine exit.
+         *
+         * The level follows s->result rather than v30's local f, so that it
+         * agrees with the result= this same line prints: under the write-once
+         * rule an earlier failure survives a later clean exit, and logging
+         * "result=timeout" at debug would hide exactly the case that matters. */
+        format_exit_status(statusbuf, sizeof statusbuf, code, status);
+        pico_log(s->result == SERVICE_SUCCESS ? PICO_LOG_DEBUG : PICO_LOG_WARNING,
+                 "%s: %s process exited, code=%s, status=%s, result=%s",
                  UNIT(s)->id,
                  is_control ? "control" : "main",
-                 code,
-                 status,
+                 sigchld_code_to_string(code),
+                 statusbuf,
                  service_result_to_string(s->result));
 
         if (is_control) {
