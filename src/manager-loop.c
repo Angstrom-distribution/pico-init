@@ -195,18 +195,40 @@ int manager_loop(Manager *m) {
 
         while (m->objective == MANAGER_RUNNING) {
                 bool timer_ready = false;
+                int timeout;
                 int n, i;
 
                 /*
-                 * Block indefinitely in normal operation, but poll while a
-                 * shutdown is pending: the drain deadline is a wall-clock
-                 * bound, and a wedged unit that generates no events would
-                 * otherwise leave us blocked past it forever.
+                 * Dispatch BEFORE waiting, not only after.
+                 *
+                 * Queued work is not an event: nothing wakes epoll to announce
+                 * that a job has become runnable. Waiting first means the boot
+                 * transaction sits in the run queue while PID 1 blocks
+                 * indefinitely for an event that could only be produced by
+                 * starting it -- a hang on real hardware. This is why the
+                 * dispatch is at the top of the loop as well as the bottom.
                  */
-                n = epoll_wait(m->epoll_fd,
-                               events,
-                               MANAGER_MAX_EVENTS,
-                               m->pending_objective == MANAGER_RUNNING ? -1 : 250);
+                manager_dispatch_run_queue(m);
+
+                if (manager_shutdown_finished(m)) {
+                        m->objective = m->pending_objective;
+                        break;
+                }
+
+                /*
+                 * Never block while runnable work remains. Poll while a
+                 * shutdown is pending, because its drain deadline is
+                 * wall-clock and a wedged unit produces no events to wake us.
+                 * Otherwise block until something actually happens.
+                 */
+                if (m->run_queue)
+                        timeout = 0;
+                else if (m->pending_objective != MANAGER_RUNNING)
+                        timeout = 250;
+                else
+                        timeout = -1;
+
+                n = epoll_wait(m->epoll_fd, events, MANAGER_MAX_EVENTS, timeout);
                 if (n < 0) {
                         if (errno == EINTR)
                                 continue;

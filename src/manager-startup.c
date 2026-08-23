@@ -16,6 +16,58 @@
 #include "unit.h"
 #include "util.h"
 
+/*
+ * Give every target an After= on each unit it Wants= or Requires=.
+ *
+ * Without this a target is not a milestone at all: Wants= is a dependency, not
+ * an ordering, so default.target would go active the instant it was started --
+ * before a single thing it pulls in had run -- and "reached default.target"
+ * would mean nothing. That is exactly what happened before this existed.
+ *
+ * This is pico-init's equivalent of upstream's DefaultDependencies=, narrowed
+ * to the one rule that makes boot milestones work. An explicit Before= in a
+ * unit file still wins, because unit_add_dependency() deduplicates and the
+ * ordering graph is checked for cycles afterwards -- a unit that genuinely
+ * must start after its own target simply says so and the cycle check reports
+ * it rather than this silently forcing the other order.
+ */
+static void manager_add_target_default_ordering(Manager *m) {
+        size_t i;
+
+        for (i = 0; i < m->n_units; i++) {
+                Unit *t = m->units[i];
+                UnitDependency deps[2] = { UNIT_WANTS, UNIT_REQUIRES };
+                size_t d;
+
+                if (t->type != UNIT_TARGET || t->load_state != UNIT_LOADED)
+                        continue;
+
+                for (d = 0; d < 2; d++) {
+                        size_t k;
+
+                        for (k = 0; k < t->n_dependencies[deps[d]]; k++) {
+                                Unit *pulled = t->dependencies[deps[d]][k];
+                                int r;
+
+                                /* Skip if the unit file already ordered these
+                                 * two in either direction -- an explicit
+                                 * statement outranks a default. */
+                                if (unit_has_dependency(t, UNIT_AFTER, pulled) ||
+                                    unit_has_dependency(t, UNIT_BEFORE, pulled))
+                                        continue;
+
+                                r = unit_add_dependency(t, UNIT_AFTER, pulled);
+                                if (r < 0)
+                                        pico_log(PICO_LOG_DEBUG,
+                                                 "%s: could not order after %s: %s",
+                                                 t->id,
+                                                 pulled->id,
+                                                 strerror(-r));
+                        }
+                }
+        }
+}
+
 int manager_startup(Manager *m, const char *default_target) {
         Unit *target = NULL;
         size_t i;
@@ -59,8 +111,11 @@ int manager_startup(Manager *m, const char *default_target) {
         if (r < 0)
                 pico_log(PICO_LOG_WARNING, "applying presets: %s", strerror(-r));
 
+        /* 5. Order every target after what it pulls in. */
+        manager_add_target_default_ordering(m);
+
         /*
-         * 5. Refuse to build a transaction over a graph that cannot be
+         * 6. Refuse to build a transaction over a graph that cannot be
          * ordered. This is fatal on purpose: a cycle means there is no boot
          * order at all, and starting units in an arbitrary one would be worse
          * than stopping and saying so. unit_dependency_detect_cycles() logs
@@ -72,7 +127,7 @@ int manager_startup(Manager *m, const char *default_target) {
                 return r;
         }
 
-        /* 6. Root the boot transaction. */
+        /* 7. Root the boot transaction. */
         r = manager_load_unit(m, default_target, &target);
         if (r < 0 || !target) {
                 pico_log(PICO_LOG_ERR, "cannot load %s: %s", default_target, strerror(r < 0 ? -r : ENOENT));

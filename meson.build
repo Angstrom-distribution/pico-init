@@ -76,6 +76,7 @@ pico_tests = [
   'test-boot-root',
   'test-service',
   'test-timer-cgroup',
+  'test-boot',
 ]
 
 foreach t : pico_tests
