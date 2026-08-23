@@ -75,6 +75,20 @@ int test_mkdir(const char *dir, const char *name) {
         return 0;
 }
 
+int test_symlink(const char *dir, const char *name, const char *target) {
+        char path[PATH_MAX];
+        int r;
+
+        r = join(path, sizeof(path), dir, name);
+        if (r < 0)
+                return r;
+
+        if (symlink(target, path) < 0 && errno != EEXIST)
+                return -errno;
+
+        return 0;
+}
+
 void test_rm_rf(const char *path) {
         struct dirent *de;
         DIR *d;

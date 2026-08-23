@@ -68,5 +68,11 @@ int test_write_file(const char *dir, const char *name, const char *content);
 /* Create <dir>/<name> as a directory. Returns 0 or -errno. */
 int test_mkdir(const char *dir, const char *name);
 
+/* Create <dir>/<name> as a symlink pointing at `target` (not resolved).
+ * Real .wants/.requires entries are symlinks, and enablement code cares only
+ * about the entry name, not the link target -- this exercises that path
+ * honestly instead of substituting a regular file. Returns 0 or -errno. */
+int test_symlink(const char *dir, const char *name, const char *target);
+
 /* Recursively remove `path` and free nothing; caller still owns the string. */
 void test_rm_rf(const char *path);
