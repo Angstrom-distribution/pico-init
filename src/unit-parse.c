@@ -12,9 +12,21 @@
  * syntax and dropped at debug level rather than erroring, matching real
  * unit-file tolerance.
  *
+ * The line-level scanner (getline loop, sections, comments, continuations,
+ * BOM, key/value split) now lives in conf-scan.c, shared with netd's
+ * `.network` parser -- see conf-scan.h for why. This file reduces to the
+ * handler table and unit-file semantics: unit_parse_file() below just drives
+ * pico_conf_scan() with unit_conf_handler().
+ *
  * Backported fixes from the 2011 baseline's real upstream history (see
- * plans/29-pico-init.md quarrying-discipline note); commit hashes below
- * are from github.com/systemd/systemd:
+ * plans/29-pico-init.md quarrying-discipline note); commit hashes below are
+ * from github.com/systemd/systemd. Seven of the original eleven are scanner
+ * properties and their citations moved to conf-scan.c with the code that
+ * carries them (e6dde451a unbounded getline, 2d4fffb00 malformed-line-skip,
+ * 9adbfeb38+0ef695858 the comment-backslash/blank-line-terminates pair,
+ * 4f29e0db1 unterminated-continuation flush, 9dd7ea9a7 BOM skip, 8ea913b2e
+ * invalid-free, 91ffff962 free-old-section-before-replacing). The three
+ * remaining are unit-file value semantics and stay here:
  *
  *  - 35b1078e1 "load-fragment: Don't assert() on invalid exec flags" --
  *    the original code hit assert(skip < l) on "ExecStart=- /bin/true"
@@ -29,23 +41,6 @@
  *    accesses" -- an unterminated quote or trailing garbage after a
  *    closing quote was silently accepted; extract_first_word() below
  *    rejects both.
- *  - 8ea913b2e "conf-parser: fix invalid free" -- a strdup() result was
- *    checked via a stale nearby variable instead of the one just
- *    assigned. Every allocation check here tests its own lvalue.
- *  - 91ffff962 "conf-parser: free old section on error" -- section names
- *    are freed before being replaced, not leaked.
- *  - 9dd7ea9a7 "conf-parser: skip UTF-8 byte order mark" -- a BOM on the
- *    first line no longer breaks "[Section]" matching.
- *  - 9adbfeb38 + 0ef695858 -- a comment line ending in backslash must not
- *    start a continuation, and a blank/comment line must still be able to
- *    terminate one already in progress.
- *  - 4f29e0db1 "conf-parser: parse last line of file even if it's an
- *    unterminated continuation" -- flushed explicitly after the read loop.
- *  - 2d4fffb00 "conf-parser: ignore lines without '='" -- one malformed
- *    line is logged and skipped, not a whole-file -EINVAL.
- *  - e6dde451a "conf-parser: use fgets_with_tabs... unbounded read" --
- *    getline() below is inherently unbounded, so a long ExecStart= line
- *    is never silently truncated the way a fixed LINE_MAX buffer would.
  *  - 92c1622e14 / 36c16a7cdd (M3, service.c quarry) -- TimeoutStartSec=/
  *    TimeoutStopSec= and RestartSec= have opposite zero-semantics upstream
  *    (0 means "never time out" for the former, "restart immediately" for
@@ -61,23 +56,31 @@
  * (3851c51ad, 598c47c86) -- multi-command ExecStart= is out of MVP scope,
  * Type=simple takes exactly one command; specifier-expansion OOM-vs-syntax
  * distinction (487060c239) -- no specifier expansion (%i etc.) exists yet.
+ *
+ * The stack-overflow-class bug the M1 review found (a VLA sized by an
+ * unbounded, attacker-controlled line length, reproduced with a 30MB
+ * Requires= line) was in config_parse_unit_deps() below, not the scanner --
+ * conf-scan.c's own getline/realloc-based line handling never used a VLA
+ * either. Its committed regression test lives in netd/test-netd-network.c,
+ * exercising the same heap-not-VLA discipline through netd's own parser
+ * (see that file for why: this project's test programs are not this file's
+ * to add to at N0).
  */
 
 #include "unit.h"
 
 #include <errno.h>
 #include <stdbool.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h> /* strcasecmp, for the boolean spellings */
 
+#include "conf-scan.h"
 #include "manager.h"
 #include "service.h"
 #include "util.h"
 
 typedef enum ConfigSection {
-        SECTION_NONE,
         SECTION_UNIT,
         SECTION_SERVICE,
         SECTION_INSTALL,
@@ -91,27 +94,6 @@ typedef struct ConfigItem {
         const char *lvalue;
         ConfigParseFn parse;
 } ConfigItem;
-
-/* --- small string helpers --- */
-
-static char *strip(char *s) {
-        char *end;
-
-        while (*s == ' ' || *s == '\t')
-                s++;
-
-        end = s + strlen(s);
-        while (end > s && (end[-1] == ' ' || end[-1] == '\t'))
-                end--;
-        *end = '\0';
-
-        return s;
-}
-
-static bool line_is_blank_or_comment(const char *l) {
-        l += strspn(l, " \t");
-        return *l == '\0' || *l == '#' || *l == ';';
-}
 
 /* --- word splitting for ExecStart=/ExecStartPre= --- */
 
@@ -316,13 +298,13 @@ static int config_parse_unit_deps(Unit *u, const char *path, unsigned line, Unit
         char *tok;
 
         /*
-         * Heap, not a VLA: rvalue comes straight from unit_parse_file()'s
-         * unbounded getline() (e6dde451a -- no LINE_MAX truncation is the
-         * whole point), so a VLA sized by strlen(rvalue) turns one long
-         * Requires= line into a stack overflow -- exactly the "malformed
-         * unit file kills PID1" class this file exists to prevent (see the
-         * 35b1078e1 note at the top of this file). Found by review before
-         * this ever shipped, not a hypothetical.
+         * Heap, not a VLA: rvalue comes straight from conf-scan.c's unbounded
+         * getline() (e6dde451a -- no LINE_MAX truncation is the whole point),
+         * so a VLA sized by strlen(rvalue) turns one long Requires= line into
+         * a stack overflow -- exactly the "malformed unit file kills PID1"
+         * class this file exists to prevent (see the 35b1078e1 note at the
+         * top of this file). Found by review before this ever shipped, not a
+         * hypothetical.
          */
         names = pico_strdup(rvalue);
         if (!names)
@@ -718,8 +700,9 @@ static int config_parse_install_names(
 
         (void) u;
 
-        /* heap, not a VLA: rvalue comes from an unbounded getline(), the same
-         * stack-overflow hazard config_parse_unit_deps() documents above */
+        /* heap, not a VLA: rvalue comes from conf-scan.c's unbounded
+         * getline(), the same stack-overflow hazard config_parse_unit_deps()
+         * documents above */
         names = pico_strdup(rvalue);
         if (!names)
                 return -ENOMEM;
@@ -774,188 +757,59 @@ static const ConfigItem config_items[] = {
         { SECTION_INSTALL,      "RequiredBy",       config_parse_required_by },
 };
 
-static const char *section_name(ConfigSection s) {
-        switch (s) {
-        case SECTION_UNIT:
-                return "Unit";
-        case SECTION_SERVICE:
-                return "Service";
-        case SECTION_INSTALL:
-                return "Install";
-        default:
-                return "?";
-        }
-}
-
-/* Parses one complete logical line (continuations already joined). */
-static int parse_line(Unit *u, const char *path, unsigned line, ConfigSection *section, char *l) {
-        char *lvalue, *rvalue, *eq;
+/*
+ * The conf-scan.h handler: dispatches one already-scanned assignment through
+ * config_items[] and logs-and-drops anything not in it. `section` is NULL
+ * for an assignment outside any [Section] header (conf-scan.c's contract);
+ * everything else, known section or not, is decided here rather than by the
+ * scanner -- an unrecognized [Section] simply never matches a config_items
+ * row, so its directives fall through to the same debug-and-drop path a
+ * recognized section's unknown directive would.
+ */
+static int unit_conf_handler(
+                const char *path,
+                unsigned line,
+                const char *section,
+                const char *lvalue,
+                const char *rvalue,
+                void *userdata) {
+        Unit *u = userdata;
+        ConfigSection sec = SECTION_UNKNOWN;
         size_t i;
 
-        l = strip(l);
-        if (line_is_blank_or_comment(l))
-                return 0;
-
-        if (l[0] == '[') {
-                char *close = strchr(l, ']');
-                if (!close) {
-                        pico_log(PICO_LOG_WARNING, "%s:%u: '[' without closing ']', ignoring line", path, line);
-                        return 0;
-                }
-                *close = '\0';
-
-                if (strcmp(l + 1, "Unit") == 0)
-                        *section = SECTION_UNIT;
-                else if (strcmp(l + 1, "Service") == 0)
-                        *section = SECTION_SERVICE;
-                else if (strcmp(l + 1, "Install") == 0)
-                        *section = SECTION_INSTALL;
-                else {
-                        pico_log(PICO_LOG_DEBUG,
-                                 "%s:%u: unknown section [%s], ignoring its directives",
-                                 path,
-                                 line,
-                                 l + 1);
-                        *section = SECTION_UNKNOWN;
-                }
-                return 0;
-        }
-
-        if (*section == SECTION_NONE) {
+        if (!section) {
                 pico_log(PICO_LOG_WARNING, "%s:%u: assignment outside any section, ignoring", path, line);
                 return 0;
         }
 
-        /* 2d4fffb00: a line with no '=' used to fail the whole file; skip just this line. */
-        eq = strchr(l, '=');
-        if (!eq) {
-                pico_log(PICO_LOG_WARNING, "%s:%u: no '=' found, ignoring line", path, line);
-                return 0;
-        }
-        *eq = '\0';
-        lvalue = strip(l);
-        rvalue = strip(eq + 1);
+        if (strcmp(section, "Unit") == 0)
+                sec = SECTION_UNIT;
+        else if (strcmp(section, "Service") == 0)
+                sec = SECTION_SERVICE;
+        else if (strcmp(section, "Install") == 0)
+                sec = SECTION_INSTALL;
 
         /* [Install] is no longer dropped wholesale: WantedBy=/RequiredBy= have
          * real backing fields and are in the table below. Everything else in
          * that section (Alias=, Also=, DefaultInstance=) still falls through
-         * to the unknown-directive debug log at the bottom, which is the
-         * graceful degradation the drop-in goal asks for. */
-
-        if (*section == SECTION_UNKNOWN)
-                return 0;
+         * to the unknown-directive debug log below, which is the graceful
+         * degradation the drop-in goal asks for. */
 
         for (i = 0; i < sizeof(config_items) / sizeof(config_items[0]); i++)
-                if (config_items[i].section == *section && strcmp(config_items[i].lvalue, lvalue) == 0)
+                if (config_items[i].section == sec && strcmp(config_items[i].lvalue, lvalue) == 0)
                         return config_items[i].parse(u, path, line, lvalue, rvalue);
 
-        pico_log(PICO_LOG_DEBUG,
-                 "%s:%u: unknown directive %s= in [%s], ignoring",
-                 path,
-                 line,
-                 lvalue,
-                 section_name(*section));
+        pico_log(PICO_LOG_DEBUG, "%s:%u: unknown directive %s= in [%s], ignoring", path, line, lvalue, section);
         return 0;
 }
 
 int unit_parse_file(Unit *u, const char *path) {
-        FILE *f;
-        char *rawline = NULL;
-        size_t rawcap = 0;
-        char *continuation = NULL;
-        ConfigSection section = SECTION_NONE;
-        unsigned line = 0;
-        bool first_line = true;
-        int r = 0;
+        int r;
 
         if (!u || !path)
                 return -EINVAL;
 
-        f = fopen(path, "re");
-        if (!f)
-                return -errno;
-
-        for (;;) {
-                ssize_t n = getline(&rawline, &rawcap, f);
-                char *l;
-
-                if (n < 0) {
-                        if (!feof(f))
-                                r = -errno;
-                        break;
-                }
-                line++;
-
-                l = rawline;
-
-                /* 9dd7ea9a7: a UTF-8 BOM on the file's first line must not shift "[Section]" */
-                if (first_line) {
-                        first_line = false;
-                        if (n >= 3 && (unsigned char) l[0] == 0xEF && (unsigned char) l[1] == 0xBB &&
-                            (unsigned char) l[2] == 0xBF) {
-                                l += 3;
-                                n -= 3;
-                        }
-                }
-
-                while (n > 0 && (l[n - 1] == '\n' || l[n - 1] == '\r'))
-                        l[--n] = '\0';
-
-                if (continuation) {
-                        /* 0ef695858: a blank/comment line still ends an in-progress
-                         * continuation instead of being folded into it. */
-                        if (line_is_blank_or_comment(l)) {
-                                r = parse_line(u, path, line, &section, continuation);
-                                continuation = pico_mfree(continuation);
-                                if (r < 0)
-                                        break;
-                                continue;
-                        }
-
-                        size_t clen = strlen(continuation);
-                        char *joined = realloc(continuation, clen + 1 + strlen(l) + 1);
-                        if (!joined) {
-                                r = -ENOMEM;
-                                break;
-                        }
-                        continuation = joined;
-                        continuation[clen] = ' ';
-                        strcpy(continuation + clen + 1, l);
-                        l = continuation;
-                } else if (line_is_blank_or_comment(l)) {
-                        /* 9adbfeb38: a comment ending in backslash must not start a continuation */
-                        continue;
-                }
-
-                n = (ssize_t) strlen(l);
-                if (n > 0 && l[n - 1] == '\\') {
-                        l[n - 1] = '\0';
-
-                        if (l != continuation) {
-                                char *c = pico_strdup(l);
-                                if (!c) { /* 8ea913b2e: check the var just assigned, not a stale one */
-                                        r = -ENOMEM;
-                                        break;
-                                }
-                                continuation = c;
-                        }
-                        continue;
-                }
-
-                r = parse_line(u, path, line, &section, l);
-                if (l == continuation)
-                        continuation = pico_mfree(continuation);
-                if (r < 0)
-                        break;
-        }
-
-        /* 4f29e0db1: a file ending mid-continuation must still parse that last line */
-        if (r == 0 && continuation)
-                r = parse_line(u, path, line, &section, continuation);
-        continuation = pico_mfree(continuation);
-
-        free(rawline);
-        fclose(f);
+        r = pico_conf_scan(path, unit_conf_handler, u);
 
         /*
          * B9/69339ae9f7/29500cf8c4/8688a389ca: load-time validation. Placed
