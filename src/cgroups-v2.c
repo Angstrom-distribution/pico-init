@@ -60,6 +60,11 @@ int cgroup_v2_new(const char *path, struct pico_cgroup **ret) {
         if (!cg)
                 return -ENOMEM;
 
+        /* calloc() zero-inits epoll_tag.source to PICO_EPOLL_SIGNAL (enum
+         * value 0) -- set it explicitly so an un-monitored cgroup can never
+         * be mistaken for one if its pointer ever ends up read as a tag. */
+        cg->epoll_tag.source = PICO_EPOLL_CGROUP;
+        cg->epoll_tag.fd = -1;
         cg->procs_fd = cg->events_fd = cg->kill_fd = cg->events_efd = -1;
 
         cg->path = pico_strdup(path);
@@ -111,8 +116,10 @@ int cgroup_v2_monitor(struct pico_cgroup *cg, int epoll_fd) {
         if (!cg)
                 return -EINVAL;
 
+        cg->epoll_tag.fd = cg->events_fd;
+
         ev.events = EPOLLPRI;
-        ev.data.ptr = cg;
+        ev.data.ptr = &cg->epoll_tag; /* first member of *cg, so dispatch casts it straight back */
 
         if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, cg->events_fd, &ev) < 0)
                 return -errno;

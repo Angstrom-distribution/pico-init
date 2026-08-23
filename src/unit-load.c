@@ -1,9 +1,11 @@
+/* SPDX-FileCopyrightText: 2010 Lennart Poettering */
 /* SPDX-FileCopyrightText: 2026 Koen Kooi */
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
  * Fragment lookup, quarried from systemd's ~2011-era unit_load_fragment()
- * in src/load-fragment.c (tag v30, commit 501c92c) down to its essential
+ * in src/load-fragment.c (tag v30, commit 501c92c, copyright 2010
+ * Lennart Poettering, GPL-2.0-or-later) down to its essential
  * shape: search a path for "<id>", hand a found file to the INI parser,
  * resolve to UNIT_LOADED or UNIT_ERROR. The 2011 original searched
  * several directories (/etc, /run, /usr/lib) with per-directory drop-in

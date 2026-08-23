@@ -46,6 +46,8 @@ struct Manager {
         int epoll_fd;
         PicoSignal *signal;
         PicoTimer *timer;
+        struct pico_epoll_tag signal_tag; /* data.ptr for signal's epoll registration */
+        struct pico_epoll_tag timer_tag;  /* data.ptr for timer's epoll registration */
 
         ManagerObjective objective;
 };

@@ -4,9 +4,11 @@
 /*
  * The single epoll loop. signalfd and timerfd are always registered (see
  * manager_new()); per-service cgroup.events fds will join the same epoll
- * set via cgroup_v2_monitor() once M3 wires services up, landing in the
- * epoll_wait() below without this file needing to know about them -- any
- * fd not recognised here is a stub no-op for now.
+ * set via cgroup_v2_monitor() once M3 wires services up to a real Service.
+ * Every registration is tagged via data.ptr with a PicoEpollSource (see
+ * util.h), so dispatch below switches on the tag rather than guessing from
+ * the fd -- a PICO_EPOLL_CGROUP event is a real no-op stub until M3, not an
+ * unrecognised one.
  */
 
 #include <errno.h>
@@ -49,8 +51,9 @@ int manager_dispatch_signal(Manager *m, int signo) {
         }
 }
 
-static int manager_dispatch_epoll_event(Manager *m, int fd) {
-        if (fd == pico_signal_fd(m->signal)) {
+static int manager_dispatch_epoll_event(Manager *m, struct pico_epoll_tag *tag) {
+        switch (tag->source) {
+        case PICO_EPOLL_SIGNAL:
                 for (;;) {
                         int signo;
                         int r = pico_signal_read(m->signal, &signo);
@@ -63,14 +66,18 @@ static int manager_dispatch_epoll_event(Manager *m, int fd) {
                         if (r < 0)
                                 return r;
                 }
-        }
 
-        if (fd == pico_timer_fd(m->timer)) {
+        case PICO_EPOLL_TIMER: {
                 int r = pico_timer_dispatch(m->timer);
                 return r < 0 ? r : 0;
         }
 
-        /* Unrecognised fd (future cgroup.events); nothing to do yet. */
+        case PICO_EPOLL_CGROUP:
+                /* TODO (M3): route to the owning Service via cgroup_v2_is_empty()
+                 * once services register their cgroup with the manager. */
+                return 0;
+        }
+
         return 0;
 }
 
@@ -89,12 +96,10 @@ int manager_loop(Manager *m) {
                 }
 
                 for (int i = 0; i < n; i++) {
-                        int r = manager_dispatch_epoll_event(m, events[i].data.fd);
+                        struct pico_epoll_tag *tag = events[i].data.ptr;
+                        int r = manager_dispatch_epoll_event(m, tag);
                         if (r < 0)
-                                pico_log(PICO_LOG_WARNING,
-                                         "event on fd %d: %s",
-                                         events[i].data.fd,
-                                         strerror(-r));
+                                pico_log(PICO_LOG_WARNING, "event on fd %d: %s", tag->fd, strerror(-r));
                 }
 
                 manager_dispatch_run_queue(m);

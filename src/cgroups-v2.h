@@ -12,7 +12,14 @@
 
 #include <sys/types.h>
 
+#include "util.h"
+
 struct pico_cgroup {
+        /* First member, so cgroup_v2_monitor()'s epoll registration can hand
+         * out &cg->epoll_tag and manager-loop.c's dispatch can cast it back
+         * to struct pico_cgroup * -- see the PicoEpollSource comment in
+         * util.h for why this must be tagged rather than registered by fd. */
+        struct pico_epoll_tag epoll_tag;
         char *path;     /* absolute path under /sys/fs/cgroup */
         int procs_fd;   /* cgroup.procs */
         int events_fd;  /* cgroup.events */

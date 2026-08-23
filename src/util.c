@@ -69,13 +69,14 @@ int pico_strv_extend(char ***strv, const char *value) {
                 return -ENOMEM;
 
         *strv = new_strv;
+        new_strv[n] = NULL;
+        new_strv[n + 1] = NULL;
 
         dup = pico_strdup(value);
         if (!dup)
                 return -ENOMEM;
 
         new_strv[n] = dup;
-        new_strv[n + 1] = NULL;
 
         return 0;
 }

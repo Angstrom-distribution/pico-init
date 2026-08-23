@@ -20,6 +20,29 @@ typedef uint64_t usec_t;
 /* CLOCK_MONOTONIC in usec; USEC_INFINITY on failure */
 usec_t now_monotonic(void);
 
+/*
+ * What kind of thing an epoll registration's data.ptr tag refers to. Every
+ * struct registered in the manager's epoll set embeds a struct
+ * pico_epoll_tag as its first member (or is one), and dispatch always reads
+ * events[i].data.ptr -- never events[i].data.fd -- so which union member a
+ * given registration used is never ambiguous at dispatch time. Mixing
+ * data.fd and data.ptr registrations in one epoll set is a real bug class:
+ * epoll_wait() returns whichever member was written at epoll_ctl() time,
+ * and a dispatcher that always reads data.fd silently reinterprets a
+ * pointer's low bits as a file descriptor for any event actually
+ * registered via data.ptr.
+ */
+typedef enum PicoEpollSource {
+        PICO_EPOLL_SIGNAL,
+        PICO_EPOLL_TIMER,
+        PICO_EPOLL_CGROUP,
+} PicoEpollSource;
+
+struct pico_epoll_tag {
+        PicoEpollSource source;
+        int fd; /* for logging only; dispatch reaches the real owner via a cast back to the containing struct */
+};
+
 typedef enum PicoLogLevel {
         PICO_LOG_ERR,
         PICO_LOG_WARNING,

@@ -1,9 +1,11 @@
+/* SPDX-FileCopyrightText: 2010 Lennart Poettering */
 /* SPDX-FileCopyrightText: 2026 Koen Kooi */
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
  * INI-style unit-file parser, quarried from systemd's ~2011-era
- * src/conf-parser.c + src/load-fragment.c (tag v30, commit 501c92c). Only
+ * src/conf-parser.c + src/load-fragment.c (tag v30, commit 501c92c,
+ * copyright 2010 Lennart Poettering, GPL-2.0-or-later). Only
  * [Unit]/[Service]/[Install] and the directives service.h/unit.h actually
  * have fields for are implemented -- everything else (dbus, socket
  * activation, cgroup v1, SELinux, specifiers) is recognized as valid INI
@@ -440,9 +442,16 @@ static int config_parse_exec_start(
         if (!s)
                 return 0;
 
+        /* Same non-fatal-per-directive policy as every other handler in this
+         * file (Restart=, RestartSec=, ...): parse_exec_line() already logged
+         * why, so just leave exec_start as it was rather than failing the
+         * whole unit over one bad directive. A unit that ends up with no
+         * ExecStart= at all is a validation problem, not a parse error --
+         * not yet enforced (no post-load validation pass exists), tracked in
+         * plans/29-pico-init.md. */
         r = parse_exec_line(path, line, rvalue, &argv);
         if (r < 0)
-                return r;
+                return 0;
 
         s->exec_start = pico_strv_free(s->exec_start);
         s->exec_start = argv;
@@ -461,7 +470,7 @@ static int config_parse_exec_start_pre(
 
         r = parse_exec_line(path, line, rvalue, &argv);
         if (r < 0)
-                return r;
+                return 0;
 
         if (s->exec_start_pre)
                 pico_log(PICO_LOG_DEBUG,

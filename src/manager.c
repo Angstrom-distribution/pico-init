@@ -15,13 +15,15 @@
 
 #include "manager.h"
 
-static int manager_epoll_add(Manager *m, int fd) {
+/* tag->fd must already be set; tag is registered via data.ptr, never data.fd
+ * -- see the PicoEpollSource comment in util.h for why the two must not mix. */
+static int manager_epoll_add(Manager *m, struct pico_epoll_tag *tag) {
         struct epoll_event ev = {
                 .events = EPOLLIN,
-                .data.fd = fd,
+                .data.ptr = tag,
         };
 
-        if (epoll_ctl(m->epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0)
+        if (epoll_ctl(m->epoll_fd, EPOLL_CTL_ADD, tag->fd, &ev) < 0)
                 return -errno;
 
         return 0;
@@ -51,7 +53,8 @@ int manager_new(Manager **ret) {
                 return r;
         }
 
-        r = manager_epoll_add(m, pico_signal_fd(m->signal));
+        m->signal_tag = (struct pico_epoll_tag){ .source = PICO_EPOLL_SIGNAL, .fd = pico_signal_fd(m->signal) };
+        r = manager_epoll_add(m, &m->signal_tag);
         if (r < 0) {
                 manager_free(m);
                 return r;
@@ -63,7 +66,8 @@ int manager_new(Manager **ret) {
                 return r;
         }
 
-        r = manager_epoll_add(m, pico_timer_fd(m->timer));
+        m->timer_tag = (struct pico_epoll_tag){ .source = PICO_EPOLL_TIMER, .fd = pico_timer_fd(m->timer) };
+        r = manager_epoll_add(m, &m->timer_tag);
         if (r < 0) {
                 manager_free(m);
                 return r;
