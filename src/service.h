@@ -27,6 +27,30 @@
  * not syslog, which would be a dependency PID1's own milestones do not need. */
 #define PICO_CONSOLE_PATH "/dev/console"
 
+/*
+ * Exit codes service-exec.c's forked child _exit()s with when its own setup
+ * fails, matching systemd.exec(5) numerically. The post-fork/pre-execve
+ * region cannot report a failure any other way (no malloc, no logger --
+ * see service-exec.c), so these are the sole channel back to the parent:
+ * service_sigchld_event() recognizes them on a CLD_EXITED status and maps
+ * every one of them to SERVICE_FAILURE_RESOURCES rather than treating them
+ * as an ordinary nonzero ExecStart= exit, because they mean pico-init's own
+ * setup failed, not the workload. Not every code here is currently
+ * reachable (EXIT_CHDIR, EXIT_FDS, EXIT_MEMORY: pico-init does none of
+ * WorkingDirectory=/rlimits/MemoryLimit= yet) -- defined now so the mapping
+ * table does not need revisiting when they become reachable.
+ */
+#define PICO_EXIT_CHDIR 200
+#define PICO_EXIT_FDS 202
+#define PICO_EXIT_EXEC 203
+#define PICO_EXIT_MEMORY 204
+#define PICO_EXIT_SIGNAL_MASK 207
+#define PICO_EXIT_STDIN 208
+#define PICO_EXIT_STDOUT 209
+#define PICO_EXIT_CGROUP 219
+#define PICO_EXIT_SETSID 220
+#define PICO_EXIT_STDERR 222
+
 typedef enum ServiceType {
         SERVICE_TYPE_SIMPLE,  /* started once forked */
         SERVICE_TYPE_ONESHOT, /* started once it has exited successfully */
@@ -55,10 +79,11 @@ typedef enum ServiceRestart {
 /* Why the service last stopped; drives Restart=on-failure and the job result. */
 typedef enum ServiceResult {
         SERVICE_SUCCESS,
-        SERVICE_FAILURE_RESOURCES, /* fork/exec/cgroup setup failed */
-        SERVICE_FAILURE_TIMEOUT,   /* TimeoutStartSec=/TimeoutStopSec= elapsed */
-        SERVICE_FAILURE_EXIT_CODE, /* exited non-zero */
-        SERVICE_FAILURE_SIGNAL,    /* killed by a signal */
+        SERVICE_FAILURE_RESOURCES,   /* fork/exec/cgroup setup failed */
+        SERVICE_FAILURE_TIMEOUT,     /* TimeoutStartSec=/TimeoutStopSec= elapsed */
+        SERVICE_FAILURE_EXIT_CODE,   /* exited non-zero */
+        SERVICE_FAILURE_SIGNAL,      /* killed by a signal */
+        SERVICE_FAILURE_START_LIMIT, /* B7: restarted too many times too fast, refusing */
         _SERVICE_RESULT_MAX,
 } ServiceResult;
 
@@ -73,18 +98,50 @@ typedef struct Service {
         char **exec_start_pre; /* may be NULL */
         char **exec_start;
 
-        pid_t main_pid;       /* ExecStart= process, 0 when none */
-        pid_t control_pid;    /* ExecStartPre= process, 0 when none */
-        int main_exit_status; /* waitpid status of the last main-process exit */
+        pid_t main_pid;    /* ExecStart= process, 0 when none */
+        pid_t control_pid; /* ExecStartPre= process, 0 when none */
+
+        /*
+         * The last main-process exit, split rather than a packed waitpid()
+         * status (B2): main_exit_code is siginfo_t.si_code (CLD_EXITED /
+         * CLD_KILLED / CLD_DUMPED), main_exit_status is si_status. A packed
+         * status cannot tell CLD_KILLED from CLD_DUMPED without WCOREDUMP,
+         * and that distinction is load-bearing for pico_is_clean_exit() in
+         * service.c: a core dump is never clean, for any signal, ever.
+         */
+        int main_exit_code;
+        int main_exit_status;
 
         struct pico_cgroup *cgroup; /* owned, NULL until started */
 
         bool remain_after_exit; /* RemainAfterExit=: EXITED still counts as active */
 
+        /*
+         * Set by service_stop(): an explicit stop is the one thing Restart=
+         * must never turn back into a start. Cleared again by service_start()
+         * so a fresh explicit start is not permanently vetoed by an old stop.
+         */
+        bool forbid_restart;
+
         ServiceRestart restart;
-        usec_t restart_usec;       /* RestartSec= */
-        usec_t timeout_start_usec; /* TimeoutStartSec= */
-        usec_t timeout_stop_usec;  /* TimeoutStopSec= */
+        usec_t restart_usec;       /* RestartSec=; 0 means restart immediately, NOT never */
+        usec_t timeout_start_usec; /* TimeoutStartSec=; USEC_INFINITY means never time out */
+        usec_t timeout_stop_usec;  /* TimeoutStopSec=; USEC_INFINITY means never time out */
+
+        /*
+         * B7: start-rate limiting. v30 already had this (a quarrying
+         * regression to have dropped it, not a deferred feature -- see
+         * service.c); these four are deliberately not parseable unit-file
+         * settings, only upstream's hardcoded defaults (10s / 5 starts,
+         * still real upstream defaults today). start_limit_begin anchors a
+         * fixed window at the first attempt in it; start_limit_num counts
+         * attempts inside that window; a successful start does not reset
+         * either, only window expiry does.
+         */
+        usec_t start_limit_interval;
+        unsigned start_limit_burst;
+        usec_t start_limit_begin;
+        unsigned start_limit_num;
 
         /*
          * The one in-flight timeout or restart delay. Owned, and managed by
@@ -106,8 +163,26 @@ typedef struct Service {
 int service_start(Service *s); /* DEAD -> START_PRE/EXEC_START */
 int service_stop(Service *s);  /* SIGTERM, then cgroup_v2_kill on timeout */
 
-/* SIGCHLD delivered for a pid belonging to this service */
-void service_sigchld_event(Service *s, pid_t pid, int status);
+/*
+ * B9/CVE-2021-4034-class load-time validation: refuse a unit whose
+ * ExecStart=/ExecStartPre= would reach execve() with a NULL or empty argv[0]
+ * (the PwnKit primitive -- no PAM/seccomp/namespaces stand between pico-init
+ * and it) or a non-absolute path. Called by unit_parse_file() once a
+ * [Service] fragment has finished parsing. 0 or -ENOEXEC.
+ */
+int service_verify(Service *s);
+
+/*
+ * SIGCHLD delivered for a pid belonging to this service.
+ *
+ * `code` is siginfo_t.si_code (CLD_EXITED / CLD_KILLED / CLD_DUMPED) and
+ * `status` is si_status. The two are separate because waitpid()'s packed
+ * status cannot distinguish CLD_KILLED from CLD_DUMPED without WCOREDUMP,
+ * and that distinction is load-bearing: a signal death may count as a clean
+ * exit for a long-running daemon, but a core dump never counts as clean for
+ * anything. Reap with waitid() so both arrive intact.
+ */
+void service_sigchld_event(Service *s, pid_t pid, int code, int status);
 
 /* cgroup.events reported populated=0 */
 void service_cgroup_empty_event(Service *s);

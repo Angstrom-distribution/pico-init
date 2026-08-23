@@ -46,6 +46,12 @@
  *  - e6dde451a "conf-parser: use fgets_with_tabs... unbounded read" --
  *    getline() below is inherently unbounded, so a long ExecStart= line
  *    is never silently truncated the way a fixed LINE_MAX buffer would.
+ *  - 92c1622e14 / 36c16a7cdd (M3, service.c quarry) -- TimeoutStartSec=/
+ *    TimeoutStopSec= and RestartSec= have opposite zero-semantics upstream
+ *    (0 means "never time out" for the former, "restart immediately" for
+ *    the latter). parse_usec() below also accepts the literal "infinity",
+ *    and only the two Timeout*Sec= handlers translate a parsed 0 to
+ *    USEC_INFINITY; config_parse_restart_sec() deliberately does not.
  *
  * Not backported (see plans/29-pico-init.md for scope): the UTF-8
  * validity/escaping fixes (b5d742138, 78d17fa09, 9e6027783) -- no
@@ -575,18 +581,24 @@ static int config_parse_restart(Unit *u, const char *path, unsigned line, const 
 
 /*
  * Minimal time-span parser: a plain integer is seconds; a single
- * "<n><suffix>" with suffix one of us/ms/s/min/m/h is also accepted.
- * Compound spans ("1min 30s") aren't supported in this MVP. The overflow
- * check is an explicit bound comparison rather than the round-trip cast
- * idiom ((uint64_t)(size_t)v != v) that 31ef154f1 (2026-08-18, most
- * recent fix in the whole quarry history) replaced for being legally
- * elidable by an optimizer -- built correctly from day one instead of
- * porting the fragile idiom.
+ * "<n><suffix>" with suffix one of us/ms/s/min/m/h is also accepted, and so
+ * is the literal spelling "infinity" (case-insensitive), which maps straight
+ * to USEC_INFINITY. Compound spans ("1min 30s") aren't supported in this
+ * MVP. The overflow check is an explicit bound comparison rather than the
+ * round-trip cast idiom ((uint64_t)(size_t)v != v) that 31ef154f1
+ * (2026-08-18, most recent fix in the whole quarry history) replaced for
+ * being legally elidable by an optimizer -- built correctly from day one
+ * instead of porting the fragile idiom.
  */
 static int parse_usec(const char *rvalue, usec_t *ret) {
         char *end;
         unsigned long long v;
         usec_t scale = USEC_PER_SEC;
+
+        if (strcasecmp(rvalue, "infinity") == 0) {
+                *ret = USEC_INFINITY;
+                return 0;
+        }
 
         errno = 0;
         v = strtoull(rvalue, &end, 10);
@@ -642,12 +654,23 @@ static int config_parse_timeout_start_sec(
                 return 0;
 
         r = parse_usec(rvalue, &s->timeout_start_usec);
-        if (r < 0)
+        if (r < 0) {
                 pico_log(PICO_LOG_WARNING,
                          "%s:%u: invalid TimeoutStartSec= value '%s', ignoring",
                          path,
                          line,
                          rvalue);
+                return 0;
+        }
+
+        /*
+         * 92c1622e14/36c16a7cdd: TimeoutStartSec=0 means "never time out",
+         * the opposite of RestartSec=0 ("restart immediately") -- do not
+         * reuse this translation there.
+         */
+        if (s->timeout_start_usec == 0)
+                s->timeout_start_usec = USEC_INFINITY;
+
         return 0;
 }
 
@@ -661,12 +684,19 @@ static int config_parse_timeout_stop_sec(
                 return 0;
 
         r = parse_usec(rvalue, &s->timeout_stop_usec);
-        if (r < 0)
+        if (r < 0) {
                 pico_log(PICO_LOG_WARNING,
                          "%s:%u: invalid TimeoutStopSec= value '%s', ignoring",
                          path,
                          line,
                          rvalue);
+                return 0;
+        }
+
+        /* 92c1622e14/36c16a7cdd: same zero-means-never translation as TimeoutStartSec= above */
+        if (s->timeout_stop_usec == 0)
+                s->timeout_stop_usec = USEC_INFINITY;
+
         return 0;
 }
 
@@ -926,5 +956,18 @@ int unit_parse_file(Unit *u, const char *path) {
 
         free(rawline);
         fclose(f);
+
+        /*
+         * B9/69339ae9f7/29500cf8c4/8688a389ca: load-time validation. Placed
+         * here rather than in unit_load() (unit-load.c) because this is the
+         * one function that already knows parsing succeeded and the fragment
+         * is otherwise done with -- a unit that parses cleanly but never sets
+         * ExecStart= is a validation problem, not a parse error, and must
+         * still fail to load rather than silently becoming a service with
+         * nothing to run.
+         */
+        if (r == 0 && u->type == UNIT_SERVICE)
+                r = service_verify(SERVICE(u));
+
         return r;
 }

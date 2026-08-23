@@ -21,6 +21,21 @@ typedef uint64_t usec_t;
 usec_t now_monotonic(void);
 
 /*
+ * Saturating a + b, for computing a deadline from "now + timeout". Every
+ * caller that does that arithmetic must use this rather than a bare '+': a
+ * timeout of USEC_INFINITY ("never") added to a real timestamp would wrap
+ * uint64_t and produce a deadline in the past, firing immediately instead of
+ * never (see B1 in service.c). Callers with a USEC_INFINITY timeout should
+ * skip arming a timer at all rather than relying on this to no-op, per
+ * timer.h's own rule -- this exists for the few places that still need a
+ * concrete (possibly-saturated) deadline value.
+ */
+static inline usec_t usec_add(usec_t a, usec_t b) {
+        usec_t c = a + b;
+        return c < a ? USEC_INFINITY : c;
+}
+
+/*
  * What kind of thing an epoll registration's data.ptr tag refers to. Every
  * struct registered in the manager's epoll set embeds a struct
  * pico_epoll_tag as its first member (or is one), and dispatch always reads
