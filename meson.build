@@ -21,6 +21,7 @@ pico_init_core_sources = files(
   'src/manager-loop.c',
   'src/manager-shutdown.c',
   'src/manager-startup.c',
+  'src/mount-setup.c',
   'src/unit.c',
   'src/unit-load.c',
   'src/unit-parse.c',

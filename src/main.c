@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include "manager.h"
+#include "mount-setup.h"
 #include "util.h"
 
 /*
@@ -40,6 +41,19 @@ int main(void) {
         if (getpid() != 1) {
                 puts("pico-init: not running as PID 1, exiting");
                 return EXIT_SUCCESS;
+        }
+
+        /*
+         * Before anything else. The kernel mounts the root filesystem and
+         * nothing more, so /proc, /sys, /run and /sys/fs/cgroup do not exist
+         * yet -- and this manager's own cgroup supervision needs the last of
+         * those to work at all. Doing it after manager_new() would start the
+         * first services into a system with no /proc.
+         */
+        r = mount_setup();
+        if (r < 0) {
+                pico_log(PICO_LOG_ERR, "mount_setup: %s", strerror(-r));
+                freeze("could not mount the API filesystems");
         }
 
         r = manager_new(&m);
