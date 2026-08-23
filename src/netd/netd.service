@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: 2026 Koen Kooi
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# netd's own unit (plan §2.7). Deliberately no After=eudev.service: netlink
+# event subscription makes interface appearance order-independent (netd-
+# link.h), which is the whole point of netd_startup()'s subscribe-before-
+# enumerate ordering. Enablement follows the preset flow like every other
+# unit; this ships WantedBy=default.target so 20-angstrom-pico.preset alone
+# decides whether it is actually enabled.
+
+[Unit]
+Description=pico network daemon
+Before=network.target
+
+[Service]
+ExecStart=/usr/sbin/netd
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

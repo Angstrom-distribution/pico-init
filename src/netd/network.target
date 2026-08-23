@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: 2026 Koen Kooi
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# A plain passive Target (plan §2.7): units that genuinely need the network
+# say After=network.target with upstream semantics. netd.service orders
+# itself Before= this, but nothing pulls it in or waits for "online" --
+# network-online.target is explicitly out of MVP scope (plan §2.9).
+
+[Unit]
+Description=Network

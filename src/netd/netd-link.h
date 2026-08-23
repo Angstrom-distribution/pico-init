@@ -169,8 +169,16 @@ int link_configure(Link *l);
  */
 int link_reconfigure(Link *l);
 
-/* Remove everything netd put in the kernel for this link and stop DHCP,
- * without freeing the Link. 0 or -errno. */
+/*
+ * Remove everything netd put in the kernel for this link (address, route,
+ * lease file), and stop and drop l->dhcp_client/l->dhcp_server if either is
+ * running -- unlike link_lose_lease() below, which tears down only the
+ * kernel state a lease put there and leaves the client running (it restarts
+ * its own DISCOVER cycle internally; see that function's doc). This is the
+ * "DHCP is no longer wanted on this link at all" path: the link losing its
+ * .network match, the link disappearing, or a reload dropping DHCP=/
+ * DHCPServer=. Without freeing the Link. 0 or -errno.
+ */
 int link_deconfigure(Link *l);
 
 /* --- lease application --- */
@@ -182,24 +190,44 @@ int link_deconfigure(Link *l);
  * when UseNTP=/UseTimezone= allow it -- option 42's NTP servers and option
  * 101's timezone handed to netd-sntp.c and netd-time.c by direct call.
  *
- * A renewal to the *same* address is a single in-place NLM_F_REPLACE
- * (lifetime refresh only), so it never has a window with no address on the
- * interface. A renewal to a genuinely *different* address removes the old
- * one before adding the new one -- the reverse of what an "atomic" renewal
- * suggests, and deliberately so: adding the new address first, while both
- * addresses share a subnet (the common case), makes it "secondary", and the
- * kernel cascades a primary-address delete into deleting every secondary in
- * that subnet too (net.ipv4.conf.*.promote_secondaries defaults to 0) --
- * reproduced directly while building N1's own end-to-end test. Add-then-
- * remove would silently lose both addresses at once instead of leaving a
- * brief gap.
+ * Address application is three cases, not one, chosen from the addresses
+ * themselves (netd-link.c's converge_address(), shared with static Address=
+ * reconfiguration) rather than from the DhcpClientEvent -- the two give the
+ * same answer, and the addresses are the ground truth the kernel actually
+ * cares about:
+ *
+ *   1. RENEW, i.e. the *same* address/prefix as already configured (the
+ *      common case: T1/T2 firing with nothing else changed) -- a single
+ *      in-place NLM_F_REPLACE (lifetime refresh only), never a delete, so
+ *      never a window with no address on the interface.
+ *   2. IP_CHANGE within the *same* subnet (a rebind handing out a different
+ *      host address in the same /24, say) -- delete the old address before
+ *      adding the new one. Adding first would make the new address
+ *      "secondary" to the old one (both cover the same connected route), and
+ *      the kernel cascades a primary-address delete into deleting every
+ *      secondary in that subnet too (net.ipv4.conf.*.promote_secondaries
+ *      defaults to 0) -- reproduced directly while building N1's own
+ *      end-to-end test. Add-then-remove here would silently lose both
+ *      addresses at once instead of leaving a brief gap.
+ *   3. IP_CHANGE to a *different* subnet -- add the new address before
+ *      removing the old one, safely: the two addresses never share a
+ *      connected route, so there is no secondary/cascade risk, and this is
+ *      the case an "atomic renewal" description was actually written for.
  *
  * 0 or -errno.
  */
 int link_apply_lease(Link *l, DhcpLease *lease);
 
-/* Lease expired or was NAKed: remove what it configured and go back to
- * LINK_CONFIGURING with the client restarted. 0 or -errno. */
+/*
+ * Lease expired, was NAKed, or was DECLINEd: remove what it configured
+ * (address, route, lease file) and go back to LINK_CONFIGURING -- but leave
+ * l->dhcp_client running. The client is not netd-link.c's to restart: it
+ * already returns itself to INIT and restarts its own DISCOVER cycle
+ * internally after notifying this event (dhcp-client.c's
+ * client_restart_full()/client_timeout_expire()), so there is nothing here
+ * to do beyond clearing the state this lease put in the kernel. Unrelated to
+ * link_deconfigure(), which is the "stop DHCP outright" path. 0 or -errno.
+ */
 int link_lose_lease(Link *l);
 
 /* --- lease state files --- */

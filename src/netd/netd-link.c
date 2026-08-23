@@ -4,13 +4,12 @@
 /*
  * The interface table and the per-link state machine. See netd-link.h.
  *
- * N1: table operations, .network matching, the per-link state machine, and
- * static Address=/Gateway= application are real. Arming a DHCPv4
- * client/server is logged and deferred -- src/netd/dhcp/'s client and server
- * objects are still quarry placeholders (N2/N3), so there is nothing yet to
- * call. link_apply_lease()/link_write_lease_file() are implemented against
- * the real DhcpLease accessor API (already landed) so N2's client has
- * somewhere real to hand a lease the moment it exists.
+ * N1+N2+N3: table operations, .network matching, the per-link state
+ * machine, static Address=/Gateway= application, and now the real DHCPv4
+ * client and server (dhcp-client-internal.h / dhcp-server-internal.h, both
+ * landed) are wired in. link_apply_lease()/link_write_lease_file() were
+ * already implemented against the real DhcpLease accessor API at N1, so N2's
+ * client had somewhere real to hand a lease the moment it existed.
  */
 
 #include "netd-link.h"
@@ -24,7 +23,9 @@
 #include <unistd.h>
 
 #include "../util.h"
+#include "dhcp/dhcp-client-internal.h"
 #include "dhcp/dhcp-lease-internal.h"
+#include "dhcp/dhcp-server-internal.h"
 #include "netd-network.h"
 #include "netd-resolv.h"
 #include "netd-sntp.h"
@@ -72,6 +73,75 @@ static int route_add_default_idempotent(NetdRtnl *rtnl, int ifindex, const struc
 static int route_del_default_idempotent(NetdRtnl *rtnl, int ifindex, const struct in_addr *gw, uint32_t metric) {
         int r = netd_rtnl_route_del(rtnl, ifindex, NULL, 0, gw, metric);
         return (r == -ESRCH || r == -ENOENT) ? 0 : r;
+}
+
+/* True when `a`/`a_pfx` and `b`/`b_pfx` name the same connected-route
+ * prefix -- the condition that makes the kernel's secondary-address
+ * cascade-delete reachable (see converge_address() below). Passed by value:
+ * in4_addr_mask() masks its argument in place. */
+static bool same_subnet(struct in_addr a, unsigned char a_pfx, struct in_addr b, unsigned char b_pfx) {
+        if (a_pfx != b_pfx)
+                return false;
+
+        (void) in4_addr_mask(&a, a_pfx);
+        (void) in4_addr_mask(&b, b_pfx);
+
+        return a.s_addr == b.s_addr;
+}
+
+/*
+ * Converge Link's configured address to (want, want_pfx), choosing add/
+ * delete ordering by the three cases the kernel's secondary-address
+ * behaviour forces on us (netd-link.h, on link_apply_lease()):
+ *
+ *   1. unchanged -- a single NLM_F_REPLACE refresh (e.g. a DHCP renewal to
+ *      the same address, or a reload that changed nothing). No delete at
+ *      all, so no window without an address.
+ *   2. a genuine change WITHIN the same subnet (e.g. a DHCP rebind handing
+ *      out a different host address in the same /24) -- delete first. Adding
+ *      the new address first would make it "secondary" to the old one
+ *      (net.ipv4.conf.*.promote_secondaries defaults to 0), and the
+ *      following delete of the old (primary) address would then cascade
+ *      into deleting the new (secondary) one too -- reproduced directly
+ *      against this kernel while building N1's own end-to-end test.
+ *   3. a genuine change to a DIFFERENT subnet -- add first, safely, for the
+ *      shortest possible address-less window; the two addresses never share
+ *      a connected route, so there is no secondary/cascade risk.
+ *
+ * `lifetime_sec` is UINT32_MAX for a static Address=, the lease time for a
+ * DHCP one. Used by both apply_static_address() and link_apply_lease() so
+ * the same kernel hazard is fixed in exactly one place.
+ */
+static int converge_address(Link *l, const struct in_addr *want, unsigned char want_pfx, uint32_t lifetime_sec) {
+        Netd *n = l->netd;
+        int r;
+
+        if (l->address_configured && l->address.s_addr == want->s_addr && l->prefixlen == want_pfx) {
+                r = address_add_idempotent(n->rtnl, l->ifindex, want, want_pfx, lifetime_sec);
+                if (r < 0)
+                        return r;
+        } else if (l->address_configured && same_subnet(l->address, l->prefixlen, *want, want_pfx)) {
+                r = address_del_idempotent(n->rtnl, l->ifindex, &l->address, l->prefixlen);
+                if (r < 0)
+                        return r;
+                l->address_configured = false;
+
+                r = address_add_idempotent(n->rtnl, l->ifindex, want, want_pfx, lifetime_sec);
+                if (r < 0)
+                        return r;
+        } else {
+                r = address_add_idempotent(n->rtnl, l->ifindex, want, want_pfx, lifetime_sec);
+                if (r < 0)
+                        return r;
+
+                if (l->address_configured)
+                        (void) address_del_idempotent(n->rtnl, l->ifindex, &l->address, l->prefixlen);
+        }
+
+        l->address = *want;
+        l->prefixlen = want_pfx;
+        l->address_configured = true;
+        return 0;
 }
 
 /* --- table operations --- */
@@ -287,37 +357,7 @@ static int apply_static_address(Link *l, const Network *nw) {
             l->prefixlen == want->prefixlen)
                 return 0;
 
-        /*
-         * Old address first, then the new one. The "already exactly right"
-         * check above is what makes an unchanged address never reach here at
-         * all, which is the case that actually needs a no-window guarantee
-         * (a lease renewal, or a reload that changed nothing) -- REPLACE
-         * refreshes it in place with no delete involved. A *genuine* change
-         * of address must not add-then-delete: reproduced directly against
-         * this kernel, adding a second address in the same subnet the
-         * current one already covers makes it "secondary", and deleting the
-         * primary cascades into deleting every secondary in that subnet too
-         * (net.ipv4.conf.*.promote_secondaries defaults to 0) -- so
-         * add-before-remove would silently delete BOTH addresses instead of
-         * leaving a brief gap, and the very next gateway route add then
-         * fails as "Nexthop has invalid gateway" because the interface has
-         * no covering route left at all.
-         */
-        if (l->address_configured) {
-                r = address_del_idempotent(n->rtnl, l->ifindex, &l->address, l->prefixlen);
-                if (r < 0)
-                        return r;
-                l->address_configured = false;
-        }
-
-        r = address_add_idempotent(n->rtnl, l->ifindex, &want->address, want->prefixlen, UINT32_MAX);
-        if (r < 0)
-                return r;
-
-        l->address = want->address;
-        l->prefixlen = want->prefixlen;
-        l->address_configured = true;
-        return 0;
+        return converge_address(l, &want->address, want->prefixlen, UINT32_MAX);
 }
 
 static int apply_static_gateway(Link *l, const Network *nw) {
@@ -349,6 +389,252 @@ static int apply_static_gateway(Link *l, const Network *nw) {
         l->gateway = nw->gateway;
         l->gateway_configured = true;
         return 0;
+}
+
+/* Defined near link_deconfigure() below; forward-declared here so
+ * link_configure() can call them without reordering the file around the
+ * teardown helpers they share with link_deconfigure() itself. */
+static void link_stop_dhcp_client(Link *l);
+static void link_stop_dhcp_server(Link *l);
+
+/* --- DHCPv4 client --- */
+
+/*
+ * Read ADDRESS= back out of this link's own lease file (netd-link.h's
+ * KEY=VALUE format), for dhcp_client_set_request_address() below --
+ * RFC 2131 4.4.2's INIT-REBOOT, and the whole reason a netd crash is cheap
+ * (plan §2.7): a restarted netd reconfirms the lease it already had instead
+ * of renumbering the interface. 0 with *ret filled, or -errno (ENOENT on a
+ * first boot, or after a clean teardown already removed the file).
+ */
+static int link_read_lease_address(Link *l, struct in_addr *ret) {
+        Netd *n = l->netd;
+        _cleanup_free_ char *path = NULL;
+        char name[32];
+        char line[256];
+        FILE *f;
+        int len, r;
+
+        len = snprintf(name, sizeof(name), "%d", l->ifindex);
+        if (len < 0 || (size_t) len >= sizeof(name))
+                return -ENAMETOOLONG;
+
+        r = netd_runtime_path(n, "leases", name, false, &path);
+        if (r < 0)
+                return r;
+
+        f = fopen(path, "re");
+        if (!f)
+                return -errno;
+
+        r = -ENODATA;
+        while (fgets(line, sizeof(line), f)) {
+                char *nl = strchr(line, '\n');
+                const char *value;
+
+                if (nl)
+                        *nl = '\0';
+
+                value = startswith(line, "ADDRESS=");
+                if (!value)
+                        continue;
+
+                r = inet_pton(AF_INET, value, ret) == 1 ? 0 : -ENODATA;
+                break;
+        }
+
+        (void) fclose(f);
+        return r;
+}
+
+/*
+ * The DHCPv4 client's event callback (dhcp-client-internal.h): `event` is a
+ * DhcpClientEvent, or a negative errno on a hard client failure. Only
+ * SELECTING's return value is looked at (dhcp-client-internal.h) -- netd has
+ * no OFFER policy, so it always accepts.
+ *
+ * IP_ACQUIRE/IP_CHANGE/RENEW hand the lease to link_apply_lease() by direct
+ * call, exactly the design the plan (§2.6) and this milestone's own header
+ * comments describe. EXPIRED (NAK, expiry, or after a DECLINE) hands off to
+ * link_lose_lease(), which deliberately does *not* touch the client -- see
+ * that function's doc for why it restarts itself.
+ */
+static int dhcp_client_event_callback(DhcpClient *client, int event, void *userdata) {
+        Link *l = userdata;
+        int r;
+
+        switch (event) {
+
+        case DHCP_CLIENT_EVENT_IP_ACQUIRE:
+        case DHCP_CLIENT_EVENT_IP_CHANGE:
+        case DHCP_CLIENT_EVENT_RENEW: {
+                DhcpLease *lease = NULL;
+
+                r = dhcp_client_get_lease(client, &lease);
+                if (r < 0 || !lease) {
+                        pico_log(PICO_LOG_WARNING,
+                                 "netd: %s: DHCP event %d but no lease is available",
+                                 l->ifname,
+                                 event);
+                        return 0;
+                }
+
+                /* dhcp_client_get_lease() hands back the client's own
+                 * borrowed reference (dhcp-client-internal.h); link_apply_
+                 * lease() takes ownership of the ref it is given, so this
+                 * needs its own. */
+                lease = dhcp_lease_ref(lease);
+
+                r = link_apply_lease(l, lease);
+                if (r < 0)
+                        pico_log(PICO_LOG_WARNING,
+                                 "netd: %s: failed to apply DHCP lease: %s",
+                                 l->ifname,
+                                 strerror(-r));
+                return 0;
+        }
+
+        case DHCP_CLIENT_EVENT_EXPIRED:
+                pico_log(PICO_LOG_INFO, "netd: %s: DHCP lease lost (expired, NAKed, or declined)", l->ifname);
+                r = link_lose_lease(l);
+                if (r < 0)
+                        pico_log(PICO_LOG_WARNING,
+                                 "netd: %s: failed to tear down an expired lease: %s",
+                                 l->ifname,
+                                 strerror(-r));
+                return 0;
+
+        case DHCP_CLIENT_EVENT_SELECTING:
+                /* Accept every OFFER: netd has no policy for preferring one
+                 * server's offer over another's. */
+                return 0;
+
+        case DHCP_CLIENT_EVENT_TRANSIENT_FAILURE:
+                pico_log(PICO_LOG_WARNING, "netd: %s: no DHCP server answering", l->ifname);
+                return 0;
+
+        case DHCP_CLIENT_EVENT_STOP:
+                return 0;
+
+        default:
+                /* A negative event is a hard client failure carrying -errno. */
+                if (event < 0)
+                        pico_log(PICO_LOG_WARNING,
+                                 "netd: %s: DHCP client failed: %s",
+                                 l->ifname,
+                                 strerror(-event));
+                return 0;
+        }
+}
+
+/*
+ * Create, configure and start a DHCPv4 client for `l`. Idempotent by
+ * construction from the caller's side only (link_configure() never calls
+ * this when l->dhcp_client is already set); this function itself always
+ * builds a fresh client. 0 or -errno.
+ */
+static int link_start_dhcp_client(Link *l) {
+        Netd *n = l->netd;
+        DhcpClient *client = NULL;
+        struct in_addr last_addr;
+        int r;
+
+        r = dhcp_client_new(n, l->ifindex, l->ifname, &client);
+        if (r < 0)
+                return r;
+
+        r = dhcp_client_set_mac(client, l->hw_addr, NULL, l->hw_addr_len, l->arp_type);
+        if (r < 0)
+                goto fail;
+
+        r = dhcp_client_set_callback(client, dhcp_client_event_callback, l);
+        if (r < 0)
+                goto fail;
+
+        /* Best-effort: nothing to request on a first boot, or once a clean
+         * teardown has already removed the lease file. */
+        if (link_read_lease_address(l, &last_addr) == 0)
+                (void) dhcp_client_set_request_address(client, &last_addr);
+
+        r = dhcp_client_start(client);
+        if (r < 0)
+                goto fail;
+
+        l->dhcp_client = client;
+        return 0;
+
+fail:
+        dhcp_client_unref(client);
+        return r;
+}
+
+/* --- DHCPv4 server --- */
+
+/*
+ * Create, configure and start a DHCPv4 server for `l`, pool derived from the
+ * .network's own Address= (plan §2.7's usb0-gadget scenario: the host's own
+ * static address on usb0 doubles as the server's address and default
+ * router). 0 or -errno.
+ */
+static int link_start_dhcp_server(Link *l, const Network *nw) {
+        Netd *n = l->netd;
+        DhcpServer *server = NULL;
+        struct in_addr address;
+        unsigned char prefixlen;
+        int r;
+
+        if (nw->n_addresses == 0) {
+                pico_log(PICO_LOG_WARNING,
+                         "netd: %s: DHCPServer=yes but no Address= to derive the pool from",
+                         l->ifname);
+                return -EINVAL;
+        }
+
+        address = nw->addresses[0].address;
+        prefixlen = nw->addresses[0].prefixlen;
+
+        r = dhcp_server_new(n, l->ifindex, l->ifname, &server);
+        if (r < 0)
+                return r;
+
+        /*
+         * offset 0 / size 0 both mean "default" to dhcp_server_configure_
+         * pool() (dhcp-server.c): skip the subnet address, fill the rest of
+         * the subnet up to (not including) the broadcast address. The
+         * server's own address is excluded automatically wherever it falls
+         * in that range (dhcp_server_address_available()/_is_in_pool()), so
+         * no separate carve-out is needed here.
+         */
+        r = dhcp_server_configure_pool(server, &address, prefixlen, 0, 0);
+        if (r < 0)
+                goto fail;
+
+        r = dhcp_server_set_router(server, &address);
+        if (r < 0)
+                goto fail;
+
+        if (nw->n_dns > 0) {
+                r = dhcp_server_set_dns(server, nw->dns, nw->n_dns);
+                if (r < 0)
+                        goto fail;
+        }
+
+        if (nw->n_ntp > 0) {
+                r = dhcp_server_set_ntp(server, nw->ntp, nw->n_ntp);
+                if (r < 0)
+                        goto fail;
+        }
+
+        r = dhcp_server_start(server);
+        if (r < 0)
+                goto fail;
+
+        l->dhcp_server = server;
+        return 0;
+
+fail:
+        dhcp_server_unref(server);
+        return r;
 }
 
 /* --- the state machine --- */
@@ -421,27 +707,52 @@ int link_configure(Link *l) {
         }
 
         /*
-         * DHCP client/server: src/netd/dhcp/'s client and server objects are
-         * still N2/N3 quarry placeholders with no constructor to call, so
-         * there is nothing to arm yet. Logged, not failed -- a link that
-         * asks for DHCP is not misconfigured, N2/N3 simply have not landed.
-         * A link in this state stays LINK_CONFIGURING rather than
-         * LINK_CONFIGURED: not everything the .network asked for is in the
-         * kernel yet.
+         * DHCPv4 client. Starting it is not itself convergence: nothing the
+         * .network asked for is in the kernel until a lease actually lands,
+         * which link_apply_lease() applies and only then marks CONFIGURED.
+         * Idempotent by construction -- an already-running client (the
+         * common SIGHUP case: DHCP= was already armed and has a lease) is
+         * left alone rather than restarted, so a reload never throws away a
+         * working lease to ask for a fresh DISCOVER.
          */
-        if (network_dhcp4_enabled(nw) && !l->dhcp_client) {
-                pico_log(PICO_LOG_DEBUG,
-                         "netd: %s: DHCP= requested; client not implemented yet (N2)",
-                         l->ifname);
-                converged = false;
-        }
+        if (network_dhcp4_enabled(nw)) {
+                if (!l->dhcp_client) {
+                        r = link_start_dhcp_client(l);
+                        if (r < 0) {
+                                pico_log(PICO_LOG_WARNING,
+                                         "netd: %s: failed to start DHCP client: %s",
+                                         l->ifname,
+                                         strerror(-r));
+                                l->state = LINK_FAILED;
+                                return r;
+                        }
+                }
+                if (!l->lease)
+                        converged = false;
+        } else if (l->dhcp_client)
+                /* DHCP= was removed by a reload: stop asking. */
+                link_stop_dhcp_client(l);
 
-        if (nw->dhcp_server && !l->dhcp_server) {
-                pico_log(PICO_LOG_DEBUG,
-                         "netd: %s: DHCPServer=yes requested; server not implemented yet (N3)",
-                         l->ifname);
-                converged = false;
-        }
+        /*
+         * DHCPv4 server. Unlike the client, starting it successfully *is*
+         * full convergence for this directive -- there is no lease to wait
+         * for on the server's own side of the link.
+         */
+        if (nw->dhcp_server) {
+                if (!l->dhcp_server) {
+                        r = link_start_dhcp_server(l, nw);
+                        if (r < 0) {
+                                pico_log(PICO_LOG_WARNING,
+                                         "netd: %s: failed to start DHCP server: %s",
+                                         l->ifname,
+                                         strerror(-r));
+                                l->state = LINK_FAILED;
+                                return r;
+                        }
+                }
+        } else if (l->dhcp_server)
+                /* DHCPServer= was removed by a reload: stop serving. */
+                link_stop_dhcp_server(l);
 
         l->state = converged ? LINK_CONFIGURED : LINK_CONFIGURING;
 
@@ -470,24 +781,15 @@ int link_reconfigure(Link *l) {
         return link_configure(l);
 }
 
-int link_deconfigure(Link *l) {
-        Netd *n;
+/*
+ * The kernel/lease-file half of teardown, shared by link_deconfigure() (which
+ * also stops DHCP outright) and link_lose_lease() (which does not -- see
+ * that function's doc in netd-link.h for why the DHCP client is not touched
+ * here). Never touches l->dhcp_client/l->dhcp_server.
+ */
+static int link_teardown_kernel_state(Link *l) {
+        Netd *n = l->netd;
         int r, ret = 0;
-
-        if (!l)
-                return -EINVAL;
-
-        n = l->netd;
-
-        if (l->applying_lease) {
-                pico_log(PICO_LOG_WARNING,
-                         "netd: %s: refusing to deconfigure while a lease is being applied",
-                         l->ifname);
-                return -EBUSY;
-        }
-
-        /* N2/N3: stop l->dhcp_client / l->dhcp_server here once those objects
-         * exist. Neither is ever non-NULL yet (see link_configure()). */
 
         if (l->gateway_configured) {
                 r = route_del_default_idempotent(n->rtnl, l->ifindex, &l->gateway, NETD_LINK_ROUTE_METRIC);
@@ -521,6 +823,50 @@ int link_deconfigure(Link *l) {
         }
 
         return ret;
+}
+
+/* dhcp_client_stop() before dhcp_client_unref(): the client's own doc asks
+ * for that order (a running client refuses a second start otherwise, and a
+ * stopped-but-still-refcounted client would leak its socket/timers if this
+ * were the only reference). Safe to call from inside that same client's own
+ * callback -- upstream's DHCP_CLIENT_DONT_DESTROY (carried, dhcp-client-
+ * internal.h) keeps the object alive through the notify call that got us
+ * here, and the client re-checks its own state afterwards. Idempotent: a
+ * NULL l->dhcp_client is a no-op. */
+static void link_stop_dhcp_client(Link *l) {
+        if (!l->dhcp_client)
+                return;
+
+        (void) dhcp_client_stop(l->dhcp_client);
+        l->dhcp_client = dhcp_client_unref(l->dhcp_client);
+}
+
+/* Same shape for the server side; DHCP_SERVER_DONT_DESTROY (dhcp-server-
+ * internal.h) is this milestone's own addition to a defect upstream never
+ * fixed -- see that header's comment. */
+static void link_stop_dhcp_server(Link *l) {
+        if (!l->dhcp_server)
+                return;
+
+        (void) dhcp_server_stop(l->dhcp_server);
+        l->dhcp_server = dhcp_server_unref(l->dhcp_server);
+}
+
+int link_deconfigure(Link *l) {
+        if (!l)
+                return -EINVAL;
+
+        if (l->applying_lease) {
+                pico_log(PICO_LOG_WARNING,
+                         "netd: %s: refusing to deconfigure while a lease is being applied",
+                         l->ifname);
+                return -EBUSY;
+        }
+
+        link_stop_dhcp_client(l);
+        link_stop_dhcp_server(l);
+
+        return link_teardown_kernel_state(l);
 }
 
 /* --- lease application --- */
@@ -568,34 +914,18 @@ int link_apply_lease(Link *l, DhcpLease *lease) {
                 lifetime_sec = (uint32_t) (lifetime / USEC_PER_SEC);
 
         /*
-         * A renewal to the *same* address (the common case: T1/T2 firing
-         * with nothing else changed) is a single NLM_F_REPLACE that only
-         * refreshes the kernel lifetime -- no delete, so no window with no
-         * address at all, exactly netd-link.h's contract. A renewal to a
-         * genuinely different address deletes the old one first: adding the
-         * new one first would make it "secondary" whenever both addresses
-         * share a subnet, and deleting the old (primary) one then cascades
-         * into deleting the new (secondary) one too
-         * (net.ipv4.conf.*.promote_secondaries defaults to 0) -- reproduced
-         * directly against this kernel while building N1's own test, see
-         * apply_static_address()'s comment for the repro. Losing both
-         * addresses at once for one lease-cycle tick is a worse outage than
-         * the brief gap this ordering accepts.
+         * The three cases converge_address() distinguishes map directly onto
+         * client_enter_bound()'s own event choice (dhcp-client.c): RENEW is
+         * exactly case 1 (same address/mask -- a REPLACE-only refresh),
+         * IP_CHANGE is case 2 or 3 depending on whether the new address
+         * shares a subnet with the one being replaced. converge_address()
+         * decides from the addresses themselves rather than the event
+         * netd-link.c is not even passed here, which gives the same answer
+         * for both a live client event and a static reload.
          */
-        if (l->address_configured && (l->address.s_addr != addr.s_addr || l->prefixlen != prefixlen)) {
-                r = address_del_idempotent(n->rtnl, l->ifindex, &l->address, l->prefixlen);
-                if (r < 0)
-                        goto fail;
-                l->address_configured = false;
-        }
-
-        r = address_add_idempotent(n->rtnl, l->ifindex, &addr, prefixlen, lifetime_sec);
+        r = converge_address(l, &addr, prefixlen, lifetime_sec);
         if (r < 0)
                 goto fail;
-
-        l->address = addr;
-        l->prefixlen = prefixlen;
-        l->address_configured = true;
 
         {
                 const struct in_addr *routers;
@@ -684,15 +1014,19 @@ int link_lose_lease(Link *l) {
         if (!l)
                 return -EINVAL;
 
+        /* Reached from the DHCP client's own EXPIRED notification (see
+         * dhcp_client_event_callback()); guarded exactly like
+         * link_apply_lease() against being reached reentrantly for the same
+         * link. link_teardown_kernel_state() below deliberately does not
+         * touch l->dhcp_client -- see this function's doc in netd-link.h. */
         if (l->applying_lease)
                 return -EBUSY;
 
-        r = link_deconfigure(l);
-
-        /* N2: restart l->dhcp_client here once it exists -- see the report
-         * on this milestone for why that call cannot be wired yet. */
-
+        l->applying_lease = true;
+        r = link_teardown_kernel_state(l);
         l->state = LINK_CONFIGURING;
+        l->applying_lease = false;
+
         return r;
 }
 

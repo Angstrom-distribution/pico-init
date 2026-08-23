@@ -59,6 +59,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "../test-util.h"
@@ -475,11 +476,129 @@ static void test_netns_static_network_and_sighup(void) {
         printf("test-netd-rtnl: static .network + SIGHUP subtest ok\n");
 }
 
+/*
+ * A real DHCP lease, acquired end to end through netd-link.c's own wiring --
+ * not test-netd-dhcp.c's job (that file drives DhcpClient/DhcpServer
+ * directly; this is the one place that proves link_configure() actually
+ * arms them and link_apply_lease() actually lands the result). One Netd
+ * instance runs both ends of a veth pair: a DHCPServer=yes side with a
+ * static Address= (the usb0-gadget shape from real usb0-server.network),
+ * and a DHCP=yes client side with none. netd_loop_run() is the real loop,
+ * unmodified -- a forked timer process sends this process a real SIGTERM
+ * after a bounded wait so the (otherwise-blocking) loop returns the way it
+ * would in production, not a hand-rolled dispatch stand-in.
+ */
+static void test_netns_dhcp_end_to_end(void) {
+        char *tmp;
+        char netdir[PATH_MAX], rundir[PATH_MAX], statedir[PATH_MAX], resolv[PATH_MAX];
+        const char *netpath[2];
+        Netd *n = NULL;
+        Link *client_link;
+        pid_t timeout_pid;
+        int r;
+
+        enter_test_netns();
+
+        tmp = test_tmpdir_new();
+        ASSERT_TRUE(tmp != NULL);
+        ASSERT_TRUE(test_mkdir(tmp, "network") == 0);
+        ASSERT_TRUE(test_mkdir(tmp, "run") == 0);
+        ASSERT_TRUE(test_mkdir(tmp, "state") == 0);
+
+        snprintf(netdir, sizeof(netdir), "%s/network", tmp);
+        snprintf(rundir, sizeof(rundir), "%s/run", tmp);
+        snprintf(statedir, sizeof(statedir), "%s/state", tmp);
+        snprintf(resolv, sizeof(resolv), "%s/resolv.conf", tmp);
+
+        if (test_write_file(netdir,
+                            "10-dhcps.network",
+                            "[Match]\nName=dhcps0\n\n[Network]\nAddress=10.253.0.1/24\nDHCPServer=yes\n") < 0 ||
+            test_write_file(netdir, "10-dhcpc.network", "[Match]\nName=dhcpc0\n\n[Network]\nDHCP=yes\n") < 0) {
+                fprintf(stderr, "test-netd-rtnl: failed to write .network fixtures\n");
+                exit(1);
+        }
+
+        run_ip("link add name dhcps0 type veth peer name dhcpc0");
+
+        r = netd_new(&n);
+        ASSERT_TRUE(r == 0);
+
+        netpath[0] = netdir;
+        netpath[1] = NULL;
+        ASSERT_TRUE(netd_set_network_path(n, netpath) == 0);
+        ASSERT_TRUE(netd_set_runtime_dir(n, rundir) == 0);
+        ASSERT_TRUE(netd_set_state_dir(n, statedir) == 0);
+        ASSERT_TRUE(netd_set_resolv_conf(n, resolv) == 0);
+
+        r = netd_startup(n);
+        ASSERT_TRUE(r == 0);
+
+        /* dhcps0 (the server side) converges immediately: starting the
+         * server successfully *is* full convergence for DHCPServer=yes,
+         * unlike the client side of a DHCP=yes link. */
+        {
+                Link *server_link = netd_find_link_by_name(n, "dhcps0");
+
+                ASSERT_TRUE(server_link != NULL);
+                ASSERT_EQ_INT(server_link->state, LINK_CONFIGURED);
+        }
+
+        client_link = netd_find_link_by_name(n, "dhcpc0");
+        ASSERT_TRUE(client_link != NULL);
+        ASSERT_TRUE(client_link->dhcp_client != NULL);
+
+        /* Real production teardown path: a forked process sends this one a
+         * real SIGTERM after a bounded wait, so netd_loop_run() below is
+         * exercised completely unmodified -- the same way pico-init stops
+         * the netd.service unit. */
+        timeout_pid = fork();
+        ASSERT_TRUE(timeout_pid >= 0);
+        if (timeout_pid == 0) {
+                sleep(10);
+                kill(getppid(), SIGTERM);
+                _exit(0);
+        }
+
+        r = netd_loop_run(n);
+        ASSERT_TRUE(r == 0);
+
+        /* The timeout process either already fired (harmless) or is still
+         * sleeping -- reap it either way rather than leaking a zombie. */
+        kill(timeout_pid, SIGKILL);
+        waitpid(timeout_pid, NULL, 0);
+
+        client_link = netd_find_link_by_name(n, "dhcpc0");
+        ASSERT_TRUE(client_link != NULL);
+
+        if (!client_link->lease) {
+                fprintf(stderr,
+                        "test-netd-rtnl: no DHCP lease acquired within the timeout -- "
+                        "see the test's own comment for known environment caveats "
+                        "(veth broadcast delivery, checksum offload) before assuming a code bug\n");
+                exit(1);
+        }
+
+        ASSERT_TRUE(client_link->address_configured);
+        ASSERT_EQ_INT(client_link->prefixlen, 24);
+        /* Must land somewhere in the server's pool: 10.253.0.0/24, excluding
+         * the server's own .1 and the subnet/broadcast addresses. */
+        run_shell("ip -4 addr show dev dhcpc0 | grep -qE '10\\.253\\.0\\.[0-9]+/24'");
+        run_shell("! ip -4 addr show dev dhcpc0 | grep -q '10\\.253\\.0\\.1/24'");
+
+        run_ip("link del dhcps0");
+        netd_free(n);
+        test_rm_rf(tmp);
+        free(tmp);
+
+        printf("test-netd-rtnl: DHCP client-vs-server end-to-end subtest ok\n");
+}
+
 int main(void) {
         test_event_names();
         test_link_snapshot_shape();
         test_netns_rtnl();
         test_netns_static_network_and_sighup();
+        test_netns_dhcp_end_to_end();
 
         printf("test-netd-rtnl: ok\n");
         return EXIT_SUCCESS;

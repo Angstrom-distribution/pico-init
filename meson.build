@@ -181,6 +181,16 @@ netd_exe = executable(
   install_dir: get_option('sbindir'),
 )
 
+# netd's own units (plan §2.7): $prefix/lib/systemd/system, not
+# $prefix/lib64 -- systemd's own convention for unit files even on a
+# multilib install, and the path meta-angstrom's recipe's FILES:netd already
+# expects (${nonarch_libdir}/systemd/system).
+install_data(
+  'src/netd/netd.service',
+  'src/netd/network.target',
+  install_dir: get_option('prefix') / 'lib' / 'systemd' / 'system',
+)
+
 # All of netd's tests, registered up front and placeholder-bodied, for exactly
 # the reason the PID 1 list above gives: N1 through N4 are independent of each
 # other, and none of them should have to touch this file.
