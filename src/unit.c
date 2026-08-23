@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include "job.h"
+#include "manager-state.h"
 #include "unit.h"
 #include "util.h"
 
@@ -21,6 +22,8 @@ const UnitVTable *unit_vtable_for(UnitType t) {
                 return &service_vtable;
         case UNIT_TARGET:
                 return &target_vtable;
+        case UNIT_SOCKET:
+                return &socket_vtable;
         default:
                 return NULL;
         }
@@ -85,6 +88,10 @@ Unit *unit_free(Unit *u) {
         if (u->vtable && u->vtable->done)
                 u->vtable->done(u);
 
+        /* Before u->id is freed -- the published file is named after it, and
+         * a state file must never outlive the unit it describes. */
+        manager_state_forget_unit(u);
+
         u->id = pico_mfree(u->id);
         u->description = pico_mfree(u->description);
         u->fragment_path = pico_mfree(u->fragment_path);
@@ -144,6 +151,15 @@ void unit_notify(Unit *u, UnitActiveState old_state, UnitActiveState new_state) 
                  unit_active_state_to_string(old_state),
                  unit_active_state_to_string(new_state));
 
+        /*
+         * Publish before the job bookkeeping below, not after: the early
+         * return when no job is waiting is the common case (a Restart= cycle,
+         * a service dying with nothing enqueued), and publishing after it
+         * would silently skip exactly the transitions picoctl most needs to
+         * report. See manager-state.h.
+         */
+        manager_state_notify_unit(u);
+
         j = u->job;
         if (!j || j->state != JOB_RUNNING)
                 return;
@@ -187,6 +203,7 @@ void unit_notify(Unit *u, UnitActiveState old_state, UnitActiveState new_state) 
 static const char * const unit_type_table[_UNIT_TYPE_MAX] = {
         [UNIT_SERVICE] = "service",
         [UNIT_TARGET] = "target",
+        [UNIT_SOCKET] = "socket",
 };
 
 const char *unit_type_to_string(UnitType t) {
@@ -236,6 +253,9 @@ UnitType unit_type_from_name(const char *id) {
 
         if (strcmp(suffix, ".target") == 0)
                 return UNIT_TARGET;
+
+        if (strcmp(suffix, ".socket") == 0)
+                return UNIT_SOCKET;
 
         return _UNIT_TYPE_INVALID;
 }

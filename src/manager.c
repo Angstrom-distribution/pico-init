@@ -14,6 +14,8 @@
 #include <sys/epoll.h>
 #include <unistd.h>
 
+#include "manager-ctrl.h"
+#include "manager-state.h"
 #include "manager.h"
 #include "service.h"
 
@@ -104,6 +106,22 @@ int manager_set_cgroup_root(Manager *m, const char *root) {
         return 0;
 }
 
+int manager_set_runtime_dir(Manager *m, const char *dir) {
+        char *copy;
+
+        if (!m || !dir)
+                return -EINVAL;
+
+        copy = pico_strdup(dir);
+        if (!copy)
+                return -ENOMEM;
+
+        pico_mfree(m->runtime_dir);
+        m->runtime_dir = copy;
+
+        return 0;
+}
+
 int manager_new(Manager **ret) {
         Manager *m;
         int r;
@@ -133,6 +151,10 @@ int manager_new(Manager **ret) {
                 goto fail;
 
         r = manager_set_cgroup_root(m, PICO_CGROUP_ROOT);
+        if (r < 0)
+                goto fail;
+
+        r = manager_set_runtime_dir(m, PICO_RUNTIME_DIR);
         if (r < 0)
                 goto fail;
 
@@ -174,6 +196,15 @@ Manager *manager_free(Manager *m) {
         if (!m)
                 return NULL;
 
+        /*
+         * Tear the control socket down before any unit is freed: an accepted
+         * connection may still hold a deferred reply keyed by a job, and
+         * resolving one against a half-freed unit table would be a
+         * use-after-free. The state files go with it.
+         */
+        manager_ctrl_done(m);
+        manager_state_done(m);
+
         /* Jobs first: each one points at a unit and unlinks itself from the
          * run queue as it goes, so this terminates. Freeing units first would
          * leave those pointers dangling for the duration of the loop. */
@@ -187,6 +218,7 @@ Manager *manager_free(Manager *m) {
         m->unit_path = pico_strv_free(m->unit_path);
         m->preset_path = pico_strv_free(m->preset_path);
         m->cgroup_root = pico_mfree(m->cgroup_root);
+        m->runtime_dir = pico_mfree(m->runtime_dir);
 
         m->timer = pico_timer_free(m->timer);
         m->signal = pico_signal_free(m->signal);

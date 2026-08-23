@@ -23,6 +23,7 @@ typedef struct Job Job;
 typedef enum UnitType {
         UNIT_SERVICE,
         UNIT_TARGET,
+        UNIT_SOCKET,
         _UNIT_TYPE_MAX,
         _UNIT_TYPE_INVALID = -1,
 } UnitType;
@@ -83,6 +84,7 @@ typedef struct UnitVTable {
 
 extern const UnitVTable service_vtable; /* service.c */
 extern const UnitVTable target_vtable;  /* target.c */
+extern const UnitVTable socket_vtable;  /* socket.c */
 
 const UnitVTable *unit_vtable_for(UnitType t); /* NULL for an invalid type */
 

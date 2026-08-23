@@ -33,8 +33,10 @@
 #include <sys/wait.h>
 
 #include "cgroups-v2.h"
+#include "manager-ctrl.h"
 #include "manager.h"
 #include "service.h"
+#include "socket.h"
 #include "unit.h"
 
 #define MANAGER_MAX_EVENTS 16
@@ -182,6 +184,25 @@ static int manager_dispatch_epoll_event(Manager *m, struct pico_epoll_tag *tag, 
         case PICO_EPOLL_TIMER:
                 /* drained after the queue, in manager_loop() */
                 return 0;
+
+        /*
+         * Both of the arms below run in pass 2 only, alongside signals and
+         * for the same reason the cgroup arm does not: neither carries an
+         * exit status, and both may enqueue a job. Queueing work during the
+         * cgroup-verification pass would let a job run before the SIGCHLDs in
+         * the same batch had been reaped.
+         */
+        case PICO_EPOLL_SOCKET:
+                if (cgroup_pass)
+                        return 0;
+
+                return socket_dispatch_io(m, tag);
+
+        case PICO_EPOLL_CONTROL:
+                if (cgroup_pass)
+                        return 0;
+
+                return manager_ctrl_dispatch(m, tag);
         }
 
         return 0;

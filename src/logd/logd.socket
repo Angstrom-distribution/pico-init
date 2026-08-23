@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: 2026 Koen Kooi
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# PID 1 binds and holds these, so they outlive logd: a logd crash loses no
+# in-flight output and severs no service's stdout. Order matters -- fd order
+# follows declared Listen* order, and LISTEN_FDNAMES is deliberately not sent.
+
+[Unit]
+Description=pico log daemon socket
+
+[Socket]
+ListenDatagram=/run/logd/stdout
+ListenDatagram=/dev/log
+SocketMode=0666
+
+[Install]
+WantedBy=sockets.target

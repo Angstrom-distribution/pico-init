@@ -41,6 +41,15 @@
 
 #define PICO_CGROUP_ROOT "/sys/fs/cgroup"
 
+/*
+ * Where PID 1 publishes its own runtime state: per-unit `Property=value`
+ * files under units/, one manager file, and the picoctl control socket.
+ * Settable on the Manager for the same reason the search paths are -- so a
+ * test can point it at a temporary directory instead of the host's real /run.
+ * See manager-state.h and manager-ctrl.h (plan §1.7).
+ */
+#define PICO_RUNTIME_DIR "/run/pico-init"
+
 /* Why the loop ended; main.c maps these to reboot(), poweroff, or a plain
  * return. MANAGER_EXIT is only legal when the manager is not PID 1 -- see
  * manager_dispatch_signal() and main(). */
@@ -67,6 +76,15 @@ struct Manager {
         char **unit_path;
         char **preset_path;
         char *cgroup_root;
+        char *runtime_dir;
+
+        /* State publisher and control socket (plan §1.7). Both are opaque
+         * here: manager-state.c and manager-ctrl.c own their shapes, so
+         * landing either does not mean editing this header. NULL until the
+         * corresponding setup() has run, and NULL is a supported state --
+         * an unwritable /run costs picoctl its verbs, never the boot. */
+        struct pico_manager_state *state;
+        struct pico_manager_ctrl *ctrl;
 
         /* units waiting for unit_load(), linked via unit->load_queue_next */
         Unit *load_queue;
@@ -120,6 +138,7 @@ Manager *manager_free(Manager *m); /* frees all units and jobs; returns NULL */
 int manager_set_unit_path(Manager *m, const char * const *path);
 int manager_set_preset_path(Manager *m, const char * const *path);
 int manager_set_cgroup_root(Manager *m, const char *root);
+int manager_set_runtime_dir(Manager *m, const char *dir);
 
 /* Scan every unit_path entry (or just `dir` when non-NULL) for files whose
  * suffix names a known unit type, creating and loading each. 0 or -errno. */

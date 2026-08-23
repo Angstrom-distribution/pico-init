@@ -74,6 +74,8 @@
 #include <string.h>
 
 #include "job.h"
+#include "manager-ctrl.h"
+#include "manager-state.h"
 #include "manager.h"
 #include "unit.h"
 #include "util.h"
@@ -297,6 +299,10 @@ static void job_install(Job *j) {
         j->installed = true;
 
         job_add_to_run_queue(j);
+
+        /* A unit with a job enqueued must report it (Job= in the published
+         * state file) before the job runs, not after it finishes. */
+        manager_state_notify_job(j);
 }
 
 static void job_uninstall(Job *j) {
@@ -438,8 +444,22 @@ int job_finish_full(Job *j, JobResult result, bool recursive) {
         else
                 pico_log(PICO_LOG_DEBUG, "%s: job finished, result=done", u->id);
 
+        /*
+         * Resolve any deferred picoctl reply BEFORE the job is freed -- this
+         * is the only point at which a job result becomes final, and it is
+         * what makes `picoctl start`'s exit code the real job result rather
+         * than a confirmation that it was enqueued. The RESTART conversion
+         * above deliberately does not reach here: a restart that has only
+         * stopped the unit is not finished, and replying there would report
+         * success halfway through.
+         */
+        manager_ctrl_notify_job_finished(j, result);
+
         job_uninstall(j);
         job_free(j);
+
+        /* j is gone; republish from the unit so Job= clears. */
+        manager_state_notify_unit(u);
 
         /*
          * Propagation is gated on `recursive` so a job completing inside

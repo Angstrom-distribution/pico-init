@@ -238,6 +238,9 @@ static void test_unit_name_validation(void) {
         ASSERT_TRUE(unit_name_is_valid("multi-user.target"));
         ASSERT_TRUE(unit_name_is_valid("serial-getty@ttyGS0.service"));
         ASSERT_TRUE(unit_name_is_valid("a_b:c.service"));
+        /* .socket became a real unit type with plan §1.6's scaffolding; a name
+         * is valid exactly when its suffix names a type this init knows. */
+        ASSERT_TRUE(unit_name_is_valid("foo.socket"));
 
         /* rejected */
         ASSERT_TRUE(!unit_name_is_valid(NULL));
@@ -250,7 +253,12 @@ static void test_unit_name_validation(void) {
         ASSERT_TRUE(!unit_name_is_valid(".hidden.service"));
         ASSERT_TRUE(!unit_name_is_valid("foo bar.service"));  /* whitespace */
         ASSERT_TRUE(!unit_name_is_valid("foo\nbar.service")); /* control char */
-        ASSERT_TRUE(!unit_name_is_valid("foo.socket"));       /* no such unit type here */
+        /* Still-unimplemented upstream unit types keep the negative case
+         * honest: a suffix this init has no type for must not validate, or a
+         * name would become a filesystem path with nothing able to load it. */
+        ASSERT_TRUE(!unit_name_is_valid("foo.timer"));
+        ASSERT_TRUE(!unit_name_is_valid("foo.mount"));
+        ASSERT_TRUE(!unit_name_is_valid("foo.path"));
         ASSERT_TRUE(!unit_name_is_valid("noSuffix"));
 
         memset(toolong, 'a', sizeof(toolong) - 1);

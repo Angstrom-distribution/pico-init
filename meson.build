@@ -31,7 +31,15 @@ pico_init_core_sources = files(
   'src/service.c',
   'src/service-exec.c',
   'src/target.c',
+  # Socket units (plan §1.6): a third unit type extending this same core,
+  # not a separate daemon.
+  'src/socket.c',
   'src/job.c',
+  # PID 1's own runtime state publisher and control socket (plan §1.7).
+  # Both are wired into unit.c/job.c/manager-loop.c already; see their
+  # headers for why the hooks live at those choke points.
+  'src/manager-state.c',
+  'src/manager-ctrl.c',
   'src/cgroups-v2.c',
   'src/timer.c',
   'src/signal.c',
@@ -79,6 +87,12 @@ pico_tests = [
   'test-service',
   'test-timer-cgroup',
   'test-boot',
+  # Socket activation (plan §1.6) and picoctl (plan §1.7), registered up
+  # front and placeholder-bodied for exactly the reason above.
+  'test-socket',
+  'test-manager-state',
+  'test-picoctl',
+  'test-manager-ctrl',
 ]
 
 foreach t : pico_tests
@@ -218,6 +232,102 @@ foreach t : netd_tests
     ['src/netd/' + t + '.c'] + pico_test_sources,
     include_directories: netd_includes,
     link_with: [netd_core, pico_init_core],
+  )
+  test(t, exe)
+endforeach
+
+# ---------------------------------------------------------------------------
+# picoctl -- the on-device systemctl equivalent (plan §1.7).
+#
+# It links pico-init-core rather than duplicating anything: the symlink verbs
+# (enable/disable/is-enabled/preset) operate on the very same .wants/ and
+# preset layouts unit-enable.c already reads at boot, so sharing that code is
+# what keeps the two halves from drifting apart and disagreeing about what
+# "enabled" means.
+#
+# Installed to sbindir as part of the MAIN pico-init package, not a subpackage:
+# it is the init's own tool, not an optional daemon the way netd and logd are.
+# ---------------------------------------------------------------------------
+picoctl_exe = executable(
+  'picoctl',
+  'src/picoctl.c',
+  link_with: pico_init_core,
+  install: true,
+  install_dir: get_option('sbindir'),
+)
+
+# ---------------------------------------------------------------------------
+# logd -- the log daemon, and picolog, its reader (plan §3).
+#
+# Same shape as netd: one static library the tests link, installed binaries
+# alongside. logd stores journald's documented plain-text EXPORT format in a
+# bounded /run ring; the binary on-disk journal format is deliberately NOT
+# built (plan §3.1), and full journalctl compatibility is reached off-device by
+# feeding `picolog -o export` to upstream's own systemd-journal-remote.
+#
+# No file here is lifted from upstream, so unlike src/netd/dhcp/ there is no
+# LGPL island: all of logd and picolog is GPL-2.0-or-later, this project's own
+# copyright, with upstream cited as a reference only.
+# ---------------------------------------------------------------------------
+logd_includes = include_directories('src/logd')
+
+logd_core_sources = files(
+  'src/logd/logd-write.c',
+  'src/logd/logd-recv.c',
+  'src/logd/logd-kmsg.c',
+  # The ring reader lives in the library, not inside picolog.c, because
+  # picoctl's per-unit log tail (plan §1.7, C1) reuses exactly this reader.
+  'src/logd/logd-read.c',
+)
+
+logd_core = static_library(
+  'logd-core',
+  logd_core_sources,
+  include_directories: logd_includes,
+)
+
+logd_exe = executable(
+  'logd',
+  'src/logd/logd.c',
+  include_directories: logd_includes,
+  link_whole: logd_core,
+  link_with: pico_init_core,
+  install: true,
+  install_dir: get_option('sbindir'),
+)
+
+# picolog goes to bindir, not sbindir: reading the log is not a privileged
+# operation and an ordinary user on a booted board should be able to run it.
+picolog_exe = executable(
+  'picolog',
+  'src/logd/picolog.c',
+  include_directories: logd_includes,
+  link_whole: logd_core,
+  link_with: pico_init_core,
+  install: true,
+  install_dir: get_option('bindir'),
+)
+
+# logd's own units (plan §3.6). logd.socket is this distro's first real
+# .socket unit -- the concrete consumer socket activation exists for.
+install_data(
+  'src/logd/logd.service',
+  'src/logd/logd.socket',
+  install_dir: get_option('prefix') / 'lib' / 'systemd' / 'system',
+)
+
+logd_tests = [
+  'test-logd-write',
+  'test-logd-recv',
+  'test-picolog',
+]
+
+foreach t : logd_tests
+  exe = executable(
+    t,
+    ['src/logd/' + t + '.c'] + pico_test_sources,
+    include_directories: logd_includes,
+    link_with: [logd_core, pico_init_core],
   )
   test(t, exe)
 endforeach

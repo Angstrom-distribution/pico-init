@@ -51,6 +51,12 @@ typedef enum PicoEpollSource {
         PICO_EPOLL_SIGNAL,
         PICO_EPOLL_TIMER,
         PICO_EPOLL_CGROUP,
+        /* A .socket unit's listening fd (socket.c). EPOLLIN in LISTENING
+         * triggers the paired service; under Accept=no PID 1 never accept()s. */
+        PICO_EPOLL_SOCKET,
+        /* The picoctl control socket and its accepted connections
+         * (manager-ctrl.c). Root-only, one bounded request per connection. */
+        PICO_EPOLL_CONTROL,
 } PicoEpollSource;
 
 struct pico_epoll_tag {

@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: 2026 Koen Kooi
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+[Unit]
+Description=pico log daemon
+
+[Service]
+ExecStart=/usr/sbin/logd
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
