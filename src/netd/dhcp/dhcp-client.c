@@ -519,10 +519,14 @@ restart:
          * client reverts to INIT state and restarts the initialization
          * process". Without this the REQUEST loop never terminates. */
         log_client_debug(client, "maximum REQUEST attempts reached, restarting");
-        if (client_restart(client) >= 0)
+        r = client_restart(client);
+        if (r >= 0)
                 return;
 
-        r = -ETIMEDOUT;
+        /* Fall through carrying client_restart()'s own error rather than a
+         * generic one: client_stop() is about to hand it to the link layer,
+         * and "could not open a socket" and "timed out" want different
+         * responses there. */
 
 error:
         client_stop(client, r);
