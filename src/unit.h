@@ -3,9 +3,10 @@
 
 /*
  * Base Unit type every unit kind embeds (as its first member), plus the
- * dependency graph. Implemented across unit.c (lifecycle/state),
- * unit-load.c (fragment lookup + load queue), unit-parse.c (INI parser),
- * unit-dependency.c (DAG build + cycle detection).
+ * dependency graph. Implemented across unit.c (lifecycle/state/vtable
+ * dispatch), unit-load.c (fragment lookup), unit-parse.c (INI parser),
+ * unit-dependency.c (DAG build + cycle detection), unit-enable.c
+ * (.wants/.requires directories and preset application).
  */
 
 #pragma once
@@ -21,6 +22,7 @@ typedef struct Job Job;
 
 typedef enum UnitType {
         UNIT_SERVICE,
+        UNIT_TARGET,
         _UNIT_TYPE_MAX,
         _UNIT_TYPE_INVALID = -1,
 } UnitType;
@@ -50,9 +52,44 @@ typedef enum UnitDependency {
         _UNIT_DEPENDENCY_MAX,
 } UnitDependency;
 
+/*
+ * The longest unit name accepted. systemd uses 256 including the NUL; this
+ * matches, so a name valid there is valid here -- keeping the drop-in
+ * unit-file-compatibility goal honest rather than inventing a smaller limit.
+ */
+#define UNIT_NAME_MAX 255
+
+/*
+ * Per-type behaviour. A concrete unit type (Service, Target) embeds Unit as
+ * its first member and exports one of these; unit.c allocates object_size
+ * bytes, calls init() once, and dispatches start/stop/active_state through it.
+ *
+ * done() exists because unit_free() cannot know what a concrete type owns: a
+ * Service holds argv vectors, a cgroup and a pending timer event, and without
+ * a per-type destructor every started service leaks all three. done() frees
+ * only the type's own members -- unit_free() still frees the Unit fields and
+ * the allocation itself.
+ */
+typedef struct UnitVTable {
+        size_t object_size; /* sizeof(Service), sizeof(Target), ... */
+
+        void (*init)(Unit *u); /* type defaults after calloc; may be NULL */
+        void (*done)(Unit *u); /* free type-owned members; may be NULL */
+
+        int (*start)(Unit *u);
+        int (*stop)(Unit *u);
+        UnitActiveState (*active_state)(Unit *u);
+} UnitVTable;
+
+extern const UnitVTable service_vtable; /* service.c */
+extern const UnitVTable target_vtable;  /* target.c */
+
+const UnitVTable *unit_vtable_for(UnitType t); /* NULL for an invalid type */
+
 struct Unit {
         Manager *manager;
         UnitType type;
+        const UnitVTable *vtable;
 
         char *id;            /* "foo.service" */
         char *description;   /* [Unit] Description=, may be NULL */
@@ -62,6 +99,20 @@ struct Unit {
         /* dependency graph: per-relation NULL-terminated arrays of borrowed Unit* */
         Unit **dependencies[_UNIT_DEPENDENCY_MAX];
         size_t n_dependencies[_UNIT_DEPENDENCY_MAX];
+
+        /*
+         * [Install] section, kept as raw names rather than resolved edges: at
+         * parse time the named target may not be loaded yet, and whether these
+         * are honoured at all depends on enablement (a .wants/ symlink or a
+         * preset rule), which is only decided once every fragment has been
+         * read. unit-enable.c turns them into real edges, or doesn't.
+         */
+        char **wanted_by;   /* [Install] WantedBy=, owned, may be NULL */
+        char **required_by; /* [Install] RequiredBy=, owned, may be NULL */
+
+        /* set once a .wants/.requires symlink or an applied preset enabled this
+         * unit, so preset application can tell "no rule ran yet" from "already on" */
+        bool enabled;
 
         Job *job; /* job currently applying to this unit, or NULL (borrowed) */
 
@@ -74,20 +125,38 @@ struct Unit {
 };
 
 /* --- unit.c --- */
+/* Allocate vtable->object_size bytes, set id/type/vtable, run vtable->init. 0 or -errno.
+ * Does NOT add the unit to the manager's table -- manager_load_unit() does that. */
 int unit_new(Manager *m, UnitType type, const char *id, Unit **ret);
-Unit *unit_free(Unit *u); /* returns NULL */
+Unit *unit_free(Unit *u); /* runs vtable->done, frees Unit fields, returns NULL */
 
 UnitActiveState unit_active_state(Unit *u);
-int unit_start(Unit *u); /* dispatches to the concrete type, e.g. service_start */
-int unit_stop(Unit *u);
+int unit_start(Unit *u); /* dispatches through vtable->start */
+int unit_stop(Unit *u);  /* dispatches through vtable->stop */
+
+/*
+ * Called by a concrete unit type after its own state machine moved. Completes
+ * or fails u->job when the unit reaches a state the in-flight job was waiting
+ * for, so job bookkeeping lives in one place instead of in every unit type.
+ */
+void unit_notify(Unit *u, UnitActiveState old_state, UnitActiveState new_state);
 
 const char *unit_type_to_string(UnitType t);
 const char *unit_load_state_to_string(UnitLoadState s);
 const char *unit_active_state_to_string(UnitActiveState s);
 UnitType unit_type_from_name(const char *id); /* by suffix; _UNIT_TYPE_INVALID if unknown */
 
+/*
+ * Reject anything that must never become a filesystem path or a graph node.
+ * Unit files are root-owned config, so this is not a privilege boundary -- but
+ * "Requires=../../tmp/evil.service" resolving to a path outside the search
+ * directories is still a bug, and one directory separator is all it takes.
+ */
+bool unit_name_is_valid(const char *name);
+
 /* --- unit-load.c --- */
-/* Find u->id's fragment in the search path, parse it, resolve to LOADED/ERROR. 0 or -errno. */
+/* Find u->id's fragment in the manager's unit search path, parse it, resolve to
+ * LOADED/ERROR. Idempotent once the unit has left UNIT_STUB. 0 or -errno. */
 int unit_load(Unit *u);
 
 /* --- unit-parse.c --- */
@@ -95,8 +164,15 @@ int unit_load(Unit *u);
 int unit_parse_file(Unit *u, const char *path);
 
 /* --- unit-dependency.c --- */
-/* Record "u has dependency d on other" (also records the inverse where one exists). */
+/* Record "u has dependency d on other", deduplicating. Also records the inverse
+ * relation where one exists in this model (Before <-> After); Requires/Wants
+ * have no inverse slot here, so nothing is recorded back for them. */
 int unit_add_dependency(Unit *u, UnitDependency d, Unit *other);
+
+/* As above, resolving `name` through the manager (loading it if needed). */
+int unit_add_dependency_by_name(Unit *u, UnitDependency d, const char *name);
+
+bool unit_has_dependency(Unit *u, UnitDependency d, Unit *other);
 
 /* Walk every loaded unit's ordering edges; -ELOOP if a cycle exists, else 0. */
 int unit_dependency_detect_cycles(Manager *m);

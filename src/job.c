@@ -75,6 +75,20 @@ int job_run(Job *j) {
         return -ENOSYS;
 }
 
+bool job_is_runnable(Job *j) {
+        (void) j;
+        /*
+         * TODO (M2): route this through a job_compare(a, b, dep) primitive
+         * shared with the transaction cycle checker rather than hand-rolling
+         * the ordering rule here. systemd carried three divergent copies of
+         * that rule until e602f15282 unified them, and the copy living in its
+         * cycle checker was the one that was wrong -- it assumed execution
+         * order always follows declared order, which is false whenever a stop
+         * job is involved.
+         */
+        return false;
+}
+
 int job_finish(Job *j, JobResult result) {
         (void) j;
         (void) result;
@@ -156,4 +170,8 @@ int transaction_add_job(Transaction *tx, JobType type, Unit *u, bool with_depend
 int transaction_activate(Transaction *tx) {
         (void) tx;
         return -ENOSYS;
+}
+
+size_t transaction_n_jobs(Transaction *tx) {
+        return tx ? tx->n_jobs : 0;
 }

@@ -9,11 +9,16 @@
  * shape: search a path for "<id>", hand a found file to the INI parser,
  * resolve to UNIT_LOADED or UNIT_ERROR. The 2011 original searched
  * several directories (/etc, /run, /usr/lib) with per-directory drop-in
- * merging; this MVP searches two -- PICO_UNIT_DIR (admin overrides) then
- * PICO_PACKAGED_UNIT_DIR (where packages actually install units, given
- * angstrom-pico-init's usrmerge decision -- see plans/29-pico-init.md
- * "The decided scope") -- keeping the loop-over-an-array shape so a third
- * directory (e.g. /run) is still a one-line change, not a rewrite.
+ * merging; this MVP searches the manager's own unit path, which defaults to
+ * two entries -- PICO_UNIT_DIR (admin overrides) then PICO_PACKAGED_UNIT_DIR
+ * (where packages actually install units, given angstrom-pico-init's usrmerge
+ * decision -- see plans/29-pico-init.md "The decided scope").
+ *
+ * The path lives on the Manager rather than in a file-static array here
+ * because it has to be redirectable: a test that cannot point unit loading at
+ * a temporary directory can only be run as root against the host's real /etc,
+ * which is no test at all. Adding a third directory (e.g. /run) stays a
+ * one-line change to the default, not a rewrite.
  *
  * Backported fix:
  *  - baa162cec "core: fix a use-after-free" -- the original freed its
@@ -34,24 +39,23 @@
 #include "manager.h"
 #include "util.h"
 
-static const char * const unit_search_path[] = {
-        PICO_UNIT_DIR,
-        PICO_PACKAGED_UNIT_DIR,
-        NULL,
-};
-
 int unit_load(Unit *u) {
-        const char * const *dir;
+        char * const *dir;
         char *fragment_path = NULL;
         int r;
 
         if (!u)
                 return -EINVAL;
 
+        /* The search path lives on the manager, so a unit without one has
+         * nowhere to look. */
+        if (!u->manager || !u->manager->unit_path)
+                return -EINVAL;
+
         if (u->load_state != UNIT_STUB)
                 return 0; /* idempotent: already resolved by an earlier call */
 
-        for (dir = unit_search_path; *dir; dir++) {
+        for (dir = u->manager->unit_path; *dir; dir++) {
                 char candidate[PATH_MAX];
                 struct stat st;
                 int n;

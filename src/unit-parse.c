@@ -64,6 +64,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h> /* strcasecmp, for the boolean spellings */
 
 #include "manager.h"
 #include "service.h"
@@ -325,7 +326,14 @@ static int config_parse_unit_deps(Unit *u, const char *path, unsigned line, Unit
                 Unit *other;
                 int r;
 
-                if (unit_type_from_name(tok) == _UNIT_TYPE_INVALID) {
+                /*
+                 * unit_name_is_valid() subsumes the old suffix check and adds
+                 * the one that actually matters: this token is concatenated
+                 * into a search-path entry by unit_load(), so
+                 * "Requires=../../tmp/evil.service" must be rejected before it
+                 * ever becomes a path.
+                 */
+                if (!unit_name_is_valid(tok)) {
                         pico_log(PICO_LOG_WARNING,
                                  "%s:%u: '%s' is not a valid unit name, ignoring",
                                  path,
@@ -357,11 +365,11 @@ static int config_parse_unit_deps(Unit *u, const char *path, unsigned line, Unit
                 }
 
                 /*
-                 * unit_add_dependency() is still an M0 -ENOSYS stub (its
-                 * own module, out of this file's scope) -- treat any
-                 * failure here as non-fatal to the rest of the unit, the
-                 * same way systemd itself logs-and-continues on a single
-                 * bad dependency rather than aborting the whole load.
+                 * A single bad dependency is non-fatal to the rest of the
+                 * unit, the same way systemd itself logs-and-continues rather
+                 * than aborting the whole load. The usual cause is a
+                 * self-dependency or an out-of-memory grow, neither of which
+                 * makes the other directives in the file wrong.
                  */
                 r = unit_add_dependency(u, d, other);
                 if (r < 0)
@@ -401,35 +409,92 @@ static int config_parse_after(Unit *u, const char *path, unsigned line, const ch
 
 /* --- [Service] handlers --- */
 
-/* Unit is always a Service in this MVP (UNIT_SERVICE is the only UnitType). */
+/* Targets are a real unit type now, so a [Service] directive on one is a
+ * misplaced-directive warning rather than an impossible case. */
 static Service *unit_to_service(Unit *u, const char *path, unsigned line) {
         if (u->type != UNIT_SERVICE) {
                 pico_log(PICO_LOG_WARNING,
-                         "%s:%u: [Service] directive on a non-service unit, ignoring",
+                         "%s:%u: [Service] directive on a %s unit, ignoring",
                          path,
-                         line);
+                         line,
+                         unit_type_to_string(u->type));
                 return NULL;
         }
         return SERVICE(u);
 }
 
 static int config_parse_type(Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
-        (void) u;
+        Service *s = unit_to_service(u, path, line);
         (void) lvalue;
 
-        /* No ServiceType field exists (service.h): Type=simple is the only supported
-         * value, so there's nothing to store -- anything else changes the service's
-         * real semantics (forking/oneshot/dbus/notify) enough that silently running
-         * it as simple would be wrong, so it's a hard error, not a dropped directive. */
-        if (strcmp(rvalue, "simple") == 0)
+        if (!s)
                 return 0;
 
-        pico_log(PICO_LOG_ERR,
-                 "%s:%u: Type=%s is not supported (only 'simple' is), failing unit",
-                 path,
-                 line,
-                 rvalue);
+        if (strcmp(rvalue, "simple") == 0)
+                s->type = SERVICE_TYPE_SIMPLE;
+        else if (strcmp(rvalue, "oneshot") == 0)
+                s->type = SERVICE_TYPE_ONESHOT;
+        else {
+                /*
+                 * Still a hard failure rather than a dropped directive:
+                 * forking/dbus/notify/idle each change *when* a service counts
+                 * as started, so silently running one as simple would report
+                 * the unit up before it actually is, and everything ordered
+                 * After= it would then start too early. Refusing is safer.
+                 */
+                pico_log(PICO_LOG_ERR,
+                         "%s:%u: Type=%s is not supported (only 'simple' and 'oneshot' are), failing unit",
+                         path,
+                         line,
+                         rvalue);
+                return -EINVAL;
+        }
+
+        return 0;
+}
+
+/*
+ * systemd's own boolean spellings (parse_boolean() in src/basic/parse-util.c):
+ * 1/yes/y/true/t/on and 0/no/n/false/f/off, case-insensitively. Matching that
+ * set exactly is part of the drop-in goal -- "RemainAfterExit=on" and "=true"
+ * both appear in real unit files.
+ */
+static int parse_boolean_value(const char *v, bool *ret) {
+        if (strcmp(v, "1") == 0 || strcasecmp(v, "yes") == 0 || strcasecmp(v, "y") == 0 ||
+            strcasecmp(v, "true") == 0 || strcasecmp(v, "t") == 0 || strcasecmp(v, "on") == 0) {
+                *ret = true;
+                return 0;
+        }
+
+        if (strcmp(v, "0") == 0 || strcasecmp(v, "no") == 0 || strcasecmp(v, "n") == 0 ||
+            strcasecmp(v, "false") == 0 || strcasecmp(v, "f") == 0 || strcasecmp(v, "off") == 0) {
+                *ret = false;
+                return 0;
+        }
+
         return -EINVAL;
+}
+
+static int config_parse_remain_after_exit(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        Service *s = unit_to_service(u, path, line);
+        bool b;
+        (void) lvalue;
+
+        if (!s)
+                return 0;
+
+        if (parse_boolean_value(rvalue, &b) < 0) {
+                pico_log(PICO_LOG_WARNING,
+                         "%s:%u: invalid RemainAfterExit= value '%s', ignoring",
+                         path,
+                         line,
+                         rvalue);
+                return 0;
+        }
+
+        s->remain_after_exit = b;
+        return 0;
 }
 
 static int config_parse_exec_start(
@@ -605,6 +670,62 @@ static int config_parse_timeout_stop_sec(
         return 0;
 }
 
+/* --- [Install] handlers --- */
+
+/*
+ * WantedBy=/RequiredBy= are stored as raw names, not resolved into edges here.
+ * At parse time the named target may not be loaded yet, and -- more
+ * importantly -- whether these are honoured at all depends on enablement (a
+ * .wants/ symlink or a preset rule), which cannot be decided until every
+ * fragment has been read. unit-enable.c turns them into real edges later, or
+ * deliberately does not.
+ */
+static int config_parse_install_names(
+                Unit *u, const char *path, unsigned line, const char *rvalue, char ***target) {
+        char *saveptr = NULL;
+        char *names;
+        char *tok;
+
+        (void) u;
+
+        /* heap, not a VLA: rvalue comes from an unbounded getline(), the same
+         * stack-overflow hazard config_parse_unit_deps() documents above */
+        names = pico_strdup(rvalue);
+        if (!names)
+                return -ENOMEM;
+
+        for (tok = strtok_r(names, " \t", &saveptr); tok; tok = strtok_r(NULL, " \t", &saveptr)) {
+                if (!unit_name_is_valid(tok)) {
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s:%u: '%s' is not a valid unit name, ignoring",
+                                 path,
+                                 line,
+                                 tok);
+                        continue;
+                }
+
+                if (pico_strv_extend(target, tok) < 0) {
+                        pico_mfree(names);
+                        return -ENOMEM;
+                }
+        }
+
+        pico_mfree(names);
+        return 0;
+}
+
+static int config_parse_wanted_by(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        (void) lvalue;
+        return config_parse_install_names(u, path, line, rvalue, &u->wanted_by);
+}
+
+static int config_parse_required_by(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        (void) lvalue;
+        return config_parse_install_names(u, path, line, rvalue, &u->required_by);
+}
+
 static const ConfigItem config_items[] = {
         {    SECTION_UNIT,     "Description",       config_parse_description },
         {    SECTION_UNIT,        "Requires",          config_parse_requires },
@@ -616,8 +737,11 @@ static const ConfigItem config_items[] = {
         { SECTION_SERVICE,    "ExecStartPre",    config_parse_exec_start_pre },
         { SECTION_SERVICE,         "Restart",           config_parse_restart },
         { SECTION_SERVICE,      "RestartSec",       config_parse_restart_sec },
+        { SECTION_SERVICE, "RemainAfterExit", config_parse_remain_after_exit },
         { SECTION_SERVICE, "TimeoutStartSec", config_parse_timeout_start_sec },
         { SECTION_SERVICE,  "TimeoutStopSec",  config_parse_timeout_stop_sec },
+        { SECTION_INSTALL,        "WantedBy",         config_parse_wanted_by },
+        { SECTION_INSTALL,      "RequiredBy",       config_parse_required_by },
 };
 
 static const char *section_name(ConfigSection s) {
@@ -682,16 +806,11 @@ static int parse_line(Unit *u, const char *path, unsigned line, ConfigSection *s
         lvalue = strip(l);
         rvalue = strip(eq + 1);
 
-        if (*section == SECTION_INSTALL) {
-                /* No install-state field in unit.h (M0 header contract has none):
-                 * accepted syntax, silently dropped, still visible at debug level. */
-                pico_log(PICO_LOG_DEBUG,
-                         "%s:%u: [Install] %s= has no backing field, ignoring",
-                         path,
-                         line,
-                         lvalue);
-                return 0;
-        }
+        /* [Install] is no longer dropped wholesale: WantedBy=/RequiredBy= have
+         * real backing fields and are in the table below. Everything else in
+         * that section (Alias=, Also=, DefaultInstance=) still falls through
+         * to the unknown-directive debug log at the bottom, which is the
+         * graceful degradation the drop-in goal asks for. */
 
         if (*section == SECTION_UNKNOWN)
                 return 0;

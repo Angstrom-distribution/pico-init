@@ -2,8 +2,9 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * Manager lifecycle, unit table and job dispatch. The epoll loop itself
- * lives in manager-loop.c, orderly shutdown in manager-shutdown.c.
+ * Manager lifecycle, search paths, the unit table and the load queue. The
+ * epoll loop lives in manager-loop.c, the boot sequence in manager-startup.c,
+ * orderly shutdown in manager-shutdown.c.
  */
 
 #include <dirent.h>
@@ -14,6 +15,19 @@
 #include <unistd.h>
 
 #include "manager.h"
+#include "service.h"
+
+static const char * const default_unit_path[] = {
+        PICO_UNIT_DIR,
+        PICO_PACKAGED_UNIT_DIR,
+        NULL,
+};
+
+static const char * const default_preset_path[] = {
+        PICO_PRESET_DIR,
+        PICO_PACKAGED_PRESET_DIR,
+        NULL,
+};
 
 /* tag->fd must already be set; tag is registered via data.ptr, never data.fd
  * -- see the PicoEpollSource comment in util.h for why the two must not mix. */
@@ -29,61 +43,150 @@ static int manager_epoll_add(Manager *m, struct pico_epoll_tag *tag) {
         return 0;
 }
 
+/* Deep-copy a NULL-terminated path vector. An empty vector is legal and
+ * returns a one-element array holding only the terminator. */
+static char **path_copy(const char * const *src) {
+        char **dst = NULL;
+        size_t i;
+
+        for (i = 0; src && src[i]; i++)
+                if (pico_strv_extend(&dst, src[i]) < 0) {
+                        pico_strv_free(dst);
+                        return NULL;
+                }
+
+        if (!dst)
+                dst = calloc(1, sizeof(char *));
+
+        return dst;
+}
+
+static int manager_set_path(char ***slot, const char * const *path) {
+        char **copy;
+
+        copy = path_copy(path);
+        if (!copy)
+                return -ENOMEM;
+
+        pico_strv_free(*slot);
+        *slot = copy;
+
+        return 0;
+}
+
+int manager_set_unit_path(Manager *m, const char * const *path) {
+        if (!m)
+                return -EINVAL;
+
+        return manager_set_path(&m->unit_path, path);
+}
+
+int manager_set_preset_path(Manager *m, const char * const *path) {
+        if (!m)
+                return -EINVAL;
+
+        return manager_set_path(&m->preset_path, path);
+}
+
+int manager_set_cgroup_root(Manager *m, const char *root) {
+        char *copy;
+
+        if (!m || !root)
+                return -EINVAL;
+
+        copy = pico_strdup(root);
+        if (!copy)
+                return -ENOMEM;
+
+        pico_mfree(m->cgroup_root);
+        m->cgroup_root = copy;
+
+        return 0;
+}
+
 int manager_new(Manager **ret) {
+        Manager *m;
+        int r;
+
         if (!ret)
                 return -EINVAL;
 
-        Manager *m = calloc(1, sizeof(Manager));
+        m = calloc(1, sizeof(Manager));
         if (!m)
                 return -ENOMEM;
 
         m->next_job_id = 1;
         m->objective = MANAGER_RUNNING;
+        m->epoll_fd = -1;
+
+        /* Real init behaviour is gated on this rather than on getpid() being
+         * re-checked all over the place; it also decides whether leaving the
+         * loop is even a legal outcome (see main.c). */
+        m->is_system = getpid() == 1;
+
+        r = manager_set_unit_path(m, default_unit_path);
+        if (r < 0)
+                goto fail;
+
+        r = manager_set_preset_path(m, default_preset_path);
+        if (r < 0)
+                goto fail;
+
+        r = manager_set_cgroup_root(m, PICO_CGROUP_ROOT);
+        if (r < 0)
+                goto fail;
 
         m->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
         if (m->epoll_fd < 0) {
-                int r = -errno;
-                manager_free(m);
-                return r;
+                r = -errno;
+                goto fail;
         }
 
-        int r = pico_signal_new(&m->signal);
-        if (r < 0) {
-                manager_free(m);
-                return r;
-        }
+        r = pico_signal_new(&m->signal);
+        if (r < 0)
+                goto fail;
 
         m->signal_tag = (struct pico_epoll_tag){ .source = PICO_EPOLL_SIGNAL, .fd = pico_signal_fd(m->signal) };
         r = manager_epoll_add(m, &m->signal_tag);
-        if (r < 0) {
-                manager_free(m);
-                return r;
-        }
+        if (r < 0)
+                goto fail;
 
         r = pico_timer_new(&m->timer);
-        if (r < 0) {
-                manager_free(m);
-                return r;
-        }
+        if (r < 0)
+                goto fail;
 
         m->timer_tag = (struct pico_epoll_tag){ .source = PICO_EPOLL_TIMER, .fd = pico_timer_fd(m->timer) };
         r = manager_epoll_add(m, &m->timer_tag);
-        if (r < 0) {
-                manager_free(m);
-                return r;
-        }
+        if (r < 0)
+                goto fail;
 
         *ret = m;
         return 0;
+
+fail:
+        manager_free(m);
+        return r;
 }
 
 Manager *manager_free(Manager *m) {
+        size_t i;
+
         if (!m)
                 return NULL;
 
-        for (size_t i = 0; i < m->n_units; i++)
+        /* Jobs first: each one points at a unit and unlinks itself from the
+         * run queue as it goes, so this terminates. Freeing units first would
+         * leave those pointers dangling for the duration of the loop. */
+        while (m->run_queue)
+                job_free(m->run_queue);
+
+        for (i = 0; i < m->n_units; i++)
                 unit_free(m->units[i]);
         free(m->units);
+
+        m->unit_path = pico_strv_free(m->unit_path);
+        m->preset_path = pico_strv_free(m->preset_path);
+        m->cgroup_root = pico_mfree(m->cgroup_root);
 
         m->timer = pico_timer_free(m->timer);
         m->signal = pico_signal_free(m->signal);
@@ -95,27 +198,178 @@ Manager *manager_free(Manager *m) {
         return NULL;
 }
 
-int manager_load_units(Manager *m, const char *dir) {
+int manager_add_unit(Manager *m, Unit *u) {
+        Unit **units;
+
+        if (!m || !u)
+                return -EINVAL;
+
+        units = realloc(m->units, (m->n_units + 1) * sizeof(Unit *));
+        if (!units)
+                return -ENOMEM;
+
+        m->units = units;
+        m->units[m->n_units++] = u;
+
+        return 0;
+}
+
+void manager_enqueue_load(Manager *m, Unit *u) {
+        if (!m || !u || u->in_load_queue)
+                return;
+
+        u->load_queue_next = m->load_queue;
+        m->load_queue = u;
+        u->in_load_queue = true;
+}
+
+int manager_dispatch_load_queue(Manager *m) {
+        int n = 0;
+
         if (!m)
                 return -EINVAL;
-        if (!dir)
-                dir = PICO_UNIT_DIR;
 
-        DIR *d = opendir(dir);
-        if (!d)
-                return -errno;
+        /*
+         * A while loop over a queue that the loop body itself extends: parsing
+         * a fragment resolves its Requires=/Wants=, each of which calls
+         * manager_load_unit() and pushes another unit onto this same queue.
+         * That is the whole point of having a queue instead of recursion.
+         */
+        while (m->load_queue) {
+                Unit *u = m->load_queue;
 
-        static const char suffix[] = ".service";
-        const size_t suffix_len = sizeof(suffix) - 1;
+                m->load_queue = u->load_queue_next;
+                u->load_queue_next = NULL;
+                u->in_load_queue = false;
 
-        int ret = 0;
-        struct dirent *de;
-        while ((de = readdir(d))) {
-                size_t len = strlen(de->d_name);
-                if (len <= suffix_len || strcmp(de->d_name + len - suffix_len, suffix) != 0)
+                /* A fragment that is missing or malformed leaves the unit in
+                 * UNIT_ERROR, which is recorded on the unit itself; it is not
+                 * an error for the queue as a whole, so the return is ignored
+                 * deliberately rather than by omission. */
+                (void) unit_load(u);
+                n++;
+        }
+
+        return n;
+}
+
+Unit *manager_get_unit(Manager *m, const char *id) {
+        size_t i;
+
+        if (!m || !id)
+                return NULL;
+
+        for (i = 0; i < m->n_units; i++)
+                if (strcmp(m->units[i]->id, id) == 0)
+                        return m->units[i];
+
+        return NULL;
+}
+
+Unit *manager_get_unit_by_pid(Manager *m, pid_t pid) {
+        size_t i;
+
+        if (!m || pid <= 0)
+                return NULL;
+
+        for (i = 0; i < m->n_units; i++) {
+                Unit *u = m->units[i];
+                Service *s;
+
+                if (u->type != UNIT_SERVICE)
                         continue;
 
-                int r = manager_load_unit(m, de->d_name, NULL);
+                s = SERVICE(u);
+                if (s->main_pid == pid || s->control_pid == pid)
+                        return u;
+        }
+
+        return NULL;
+}
+
+int manager_load_unit(Manager *m, const char *id, Unit **ret) {
+        Unit *u;
+        int r;
+
+        if (!m || !id)
+                return -EINVAL;
+
+        if (ret)
+                *ret = NULL;
+
+        if (!unit_name_is_valid(id))
+                return -EINVAL;
+
+        u = manager_get_unit(m, id);
+        if (!u) {
+                UnitType type = unit_type_from_name(id);
+
+                r = unit_new(m, type, id, &u);
+                if (r < 0)
+                        return r;
+
+                r = manager_add_unit(m, u);
+                if (r < 0) {
+                        unit_free(u);
+                        return r;
+                }
+
+                manager_enqueue_load(m, u);
+        }
+
+        /*
+         * Hand the caller the node before draining. A re-entrant caller gets a
+         * unit still in UNIT_STUB, and that is correct: what a Requires= line
+         * needs is the graph node to attach an edge to, not a parsed fragment.
+         */
+        if (ret)
+                *ret = u;
+
+        /*
+         * Re-entrant call, i.e. a fragment's own Requires= resolving while
+         * that fragment's parser is running. Enqueue and return; the outermost
+         * caller's drain will reach it. Recursing here instead would blow
+         * PID1's stack on a long dependency chain and would never terminate on
+         * a dependency cycle.
+         */
+        if (m->dispatching_load_queue)
+                return 0;
+
+        m->dispatching_load_queue = true;
+        r = manager_dispatch_load_queue(m);
+        m->dispatching_load_queue = false;
+
+        return r < 0 ? r : 0;
+}
+
+static int manager_load_units_one_dir(Manager *m, const char *dir) {
+        struct dirent *de;
+        int ret = 0;
+        DIR *d;
+
+        d = opendir(dir);
+        if (!d) {
+                /* A missing search directory is normal, not a failure: an
+                 * image may legitimately ship no /etc/systemd/system at all. */
+                if (errno == ENOENT)
+                        return 0;
+
+                return -errno;
+        }
+
+        while ((de = readdir(d))) {
+                int r;
+
+                /*
+                 * One check does the whole filter: it rejects "." and "..",
+                 * anything with a suffix naming no unit type (so ".wants" and
+                 * ".requires" directories and drop-in ".d" dirs are skipped),
+                 * and anything containing a path separator.
+                 */
+                if (!unit_name_is_valid(de->d_name))
+                        continue;
+
+                r = manager_load_unit(m, de->d_name, NULL);
                 if (r < 0 && ret == 0)
                         ret = r; /* keep loading the rest, report the first failure */
         }
@@ -124,58 +378,40 @@ int manager_load_units(Manager *m, const char *dir) {
         return ret;
 }
 
-Unit *manager_get_unit(Manager *m, const char *id) {
-        if (!m || !id)
-                return NULL;
+int manager_load_units(Manager *m, const char *dir) {
+        int ret = 0;
+        int r;
 
-        for (size_t i = 0; i < m->n_units; i++)
-                if (strcmp(m->units[i]->id, id) == 0)
-                        return m->units[i];
-
-        return NULL;
-}
-
-int manager_load_unit(Manager *m, const char *id, Unit **ret) {
-        if (!m || !id)
+        if (!m)
                 return -EINVAL;
 
-        Unit *u = manager_get_unit(m, id);
-        if (u) {
-                if (ret)
-                        *ret = u;
-                return 0;
+        if (dir)
+                ret = manager_load_units_one_dir(m, dir);
+        else {
+                size_t i;
+
+                for (i = 0; m->unit_path && m->unit_path[i]; i++) {
+                        r = manager_load_units_one_dir(m, m->unit_path[i]);
+                        if (r < 0 && ret == 0)
+                                ret = r;
+                }
         }
 
-        UnitType type = unit_type_from_name(id);
-        if (type == _UNIT_TYPE_INVALID)
-                return -EINVAL;
+        r = manager_dispatch_load_queue(m);
+        if (r < 0 && ret == 0)
+                ret = r;
 
-        int r = unit_new(m, type, id, &u);
-        if (r < 0)
-                return r;
-
-        Unit **units = realloc(m->units, (m->n_units + 1) * sizeof(Unit *));
-        if (!units) {
-                unit_free(u);
-                return -ENOMEM;
-        }
-        m->units = units;
-        m->units[m->n_units++] = u;
-
-        /* fragment problems leave u in UNIT_ERROR; not fatal to the caller here */
-        unit_load(u);
-
-        if (ret)
-                *ret = u;
-        return 0;
+        return ret;
 }
 
 int manager_add_job(Manager *m, JobType type, Unit *u, Job **ret) {
+        Transaction *tx = NULL;
+        int r;
+
         if (!m || !u)
                 return -EINVAL;
 
-        Transaction *tx = NULL;
-        int r = transaction_new(m, &tx);
+        r = transaction_new(m, &tx);
         if (r < 0)
                 return r;
 
@@ -196,13 +432,16 @@ int manager_add_job(Manager *m, JobType type, Unit *u, Job **ret) {
 }
 
 int manager_dispatch_run_queue(Manager *m) {
+        int n = 0;
+        Job *j;
+
         if (!m)
                 return -EINVAL;
 
-        int n = 0;
-        Job *j = m->run_queue;
+        j = m->run_queue;
         while (j) {
                 Job *next = j->run_queue_next; /* job_run()/job_finish() may unlink j */
+
                 if (j->state == JOB_WAITING && job_run(j) == 0)
                         n++;
                 j = next;
