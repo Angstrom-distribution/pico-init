@@ -120,6 +120,13 @@ struct Unit {
         Unit *load_queue_next;
         bool in_load_queue;
 
+        /* intrusive cgroup-empty-queue link (see manager.h). A verified
+         * emptiness notification waits here until every signal in the same
+         * epoll batch has been handled -- see the ordering comment at the top
+         * of manager-loop.c for why that ordering is not optional. */
+        Unit *cgroup_empty_queue_next;
+        bool in_cgroup_empty_queue;
+
         /* DFS generation marker for cycle detection, owned by unit-dependency.c */
         unsigned dep_generation;
 };

@@ -253,6 +253,64 @@ int manager_dispatch_load_queue(Manager *m) {
         return n;
 }
 
+void manager_enqueue_cgroup_empty(Manager *m, Unit *u) {
+        if (!m || !u || u->in_cgroup_empty_queue)
+                return;
+
+        u->cgroup_empty_queue_next = m->cgroup_empty_queue;
+        m->cgroup_empty_queue = u;
+        u->in_cgroup_empty_queue = true;
+}
+
+void manager_dequeue_cgroup_empty(Manager *m, Unit *u) {
+        Unit **cur;
+
+        if (!m || !u || !u->in_cgroup_empty_queue)
+                return;
+
+        for (cur = &m->cgroup_empty_queue; *cur; cur = &(*cur)->cgroup_empty_queue_next)
+                if (*cur == u) {
+                        *cur = u->cgroup_empty_queue_next;
+                        break;
+                }
+
+        u->cgroup_empty_queue_next = NULL;
+        u->in_cgroup_empty_queue = false;
+}
+
+int manager_dispatch_cgroup_empty_queue(Manager *m) {
+        int n = 0;
+
+        if (!m)
+                return -EINVAL;
+
+        /* The handler can start or stop units, which can queue more emptiness
+         * events; the guard keeps a re-entrant drain from running underneath
+         * this one, exactly as the load queue does. */
+        if (m->dispatching_cgroup_empty_queue)
+                return 0;
+
+        m->dispatching_cgroup_empty_queue = true;
+
+        while (m->cgroup_empty_queue) {
+                Unit *u = m->cgroup_empty_queue;
+
+                /* unlink before dispatching: the handler may free u */
+                m->cgroup_empty_queue = u->cgroup_empty_queue_next;
+                u->cgroup_empty_queue_next = NULL;
+                u->in_cgroup_empty_queue = false;
+
+                if (u->type == UNIT_SERVICE)
+                        service_cgroup_empty_event(SERVICE(u));
+
+                n++;
+        }
+
+        m->dispatching_cgroup_empty_queue = false;
+
+        return n;
+}
+
 Unit *manager_get_unit(Manager *m, const char *id) {
         size_t i;
 
@@ -433,18 +491,32 @@ int manager_add_job(Manager *m, JobType type, Unit *u, Job **ret) {
 
 int manager_dispatch_run_queue(Manager *m) {
         int n = 0;
-        Job *j;
 
         if (!m)
                 return -EINVAL;
 
-        j = m->run_queue;
-        while (j) {
-                Job *next = j->run_queue_next; /* job_run()/job_finish() may unlink j */
+        /*
+         * Rescan from the head after every job that runs, rather than walking
+         * the list once. job_run() can finish not just this job but others --
+         * a Target completes synchronously, which finishes its job, which
+         * re-queues every neighbour -- so any pointer into the list taken
+         * before the call may be stale afterwards. Quadratic in the worst
+         * case, over a queue that is a handful of entries on a real boot.
+         */
+        for (;;) {
+                Job *j;
+                bool ran = false;
 
-                if (j->state == JOB_WAITING && job_run(j) == 0)
-                        n++;
-                j = next;
+                for (j = m->run_queue; j; j = j->run_queue_next)
+                        if (j->state == JOB_WAITING && job_is_runnable(j)) {
+                                job_run(j);
+                                n++;
+                                ran = true;
+                                break;
+                        }
+
+                if (!ran)
+                        break;
         }
 
         return n;

@@ -72,6 +72,14 @@ struct Manager {
         Unit *load_queue;
         bool dispatching_load_queue; /* re-entrancy guard, see manager_load_unit() */
 
+        /* units whose cgroup was observed empty, linked via
+         * unit->cgroup_empty_queue_next. Deliberately a queue rather than a
+         * direct call: emptiness must not be acted on until every SIGCHLD in
+         * the same epoll batch has been reaped, or the exit status is lost.
+         * See manager-loop.c. */
+        Unit *cgroup_empty_queue;
+        bool dispatching_cgroup_empty_queue;
+
         /* runnable jobs, linked via job->run_queue_next */
         Job *run_queue;
         uint32_t next_job_id;
@@ -87,6 +95,20 @@ struct Manager {
         bool is_system;
 
         ManagerObjective objective;
+
+        /*
+         * Where we are heading once the stop jobs have drained.
+         * manager_shutdown() sets this rather than `objective` directly: a
+         * shutdown that switched objective immediately would leave the loop
+         * before any of the stop jobs it just queued had run, so nothing would
+         * actually be stopped. MANAGER_RUNNING here means "no shutdown
+         * pending".
+         */
+        ManagerObjective pending_objective;
+
+        /* When to stop waiting for the drain and go anyway. A service that
+         * will not die must not be able to keep the machine up forever. */
+        usec_t shutdown_deadline;
 };
 
 /* --- manager.c --- */
@@ -131,6 +153,19 @@ void manager_enqueue_load(Manager *m, Unit *u);
 /* Drain the load queue, calling unit_load() on each entry. Number loaded, or -errno. */
 int manager_dispatch_load_queue(Manager *m);
 
+/*
+ * Queue u as having a confirmed-empty cgroup, or take it back off again.
+ *
+ * Dequeue exists because cgroup.events notifications coalesce: a cgroup can go
+ * empty and be repopulated before the queue is drained, and acting on the
+ * stale notification would declare a running service dead.
+ */
+void manager_enqueue_cgroup_empty(Manager *m, Unit *u);
+void manager_dequeue_cgroup_empty(Manager *m, Unit *u);
+
+/* Drain it, delivering each unit's cgroup-empty event. Number delivered. */
+int manager_dispatch_cgroup_empty_queue(Manager *m);
+
 /* Build a transaction for (type, unit) + dependencies and activate it.
  * Installed job via ret (may be NULL). 0 or -errno. */
 int manager_add_job(Manager *m, JobType type, Unit *u, Job **ret);
@@ -169,7 +204,11 @@ int manager_loop(Manager *m);
 int manager_dispatch_signal(Manager *m, int signo);
 
 /* --- manager-shutdown.c --- */
-/* Queue stop jobs for everything, set the objective for after teardown. 0 or -errno. */
+/* Queue stop jobs for everything and record where to go once they drain. 0 or -errno. */
 int manager_shutdown(Manager *m, ManagerObjective objective);
+
+/* True when a pending shutdown may now be acted on: the run queue has drained,
+ * or the deadline passed and a wedged unit is not going to be waited for. */
+bool manager_shutdown_finished(Manager *m);
 
 const char *manager_objective_to_string(ManagerObjective o);

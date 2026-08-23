@@ -40,6 +40,8 @@ typedef enum JobResult {
         JOB_CANCELED,
         JOB_TIMEOUT,
         _JOB_RESULT_MAX,
+        _JOB_RESULT_INVALID =
+                        -1, /* a fresh job has no result yet; don't let 0 (JOB_DONE) mean that by accident */
 } JobResult;
 
 struct Job {
@@ -49,11 +51,44 @@ struct Job {
         uint32_t id;
         JobType type;
         JobState state;
-        JobResult result; /* valid once finished */
+        JobResult result; /* _JOB_RESULT_INVALID until finished */
 
         /* intrusive run-queue link (see manager.h) */
         Job *run_queue_next;
         bool in_run_queue;
+
+        /*
+         * DFS marker/backtrack pointer for transaction_activate()'s ordering-
+         * cycle check (job.c, transaction_verify_order_one()). generation is
+         * compared against a per-sweep counter rather than a plain visited
+         * bool so a stale mark from an earlier sweep can never be confused
+         * with "visited this sweep" -- see the transaction_activate() note in
+         * job.c about resetting every installed job's generation first.
+         * marker points back along the DFS path so a detected cycle can be
+         * walked to find a job actually worth deleting.
+         */
+        unsigned generation;
+        Job *marker;
+
+        /*
+         * True once the job has been handed to the manager: attached to its
+         * unit as unit->job and linked onto the run queue. It is the whole of
+         * the ownership question -- a transaction frees exactly those of its
+         * jobs that are not installed, and job_free() refuses to free one that
+         * is. Upstream spent six commits removing the case where a job could
+         * be both in a transaction and installed; keeping the two disjoint by
+         * construction is what avoids all of it.
+         */
+        bool installed;
+
+        /*
+         * Whether dropping this job would defeat the request the transaction
+         * was built for. Set by propagation from the anchor along Requires=
+         * edges only: a Wants= dependency is by definition sacrificeable,
+         * which is the entire difference between the two in this model. Cycle
+         * breaking may only ever delete a job for which this is false.
+         */
+        bool matters_to_anchor;
 };
 
 /* --- job.c --- */
@@ -63,8 +98,22 @@ Job *job_free(Job *j); /* uninstalls from unit + queues; returns NULL */
 /* Start executing a WAITING job whose ordering dependencies are satisfied. 0 or -errno. */
 int job_run(Job *j);
 
-/* Record the result, uninstall, unblock dependent jobs. 0 or -errno. */
+/* Record the result, uninstall, unblock dependent jobs. Equivalent to
+ * job_finish_full(j, result, true). 0 or -errno. */
 int job_finish(Job *j, JobResult result);
+
+/*
+ * As job_finish(), with an explicit recursion flag. `recursive` gates the
+ * dependency-failure-propagation step: a job whose Requires= depended on this
+ * one is itself failed only when recursive is true. Transaction
+ * activation/installation already walks every job it touches, so it always
+ * passes false here -- without that, a long Requires= chain finishing during
+ * transaction_apply() would recurse back into code already iterating the
+ * transaction and could double-finish a job. Anything reached from outside a
+ * transaction (a job's own unit reporting a state change) wants the default,
+ * recursive job_finish(). 0 or -errno.
+ */
+int job_finish_full(Job *j, JobResult result, bool recursive);
 
 /* True when every job this one is ordered after has already finished. */
 bool job_is_runnable(Job *j);

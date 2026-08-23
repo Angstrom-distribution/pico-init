@@ -26,10 +26,22 @@ int pico_signal_new(PicoSignal **ret) {
         if (!s)
                 return -ENOMEM;
 
+        /*
+         * The handled set. SIGCHLD/SIGTERM/SIGHUP are the daemon-shaped ones;
+         * the rest are the init convention for "change the machine's power
+         * state", which PID 1 has to answer and a daemon never does:
+         * SIGINT is what the kernel sends for ctrl-alt-del, and SIGRTMIN+3 /
+         * SIGRTMIN+4 are what systemd's own shutdown tooling sends. Blocking
+         * them here is what lets them be read from the signalfd instead of
+         * killing us with their default dispositions.
+         */
         sigemptyset(&mask);
         sigaddset(&mask, SIGCHLD);
         sigaddset(&mask, SIGTERM);
         sigaddset(&mask, SIGHUP);
+        sigaddset(&mask, SIGINT);
+        sigaddset(&mask, SIGRTMIN + 3);
+        sigaddset(&mask, SIGRTMIN + 4);
 
         if (sigprocmask(SIG_BLOCK, &mask, &s->old_mask) < 0) {
                 r = -errno;
