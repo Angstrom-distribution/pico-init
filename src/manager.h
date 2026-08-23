@@ -20,7 +20,12 @@
 #include "unit.h"
 #include "util.h"
 
+/* angstrom-pico-init adopts usrmerge (see plans/29-pico-init.md §4), so
+ * this matches oe-core's real systemd_system_unitdir for that distro:
+ * /etc overrides admin-placed units, /usr/lib is where packages install
+ * theirs -- same two-entry order real systemd searches. */
 #define PICO_UNIT_DIR "/etc/systemd/system"
+#define PICO_PACKAGED_UNIT_DIR "/usr/lib/systemd/system"
 
 /* Why the loop ended; main.c maps these to exit(), reboot(), poweroff. */
 typedef enum ManagerObjective {

@@ -9,9 +9,11 @@
  * shape: search a path for "<id>", hand a found file to the INI parser,
  * resolve to UNIT_LOADED or UNIT_ERROR. The 2011 original searched
  * several directories (/etc, /run, /usr/lib) with per-directory drop-in
- * merging; this MVP has exactly one directory (PICO_UNIT_DIR) but keeps
- * the loop-over-an-array shape so a second search directory is a one-line
- * change, not a rewrite, when that's actually needed.
+ * merging; this MVP searches two -- PICO_UNIT_DIR (admin overrides) then
+ * PICO_PACKAGED_UNIT_DIR (where packages actually install units, given
+ * angstrom-pico-init's usrmerge decision -- see plans/29-pico-init.md
+ * "The decided scope") -- keeping the loop-over-an-array shape so a third
+ * directory (e.g. /run) is still a one-line change, not a rewrite.
  *
  * Backported fix:
  *  - baa162cec "core: fix a use-after-free" -- the original freed its
@@ -34,6 +36,7 @@
 
 static const char * const unit_search_path[] = {
         PICO_UNIT_DIR,
+        PICO_PACKAGED_UNIT_DIR,
         NULL,
 };
 
