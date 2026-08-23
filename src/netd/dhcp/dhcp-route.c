@@ -3,22 +3,40 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 /*
- * QUARRY PLACEHOLDER -- src/libsystemd-network/dhcp-route.c (153 lines).
+ * Ported near-verbatim from src/libsystemd-network/dhcp-route.c (29 lines,
+ * not the 153 this file's own placeholder guessed -- the RFC 3442 compact
+ * encode/decode logic it described actually lives in dhcp-message.c, as it
+ * does upstream; verified against the real v261.2 tree).
  *
- * Parsing and serializing options 33 and 121, including the compact
- * destination-descriptor encoding RFC 3442 defines.
- *
- * Quarry point: systemd v261.2, commit 4925d9f07f. Nothing has been lifted
- * yet; this file exists so meson, REUSE and the include graph are settled
- * before N2 starts, and so no later milestone has to edit
- * meson.build while another one is also editing it.
- *
- * When the lift happens, this comment is replaced by the real one, in exactly
- * the style src/unit-parse.c's header demonstrates: the history review from
- * 4925d9f07f forward on main, and one recorded keep-or-backport call per
- * upstream fix, each with its commit hash. That record is the deliverable,
- * not a formality -- it is the only thing that makes a lifted file
- * maintainable afterwards.
+ * Quarry point: systemd v261.2, commit 4925d9f07f. History review
+ * (4925d9f07f..main, plan §2.2): no fix in the 26-commit lift-set window
+ * touches this file.
  */
 
+#include "netd-compat.h"
+
 #include "dhcp-route.h"
+
+int dhcp_route_get_destination(const DhcpRoute *route, struct in_addr *ret) {
+        assert_return(route, -EINVAL);
+        assert_return(ret, -EINVAL);
+
+        *ret = route->dst_addr;
+        return 0;
+}
+
+int dhcp_route_get_destination_prefix_length(const DhcpRoute *route, uint8_t *ret) {
+        assert_return(route, -EINVAL);
+        assert_return(ret, -EINVAL);
+
+        *ret = route->dst_prefixlen;
+        return 0;
+}
+
+int dhcp_route_get_gateway(const DhcpRoute *route, struct in_addr *ret) {
+        assert_return(route, -EINVAL);
+        assert_return(ret, -EINVAL);
+
+        *ret = route->gw_addr;
+        return 0;
+}
