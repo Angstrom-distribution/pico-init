@@ -15,6 +15,15 @@
  * server-list/DNS iteration -- sd-resolve is gone entirely, so servers arrive
  * here as addresses, from [Network] NTP= or from DHCP option 42.
  *
+ * Two checks the history review found missing from plan §2.6's own summary
+ * are carried anyway, because dropping them would be exactly the failure the
+ * review exists to prevent: a short-packet reject (NETD_SNTP_REJECT_MALFORMED
+ * on a datagram smaller than the header), and an epoch floor
+ * (NETD_SNTP_REJECT_EPOCH) that rejects recv_time/trans_time claiming a time
+ * before this build's compiled-in epoch (netd-time.h's NETD_TIME_EPOCH_SEC) --
+ * the only thing stopping a hostile or broken server from walking an
+ * RTC-less board's clock back past the day it was built.
+ *
  * The packet layout below is netd's own, written from RFC 5905 §7.3 rather
  * than lifted, which is why this file is GPL-2.0-or-later with no systemd
  * attribution: an on-the-wire header has exactly one legal shape.
@@ -119,12 +128,22 @@ typedef enum NetdSntpReject {
         NETD_SNTP_REJECT_UNSOLICITED,    /* no request outstanding */
         NETD_SNTP_REJECT_SOURCE,         /* not from the server we asked */
         NETD_SNTP_REJECT_NONCE,          /* origin timestamp != our transmit nonce */
-        NETD_SNTP_REJECT_LEAP,           /* leap indicator 3: server not synchronised */
-        NETD_SNTP_REJECT_STRATUM,        /* 0 (kiss-o'-death) or >= 16 (unsynchronised) */
-        NETD_SNTP_REJECT_VERSION,        /* neither 3 nor 4 */
-        NETD_SNTP_REJECT_MODE,           /* not mode 4 */
-        NETD_SNTP_REJECT_ROOT_DISTANCE,  /* too far from a real clock to trust */
         NETD_SNTP_REJECT_ZERO_TIMESTAMP, /* transmit timestamp 0: nothing to compute from */
+        /*
+         * History-review addition (plan §2.2 prose, §2.6): recv_time or
+         * trans_time claims a time before this build's epoch floor. Kept in
+         * full even though it was missing from §2.6's own summary list --
+         * it is the entire reason a broken or hostile server cannot walk an
+         * RTC-less board's clock backwards past the build date. Checked after
+         * ZERO_TIMESTAMP so an all-zero reply (trivially before any epoch)
+         * gets the more specific reason.
+         */
+        NETD_SNTP_REJECT_EPOCH,
+        NETD_SNTP_REJECT_LEAP,          /* leap indicator 3: server not synchronised */
+        NETD_SNTP_REJECT_STRATUM,       /* 0 (kiss-o'-death) or >= 16 (unsynchronised) */
+        NETD_SNTP_REJECT_VERSION,       /* neither 3 nor 4 */
+        NETD_SNTP_REJECT_MODE,          /* not mode 4 */
+        NETD_SNTP_REJECT_ROOT_DISTANCE, /* too far from a real clock to trust */
         _NETD_SNTP_REJECT_MAX,
 } NetdSntpReject;
 
