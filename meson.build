@@ -88,3 +88,114 @@ foreach t : pico_tests
   )
   test(t, exe)
 endforeach
+
+# ---------------------------------------------------------------------------
+# netd -- the network daemon (plan §2). A second executable in the same tree,
+# built exactly like PID 1: one static library the tests link, one installed
+# binary. It lives here rather than in its own repo because the recipe already
+# fetches this one, and because one build means one test harness and one REUSE
+# tree.
+#
+# netd does not reimplement PID 1's event plumbing: it links timer.c, signal.c
+# and util.c out of pico-init-core, so the loop in src/netd/netd-loop.c is a
+# thin epoll wrapper over already-tested code rather than a second
+# implementation of the same thing.
+# ---------------------------------------------------------------------------
+
+# 'src/netd' only, so the lifted files under src/netd/dhcp/ can say
+# "netd-compat.h" without a relative path.
+#
+# 'src' is deliberately NOT here, and that is not a style preference. GCC
+# searches -I directories for angle-bracket includes too, so putting src/ on
+# the include path makes netd's own `#include <signal.h>` resolve to this
+# project's src/signal.h -- which documents that it never includes the libc
+# header, and so hides SIGTERM from every netd translation unit. netd reaches
+# the shared code as "../util.h" / "../timer.h" / "../signal.h" instead, which
+# is explicit about crossing out of netd into the PID 1 core and cannot shadow
+# a system header.
+netd_includes = include_directories('src/netd')
+
+# netd's own code: GPL-2.0-or-later, like the rest of the project.
+netd_own_sources = files(
+  'src/netd/netd-loop.c',
+  'src/netd/netd-link.c',
+  'src/netd/netd-network.c',
+  'src/netd/netd-rtnl.c',
+  'src/netd/netd-resolv.c',
+  'src/netd/netd-sntp.c',
+  'src/netd/netd-time.c',
+)
+
+# The DHCPv4 implementation lifted from systemd v261.2 (commit 4925d9f07f).
+# Each file keeps its own LGPL-2.1-or-later identifier and its upstream-derived
+# name, so the quarry provenance stays legible; the combined netd binary is
+# GPL-2.0-or-later as a whole, the permitted linking direction.
+#
+# Placeholders at N0, and registered now on purpose: it means N2 and N3 add
+# code to files that already exist and are already built, instead of editing
+# this file while another milestone is also editing it.
+netd_dhcp_sources = files(
+  'src/netd/dhcp/dhcp-message.c',
+  'src/netd/dhcp/dhcp-protocol.c',
+  'src/netd/dhcp/dhcp-route.c',
+  'src/netd/dhcp/dhcp-lease.c',
+  'src/netd/dhcp/dhcp-client-id.c',
+  'src/netd/dhcp/dhcp-client.c',
+  'src/netd/dhcp/dhcp-client-send.c',
+  'src/netd/dhcp/dhcp-server.c',
+  'src/netd/dhcp/dhcp-server-request.c',
+  'src/netd/dhcp/dhcp-server-send.c',
+  'src/netd/dhcp/dhcp-server-lease.c',
+  # tlv-util is not optional: struct sd_dhcp_message embeds a TLV by value, so
+  # dhcp-message.c cannot compile without it. Missing from the plan's quarry
+  # table; found by the quarry-history review.
+  'src/netd/dhcp/tlv-util.c',
+  # The flat-string DNS name subset. Options 12 and 15 still route through it
+  # even with 81/162/119 dropped, so dns-domain.c does not disappear entirely
+  # the way the plan assumed -- only its RFC 3397 compression decoder does.
+  'src/netd/dhcp/dns-name.c',
+  # Third-party support, carried near-verbatim with its own licence:
+  # siphash24.{c,h} is CC0-1.0. sparse-endian.h (MIT, Josh Triplett) and
+  # unaligned.h (LGPL-2.1-or-later) are headers and need no entry here.
+  'src/netd/dhcp/siphash24.c',
+)
+
+netd_core = static_library(
+  'netd-core',
+  netd_own_sources + netd_dhcp_sources,
+  include_directories: netd_includes,
+)
+
+# link_whole for netd's own objects, for the reason spelled out above
+# pico-init-core; link_with for pico-init-core itself, which then contributes
+# only the shared util/timer/signal objects netd actually references and none
+# of PID 1.
+netd_exe = executable(
+  'netd',
+  'src/netd/netd.c',
+  include_directories: netd_includes,
+  link_whole: netd_core,
+  link_with: pico_init_core,
+  install: true,
+  install_dir: get_option('sbindir'),
+)
+
+# All four of netd's tests, registered up front and placeholder-bodied, for
+# exactly the reason the PID 1 list above gives: N1 through N4 are independent
+# of each other, and none of them should have to touch this file.
+netd_tests = [
+  'test-netd-network',
+  'test-netd-rtnl',
+  'test-netd-dhcp',
+  'test-netd-sntp',
+]
+
+foreach t : netd_tests
+  exe = executable(
+    t,
+    ['src/netd/' + t + '.c'] + pico_test_sources,
+    include_directories: netd_includes,
+    link_with: [netd_core, pico_init_core],
+  )
+  test(t, exe)
+endforeach
