@@ -73,6 +73,21 @@ typedef enum PicoLogLevel {
 
 void pico_log_internal(PicoLogLevel level, const char *format, ...) __attribute__((format(printf, 2, 3)));
 
+/*
+ * Redirect pico_log() to /dev/kmsg, with a real syslog priority prefix so the
+ * kernel ring carries the level rather than flattening it.
+ *
+ * Opt-in at runtime, and deliberately not unconditional: pico_log() is shared
+ * by the daemons AND by the interactive tools (picolog, picoctl), and an
+ * interactive tool's diagnostics belong on the caller's own terminal, never in
+ * the kernel ring. A settable sink also leaves pico_log()'s signature alone,
+ * so no existing call site changes.
+ *
+ * Best-effort: if /dev/kmsg cannot be opened the sink stays stderr, which is
+ * the pre-existing behaviour and always safe.
+ */
+void pico_log_to_kmsg(void);
+
 #define pico_log(level, ...) pico_log_internal((level), __VA_ARGS__)
 
 /* strdup returning NULL on OOM (plain strdup, named to avoid confusion later) */

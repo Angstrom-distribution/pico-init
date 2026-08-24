@@ -8,7 +8,9 @@
 #include "util.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,6 +42,45 @@ static const char *log_level_prefix(PicoLogLevel level) {
 }
 
 /*
+ * The syslog priority /dev/kmsg's own "<N>message" framing expects, so a
+ * record's level survives into the kernel ring instead of being flattened to
+ * whatever default the kernel assigns a plain write.
+ */
+static int log_level_syslog_priority(PicoLogLevel level) {
+        switch (level) {
+        case PICO_LOG_ERR:
+                return 3; /* LOG_ERR */
+        case PICO_LOG_WARNING:
+                return 4; /* LOG_WARNING */
+        case PICO_LOG_INFO:
+                return 6; /* LOG_INFO */
+        case PICO_LOG_DEBUG:
+                return 7; /* LOG_DEBUG */
+        }
+
+        return 6;
+}
+
+/* Where pico_log() writes. stderr until a daemon opts into /dev/kmsg; see
+ * pico_log_to_kmsg() and util.h for why that is opt-in rather than automatic. */
+static int log_fd = STDERR_FILENO;
+static bool log_fd_is_kmsg = false;
+
+void pico_log_to_kmsg(void) {
+        int fd;
+
+        if (log_fd_is_kmsg)
+                return;
+
+        fd = open("/dev/kmsg", O_WRONLY | O_CLOEXEC);
+        if (fd < 0)
+                return; /* stay on stderr: always safe, and the old behaviour */
+
+        log_fd = fd;
+        log_fd_is_kmsg = true;
+}
+
+/*
  * One buffer, one write() -- not fprintf()+vfprintf()+fputc() as three
  * separate calls. Harmless against a plain console/pipe, but this is the
  * discipline a line-oriented destination needs in general (three writes
@@ -53,7 +94,15 @@ void pico_log_internal(PicoLogLevel level, const char *format, ...) {
         int prefix_len, msg_len, total;
         va_list ap;
 
-        prefix_len = snprintf(buf, sizeof(buf), "pico-init[%s]: ", log_level_prefix(level));
+        if (log_fd_is_kmsg)
+                prefix_len = snprintf(
+                                buf,
+                                sizeof(buf),
+                                "<%d>pico-init[%s]: ",
+                                log_level_syslog_priority(level),
+                                log_level_prefix(level));
+        else
+                prefix_len = snprintf(buf, sizeof(buf), "pico-init[%s]: ", log_level_prefix(level));
         if (prefix_len < 0)
                 prefix_len = 0;
         if ((size_t) prefix_len >= sizeof(buf))
@@ -71,7 +120,7 @@ void pico_log_internal(PicoLogLevel level, const char *format, ...) {
         buf[total] = '\n';
         total += 1;
 
-        (void) write(STDERR_FILENO, buf, (size_t) total);
+        (void) write(log_fd, buf, (size_t) total);
 }
 
 char *pico_strdup(const char *s) {

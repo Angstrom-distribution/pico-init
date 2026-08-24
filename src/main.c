@@ -60,6 +60,25 @@ int main(void) {
          * the first service exists to write into a log socket. */
         sysctl_setup();
 
+        /*
+         * PID 1's own output has nowhere else to go: it is not a supervised
+         * service, so nothing connects its stdout to logd, and the console it
+         * writes to otherwise is captured nowhere. /dev/kmsg is -- and a fresh
+         * reader sees the whole ring, so a logd started later in the boot
+         * backfills every line pico-init emitted before logd existed, with no
+         * persistent state involved.
+         *
+         * Deliberately PID 1 only, not every daemon. netd and logd are
+         * supervised services whose stdout service-exec.c already connects
+         * straight to logd, which is strictly better: those records arrive
+         * with _TRANSPORT=stdout and a real _SYSTEMD_UNIT resolved from
+         * kernel-verified credentials, where a kmsg record has neither.
+         * Redirecting them would trade correct attribution for none, and in
+         * logd's case would have it ingesting its own output as kernel
+         * records.
+         */
+        pico_log_to_kmsg();
+
         r = manager_new(&m);
         if (r < 0) {
                 pico_log(PICO_LOG_ERR, "manager_new: %s", strerror(-r));
