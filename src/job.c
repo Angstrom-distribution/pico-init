@@ -77,6 +77,7 @@
 #include "manager-ctrl.h"
 #include "manager-state.h"
 #include "manager.h"
+#include "status.h"
 #include "unit.h"
 #include "util.h"
 
@@ -489,6 +490,40 @@ int job_finish_full(Job *j, JobResult result, bool recursive) {
                 pico_log(PICO_LOG_WARNING, "%s: job finished, result=%s", u->id, job_result_to_string(result));
         else
                 pico_log(PICO_LOG_DEBUG, "%s: job finished, result=done", u->id);
+
+        /*
+         * The console's own progress line, systemd's "[  OK  ] Started foo."
+         * The log record above stays exactly as it was: upstream emits both
+         * too, and they are read by different people at different times (see
+         * status.h).
+         *
+         * Start jobs, successful ones, only. A stop job's line is upstream's
+         * "Stopped foo.", which belongs to a shutdown sequence this manager
+         * does not print yet, and a failure wants the red "FAILED" word and
+         * the "See 'picoctl status ...'" follow-up that goes with it rather
+         * than a green tick bolted onto this branch. A restart reaches this
+         * function twice, but its first pass was converted into a start above
+         * and left through `finish`, so the line is printed once -- when the
+         * unit is actually back up.
+         *
+         * The verb follows the unit type, the way upstream's per-type
+         * finished_start_job[JOB_DONE] formats do: "Reached target %s."
+         * (src/core/target.c), "Listening on %s." (src/core/socket.c), and
+         * the generic "Started %s." (src/core/job.c) for the rest. The name
+         * is Description= where the unit has one and its id otherwise, which
+         * is what unit_status_string() resolves to by default upstream.
+         */
+        if (j->type == JOB_START && result == JOB_DONE) {
+                const char *verb = u->type == UNIT_TARGET ? "Reached target" :
+                                u->type == UNIT_SOCKET    ? "Listening on" :
+                                                            "Started";
+
+                status_printf(STATUS_WORD_OK,
+                              STATUS_COLOR_OK,
+                              "%s %s.",
+                              verb,
+                              u->description ? u->description : u->id);
+        }
 
         /*
          * Resolve any deferred picoctl reply BEFORE the job is freed -- this
