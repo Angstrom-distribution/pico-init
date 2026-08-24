@@ -1,0 +1,17 @@
+/* SPDX-FileCopyrightText: 2026 Koen Kooi */
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+
+/*
+ * Template for the generated version.h. meson's vcs_tag() substitutes
+ * @VCS_TAG@ with `git describe` output at BUILD time rather than configure
+ * time, so a rebuild after a commit reports the new hash without anyone
+ * having to re-run meson. See the vcs_tag() call in meson.build for the
+ * fallback a source tree with no .git gets.
+ *
+ * Nothing includes this directly: status.h composes it with the project
+ * version into PICO_INIT_VERSION_STRING, which is the string PID 1 announces.
+ */
+
+#pragma once
+
+#define PICO_INIT_GIT_VERSION "@VCS_TAG@"

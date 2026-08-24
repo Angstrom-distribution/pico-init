@@ -3,7 +3,7 @@
 
 project(
   'pico-init', 'c',
-  version: '0.0.0',
+  version: '0.1.0',
   license: 'GPL-2.0-or-later',
   default_options: [
     'c_std=gnu17',
@@ -11,6 +11,27 @@ project(
     'werror=true',
   ],
   meson_version: '>= 0.62.0',
+)
+
+# The version PID 1 announces on the console. Two halves, mirroring systemd's
+# own PROJECT_VERSION/GIT_VERSION pair -- see status.h for what each is for.
+#
+# A -D rather than a second generated header: vcs_tag() substitutes exactly one
+# placeholder, so carrying the project version through it too would mean
+# chaining a configure_file() into it for what one compiler flag does.
+add_project_arguments('-DPICO_INIT_VERSION="' + meson.project_version() + '"', language: 'c')
+
+# vcs_tag() runs `git describe` at BUILD time rather than configure time, so a
+# rebuild after a commit reports the new hash without anyone re-running meson.
+#
+# The fallback is not decoration: an OE build compiles whatever the fetcher
+# unpacked, which may be an exported tree with no .git in it at all, and a
+# board that says "unknown" is telling the truth about what it was built from.
+version_h = vcs_tag(
+  command: ['git', 'describe', '--always', '--dirty', '--tags'],
+  fallback: 'unknown',
+  input: 'src/version.h.in',
+  output: 'version.h',
 )
 
 # Everything except main() builds into a static library, so the test programs
@@ -45,11 +66,18 @@ pico_init_core_sources = files(
   'src/signal.c',
   'src/util.c',
   'src/compat.c',
+  # The boot console channel and the os-release lookup behind its greeting
+  # (plan §1.8). Separate from util.c's logging on purpose; status.h says why.
+  'src/status.c',
+  'src/os-release.c',
 )
 
+# version_h is listed as a source so ninja generates the header before
+# anything that includes status.h is compiled, not because it is compiled.
 pico_init_core = static_library(
   'pico-init-core',
   pico_init_core_sources,
+  version_h,
 )
 
 # link_whole, not link_with: a static library only contributes the object
@@ -60,6 +88,7 @@ pico_init_core = static_library(
 pico_init_exe = executable(
   'pico-init',
   'src/main.c',
+  version_h,
   link_whole: pico_init_core,
   install: true,
   install_dir: get_option('sbindir'),
@@ -97,12 +126,15 @@ pico_tests = [
   # parser test the §7 unit-test item asks for.
   'test-dev-setup',
   'test-unit-parse',
+  # The boot console channel: the os-release parser behind the greeting, and
+  # the byte-level shape of what lands on the console.
+  'test-status',
 ]
 
 foreach t : pico_tests
   exe = executable(
     t,
-    ['src/' + t + '.c'] + pico_test_sources,
+    ['src/' + t + '.c'] + pico_test_sources + [version_h],
     link_with: pico_init_core,
   )
   test(t, exe)

@@ -16,6 +16,7 @@
 
 #include "manager.h"
 #include "mount-setup.h"
+#include "status.h"
 #include "util.h"
 
 /*
@@ -95,6 +96,27 @@ int main(void) {
          * records.
          */
         pico_log_to_kmsg();
+
+        /*
+         * Who is running this machine, before it does anything to it. A log
+         * record rather than console status output, and deliberately so:
+         * systemd's own version banner is log_info("systemd " GIT_VERSION
+         * " running in %ssystem mode (%s)") in src/core/main.c, for the same
+         * reason -- this is the line someone reads back out of a log to find
+         * out what was actually running, which is exactly what the prefix,
+         * the level and the kmsg mirror are for. status.h has the other half
+         * of that split.
+         */
+        pico_log(PICO_LOG_INFO, "pico-init " PICO_INIT_VERSION_STRING " running as PID 1");
+
+        /*
+         * And the console channel itself, opened here rather than lazily on
+         * first use so that the greeting is the first thing this init puts on
+         * a console -- before any unit starts reporting progress against it.
+         * Needs the /dev mount_setup() made above.
+         */
+        status_enable();
+        status_welcome(NULL);
 
         r = manager_new(&m);
         if (r < 0) {
