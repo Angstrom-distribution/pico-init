@@ -112,6 +112,19 @@ Unit *unit_free(Unit *u) {
          * -- reading a Service whose done() hook had already freed its members
          * would be the use-after-free this fix exists to prevent, one layer
          * further in.
+         *
+         * One constraint this hands to whoever writes the reload, worth
+         * stating because this call is where it will first be noticed rather
+         * than where it originates: job_finish_full() ends by walking this
+         * unit's Before=/After= neighbours to re-queue whatever its completion
+         * unblocked, and those are borrowed pointers into the manager's unit
+         * table. So a unit must be freed while the units it has edges to are
+         * still alive -- drop stale units one at a time from a table that is
+         * otherwise intact, never bulk-free a set with edges among it. That is
+         * already true of the dependency arrays themselves (any surviving unit
+         * holding an edge to a freed one is dangling regardless of jobs);
+         * manager_free() sidesteps it entirely by finishing every job before
+         * it frees any unit.
          */
         if (u->job)
                 job_finish_full(u->job, JOB_CANCELED, false);
