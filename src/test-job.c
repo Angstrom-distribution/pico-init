@@ -495,8 +495,78 @@ static void test_restart_completes(void) {
         free(dir);
 }
 
+/*
+ * Every verb against every starting state must terminate. Six combinations,
+ * because covering only the ones that obviously work is what let a real bug
+ * through: the first version of this file tested restart on an ACTIVE unit --
+ * which genuinely stops, so unit_notify() fires and the conversion runs -- and
+ * never tested restart on an INACTIVE one, where unit_stop() is a silent
+ * no-op, nothing notifies, and the job hung forever.
+ *
+ * Three dispatches each: enough for a restart's stop half, its conversion and
+ * its start half, and harmless for the cases that finish sooner.
+ */
+static void test_all_verb_state_combinations(void) {
+        static const struct {
+                JobType type;
+                bool start_active;
+                UnitActiveState want;
+                const char *what;
+        } cases[] = {
+                {   JOB_START, false,   UNIT_ACTIVE,                   "start on inactive" },
+                {   JOB_START,  true,   UNIT_ACTIVE,  "start on active (redundant anchor)" },
+                {    JOB_STOP, false, UNIT_INACTIVE, "stop on inactive (redundant anchor)" },
+                {    JOB_STOP,  true, UNIT_INACTIVE,                      "stop on active" },
+                { JOB_RESTART, false,   UNIT_ACTIVE,                 "restart on inactive" },
+                { JOB_RESTART,  true,   UNIT_ACTIVE,                   "restart on active" },
+        };
+        size_t c;
+
+        for (c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+                Manager *m;
+                char *dir;
+                Unit *a;
+                int d;
+
+                dir = test_tmpdir_new();
+                ASSERT_TRUE(dir != NULL);
+                ASSERT_EQ_INT(test_write_file(dir, "a.target", "[Unit]\nDescription=A\n"), 0);
+
+                m = manager_for(dir);
+                ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+                a = manager_get_unit(m, "a.target");
+                ASSERT_TRUE(a != NULL);
+
+                if (cases[c].start_active) {
+                        ASSERT_EQ_INT(manager_add_job(m, JOB_START, a, NULL), 0);
+                        manager_dispatch_run_queue(m);
+                        ASSERT_EQ_INT(unit_active_state(a), UNIT_ACTIVE);
+                }
+
+                ASSERT_EQ_INT(manager_add_job(m, cases[c].type, a, NULL), 0);
+                for (d = 0; d < 3; d++)
+                        manager_dispatch_run_queue(m);
+
+                if (a->job != NULL || unit_active_state(a) != cases[c].want)
+                        fprintf(stderr,
+                                "%s: job=%s state=%d want=%d\n",
+                                cases[c].what,
+                                a->job ? "STUCK" : "clear",
+                                (int) unit_active_state(a),
+                                (int) cases[c].want);
+
+                ASSERT_TRUE(a->job == NULL);
+                ASSERT_EQ_INT(unit_active_state(a), cases[c].want);
+
+                manager_free(m);
+                test_rm_rf(dir);
+                free(dir);
+        }
+}
+
 int main(void) {
         test_ordering_c_b_a();
+        test_all_verb_state_combinations();
         test_redundant_anchor_job_finishes();
         test_superseded_job_is_finished();
         test_restart_completes();
