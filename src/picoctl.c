@@ -34,8 +34,11 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
+#include "logd-read.h"
+#include "logd.h"
 #include "manager.h"
 #include "unit-enable.h"
 #include "unit.h"
@@ -401,6 +404,102 @@ static void print_cgroup_procs(const char *unit_id) {
         fclose(f);
 }
 
+/* --- status: per-unit log tail --- */
+
+/* systemctl status's own default depth; picolog's -n exists for the
+ * interactive case, this one is fixed since status has no flag for it. */
+#define PICOCTL_STATUS_LOG_LINES 10
+
+/*
+ * journalctl's short format, matching picolog.c's print_short() field for
+ * field -- deliberately not shared code (logd-read.h's own header explains
+ * why the reader and the formatter live in separate translation units).
+ * There is no -a here: plain `systemctl status`'s own log tail never passes
+ * journalctl -a either, so a binary-safe MESSAGE always prints the "blob
+ * data" placeholder, matching real journalctl's default rather than ever
+ * writing raw bytes to a TTY.
+ */
+static void print_log_line(const LogdEntry *e) {
+        const LogdReadField *rt = logd_entry_field(e, "__REALTIME_TIMESTAMP");
+        const LogdReadField *msg = logd_entry_field(e, "MESSAGE");
+        const LogdReadField *ident = logd_entry_field(e, "SYSLOG_IDENTIFIER");
+        const LogdReadField *comm = logd_entry_field(e, "_COMM");
+        const LogdReadField *pid = logd_entry_field(e, "_PID");
+        char host[256];
+        char timebuf[32];
+        struct tm tmv;
+        time_t sec = 0;
+
+        if (gethostname(host, sizeof(host)) < 0 || host[0] == '\0')
+                snprintf(host, sizeof(host), "(none)");
+        host[sizeof(host) - 1] = '\0';
+
+        if (rt && !rt->binary && rt->value_len > 0 && rt->value_len < 24) {
+                char numbuf[24];
+                unsigned long long usec;
+
+                memcpy(numbuf, rt->value, rt->value_len);
+                numbuf[rt->value_len] = '\0';
+                usec = strtoull(numbuf, NULL, 10);
+                sec = (time_t) (usec / 1000000ULL);
+        }
+
+        if (sec > 0 && localtime_r(&sec, &tmv))
+                strftime(timebuf, sizeof(timebuf), "%b %e %H:%M:%S", &tmv);
+        else
+                snprintf(timebuf, sizeof(timebuf), "(no timestamp)");
+
+        printf("%s %s ", timebuf, host);
+
+        if (ident)
+                fwrite(ident->value, 1, ident->value_len, stdout);
+        else if (comm)
+                fwrite(comm->value, 1, comm->value_len, stdout);
+        else
+                fputs("-", stdout);
+
+        if (pid && !pid->binary) {
+                putchar('[');
+                fwrite(pid->value, 1, pid->value_len, stdout);
+                putchar(']');
+        }
+
+        fputs(": ", stdout);
+
+        if (msg && !msg->binary)
+                fwrite(msg->value, 1, msg->value_len, stdout);
+        else if (msg)
+                fputs("blob data", stdout);
+
+        putchar('\n');
+}
+
+/*
+ * An absent or empty ring -- an image without logd, a supported
+ * configuration -- degrades to printing nothing, never an error: this is
+ * exactly manager-state.h's own "never cost the boot" rule applied to a
+ * read verb rather than to startup.
+ */
+static void print_log_tail(const char *unit_id) {
+        char rt[PATH_MAX];
+        LogdRing *ring;
+        size_t n, i;
+        int r;
+
+        if (path_join(rt, sizeof(rt), LOGD_RUNTIME_DIR) < 0)
+                return;
+
+        r = logd_ring_read_filtered(rt, unit_id, PICOCTL_STATUS_LOG_LINES, &ring);
+        if (r < 0)
+                return;
+
+        n = logd_ring_n_entries(ring);
+        for (i = 0; i < n; i++)
+                print_log_line(logd_ring_entry(ring, i));
+
+        logd_ring_free(ring);
+}
+
 static int cmd_status(int argc, char *argv[]) {
         int i, worst = 0;
 
@@ -445,16 +544,7 @@ static int cmd_status(int argc, char *argv[]) {
                         printf("        Job: %s\n", st.job);
 
                 print_cgroup_procs(argv[i]);
-
-                /*
-                 * Per-unit log tail deliberately NOT implemented here: it
-                 * reuses picolog's ring reader (plan §3.4, milestone J3),
-                 * which does not exist yet -- another agent is building it.
-                 * This is the slot it lands in once it does: read the last
-                 * N lines logd recorded for argv[i] and print them below the
-                 * CGroup block, the same way real `systemctl status`
-                 * appends a journal tail.
-                 */
+                print_log_tail(argv[i]);
 
                 if (strcmp(st.active_state, "active") != 0 && strcmp(st.active_state, "reloading") != 0) {
                         if (worst < 3)

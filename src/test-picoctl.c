@@ -756,12 +756,129 @@ static void test_read_verbs_against_real_boot(void) {
         free(root);
 }
 
+/*
+ * --- status's log tail (the slot this milestone fills in cmd_status()) ---
+ *
+ * meson.build (frozen for this milestone) links this test program against
+ * pico-init-core only, not logd-core -- the real `picoctl` binary under
+ * test links logd-core and is what actually exercises logd_ring_read_
+ * filtered(). So the fixture ring file below is hand-written to match
+ * logd-write.c's on-disk encoding byte for byte (plain "NAME=value\n", or
+ * the binary-safe "NAME\n<8-byte-LE-len><data>\n" form), rather than built
+ * via logd_writer_append(), which is the only way to exercise the read
+ * side here without a link_with change to a frozen file. "/run/logd" below
+ * is LOGD_RUNTIME_DIR (src/logd/logd.h), inlined for the same reason.
+ */
+static void write_plain_field(FILE *f, const char *name, const char *value) {
+        fprintf(f, "%s=%s\n", name, value);
+}
+
+static void write_binary_field(FILE *f, const char *name, const void *value, size_t len) {
+        unsigned char len_le[8];
+        size_t i;
+
+        fputs(name, f);
+        fputc('\n', f);
+        for (i = 0; i < sizeof(len_le); i++)
+                len_le[i] = (unsigned char) ((len >> (8 * i)) & 0xff);
+        fwrite(len_le, 1, sizeof(len_le), f);
+        fwrite(value, 1, len, f);
+        fputc('\n', f);
+}
+
+/* One entry: the three fields logd_writer_append() always emits, plus a
+ * caller-chosen unit/ident/pid/message, plus the blank-line separator. */
+static void write_fixture_log_entry(FILE *f, const char *unit, const char *message, bool message_binary) {
+        write_plain_field(f, "__REALTIME_TIMESTAMP", "1700000000000000");
+        write_plain_field(f, "__MONOTONIC_TIMESTAMP", "1000000");
+        write_plain_field(f, "_BOOT_ID", "0123456789abcdef0123456789abcdef");
+        write_plain_field(f, "SYSLOG_IDENTIFIER", "demo");
+        write_plain_field(f, "_PID", "4242");
+        write_plain_field(f, "_SYSTEMD_UNIT", unit);
+        if (message_binary)
+                write_binary_field(f, "MESSAGE", message, strlen(message));
+        else
+                write_plain_field(f, "MESSAGE", message);
+        fputc('\n', f);
+}
+
+static void test_status_log_tail(void) {
+        char *root;
+        char rtdir[PATH_MAX], unitsdir[PATH_MAX + 16], logdir[PATH_MAX + 16], logpath[PATH_MAX + 32];
+        FILE *f;
+        struct run_result res;
+
+        root = test_tmpdir_new();
+        ASSERT_TRUE(root != NULL);
+
+        /* A published unit-state file: cmd_status() skips the log tail
+         * entirely for a unit it never found (see picoctl.c), so this has
+         * to exist for the tail to be exercised at all. */
+        snprintf(rtdir, sizeof(rtdir), "%s%s", root, PICO_RUNTIME_DIR);
+        snprintf(unitsdir, sizeof(unitsdir), "%s/units", rtdir);
+        ASSERT_EQ_INT(fixture_mkdir_p(unitsdir), 0);
+        ASSERT_EQ_INT(test_write_file(unitsdir,
+                                      "demo.service",
+                                      "ActiveState=active\nSubState=running\n"
+                                      "LoadState=loaded\nDescription=Demo\n"),
+                      0);
+
+        snprintf(logdir, sizeof(logdir), "%s/run/logd", root);
+        ASSERT_EQ_INT(fixture_mkdir_p(logdir), 0);
+        snprintf(logpath, sizeof(logpath), "%s/active.export", logdir);
+        f = fopen(logpath, "wb");
+        ASSERT_TRUE(f != NULL);
+        write_fixture_log_entry(f, "other.service", "not this unit's line", false);
+        write_fixture_log_entry(f, "demo.service", "hello from demo", false);
+        write_fixture_log_entry(f, "demo.service", "bad\x01byte", true);
+        fclose(f);
+
+        RUN_PICOCTL(&res, "--root", root, "status", "demo.service");
+        ASSERT_EQ_INT(res.exit_code, 0);
+        /* filtered to _SYSTEMD_UNIT == demo.service: the other unit's line
+         * must never appear */
+        ASSERT_TRUE(strstr(res.out, "not this unit's line") == NULL);
+        ASSERT_TRUE(strstr(res.out, "demo[4242]: hello from demo") != NULL);
+        /* binary-safe MESSAGE prints the blob-data placeholder, never the
+         * raw control byte */
+        ASSERT_TRUE(strstr(res.out, "demo[4242]: blob data") != NULL);
+        ASSERT_TRUE(strstr(res.out, "bad\x01byte") == NULL);
+
+        /* an image with no logd at all -- no /run/logd whatsoever -- must
+         * degrade to no log lines, not an error */
+        {
+                char root2dir[PATH_MAX], units2dir[PATH_MAX + 16];
+                char *root2 = test_tmpdir_new();
+
+                ASSERT_TRUE(root2 != NULL);
+                snprintf(root2dir, sizeof(root2dir), "%s%s", root2, PICO_RUNTIME_DIR);
+                snprintf(units2dir, sizeof(units2dir), "%s/units", root2dir);
+                ASSERT_EQ_INT(fixture_mkdir_p(units2dir), 0);
+                ASSERT_EQ_INT(test_write_file(units2dir,
+                                              "demo.service",
+                                              "ActiveState=active\nSubState=running\n"
+                                              "LoadState=loaded\nDescription=Demo\n"),
+                              0);
+
+                RUN_PICOCTL(&res, "--root", root2, "status", "demo.service");
+                ASSERT_EQ_INT(res.exit_code, 0);
+                ASSERT_TRUE(strstr(res.out, "Demo") != NULL); /* the status block itself still works */
+
+                test_rm_rf(root2);
+                free(root2);
+        }
+
+        test_rm_rf(root);
+        free(root);
+}
+
 int main(void) {
         test_enable_disable_is_enabled();
         test_preset();
         test_preset_default_enable();
         test_oracle_symlinks_byte_identical();
         test_read_verbs_against_real_boot();
+        test_status_log_tail();
 
         printf("test-picoctl: all checks passed\n");
         return 0;
