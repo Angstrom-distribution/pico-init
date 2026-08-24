@@ -345,8 +345,161 @@ static void test_redundant_job_dropped(void) {
         free(dir);
 }
 
+/*
+ * A redundant ANCHOR job must still finish. transaction_drop_redundant()
+ * deliberately exempts the anchor, and a unit type's start/stop returns 0
+ * without a state change when it is already in the state asked for -- so
+ * nothing called unit_notify() and nothing finished the job. It sat in
+ * JOB_RUNNING forever, and everything waiting on its result waited with it.
+ *
+ * Not an exotic path: this is `picoctl start` on a running unit and
+ * `picoctl stop` on a dead one, the two commonest things anyone asks.
+ */
+static void test_redundant_anchor_job_finishes(void) {
+        Manager *m;
+        char *dir;
+        Unit *a;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir, "a.target", "[Unit]\nDescription=A\n"), 0);
+
+        m = manager_for(dir);
+        ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+
+        a = manager_get_unit(m, "a.target");
+        ASSERT_TRUE(a != NULL);
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, a, NULL), 0);
+        manager_dispatch_run_queue(m);
+        ASSERT_EQ_INT(unit_active_state(a), UNIT_ACTIVE);
+
+        /* Already active: redundant, but it is the anchor so it is not dropped. */
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, a, NULL), 0);
+        manager_dispatch_run_queue(m);
+        ASSERT_TRUE(a->job == NULL); /* stuck in JOB_RUNNING before the fix */
+        ASSERT_EQ_INT(unit_active_state(a), UNIT_ACTIVE);
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_STOP, a, NULL), 0);
+        manager_dispatch_run_queue(m);
+        ASSERT_EQ_INT(unit_active_state(a), UNIT_INACTIVE);
+
+        /* The mirror case: stop on an already-inactive unit. */
+        ASSERT_EQ_INT(manager_add_job(m, JOB_STOP, a, NULL), 0);
+        manager_dispatch_run_queue(m);
+        ASSERT_TRUE(a->job == NULL); /* stuck here too */
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * Installing a job on a unit that already has one must finish the displaced
+ * job rather than overwrite the pointer. The old job stayed installed, stayed
+ * on the run queue and became unreachable: never finished, never freed.
+ *
+ * Reachable from manager_shutdown()'s stop sweep landing on a unit with a
+ * start job in flight, and from any second request for the same unit.
+ */
+static void test_superseded_job_is_finished(void) {
+        Manager *m;
+        char *dir;
+        Unit *a;
+        Job *first = NULL;
+        uint32_t first_id;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        /* A service, so the start job stays in flight rather than completing
+         * synchronously the way a target does. */
+        ASSERT_EQ_INT(test_write_file(dir, "a.service", "[Service]\nExecStart=/bin/sleep 30\n"), 0);
+
+        m = manager_for(dir);
+        ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+
+        a = manager_get_unit(m, "a.service");
+        ASSERT_TRUE(a != NULL);
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, a, &first), 0);
+        ASSERT_TRUE(first != NULL);
+        first_id = first->id;
+        ASSERT_TRUE(a->job != NULL);
+
+        /* Supersede it before it ran. */
+        ASSERT_EQ_INT(manager_add_job(m, JOB_STOP, a, NULL), 0);
+        ASSERT_TRUE(a->job != NULL);
+        ASSERT_TRUE(a->job->id != first_id); /* genuinely a different job */
+        ASSERT_EQ_INT(a->job->type, JOB_STOP);
+
+        /* At most one job for this unit may remain queued: if the displaced
+         * one were still on the run queue the manager would run a freed job. */
+        {
+                const char *ids[8];
+                size_t n = run_queue_ids(m, ids, 8);
+
+                ASSERT_TRUE(n <= 1);
+        }
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * A restart must actually restart. unit_notify()'s JOB_RESTART arm was a bare
+ * break, so nothing ever reported the stop half reaching INACTIVE, so
+ * job_finish_full()'s restart-conversion block -- carefully written, carefully
+ * commented -- was unreachable dead code. A restart stopped the unit and left
+ * the job in JOB_RUNNING forever.
+ *
+ * Invisible to every test that existed, because none of them ever finished a
+ * restart job: test_restart_pulls_start_deps() only checks what a restart
+ * transaction pulls in, never that it completes.
+ */
+static void test_restart_completes(void) {
+        Manager *m;
+        char *dir;
+        Unit *a;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir, "a.target", "[Unit]\nDescription=A\n"), 0);
+
+        m = manager_for(dir);
+        ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+
+        a = manager_get_unit(m, "a.target");
+        ASSERT_TRUE(a != NULL);
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, a, NULL), 0);
+        manager_dispatch_run_queue(m);
+        ASSERT_EQ_INT(unit_active_state(a), UNIT_ACTIVE);
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_RESTART, a, NULL), 0);
+
+        /* Two dispatches: one for the stop half, one for the start half the
+         * conversion queues. Before the fix the unit stayed INACTIVE and
+         * a->job never cleared. */
+        manager_dispatch_run_queue(m);
+        manager_dispatch_run_queue(m);
+
+        ASSERT_EQ_INT(unit_active_state(a), UNIT_ACTIVE);
+        ASSERT_TRUE(a->job == NULL);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
         test_ordering_c_b_a();
+        test_redundant_anchor_job_finishes();
+        test_superseded_job_is_finished();
+        test_restart_completes();
         test_transaction_dedup();
         test_cycle_does_not_deadlock();
         test_transaction_ownership();

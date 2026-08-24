@@ -186,13 +186,23 @@ void unit_notify(Unit *u, UnitActiveState old_state, UnitActiveState new_state) 
 
         case JOB_RESTART:
                 /*
-                 * TODO (M2): a restart is a stop that turns into a start once
-                 * the unit is down. Upstream does that conversion inside
-                 * job_finish() and nowhere else -- doing it at dispatch time
-                 * is what lost the ordering in systemd's dd17d38879, and
-                 * returning early after the conversion is what left dependent
-                 * jobs waiting forever in 57981b9812. Leave it to job.c.
+                 * A restart is a stop that turns into a start once the unit is
+                 * down, and job_finish_full() is where that conversion belongs
+                 * -- doing it at dispatch time is what lost the ordering in
+                 * systemd's dd17d38879, and returning early after it is what
+                 * left dependent jobs waiting forever in 57981b9812.
+                 *
+                 * But job.c only ever sees the restart if something reports
+                 * the unit reaching INACTIVE, and nothing did: this arm was a
+                 * bare break, which made job_finish_full()'s conversion block
+                 * unreachable, so a restart stopped a unit and never started
+                 * it again. Reporting the stop half here is the whole of the
+                 * missing link; the conversion itself stays in job.c.
                  */
+                if (new_state == UNIT_INACTIVE)
+                        job_finish(j, JOB_DONE);
+                else if (new_state == UNIT_FAILED)
+                        job_finish(j, JOB_FAILED);
                 break;
 
         default:

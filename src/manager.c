@@ -211,6 +211,13 @@ Manager *manager_free(Manager *m) {
         while (m->run_queue)
                 job_free(m->run_queue);
 
+        /* job_run() unlinks a job from the run queue before running it, so
+         * draining the queue never reaches one that is already RUNNING and it
+         * leaked. job_free() uninstalls as it goes, clearing unit->job. */
+        for (i = 0; i < m->n_units; i++)
+                if (m->units[i]->job)
+                        job_free(m->units[i]->job);
+
         for (i = 0; i < m->n_units; i++)
                 unit_free(m->units[i]);
         free(m->units);

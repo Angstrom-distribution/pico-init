@@ -292,8 +292,27 @@ int job_new(Manager *m, JobType type, Unit *u, Job **ret) {
 
 /* Hand the job to the manager: attach to the unit and queue it. */
 static void job_install(Job *j) {
+        Job *old;
+
         if (!j || j->installed)
                 return;
+
+        /*
+         * A job already installed on this unit is superseded, not silently
+         * discarded. Overwriting unit->job left the old one installed, still
+         * on the run queue and unreachable: it never finished, never freed,
+         * and anything waiting on its result waited forever. Three real
+         * callers reach it -- a second control-socket request for one unit,
+         * manager_shutdown()'s stop sweep landing on a unit with a start job
+         * in flight, and any transaction pulling the unit in as a dependency.
+         *
+         * recursive = false: this runs inside transaction_activate(), which is
+         * still iterating the transaction -- the same reason
+         * job_propagate_failure() passes false (563ba9ea6e, 1abc85b8d0).
+         */
+        old = j->unit->job;
+        if (old && old != j)
+                job_finish_full(old, JOB_CANCELED, false);
 
         j->unit->job = j;
         j->installed = true;
@@ -383,6 +402,22 @@ int job_run(Job *j) {
                 job_finish_full(j, JOB_FAILED, true);
                 return r;
         }
+
+        /*
+         * The unit was already in the state the job wanted, so unit_start() /
+         * unit_stop() was a no-op: no state changed, so nothing called
+         * unit_notify(), so nothing above finished this job and it would have
+         * sat in JOB_RUNNING forever with everything waiting on it waiting
+         * forever too.
+         *
+         * transaction_drop_redundant() cannot have caught this, because it
+         * deliberately exempts the anchor job -- and the anchor is exactly what
+         * a direct request produces. `picoctl start` on an already-active unit
+         * and `picoctl stop` on an already-dead one are both this case, and
+         * they are the two commonest things anyone will ask.
+         */
+        if (job_type_is_redundant(j->type, unit_active_state(u)))
+                job_finish_full(j, JOB_DONE, true);
 
         return 0;
 }
