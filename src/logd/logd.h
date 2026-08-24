@@ -35,3 +35,24 @@
  * through LISTEN_FDS in declared order (plan §1.6: no LISTEN_FDNAMES). */
 #define LOGD_STDOUT_SOCKET_PATH LOGD_RUNTIME_DIR "/stdout"
 #define LOGD_SYSLOG_SOCKET_PATH "/dev/log"
+
+/*
+ * The per-line cap before a forced split, tagged _LINE_BREAK=line-max --
+ * upstream's own field and value (journald-stream.c), so journalctl renders
+ * it correctly after conversion. Upstream's own LineMax= defaults to 48K;
+ * pico's whole ring defaults to 2 MiB (24x smaller), so a proportionally
+ * smaller line cap keeps one pathological line from dominating it.
+ */
+#define LOGD_LINE_MAX ((size_t) 8192)
+
+/*
+ * The bounded per-stream fragment-tail table (plan §3.2, corrected
+ * 2026-08-24): keyed by stream identity -- the sender's bound source
+ * address on the stdout socket -- not by PID, which neither survives a
+ * service that spans several PIDs on one stream (an ordinary
+ * ExecStart=/bin/sh -c '...' has the shell and its children sharing one
+ * fd) nor resists PID reuse corrupting an unrelated later stream. LRU-
+ * evicted, so a burst of distinct senders never grows this past a fixed
+ * bound regardless of how many connect.
+ */
+#define LOGD_MAX_STREAMS ((size_t) 64)
