@@ -93,8 +93,10 @@ pico_tests = [
   'test-manager-state',
   'test-picoctl',
   'test-manager-ctrl',
-  # D0's five /dev symlinks (plan §1.8).
+  # D0's five /dev symlinks (plan §1.8), and the fixture-driven unit-file
+  # parser test the §7 unit-test item asks for.
   'test-dev-setup',
+  'test-unit-parse',
 ]
 
 foreach t : pico_tests
