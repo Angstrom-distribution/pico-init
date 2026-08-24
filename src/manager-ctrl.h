@@ -22,6 +22,8 @@
 
 #pragma once
 
+#include <stddef.h>
+
 #include "job.h"
 #include "util.h"
 
@@ -46,3 +48,13 @@ int manager_ctrl_dispatch(Manager *m, struct pico_epoll_tag *tag);
 /* Resolve any deferred reply waiting on this job. Called from
  * job_finish_full(), which is the only place a job result becomes final. */
 void manager_ctrl_notify_job_finished(Job *j, JobResult result);
+
+/*
+ * Test-only introspection: the number of currently-tracked connections and
+ * deferred-reply records. 0 (never an error) when ctrl is not set up at
+ * all. Production code never calls these -- they exist so a test can prove
+ * an early-disconnecting client leaks nothing, rather than merely asserting
+ * the happy path (plan §1.7, C2's own "done when").
+ */
+size_t manager_ctrl_debug_n_conns(Manager *m);
+size_t manager_ctrl_debug_n_pending(Manager *m);

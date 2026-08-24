@@ -20,10 +20,17 @@
  * root and without touching the host's real /etc, exactly as systemctl
  * --root is this project's compliance oracle for the same operations.
  *
- * start/stop/restart/reset-failed are NOT here: they need the live manager
- * (plan §1.7 C2, not yet built) and stay unimplemented until the control
- * socket lands.
+ * start/stop/restart/reset-failed (plan §1.7, milestone C2) are the third
+ * half: a client for manager-ctrl.c's control socket. They are the only
+ * verbs that need a live, unwedged manager -- everything above keeps
+ * working even when PID 1's loop is stuck, which is the whole reason the
+ * other two halves exist as files rather than IPC.
  */
+
+/* accept4()'s AF_UNIX peers pull in struct sockaddr_un; -std=gnu17 alone
+ * does not imply _GNU_SOURCE for every glibc extension this needs
+ * (manager-ctrl.c's own note), so this has to be explicit and first. */
+#define _GNU_SOURCE
 
 #include <dirent.h>
 #include <errno.h>
@@ -32,8 +39,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -913,12 +922,179 @@ static int cmd_preset(int argc, char *argv[]) {
         return status;
 }
 
+/* --- start/stop/restart/reset-failed: the control-socket client half --- */
+
+/* Reply buffer: generous against manager-ctrl.c's own PICO_CTRL_LINE_MAX --
+ * the two are not required to agree on an exact number, only for this one
+ * to be at least as large as any reply the server actually sends, which is
+ * always a single short line. */
+#define PICOCTL_CTRL_REPLY_MAX 512
+
+/*
+ * Connect to <root><runtime_dir>/control -- manager-ctrl.c's own path,
+ * exactly. A missing socket (an image with no C2 control socket, or one
+ * whose setup failed at boot) is a supported configuration, per manager-
+ * ctrl.h -- this just fails with -ENOENT/-ECONNREFUSED like any other
+ * connect() to nothing there, and the caller reports it like any other
+ * error rather than treating it as special.
+ */
+static int ctrl_connect(void) {
+        char rt[PATH_MAX];
+        struct sockaddr_un addr;
+        int fd, n, r;
+
+        if (path_join(rt, sizeof(rt), PICO_RUNTIME_DIR) < 0)
+                return -ENAMETOOLONG;
+
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        n = snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/control", rt);
+        if (n < 0 || (size_t) n >= sizeof(addr.sun_path))
+                return -ENAMETOOLONG;
+
+        fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+        if (fd < 0)
+                return -errno;
+
+        if (connect(fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+                r = -errno;
+                close(fd);
+                return r;
+        }
+
+        return fd;
+}
+
+/*
+ * One request/reply round trip: connect, send exactly "PICO1 <verb> <unit>
+ * [--no-block]" (manager-ctrl.c's wire grammar, no trailing newline --
+ * SOCK_SEQPACKET preserves the message boundary, so none is needed), block
+ * for the single reply line, NUL-terminate it into `reply`. 0 or -errno;
+ * *reply is only meaningful on success.
+ */
+static int ctrl_roundtrip(const char *verb, const char *unit, bool no_block, char *reply, size_t reply_size) {
+        char line[16 + UNIT_NAME_MAX + 16];
+        int fd, n;
+        ssize_t r;
+
+        fd = ctrl_connect();
+        if (fd < 0)
+                return fd;
+
+        n = snprintf(line, sizeof(line), "PICO1 %s %s%s", verb, unit, no_block ? " --no-block" : "");
+        if (n < 0 || (size_t) n >= sizeof(line)) {
+                close(fd);
+                return -ENAMETOOLONG;
+        }
+
+        r = send(fd, line, (size_t) n, MSG_NOSIGNAL);
+        if (r < 0) {
+                int e = -errno;
+
+                close(fd);
+                return e;
+        }
+
+        r = recv(fd, reply, reply_size - 1, 0);
+        close(fd);
+        if (r < 0)
+                return -errno;
+
+        reply[r] = '\0';
+        return 0;
+}
+
+/* start/stop/restart share everything except the wire verb; reset-failed
+ * (below) does not take --no-block, so it stays a separate, simpler
+ * function rather than a fourth case squeezed in here. */
+static int cmd_verb_generic(int argc, char *argv[], const char *verb) {
+        bool no_block = false;
+        bool any_unit = false;
+        int i, status = 0;
+
+        if (argc < 1) {
+                fprintf(stderr, "picoctl %s: missing unit name\n", verb);
+                return 1;
+        }
+
+        for (i = 0; i < argc; i++)
+                if (strcmp(argv[i], "--no-block") == 0)
+                        no_block = true;
+
+        for (i = 0; i < argc; i++) {
+                char reply[PICOCTL_CTRL_REPLY_MAX];
+                int r;
+
+                if (strcmp(argv[i], "--no-block") == 0)
+                        continue;
+                any_unit = true;
+
+                r = ctrl_roundtrip(verb, argv[i], no_block, reply, sizeof(reply));
+                if (r < 0) {
+                        fprintf(stderr, "picoctl %s: %s: %s\n", verb, argv[i], strerror(-r));
+                        status = 1;
+                        continue;
+                }
+
+                if (strncmp(reply, "ok", 2) == 0)
+                        printf("%s\n", argv[i]);
+                else {
+                        fprintf(stderr, "picoctl %s: %s: %s", verb, argv[i], reply);
+                        status = 1;
+                }
+        }
+
+        if (!any_unit) {
+                fprintf(stderr, "picoctl %s: missing unit name\n", verb);
+                return 1;
+        }
+
+        return status;
+}
+
+static int cmd_start(int argc, char *argv[]) {
+        return cmd_verb_generic(argc, argv, "start");
+}
+
+static int cmd_stop(int argc, char *argv[]) {
+        return cmd_verb_generic(argc, argv, "stop");
+}
+
+static int cmd_restart(int argc, char *argv[]) {
+        return cmd_verb_generic(argc, argv, "restart");
+}
+
+static int cmd_reset_failed(int argc, char *argv[]) {
+        int i, status = 0;
+
+        if (argc < 1) {
+                fprintf(stderr, "picoctl reset-failed: missing unit name\n");
+                return 1;
+        }
+
+        for (i = 0; i < argc; i++) {
+                char reply[PICOCTL_CTRL_REPLY_MAX];
+                int r = ctrl_roundtrip("reset-failed", argv[i], false, reply, sizeof(reply));
+
+                if (r < 0) {
+                        fprintf(stderr, "picoctl reset-failed: %s: %s\n", argv[i], strerror(-r));
+                        status = 1;
+                } else if (strncmp(reply, "ok", 2) != 0) {
+                        fprintf(stderr, "picoctl reset-failed: %s: %s", argv[i], reply);
+                        status = 1;
+                }
+        }
+
+        return status;
+}
+
 /* --- main --- */
 
 static void usage(void) {
         fprintf(stderr,
-                "usage: picoctl [--root DIR] VERB [UNIT...]\n"
-                "verbs: status list-units is-active is-failed show enable disable is-enabled preset\n");
+                "usage: picoctl [--root DIR] VERB [UNIT...] [--no-block]\n"
+                "verbs: status list-units is-active is-failed show enable disable is-enabled "
+                "preset start stop restart reset-failed\n");
 }
 
 int main(int argc, char *argv[]) {
@@ -926,15 +1102,19 @@ int main(int argc, char *argv[]) {
                 const char *name;
                 int (*fn)(int, char **);
         } verbs[] = {
-                {     "status",     cmd_status },
-                { "list-units", cmd_list_units },
-                {  "is-active",  cmd_is_active },
-                {  "is-failed",  cmd_is_failed },
-                {       "show",       cmd_show },
-                {     "enable",     cmd_enable },
-                {    "disable",    cmd_disable },
-                { "is-enabled", cmd_is_enabled },
-                {     "preset",     cmd_preset },
+                {       "status",       cmd_status },
+                {   "list-units",   cmd_list_units },
+                {    "is-active",    cmd_is_active },
+                {    "is-failed",    cmd_is_failed },
+                {         "show",         cmd_show },
+                {       "enable",       cmd_enable },
+                {      "disable",      cmd_disable },
+                {   "is-enabled",   cmd_is_enabled },
+                {       "preset",       cmd_preset },
+                {        "start",        cmd_start },
+                {         "stop",         cmd_stop },
+                {      "restart",      cmd_restart },
+                { "reset-failed", cmd_reset_failed },
         };
         int argi = 1;
         size_t i;
