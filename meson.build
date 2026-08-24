@@ -236,25 +236,7 @@ foreach t : netd_tests
   test(t, exe)
 endforeach
 
-# ---------------------------------------------------------------------------
-# picoctl -- the on-device systemctl equivalent (plan §1.7).
-#
-# It links pico-init-core rather than duplicating anything: the symlink verbs
-# (enable/disable/is-enabled/preset) operate on the very same .wants/ and
-# preset layouts unit-enable.c already reads at boot, so sharing that code is
-# what keeps the two halves from drifting apart and disagreeing about what
-# "enabled" means.
-#
-# Installed to sbindir as part of the MAIN pico-init package, not a subpackage:
-# it is the init's own tool, not an optional daemon the way netd and logd are.
-# ---------------------------------------------------------------------------
-picoctl_exe = executable(
-  'picoctl',
-  'src/picoctl.c',
-  link_with: pico_init_core,
-  install: true,
-  install_dir: get_option('sbindir'),
-)
+# picoctl is defined after logd below, because it links logd's ring reader.
 
 # ---------------------------------------------------------------------------
 # logd -- the log daemon, and picolog, its reader (plan §3).
@@ -331,3 +313,30 @@ foreach t : logd_tests
   )
   test(t, exe)
 endforeach
+
+# ---------------------------------------------------------------------------
+# picoctl -- the on-device systemctl equivalent (plan §1.7).
+#
+# It links pico-init-core rather than duplicating anything: the symlink verbs
+# (enable/disable/is-enabled/preset) operate on the very same .wants/ and
+# preset layouts unit-enable.c already reads at boot, so sharing that code is
+# what keeps the two halves from drifting apart and disagreeing about what
+# "enabled" means.
+#
+# It links logd-core too, for `picoctl status`'s per-unit log tail: that calls
+# logd_ring_read_filtered() directly rather than shelling out to picolog, which
+# is the whole reason the ring reader lives in its own translation unit instead
+# of inside picolog.c's main(). Defined here rather than next to the other
+# PID 1 targets because logd_core has to exist first.
+#
+# Installed to sbindir as part of the MAIN pico-init package, not a subpackage:
+# it is the init's own tool, not an optional daemon the way netd and logd are.
+# ---------------------------------------------------------------------------
+picoctl_exe = executable(
+  'picoctl',
+  'src/picoctl.c',
+  include_directories: logd_includes,
+  link_with: [pico_init_core, logd_core],
+  install: true,
+  install_dir: get_option('sbindir'),
+)
