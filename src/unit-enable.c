@@ -251,7 +251,14 @@ static int collect_preset_entries(Manager *m, PresetEntry **ret, size_t *ret_n) 
                 closedir(d);
         }
 
-        qsort(entries, n, sizeof(PresetEntry), preset_entry_cmp);
+        /* Guarded rather than unconditional: with no preset files anywhere in
+         * the search path `entries` is still NULL, and qsort(NULL, 0, ...) is
+         * undefined behaviour even though glibc tolerates it -- UBSan reports
+         * a null pointer passed to a parameter declared never-null. An image
+         * with no preset files at all is a supported configuration, so this is
+         * reachable rather than theoretical. */
+        if (entries && n > 1)
+                qsort(entries, n, sizeof(PresetEntry), preset_entry_cmp);
 
         *ret = entries;
         *ret_n = n;
