@@ -24,6 +24,13 @@
  * the cap. 2 MiB matches the incumbent RuntimeMaxUse=2M budget exactly. */
 #define LOGD_DEFAULT_MAX_BYTES ((size_t) (2 * 1024 * 1024))
 
+/* Ring filenames only -- joined against whatever directory the writer is
+ * configured with (settable, logd-write.h), never against LOGD_RUNTIME_DIR
+ * directly, so tests need neither root nor a real /run. picolog (J3) reads
+ * rotated-then-active, in that order, using these same two names. */
+#define LOGD_RING_ACTIVE_NAME "active.export"
+#define LOGD_RING_ROTATED_NAME "rotated.export"
+
 /* The bound datagram sockets logd receives on, both handed over by PID 1
  * through LISTEN_FDS in declared order (plan §1.6: no LISTEN_FDNAMES). */
 #define LOGD_STDOUT_SOCKET_PATH LOGD_RUNTIME_DIR "/stdout"
