@@ -219,6 +219,7 @@ Manager *manager_free(Manager *m) {
         m->preset_path = pico_strv_free(m->preset_path);
         m->cgroup_root = pico_mfree(m->cgroup_root);
         m->runtime_dir = pico_mfree(m->runtime_dir);
+        m->default_target = pico_mfree(m->default_target);
 
         m->timer = pico_timer_free(m->timer);
         m->signal = pico_signal_free(m->signal);

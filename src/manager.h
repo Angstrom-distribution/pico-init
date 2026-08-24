@@ -78,6 +78,12 @@ struct Manager {
         char *cgroup_root;
         char *runtime_dir;
 
+        /* What manager_startup() was actually asked to boot into, recorded
+         * because the published state file must report the real target rather
+         * than re-assert the compile-time default. NULL before startup;
+         * PICO_DEFAULT_TARGET once startup ran without an override. */
+        char *default_target;
+
         /* State publisher and control socket (plan §1.7). Both are opaque
          * here: manager-state.c and manager-ctrl.c own their shapes, so
          * landing either does not mean editing this header. NULL until the

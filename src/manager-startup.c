@@ -81,6 +81,11 @@ int manager_startup(Manager *m, const char *default_target) {
         if (!default_target)
                 default_target = PICO_DEFAULT_TARGET;
 
+        /* Record it before publishing anything, so the manager state file
+         * reports the target actually being booted rather than the default. */
+        pico_mfree(m->default_target);
+        m->default_target = pico_strdup(default_target);
+
         /*
          * 0. Bring up the runtime state directory and the control socket
          * before anything can transition, so the very first unit_notify() of
