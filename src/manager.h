@@ -39,6 +39,11 @@
 /* The root of the boot transaction, matching upstream naming. */
 #define PICO_DEFAULT_TARGET "default.target"
 
+/* Upstream .socket units install with WantedBy=sockets.target, so the target
+ * must exist for drop-in enablement to resolve at all; ordinary services are
+ * ordered After= it so none can race a socket it may be activated by. */
+#define PICO_SOCKETS_TARGET "sockets.target"
+
 #define PICO_CGROUP_ROOT "/sys/fs/cgroup"
 
 /*

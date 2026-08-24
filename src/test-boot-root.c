@@ -519,7 +519,74 @@ static void test_default_target_boots_hand_built_set(void) {
         free(pdir);
 }
 
+/*
+ * Every ordinary service is ordered After=sockets.target, so none can race a
+ * socket it may be activated by -- pico's compressed slice of upstream's
+ * After=basic.target -> After=sockets.target chain.
+ *
+ * The three negative cases are the point: a Socket must NOT be ordered after
+ * the target it installs into, a Target must not either (that closes a
+ * cycle), and an explicit ordering in the unit file outranks the default. The
+ * whole rule is worthless if applying it makes the graph unorderable, so the
+ * real cycle checker is run at the end rather than trusted.
+ */
+static void test_services_ordered_after_sockets_target(void) {
+        Unit *sockets, *svc, *sock, *other, *explicit_before;
+        Manager *m;
+        char *udir;
+
+        udir = test_tmpdir_new();
+        ASSERT_TRUE(udir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(udir, "default.target", default_target_unit), 0);
+        ASSERT_EQ_INT(test_write_file(udir, "sockets.target", "[Unit]\nDescription=Socket units\n"), 0);
+        ASSERT_EQ_INT(test_write_file(udir, "svc.service", simple_service), 0);
+        ASSERT_EQ_INT(test_write_file(udir, "other.target", "[Unit]\nDescription=Other\n"), 0);
+        ASSERT_EQ_INT(test_write_file(udir,
+                                      "svc.socket",
+                                      "[Socket]\nListenStream=/run/pico-test-order.sock\n"
+                                      "[Install]\nWantedBy=sockets.target\n"),
+                      0);
+        /* An explicit Before= must survive: this one legitimately runs before
+         * sockets.target and must not be flipped. */
+        ASSERT_EQ_INT(test_write_file(udir,
+                                      "early.service",
+                                      "[Unit]\nBefore=sockets.target\n[Service]\nExecStart=/bin/true\n"),
+                      0);
+
+        m = manager_for(udir);
+        ASSERT_EQ_INT(manager_startup(m, "default.target"), 0);
+
+        sockets = manager_get_unit(m, "sockets.target");
+        svc = manager_get_unit(m, "svc.service");
+        sock = manager_get_unit(m, "svc.socket");
+        other = manager_get_unit(m, "other.target");
+        explicit_before = manager_get_unit(m, "early.service");
+        ASSERT_TRUE(sockets && svc && sock && other && explicit_before);
+
+        /* the rule itself */
+        ASSERT_TRUE(unit_has_dependency(svc, UNIT_AFTER, sockets));
+
+        /* a socket is not ordered after the target it installs into */
+        ASSERT_TRUE(!unit_has_dependency(sock, UNIT_AFTER, sockets));
+
+        /* nor is another target, which would close a cycle */
+        ASSERT_TRUE(!unit_has_dependency(other, UNIT_AFTER, sockets));
+
+        /* an explicit ordering outranks the default, in the stated direction */
+        ASSERT_TRUE(unit_has_dependency(explicit_before, UNIT_BEFORE, sockets));
+        ASSERT_TRUE(!unit_has_dependency(explicit_before, UNIT_AFTER, sockets));
+
+        /* and the graph is still orderable with all of that applied */
+        ASSERT_EQ_INT(unit_dependency_detect_cycles(m), 0);
+
+        manager_free(m);
+        test_rm_rf(udir);
+        free(udir);
+}
+
 int main(void) {
+        test_services_ordered_after_sockets_target();
         test_wants_dir_produces_wants_edges();
         test_requires_dir_produces_requires_edges();
         test_missing_wants_dir_is_not_an_error();

@@ -70,6 +70,50 @@ static void manager_add_target_default_ordering(Manager *m) {
         }
 }
 
+/*
+ * Give every ordinary service an After= on sockets.target.
+ *
+ * The second slice of upstream's DefaultDependencies= pico adopts, and taken
+ * for the same reason as the target rule above: its absence produces silently
+ * wrong boots. Upstream reaches this through a chain -- every service is
+ * After=basic.target, which is After=sockets.target -- that pico compresses to
+ * one hop. Without it nothing orders a boot-time service after the sockets it
+ * may be activated by, so a service can race its own socket's bind and lose.
+ *
+ * Scoped deliberately: services only, never a Socket (which must start before
+ * the target it is pulled into, not after) and never a Target (which would
+ * order sockets.target after itself and close a cycle). An explicit ordering
+ * in the unit file still wins, exactly as above.
+ */
+static void manager_add_socket_default_ordering(Manager *m) {
+        Unit *sockets;
+        size_t i;
+
+        sockets = manager_get_unit(m, PICO_SOCKETS_TARGET);
+        if (!sockets || sockets->load_state != UNIT_LOADED)
+                return; /* an image with no sockets.target has nothing to order against */
+
+        for (i = 0; i < m->n_units; i++) {
+                Unit *u = m->units[i];
+                int r;
+
+                if (u->type != UNIT_SERVICE || u->load_state != UNIT_LOADED)
+                        continue;
+
+                if (unit_has_dependency(u, UNIT_AFTER, sockets) ||
+                    unit_has_dependency(u, UNIT_BEFORE, sockets))
+                        continue;
+
+                r = unit_add_dependency(u, UNIT_AFTER, sockets);
+                if (r < 0)
+                        pico_log(PICO_LOG_DEBUG,
+                                 "%s: could not order after %s: %s",
+                                 u->id,
+                                 sockets->id,
+                                 strerror(-r));
+        }
+}
+
 int manager_startup(Manager *m, const char *default_target) {
         Unit *target = NULL;
         size_t i;
@@ -140,8 +184,13 @@ int manager_startup(Manager *m, const char *default_target) {
         if (r < 0)
                 pico_log(PICO_LOG_WARNING, "applying presets: %s", strerror(-r));
 
-        /* 5. Order every target after what it pulls in. */
+        /* 5. Order every target after what it pulls in, and every service
+         * after sockets.target so nothing races a socket it may be
+         * activated by. Both before the cycle check, so a unit file that
+         * genuinely contradicts either rule is reported rather than
+         * silently overridden. */
         manager_add_target_default_ordering(m);
+        manager_add_socket_default_ordering(m);
 
         /*
          * 6. Refuse to build a transaction over a graph that cannot be
