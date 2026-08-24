@@ -86,6 +86,7 @@
 #include "job.h"
 #include "manager.h"
 #include "service.h"
+#include "socket.h"
 #include "timer.h"
 #include "unit.h"
 #include "util.h"
@@ -356,6 +357,10 @@ static void service_enter_dead(Service *s) {
          * made "start" never return in the systemd bug this fixed. */
         service_set_state(s, s->result != SERVICE_SUCCESS ? SERVICE_FAILED : SERVICE_DEAD);
 
+        /* Terminal, so a paired .socket unit may go back to listening and
+         * re-trigger on the next connection. No-op when nothing pairs. */
+        socket_notify_service_dead(UNIT(s));
+
         restart = service_shall_restart(s, &reason);
         if (!restart) {
                 pico_log(PICO_LOG_DEBUG, "%s: not restarting (%s)", UNIT(s)->id, reason);
@@ -506,6 +511,13 @@ static void service_do_start(Service *s) {
                 s->result = SERVICE_FAILURE_START_LIMIT;
                 service_timer_reset(s);
                 service_set_state(s, SERVICE_FAILED);
+
+                /* This path deliberately skips service_enter_dead(), so it
+                 * needs its own notify -- and it is the one that matters most:
+                 * a paired socket must go FAILED here rather than re-arm, or
+                 * it re-triggers the crash loop its own start limit just
+                 * stopped (c2f3480897, "so sockets won't act as tarpits"). */
+                socket_notify_service_dead(UNIT(s));
                 return;
         }
 
