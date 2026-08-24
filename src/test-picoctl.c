@@ -586,9 +586,16 @@ static void use_private_cgroup_root(Manager *m, char *out, size_t out_size) {
 
 static void free_private_cgroup_root(const char *root) {
         char slice[PATH_MAX];
+        int n;
 
-        snprintf(slice, sizeof(slice), "%s/system.slice", root);
-        rmdir(slice);
+        /* Checked rather than ignored: under optimisation gcc can prove `root`
+         * may itself approach PATH_MAX, so appending can truncate -- and a
+         * truncated path here would rmdir() some other directory, which is far
+         * worse than leaving a test fixture behind. */
+        n = snprintf(slice, sizeof(slice), "%s/system.slice", root);
+        if (n > 0 && (size_t) n < sizeof(slice))
+                rmdir(slice);
+
         rmdir(root);
 }
 

@@ -484,7 +484,11 @@ static bool setup_fake_cgroup(char *orig_cgroup_out, size_t orig_sz) {
 
                         if (nl)
                                 *nl = '\0';
-                        snprintf(orig_cgroup_out, orig_sz, "/sys/fs/cgroup%s", line + 3);
+                        /* Checked: this path is restored later, and restoring
+                         * a truncated one would move the process into some
+                         * other cgroup entirely. Better to record nothing. */
+                        if (snprintf(orig_cgroup_out, orig_sz, "/sys/fs/cgroup%s", line + 3) >= (int) orig_sz)
+                                orig_cgroup_out[0] = '\0';
                 }
                 fclose(f);
         }

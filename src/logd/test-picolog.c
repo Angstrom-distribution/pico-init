@@ -373,7 +373,11 @@ static bool find_picolog(char *out, size_t outsz) {
                 return false;
         *slash = '\0';
 
-        snprintf(out, outsz, "%s/picolog", self);
+        /* Checked: a truncated path would name some other file, and access()
+         * succeeding on it would run the wrong binary under test. */
+        if (snprintf(out, outsz, "%s/picolog", self) >= (int) outsz)
+                return false;
+
         return access(out, X_OK) == 0;
 }
 

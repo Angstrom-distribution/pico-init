@@ -325,13 +325,19 @@ static int write_full(int fd, const char *buf, size_t len, size_t original_size)
                                 continue;
 
                         if (off > 0)
-                                (void) ftruncate(fd, (off_t) original_size);
+                                if (ftruncate(fd, (off_t) original_size) < 0) {
+                                        /* Already on the error path; the
+                                         * short record is the lesser evil. */
+                                }
                         return -errno;
                 }
 
                 if (n == 0) {
                         if (off > 0)
-                                (void) ftruncate(fd, (off_t) original_size);
+                                if (ftruncate(fd, (off_t) original_size) < 0) {
+                                        /* Already on the error path; the
+                                         * short record is the lesser evil. */
+                                }
                         return -EIO;
                 }
 
@@ -512,7 +518,14 @@ int logd_writer_open(LogdWriter *w) {
 int logd_writer_append(LogdWriter *w, const LogdField *fields, size_t n_fields) {
         char realtime_buf[32], monotonic_buf[32], boot_id_buf[LOGD_BOOT_ID_STRLEN + 1];
         LogdField auto_fields[3];
-        usec_t realtime, monotonic;
+        /* realtime is initialised only to satisfy -Wmaybe-uninitialised under
+         * optimisation: now_realtime() writes it on every success and this
+         * function returns on its failure, so the value is never actually
+         * read uninitialised -- gcc simply cannot prove that across the
+         * inlined call at -Os. Zero is not a plausible timestamp, so a
+         * regression that did reach the writer would still be obvious. */
+        usec_t realtime = 0;
+        usec_t monotonic;
         char *buf;
         size_t total = 0, off = 0;
         int r;

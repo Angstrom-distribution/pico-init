@@ -120,7 +120,13 @@ void pico_log_internal(PicoLogLevel level, const char *format, ...) {
         buf[total] = '\n';
         total += 1;
 
-        (void) write(log_fd, buf, (size_t) total);
+        /* Not `(void) write(...)`: a void cast does NOT suppress
+         * warn_unused_result in GCC, and glibc marks write() __wur under
+         * _FORTIFY_SOURCE -- which the target build enables and a -O0 host
+         * build does not, so this is invisible until cross-compilation. */
+        if (write(log_fd, buf, (size_t) total) < 0) {
+                /* Nothing useful to do here: this is the logger. */
+        }
 }
 
 char *pico_strdup(const char *s) {
