@@ -11,6 +11,12 @@ Description=pico log daemon socket
 [Socket]
 ListenDatagram=/run/logd/stdout
 ListenDatagram=/dev/log
+# 0666 is for /dev/log, which arbitrary syslog(3) clients open by path.
+# /run/logd/stdout does not need it -- PID 1 connects that one and children
+# inherit the fd -- but SocketMode= is per-unit, so splitting the two means a
+# second .socket unit (upstream ships a separate journald-dev-log.socket for
+# exactly this). Harmless here: attribution is by kernel ucred plus cgroup,
+# never by what a writer claims, so a stray writer is attributed to itself.
 SocketMode=0666
 
 [Install]
