@@ -35,6 +35,7 @@
  * logd-recv.c's identical comment for why this has to be first. */
 #define _GNU_SOURCE
 
+#include "logd-kmsg.h"
 #include "logd-read.h"
 #include "logd-recv.h"
 #include "logd-write.h"
@@ -740,6 +741,68 @@ static void test_bind_socket_sets_passcred(void) {
         printf("test-logd-recv: logd_recv_bind_socket() sets SO_PASSCRED before bind()\n");
 }
 
+/*
+ * The real /dev/kmsg backfill mechanism (plan §3.2, milestone J2): a
+ * fresh open() starts at the ring's beginning, not "now", so draining it
+ * immediately captures the whole kernel ring already accumulated before
+ * logd's kmsg reader ever existed -- exercised here against the real,
+ * running kernel's actual ring, not a fixture (no dedicated test-logd-
+ * kmsg is registered in meson.build, so this lives alongside J1's other
+ * real-kernel-backed checks). Skipped cleanly, not failed, if this
+ * environment has no /dev/kmsg or no permission to read it.
+ */
+static void test_kmsg_backfill_and_transport(void) {
+        LogdKmsg *k;
+        LogdWriter *w;
+        char *dir = test_tmpdir_new();
+        int r, n;
+        LogdRing *ring;
+
+        ASSERT_TRUE(dir != NULL);
+
+        r = logd_kmsg_new(&k);
+        if (r < 0) {
+                printf("test-logd-recv: skipping /dev/kmsg backfill check (unavailable here: %s)\n",
+                       strerror(-r));
+                test_rm_rf(dir);
+                free(dir);
+                return;
+        }
+
+        w = new_test_writer(dir);
+        n = logd_kmsg_drain(k, w);
+        logd_kmsg_free(k);
+        logd_writer_free(w);
+
+        ASSERT_TRUE(n > 0); /* a real kernel always has something in its ring by the time this runs */
+
+        ASSERT_EQ_INT(logd_ring_read(dir, &ring), 0);
+        ASSERT_EQ_INT((int) logd_ring_n_entries(ring), n);
+        {
+                size_t i;
+
+                for (i = 0; i < logd_ring_n_entries(ring); i++) {
+                        const LogdEntry *e = logd_ring_entry(ring, i);
+                        const LogdReadField *transport = logd_entry_field(e, "_TRANSPORT");
+                        const LogdReadField *prio = logd_entry_field(e, "PRIORITY");
+                        const LogdReadField *msg = logd_entry_field(e, "MESSAGE");
+
+                        ASSERT_TRUE(logd_field_equals(transport, "kernel"));
+                        ASSERT_TRUE(prio != NULL && !prio->binary && prio->value_len == 1);
+                        ASSERT_TRUE(((const char *) prio->value)[0] >= '0' &&
+                                    ((const char *) prio->value)[0] <= '7');
+                        ASSERT_TRUE(msg != NULL);
+                }
+        }
+        logd_ring_free(ring);
+
+        test_rm_rf(dir);
+        free(dir);
+        printf("test-logd-recv: /dev/kmsg backfill against the real running kernel produced %d correctly "
+               "framed _TRANSPORT=kernel records\n",
+               n);
+}
+
 int main(void) {
         test_stdout_multiline();
         test_stdout_partial_then_continuation();
@@ -754,6 +817,7 @@ int main(void) {
         test_syslog_real_client();
         test_shutdown_flushes_pending_tail();
         test_bind_socket_sets_passcred();
+        test_kmsg_backfill_and_transport();
 
         printf("test-logd-recv: all cases passed\n");
         return 0;

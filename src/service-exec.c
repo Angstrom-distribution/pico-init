@@ -94,6 +94,32 @@
  * hand-rolled rather than qsort(3): glibc's qsort can malloc a scratch
  * buffer for large-enough inputs, which this async-signal-safe region must
  * never do; n is at most PICO_MAX_SOCKET_FDS, where O(n^2) costs nothing.
+ *
+ * logd stdout/stderr capture (plan §3.2/§3.6, milestone J2) landed on top
+ * of the above the same way S1 did: new pico-original code (not a
+ * backport -- upstream's own equivalent, exec-invoke.c's SOCK_STREAM
+ * handshake plus fd-store, is deliberately not adopted; see logd-write.h's
+ * header for why) sharing the exact fork/exec region the file's opening
+ * paragraph constrains. create_stdout_socket() runs in the PARENT, before
+ * fork(): it creates a datagram socket, binds it to a unique Linux
+ * abstract-namespace name (never a filesystem path -- no cleanup needed,
+ * cannot collide with a real file), then connect()s it to logd's stdout
+ * socket. Binding before connecting is the load-bearing step, not
+ * decoration: the child cannot rebind an already-bound AF_UNIX socket (a
+ * second bind() returns EINVAL), so every datagram this socket -- and
+ * everything the child forks that inherits fd 1/2 from it -- ever sends
+ * reports that SAME source address to logd's recvfrom(), which is the
+ * whole basis logd-recv.h's corrected design rests on: fragment tails
+ * keyed by stream identity, not by PID, immune to PID reuse and correct
+ * for a service that spans several PIDs on one stream. child_exec() then
+ * dup2()s it over stdout AND stderr in the exact slot the console fd used
+ * to go alone -- stdin is unaffected, still the console always. Any
+ * failure anywhere in this chain (socket()/bind()/connect() all
+ * best-effort, logd not installed, its socket not present yet, whatever)
+ * yields stdout_fd == -1 and child_exec() falls straight back to the
+ * console path unmodified: degradation, never a spawn failure, so an
+ * image without logd behaves exactly as one that never shipped this
+ * feature would.
  */
 
 /* close_range() is a glibc >= 2.34 wrapper; -std=gnu17 alone does not imply
@@ -106,10 +132,13 @@
 #include <limits.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -141,7 +170,8 @@ extern char **environ;
  */
 
 /* Hand-rolled ascending insertion sort -- see this file's header for why
- * qsort(3) is not used here. `n` is at most PICO_MAX_SOCKET_FDS. */
+ * qsort(3) is not used here. `n` is at most PICO_MAX_SOCKET_FDS + 1 (the
+ * socket-activation set plus the logd stdout socket, J2). */
 static void sort_fds_ascending(int *a, unsigned n) {
         unsigned i, j;
 
@@ -167,13 +197,17 @@ static void sort_fds_ascending(int *a, unsigned n) {
  * close_range() itself first failed, if the kernel does not have it
  * (pre-5.9) -- same fds end up closed either way. Async-signal-safe:
  * close_range()/close() only, plus the insertion sort above (no malloc).
- */
+ * `keep` may hold up to PICO_MAX_SOCKET_FDS + 1 entries -- the socket-
+ * activation set plus the logd stdout socket (J2); anything beyond that
+ * is silently clamped rather than overflowing `sorted` below, which
+ * cannot happen in practice since every caller already bounds n_keep
+ * itself, but the clamp is the honest contract regardless. */
 static void close_all_except(const int *keep, unsigned n_keep, long max_fd) {
-        int sorted[PICO_MAX_SOCKET_FDS];
+        int sorted[PICO_MAX_SOCKET_FDS + 1];
         unsigned i, n, next;
         bool use_close_range = true;
 
-        n = n_keep < PICO_MAX_SOCKET_FDS ? n_keep : PICO_MAX_SOCKET_FDS;
+        n = n_keep < PICO_MAX_SOCKET_FDS + 1 ? n_keep : PICO_MAX_SOCKET_FDS + 1;
         for (i = 0; i < n; i++)
                 sorted[i] = keep[i];
         sort_fds_ascending(sorted, n);
@@ -340,6 +374,80 @@ static void free_socket_envp(char **envp) {
 }
 
 /*
+ * PID 1's own hardcoded knowledge of where logd listens for captured
+ * stdout/stderr -- deliberately duplicated from logd.h's
+ * LOGD_STDOUT_SOCKET_PATH rather than #include-d, so pico-init-core never
+ * gains a build-time dependency on logd's own headers or library (plan
+ * §3.2's whole point: logd runs completely independently of PID 1). Both
+ * sides agree on this one path by convention; nothing else couples them.
+ */
+#define PICO_LOGD_STDOUT_SOCKET_PATH "/run/logd/stdout"
+
+/*
+ * See this file's header for the full design. Best-effort throughout:
+ * returns -1 (never fatal to the spawn) on any failure. `unit_id` is used
+ * only to make the bound name legible in a socket listing for debugging --
+ * logd itself never parses it, only compares the raw address bytes for
+ * equality (logd-recv.h) -- so truncating a long one costs nothing real.
+ */
+static int create_stdout_socket(const char *unit_id) {
+        static unsigned invocation_counter = 0;
+        struct sockaddr_un addr, target;
+        size_t target_len;
+        int fd, n, sndbuf;
+
+        fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+        if (fd < 0)
+                return -1;
+
+        /* Abstract namespace: sun_path[0] == '\0', unique per invocation via
+         * the counter -- unbind()/unlink() concerns simply do not apply. */
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        n = snprintf(addr.sun_path + 1,
+                     sizeof(addr.sun_path) - 1,
+                     "pico-init-stdout/%.48s/%u",
+                     unit_id ? unit_id : "?",
+                     invocation_counter++);
+        if (n < 0) {
+                close(fd);
+                return -1;
+        }
+        if ((size_t) n >= sizeof(addr.sun_path) - 1)
+                n = (int) sizeof(addr.sun_path) - 2;
+
+        if (bind(fd,
+                 (struct sockaddr *) &addr,
+                 (socklen_t) (offsetof(struct sockaddr_un, sun_path) + 1 + (size_t) n)) < 0) {
+                close(fd);
+                return -1;
+        }
+
+        target_len = strlen(PICO_LOGD_STDOUT_SOCKET_PATH);
+        if (target_len >= sizeof(target.sun_path)) {
+                close(fd);
+                return -1;
+        }
+        memset(&target, 0, sizeof(target));
+        target.sun_family = AF_UNIX;
+        memcpy(target.sun_path, PICO_LOGD_STDOUT_SOCKET_PATH, target_len);
+
+        if (connect(fd, (struct sockaddr *) &target, sizeof(target)) < 0) {
+                close(fd);
+                return -1;
+        }
+
+        /* Matches J1's own measured real receive-side default (212992
+         * bytes); SO_RCVBUF was found to have no effect on AF_UNIX
+         * SOCK_DGRAM's actual queue depth (net.unix.max_dgram_qlen governs
+         * that instead), so this is parity/hygiene, not load-bearing. */
+        sndbuf = 212992;
+        (void) setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+
+        return fd;
+}
+
+/*
  * Reopens the unit's cgroup.procs by path rather than reusing any fd the
  * parent had open for it: everything this process inherited is closed in
  * the fd sweep before this runs (see child_exec() step 5), so there is
@@ -385,9 +493,18 @@ static void child_attach_cgroup(const struct pico_cgroup *cg) {
  * renumbered and unflagged at step 5b. `envp`/`pid_slot` are likewise
  * parent-built (build_socket_envp()); NULL/0 together mean "no fds, use the
  * inherited environ unchanged", the same behaviour this function always had.
+ * `stdout_fd` (create_stdout_socket(), also parent-built) is likewise
+ * excluded from the sweep, then dup2()'d over stdout/stderr at step 8;
+ * -1 means "logd unavailable", the console fallback (plan §3.6).
  */
-static _Noreturn void child_exec(
-                Service *s, char **argv, char **envp, int *sock_fds, unsigned n_sock_fds, size_t pid_slot) {
+static _Noreturn void
+                child_exec(Service *s,
+                           char **argv,
+                           char **envp,
+                           int *sock_fds,
+                           unsigned n_sock_fds,
+                           size_t pid_slot,
+                           int stdout_fd) {
         char pidbuf[32];
         sigset_t empty;
         int sig, fd;
@@ -423,15 +540,26 @@ static _Noreturn void child_exec(
                 _exit(PICO_EXIT_SIGNAL_MASK);
 
         /* 5. Close everything this process inherited, except the fds being
-         * passed for socket activation (sock_fds -- LISTEN_FDS). The cgroup
-         * control file (step 7) and the console (step 8) are both reopened
-         * fresh by path below, so nothing else needs to survive this. See
-         * close_all_except()'s own comment for why this is not simply a
-         * close() per fd number any more. */
-        max_fd = sysconf(_SC_OPEN_MAX);
-        if (max_fd < 0)
-                max_fd = 1024; /* sane fallback if the syscall itself fails */
-        close_all_except(sock_fds, n_sock_fds, max_fd);
+         * passed for socket activation (sock_fds -- LISTEN_FDS) and the
+         * logd stdout socket (stdout_fd, if create_stdout_socket()
+         * succeeded). The cgroup control file (step 7) and the console
+         * (step 8) are both reopened fresh by path below, so nothing else
+         * needs to survive this. See close_all_except()'s own comment for
+         * why this is not simply a close() per fd number any more. */
+        {
+                int keep_fds[PICO_MAX_SOCKET_FDS + 1];
+                unsigned n_keep = 0, i;
+
+                for (i = 0; i < n_sock_fds && n_keep < PICO_MAX_SOCKET_FDS; i++)
+                        keep_fds[n_keep++] = sock_fds[i];
+                if (stdout_fd >= 0)
+                        keep_fds[n_keep++] = stdout_fd;
+
+                max_fd = sysconf(_SC_OPEN_MAX);
+                if (max_fd < 0)
+                        max_fd = 1024; /* sane fallback if the syscall itself fails */
+                close_all_except(keep_fds, n_keep, max_fd);
+        }
 
         /* 5b. LISTEN_FDS/sd_listen_fds(): renumber the kept fds to a
          * contiguous run starting at 3, then clear the flags PID 1 needed
@@ -471,22 +599,41 @@ static _Noreturn void child_exec(
 
         /*
          * 8. O_RDWR, not O_RDONLY (171ceb4a00): a read-only console dup'd
-         * onto stdout/stderr gives every write() a silent EBADF. Never
+         * onto stdin gives every read() a silent EBADF. Never
          * vhangu()/reset/lock it (43efbc3959): every unit here shares this
          * same console, and clearing it out from under a concurrent writer
          * is a real boot deadlock in pico-init's design, not a hypothetical
-         * one. stdout before stderr, matching the order every failure code
-         * below reports.
+         * one. stdin always comes from the console (plan §3.6) -- opened
+         * first regardless of what stdout/stderr end up as below.
          */
         fd = open(PICO_CONSOLE_PATH, O_RDWR | O_NOCTTY);
         if (fd < 0)
                 _exit(PICO_EXIT_STDIN);
         if (dup2(fd, STDIN_FILENO) < 0)
                 _exit(PICO_EXIT_STDIN);
-        if (dup2(fd, STDOUT_FILENO) < 0)
-                _exit(PICO_EXIT_STDOUT);
-        if (dup2(fd, STDERR_FILENO) < 0)
-                _exit(PICO_EXIT_STDERR);
+
+        /*
+         * stdout/stderr: logd's socket when create_stdout_socket() (the
+         * PARENT, before fork()) succeeded, else the same console fd stdin
+         * just got -- the pre-J2 behaviour, unchanged, so an image without
+         * logd (or one where it simply is not listening yet) behaves
+         * exactly as before (plan §3.6). Either way both descriptors point
+         * at the SAME open file description, matching upstream's own
+         * stdout==stderr default and this file's pre-J2 console behaviour.
+         */
+        if (stdout_fd >= 0) {
+                if (dup2(stdout_fd, STDOUT_FILENO) < 0)
+                        _exit(PICO_EXIT_STDOUT);
+                if (dup2(stdout_fd, STDERR_FILENO) < 0)
+                        _exit(PICO_EXIT_STDERR);
+                if (stdout_fd > STDERR_FILENO)
+                        close(stdout_fd);
+        } else {
+                if (dup2(fd, STDOUT_FILENO) < 0)
+                        _exit(PICO_EXIT_STDOUT);
+                if (dup2(fd, STDERR_FILENO) < 0)
+                        _exit(PICO_EXIT_STDERR);
+        }
         if (fd > STDERR_FILENO)
                 close(fd);
 
@@ -512,11 +659,44 @@ static _Noreturn void child_exec(
         _exit(PICO_EXIT_EXEC);
 }
 
+/*
+ * PID 1 raises net.unix.max_dgram_qlen from its distro default (commonly
+ * as low as 10, so an AF_UNIX SOCK_DGRAM receive queue holds only ~11
+ * datagrams regardless of SO_RCVBUF -- J1's own measurement, against a
+ * 4096-byte stdio flush unit that is only ~44 KiB of crash-survival
+ * window per service) to 64. This has no natural home in a PID-1-startup
+ * file this milestone was not handed (manager-startup.c/main.c), and
+ * every real effect it needs -- /proc mounted, which mount-setup.c
+ * guarantees before any unit starts -- already holds true by the time
+ * service_spawn() is first called, so it rides in here instead: a lazy
+ * one-time action on the first spawn of any kind, not literally at
+ * process startup, but before the very first service (and so the very
+ * first burst of logd traffic) exists either way. Best-effort and silent
+ * on failure -- a read-only /proc/sys (a restrictive container, a non-
+ * root test run) must never stop services from starting.
+ */
+static void ensure_max_dgram_qlen(void) {
+        static bool done = false;
+        int fd;
+
+        if (done)
+                return;
+        done = true;
+
+        fd = open("/proc/sys/net/unix/max_dgram_qlen", O_WRONLY | O_CLOEXEC);
+        if (fd < 0)
+                return;
+
+        (void) write(fd, "64\n", 3);
+        close(fd);
+}
+
 int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
         int sock_fds[PICO_MAX_SOCKET_FDS];
         int n_sock_fds = 0;
         char **envp = NULL;
         size_t pid_slot = 0;
+        int stdout_fd;
         pid_t pid;
         int r;
 
@@ -529,6 +709,8 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
          * caller mistake never even forks. */
         if (!argv || !argv[0] || argv[0][0] == '\0')
                 return -ENOEXEC;
+
+        ensure_max_dgram_qlen();
 
         /*
          * Only the main command inherits socket-activation fds, matching
@@ -564,20 +746,31 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
                 }
         }
 
+        /* Every start, not only ExecStart= (plan §3.6: nothing scopes stdout
+         * capture to the main command the way LISTEN_FDS is scoped above).
+         * Best-effort: -1 on any failure just means "no logd, use the
+         * console" below, never a reason to fail the spawn itself. */
+        stdout_fd = create_stdout_socket(UNIT(s)->id);
+
         pid = fork();
         if (pid < 0) {
                 r = -errno; /* 74129a1276: never a stale success value */
                 free_socket_envp(envp);
+                if (stdout_fd >= 0)
+                        close(stdout_fd);
                 return r;
         }
 
         if (pid == 0)
-                child_exec(s, argv, envp, sock_fds, (unsigned) n_sock_fds, pid_slot); /* never returns */
+                child_exec(s, argv, envp, sock_fds, (unsigned) n_sock_fds, pid_slot, stdout_fd); /* never returns */
 
-        /* COW: the child already has its own copy of everything envp points
-         * to, made at fork() -- freeing the parent's copy here cannot affect
-         * it. See build_socket_envp()'s and free_socket_envp()'s own notes. */
+        /* COW: the child already has its own copy of everything envp/
+         * stdout_fd point to, made at fork() -- freeing/closing the
+         * parent's copies here cannot affect it. See build_socket_envp()'s
+         * and free_socket_envp()'s own notes; same reasoning for stdout_fd. */
         free_socket_envp(envp);
+        if (stdout_fd >= 0)
+                close(stdout_fd);
 
         *ret_pid = pid;
         return 0;

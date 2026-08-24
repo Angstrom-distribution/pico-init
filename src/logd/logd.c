@@ -45,6 +45,7 @@
 
 #include "../signal.h"
 #include "../util.h"
+#include "logd-kmsg.h"
 #include "logd-recv.h"
 #include "logd-write.h"
 #include "logd.h"
@@ -92,6 +93,7 @@ static bool get_listen_fds(int *stdout_fd, int *syslog_fd) {
 int main(int argc, char *argv[]) {
         LogdWriter *writer = NULL;
         LogdRecv *recv_ctx = NULL;
+        LogdKmsg *kmsg_ctx = NULL;
         PicoSignal *sig = NULL;
         const char *runtime_dir_override = NULL;
         long max_bytes_override = -1;
@@ -130,6 +132,31 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "logd: recv init failed: %s\n", strerror(-r));
                 logd_writer_free(writer);
                 return 1;
+        }
+
+        /* Best-effort and independent of the datagram sockets below: a
+         * kernel with no /dev/kmsg, or a run with no CAP_SYSLOG, just means
+         * no kernel transport this time, never a reason to refuse to start
+         * (plan §3.2). Opened before anything else logs, so the very first
+         * drain -- right here, not deferred to the epoll loop -- picks up
+         * the whole ring from seq 0, including whatever the kernel itself
+         * logged before logd existed. */
+        r = logd_kmsg_new(&kmsg_ctx);
+        if (r < 0) {
+                pico_log(PICO_LOG_WARNING,
+                         "logd: /dev/kmsg unavailable, no kernel transport this run: %s",
+                         strerror(-r));
+                kmsg_ctx = NULL;
+        } else {
+                int n = logd_kmsg_drain(kmsg_ctx, writer);
+
+                if (n < 0)
+                        pico_log(PICO_LOG_WARNING, "logd: initial /dev/kmsg drain failed: %s", strerror(-n));
+                else
+                        pico_log(PICO_LOG_INFO,
+                                 "logd: backfilled %d kernel message%s from /dev/kmsg",
+                                 n,
+                                 n == 1 ? "" : "s");
         }
 
         activated = get_listen_fds(&stdout_fd, &syslog_fd);
@@ -220,6 +247,14 @@ int main(int argc, char *argv[]) {
                                          strerror(errno));
                 }
 
+                if (kmsg_ctx) {
+                        ev.data.fd = logd_kmsg_fd(kmsg_ctx);
+                        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, ev.data.fd, &ev) < 0)
+                                pico_log(PICO_LOG_WARNING,
+                                         "logd: failed to register /dev/kmsg: %s",
+                                         strerror(errno));
+                }
+
                 ev.data.fd = pico_signal_fd(sig);
                 if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, pico_signal_fd(sig), &ev) < 0)
                         pico_log(PICO_LOG_WARNING,
@@ -254,6 +289,8 @@ int main(int argc, char *argv[]) {
                                         (void) logd_recv_drain_stdout(recv_ctx, fd);
                                 else if (fd == syslog_fd)
                                         (void) logd_recv_drain_syslog(recv_ctx, fd);
+                                else if (kmsg_ctx && fd == logd_kmsg_fd(kmsg_ctx))
+                                        (void) logd_kmsg_drain(kmsg_ctx, writer);
                                 else if (fd == pico_signal_fd(sig)) {
                                         int signo;
 
@@ -271,6 +308,7 @@ int main(int argc, char *argv[]) {
 
         (void) close(epoll_fd);
         (void) pico_signal_free(sig);
+        (void) logd_kmsg_free(kmsg_ctx);
         (void) logd_recv_free(recv_ctx);
         (void) logd_writer_free(writer);
 
