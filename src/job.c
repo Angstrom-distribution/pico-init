@@ -416,7 +416,18 @@ int job_run(Job *j) {
          * and `picoctl stop` on an already-dead one are both this case, and
          * they are the two commonest things anyone will ask.
          */
-        if (job_type_is_redundant(j->type, unit_active_state(u)))
+        /*
+         * A restart is asked about its STOP half, not about itself.
+         * job_run() dispatched it through unit_stop() above, and
+         * job_type_is_redundant() answers false for JOB_RESTART
+         * unconditionally and correctly -- a restart is never redundant as a
+         * whole. Testing the whole type here left `restart` on an
+         * already-inactive or failed unit hanging in exactly the way the two
+         * cases above did, because unit_stop() on a dead unit is a silent
+         * no-op. Finishing the stop half as JOB_DONE is what
+         * job_finish_full()'s conversion block then turns into the start.
+         */
+        if (job_type_is_redundant(j->type == JOB_RESTART ? JOB_STOP : j->type, unit_active_state(u)))
                 job_finish_full(j, JOB_DONE, true);
 
         return 0;
