@@ -80,7 +80,44 @@ Unit *unit_free(Unit *u) {
                 return NULL;
 
         /*
-         * Per-type teardown first. Only the concrete type knows what it owns
+         * Cancel any job still applying to this unit, before anything else is
+         * torn down.
+         *
+         * A job holds a borrowed j->unit and the unit points back at it as
+         * u->job; freeing the unit without breaking that pair leaves the job
+         * installed, still on the run queue, pointing at freed memory -- and
+         * the next manager_dispatch_run_queue() runs it. job_free() already
+         * refuses to leave the mirror image of this dangling (it uninstalls
+         * first, clearing unit->job), and this is the other half of the same
+         * invariant.
+         *
+         * Not reachable from today's two callers: manager_free() frees every
+         * job before it frees any unit, and manager_load_unit()'s error path
+         * runs on a unit that never had one. It becomes reachable the moment
+         * a SIGHUP reload or unit garbage collection drops a live unit -- the
+         * reload TODO in manager-loop.c -- so it is closed as a prerequisite
+         * of that work rather than after it.
+         *
+         * JOB_CANCELED, non-recursive: this is job_install()'s own supersede
+         * call, for the same reason. The unit is going away structurally, so
+         * this is not a runtime failure of the unit and must not fail the
+         * start jobs of everything that Requires= it; and recursion here would
+         * re-enter a manager whose unit table is mid-edit. job_finish_full()
+         * uninstalls, unlinks the run queue, resolves any deferred picoctl
+         * reply with the real CANCELED result rather than leaving a client
+         * hanging, and clears u->job on the way out.
+         *
+         * Before vtable->done(), not after: job_finish_full() republishes the
+         * unit's state file, which dispatches through vtable->active_state()
+         * -- reading a Service whose done() hook had already freed its members
+         * would be the use-after-free this fix exists to prevent, one layer
+         * further in.
+         */
+        if (u->job)
+                job_finish_full(u->job, JOB_CANCELED, false);
+
+        /*
+         * Per-type teardown next. Only the concrete type knows what it owns
          * -- a Service holds two argv vectors, a cgroup and possibly a queued
          * timer event -- so without this hook every started service leaked all
          * of them. The base type cannot guess at any of it.

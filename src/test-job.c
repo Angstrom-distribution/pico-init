@@ -564,8 +564,117 @@ static void test_all_verb_state_combinations(void) {
         }
 }
 
+/*
+ * Drop a unit from the manager's table the way a SIGHUP reload will have to.
+ *
+ * The reload path does not exist yet (manager-loop.c still carries its TODO),
+ * so the removal is done here rather than through it -- but the thing under
+ * test is unit_free() itself, which is the call reload will make, unchanged.
+ */
+static void manager_forget_unit(Manager *m, Unit *u) {
+        size_t i;
+
+        for (i = 0; i < m->n_units; i++)
+                if (m->units[i] == u) {
+                        memmove(&m->units[i], &m->units[i + 1], (m->n_units - i - 1) * sizeof(Unit *));
+                        m->n_units--;
+                        return;
+                }
+
+        ASSERT_TRUE(false); /* not in the table at all */
+}
+
+/*
+ * Freeing a unit that still has a job must not leave the job behind.
+ *
+ * unit_free() used to ignore u->job entirely, so the job stayed installed --
+ * queued, and holding a borrowed j->unit pointing straight at the freed
+ * allocation. The next manager_dispatch_run_queue() would then run it and
+ * dispatch unit_start() through a dangling pointer.
+ *
+ * Two cases, because they fail differently. A WAITING job is observable
+ * directly: it is still linked on the run queue, so the plain assertion below
+ * catches it (verified by reverting the fix and watching it fail). A RUNNING
+ * job has already been unlinked from the queue, so nothing in-process can see
+ * it any more -- with the fix reverted it shows up only under
+ * -Db_sanitize=address,undefined, as the still-installed job leaking with its
+ * unit freed underneath it. That is the same measured-rather-than-asserted
+ * check C2's connection leak uses, and the reason both cases are here: the
+ * observable half proves the mechanism, the sanitizer half covers the state
+ * the observable half cannot reach.
+ */
+static void test_unit_free_cancels_its_job(void) {
+        Manager *m;
+        char *dir;
+        Unit *a, *b;
+        Job *j = NULL;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        /* Services, not targets: a target completes its job synchronously, so
+         * there would be no live job left to dangle. */
+        ASSERT_EQ_INT(test_write_file(dir, "a.service", "[Service]\nExecStart=/bin/sleep 30\n"), 0);
+
+        /* Type=oneshot for the second case specifically: a Type=simple unit
+         * counts as started the instant fork() returns, so its start job would
+         * finish during the very dispatch meant to leave it RUNNING. Oneshot
+         * keeps the job in flight for as long as the process lives, which is
+         * the state this case needs to exist at all. */
+        ASSERT_EQ_INT(test_write_file(dir, "b.service", "[Service]\nType=oneshot\nExecStart=/bin/sleep 30\n"),
+                      0);
+
+        m = manager_for(dir);
+        ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+
+        /* Case one: the job is still WAITING on the run queue. */
+        a = manager_get_unit(m, "a.service");
+        ASSERT_TRUE(a != NULL);
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, a, &j), 0);
+        ASSERT_TRUE(j != NULL);
+        ASSERT_TRUE(a->job == j);
+        ASSERT_EQ_INT(j->state, JOB_WAITING);
+        ASSERT_TRUE(m->run_queue == j);
+
+        manager_forget_unit(m, a);
+        unit_free(a);
+
+        /* The queue held exactly that one job, and it must be gone with the
+         * unit. Before the fix it was still linked here, pointing at freed
+         * memory. */
+        ASSERT_TRUE(m->run_queue == NULL);
+
+        /* And running the queue must not reach it. */
+        ASSERT_EQ_INT(manager_dispatch_run_queue(m), 0);
+
+        /* Case two: the job is RUNNING, so it is off the queue already and
+         * only the freed j->unit would be left to find. */
+        b = manager_get_unit(m, "b.service");
+        ASSERT_TRUE(b != NULL);
+
+        j = NULL;
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, b, &j), 0);
+        ASSERT_TRUE(j != NULL);
+        ASSERT_EQ_INT(manager_dispatch_run_queue(m), 1);
+        ASSERT_TRUE(b->job == j);
+        ASSERT_EQ_INT(j->state, JOB_RUNNING);
+        ASSERT_TRUE(m->run_queue == NULL);
+
+        manager_forget_unit(m, b);
+        unit_free(b);
+
+        ASSERT_TRUE(m->run_queue == NULL);
+        ASSERT_EQ_INT(manager_dispatch_run_queue(m), 0);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
         test_ordering_c_b_a();
+        test_unit_free_cancels_its_job();
         test_all_verb_state_combinations();
         test_redundant_anchor_job_finishes();
         test_superseded_job_is_finished();
