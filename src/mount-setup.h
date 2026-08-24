@@ -32,6 +32,27 @@
 int mount_setup(void);
 
 /*
+ * The five /dev symlinks PID 1 owns: /dev/fd, /dev/stdin, /dev/stdout,
+ * /dev/stderr and (when the kernel has one) /dev/core.
+ *
+ * Nobody else makes these either. devtmpfs creates device nodes, never
+ * symlinks, and every device manager since udev ~176 is only a policy layer on
+ * top of it -- so on a devtmpfs-only image these simply do not exist, and
+ * `foo >/dev/stderr` and every /dev/fd/N shell idiom fail. Upstream systemd
+ * has them in PID 1 for exactly this reason (src/shared/dev-setup.c), not in
+ * udev.
+ *
+ * `prefix` is prepended to each link's own path for tests; NULL means none.
+ * The link *targets* are never prefixed -- see mount-setup.c.
+ *
+ * Idempotent, and safe to call on a /dev that already has some of them.
+ * Returns the number of the five now correctly in place, or -errno only on an
+ * internal error (a path that will not fit). A symlink that cannot be created
+ * is logged and skipped: none of these is worth refusing to boot over.
+ */
+int dev_setup(const char *prefix);
+
+/*
  * Kernel tunables PID 1 sets once, after mount_setup() has given it a /proc.
  *
  * Currently one: net.unix.max_dgram_qlen. Its distro default is commonly 10,

@@ -56,6 +56,23 @@ int main(void) {
                 freeze("could not mount the API filesystems");
         }
 
+        /*
+         * Immediately after, and for the same reason: devtmpfs gives /dev its
+         * device nodes and nothing gives it /dev/fd or /dev/std{in,out,err},
+         * so without this every `foo >/dev/stderr` and every /dev/fd/N idiom
+         * in any script the image runs fails. Needs the /proc mount_setup()
+         * just made, both because the links point into it and because the
+         * /dev/core check reads it.
+         *
+         * Not fatal. A board missing /dev/stdout is worth a warning, never a
+         * refusal to boot.
+         */
+        r = dev_setup(NULL);
+        if (r < 0)
+                pico_log(PICO_LOG_WARNING, "dev_setup: %s", strerror(-r));
+        else
+                pico_log(PICO_LOG_DEBUG, "dev_setup: %d /dev symlinks in place", r);
+
         /* Needs the /proc that mount_setup() just made, and must land before
          * the first service exists to write into a log socket. */
         sysctl_setup();

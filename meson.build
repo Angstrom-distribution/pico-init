@@ -93,6 +93,8 @@ pico_tests = [
   'test-manager-state',
   'test-picoctl',
   'test-manager-ctrl',
+  # D0's five /dev symlinks (plan §1.8).
+  'test-dev-setup',
 ]
 
 foreach t : pico_tests
