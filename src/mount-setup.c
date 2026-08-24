@@ -17,6 +17,7 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdbool.h>
 #include <string.h>
@@ -157,4 +158,30 @@ int mount_setup(void) {
         }
 
         return n;
+}
+
+void sysctl_setup(void) {
+        static const struct {
+                const char *path;
+                const char *value;
+        } tunables[] = {
+                { "/proc/sys/net/unix/max_dgram_qlen", "64\n" },
+        };
+        size_t i;
+
+        for (i = 0; i < sizeof(tunables) / sizeof(tunables[0]); i++) {
+                ssize_t len = (ssize_t) strlen(tunables[i].value);
+                int fd;
+
+                fd = open(tunables[i].path, O_WRONLY | O_CLOEXEC);
+                if (fd < 0) {
+                        pico_log(PICO_LOG_DEBUG, "%s: %s", tunables[i].path, strerror(errno));
+                        continue;
+                }
+
+                if (write(fd, tunables[i].value, (size_t) len) != len)
+                        pico_log(PICO_LOG_DEBUG, "%s: write: %s", tunables[i].path, strerror(errno));
+
+                close(fd);
+        }
 }

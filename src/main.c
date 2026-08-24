@@ -56,6 +56,10 @@ int main(void) {
                 freeze("could not mount the API filesystems");
         }
 
+        /* Needs the /proc that mount_setup() just made, and must land before
+         * the first service exists to write into a log socket. */
+        sysctl_setup();
+
         r = manager_new(&m);
         if (r < 0) {
                 pico_log(PICO_LOG_ERR, "manager_new: %s", strerror(-r));

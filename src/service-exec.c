@@ -659,38 +659,6 @@ static _Noreturn void
         _exit(PICO_EXIT_EXEC);
 }
 
-/*
- * PID 1 raises net.unix.max_dgram_qlen from its distro default (commonly
- * as low as 10, so an AF_UNIX SOCK_DGRAM receive queue holds only ~11
- * datagrams regardless of SO_RCVBUF -- J1's own measurement, against a
- * 4096-byte stdio flush unit that is only ~44 KiB of crash-survival
- * window per service) to 64. This has no natural home in a PID-1-startup
- * file this milestone was not handed (manager-startup.c/main.c), and
- * every real effect it needs -- /proc mounted, which mount-setup.c
- * guarantees before any unit starts -- already holds true by the time
- * service_spawn() is first called, so it rides in here instead: a lazy
- * one-time action on the first spawn of any kind, not literally at
- * process startup, but before the very first service (and so the very
- * first burst of logd traffic) exists either way. Best-effort and silent
- * on failure -- a read-only /proc/sys (a restrictive container, a non-
- * root test run) must never stop services from starting.
- */
-static void ensure_max_dgram_qlen(void) {
-        static bool done = false;
-        int fd;
-
-        if (done)
-                return;
-        done = true;
-
-        fd = open("/proc/sys/net/unix/max_dgram_qlen", O_WRONLY | O_CLOEXEC);
-        if (fd < 0)
-                return;
-
-        (void) write(fd, "64\n", 3);
-        close(fd);
-}
-
 int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
         int sock_fds[PICO_MAX_SOCKET_FDS];
         int n_sock_fds = 0;
@@ -709,8 +677,6 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
          * caller mistake never even forks. */
         if (!argv || !argv[0] || argv[0][0] == '\0')
                 return -ENOEXEC;
-
-        ensure_max_dgram_qlen();
 
         /*
          * Only the main command inherits socket-activation fds, matching

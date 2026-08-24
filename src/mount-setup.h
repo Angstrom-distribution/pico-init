@@ -30,3 +30,16 @@
  * console where someone can debug it.
  */
 int mount_setup(void);
+
+/*
+ * Kernel tunables PID 1 sets once, after mount_setup() has given it a /proc.
+ *
+ * Currently one: net.unix.max_dgram_qlen. Its distro default is commonly 10,
+ * which caps an AF_UNIX SOCK_DGRAM receive queue at eleven datagrams
+ * regardless of SO_RCVBUF -- and that queue is what holds a service's output
+ * across a logd restart, so eleven datagrams against a 4 KiB stdio flush unit
+ * is only ~44 KiB of crash-survival window per service. Raised to 64.
+ *
+ * Best-effort and silent: a read-only /proc/sys must never stop a boot.
+ */
+void sysctl_setup(void);
