@@ -88,6 +88,33 @@ static bool unit_file_exists(const char *runtime_dir, const char *unit_id) {
         return stat(path, &st) == 0;
 }
 
+/*
+ * Every real-boot test below shares unit names ("console.service") with
+ * test-picoctl.c's own real-boot fixture, and `meson test` runs different
+ * test binaries concurrently -- so without a per-test cgroup root, two
+ * processes both defaulting to /sys/fs/cgroup/system.slice/console.service
+ * race each other for the same real cgroup, exactly the flake this project's
+ * own "run things, don't reason about them" discipline caught here. `tag`
+ * (plus this process's own pid, which test-boot.c's identical pattern also
+ * uses) is enough to keep every test binary and every test run apart.
+ */
+static void use_private_cgroup_root(Manager *m, const char *tag, char *out, size_t out_size) {
+        int n = snprintf(out, out_size, "/sys/fs/cgroup/pico-state-test-%s-%lld", tag, (long long) getpid());
+
+        ASSERT_TRUE(n > 0 && (size_t) n < out_size);
+        if (mkdir(out, 0755) < 0)
+                ASSERT_TRUE(errno == EEXIST);
+        ASSERT_EQ_INT(manager_set_cgroup_root(m, out), 0);
+}
+
+static void free_private_cgroup_root(const char *root) {
+        char slice[PATH_MAX];
+
+        snprintf(slice, sizeof(slice), "%s/system.slice", root);
+        rmdir(slice); /* per-unit leaf dirs are already gone via manager_free() */
+        rmdir(root);
+}
+
 static void stop_the_loop(void *userdata, usec_t now) {
         Manager *m = userdata;
 
@@ -122,6 +149,7 @@ static const char *sysinit_service =
 
 static void test_boot_files_match_reality(void) {
         char *unitdir, *rtdir;
+        char cgroup_root[PATH_MAX];
         Manager *m = NULL;
         Unit *target, *sysinit, *console;
         char val[256];
@@ -144,6 +172,7 @@ static void test_boot_files_match_reality(void) {
                 ASSERT_EQ_INT(manager_set_preset_path(m, pd), 0);
         }
         ASSERT_EQ_INT(manager_set_runtime_dir(m, rtdir), 0);
+        use_private_cgroup_root(m, "boot", cgroup_root, sizeof(cgroup_root));
 
         ASSERT_EQ_INT(manager_startup(m, NULL), 0);
 
@@ -234,6 +263,7 @@ static void test_boot_files_match_reality(void) {
         }
 
         manager_free(m);
+        free_private_cgroup_root(cgroup_root);
         test_rm_rf(unitdir);
         test_rm_rf(rtdir);
         free(unitdir);
@@ -244,6 +274,7 @@ static void test_boot_files_match_reality(void) {
 
 static void test_killed_service_shows_failure(void) {
         char *unitdir, *rtdir;
+        char cgroup_root[PATH_MAX];
         Manager *m = NULL;
         Unit *victim;
         pid_t main_pid;
@@ -267,6 +298,7 @@ static void test_killed_service_shows_failure(void) {
                 ASSERT_EQ_INT(manager_set_unit_path(m, up), 0);
         }
         ASSERT_EQ_INT(manager_set_runtime_dir(m, rtdir), 0);
+        use_private_cgroup_root(m, "killed", cgroup_root, sizeof(cgroup_root));
         ASSERT_EQ_INT(manager_state_setup(m), 0);
 
         ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
@@ -352,6 +384,7 @@ static void test_killed_service_shows_failure(void) {
         }
 
         manager_free(m);
+        free_private_cgroup_root(cgroup_root);
         test_rm_rf(unitdir);
         test_rm_rf(rtdir);
         free(unitdir);
@@ -401,6 +434,7 @@ static void test_file_vanishes_with_unit(void) {
 static void test_unwritable_runtime_dir_never_fails_boot(void) {
         char *unitdir, *blockdir;
         char bogus_runtime[PATH_MAX];
+        char cgroup_root[PATH_MAX];
         Manager *m = NULL;
         Unit *console;
         int objective;
@@ -429,6 +463,7 @@ static void test_unwritable_runtime_dir_never_fails_boot(void) {
                 ASSERT_EQ_INT(manager_set_preset_path(m, pd), 0);
         }
         ASSERT_EQ_INT(manager_set_runtime_dir(m, bogus_runtime), 0);
+        use_private_cgroup_root(m, "unwritable", cgroup_root, sizeof(cgroup_root));
 
         /* Direct check: setup itself must report the failure ... */
         ASSERT_TRUE(manager_state_setup(m) < 0);
@@ -459,6 +494,7 @@ static void test_unwritable_runtime_dir_never_fails_boot(void) {
 
         manager_free(m); /* must not crash despite every unit_free() calling
                              manager_state_forget_unit() against a NULL m->state */
+        free_private_cgroup_root(cgroup_root);
 
         test_rm_rf(unitdir);
         test_rm_rf(blockdir);
@@ -509,6 +545,7 @@ static bool state_file_is_well_formed_or_absent(const char *path) {
 static void test_reader_never_sees_partial_file(void) {
         char *unitdir, *rtdir;
         char state_path[PATH_MAX];
+        char cgroup_root[PATH_MAX];
         Manager *m = NULL;
         Unit *u;
         Service *s;
@@ -537,6 +574,7 @@ static void test_reader_never_sees_partial_file(void) {
                 ASSERT_EQ_INT(manager_set_unit_path(m, up), 0);
         }
         ASSERT_EQ_INT(manager_set_runtime_dir(m, rtdir), 0);
+        use_private_cgroup_root(m, "churn", cgroup_root, sizeof(cgroup_root));
         ASSERT_EQ_INT(manager_state_setup(m), 0);
 
         ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
@@ -591,14 +629,26 @@ static void test_reader_never_sees_partial_file(void) {
                                         if (rr < 0 || signo != SIGCHLD)
                                                 continue;
 
-                                        for (;;) {
+                                        /*
+                                         * P_PID, scoped to this service's own
+                                         * pid -- NOT P_ALL. The reader child
+                                         * forked below is also this process's
+                                         * child, and a P_ALL WNOHANG reap here
+                                         * would race it: whichever exits
+                                         * first gets silently consumed and
+                                         * discarded ("not ours"), leaving the
+                                         * other side's later waitpid() an
+                                         * ECHILD. Reproduced by running this
+                                         * test under load (five concurrent
+                                         * copies) before this fix.
+                                         */
+                                        if (s->main_pid > 0) {
                                                 siginfo_t info;
 
                                                 memset(&info, 0, sizeof(info));
-                                                if (waitid(P_ALL, 0, &info, WEXITED | WNOHANG) < 0 ||
-                                                    info.si_pid == 0)
-                                                        break;
-                                                if (info.si_pid == s->main_pid)
+                                                if (waitid(P_PID, (id_t) s->main_pid, &info, WEXITED | WNOHANG) ==
+                                                                    0 &&
+                                                    info.si_pid == s->main_pid)
                                                         service_sigchld_event(
                                                                         s,
                                                                         info.si_pid,
@@ -631,6 +681,7 @@ static void test_reader_never_sees_partial_file(void) {
         ASSERT_EQ_INT(WEXITSTATUS(status), 0); /* never caught a torn or malformed read */
 
         manager_free(m);
+        free_private_cgroup_root(cgroup_root);
         test_rm_rf(unitdir);
         test_rm_rf(rtdir);
         free(unitdir);
