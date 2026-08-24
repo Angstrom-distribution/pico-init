@@ -56,21 +56,288 @@
  *
  * Deliberately not backported here: 78d17fa09/b5d742138 (UTF-8 argv
  * validation -- no specifier expansion exists in this MVP to need it) and
- * everything socket-activation/notify-protocol/PAM/SELinux-shaped, none of
- * which service.h has fields for.
+ * everything notify-protocol/PAM/SELinux-shaped, none of which service.h has
+ * fields for.
+ *
+ * Socket activation (plan §1.6, S1) landed on top of the above rather than
+ * beside it, because it touches the exact region the constraint above is
+ * about -- LISTEN_PID has to be the CHILD's own pid, so it is the one
+ * variable-length string this file ever builds after fork(), and it is
+ * built the only async-signal-safe way available: snprintf() into automatic
+ * (stack) storage, no malloc. Everything else -- fd collection
+ * (socket_collect_fds()), the LISTEN_FDS=<n> string, and the envp array
+ * itself -- is built in the PARENT, before fork(), same as argv always was.
+ * shift_fds()/flags_fds() below are v30's own execute.c:63-101, ported
+ * verbatim (the algorithm, not just the citation: F_DUPFD's "lowest free fd
+ * >= target" guarantee is what makes the restart-from-collision loop in
+ * shift_fds() converge, and reimplementing it differently would be the kind
+ * of edit this file's own opening paragraph warns against). This is also
+ * why `execv()` becomes `execve()` here: passing fds by inherited-and-
+ * renumbered file descriptor plus an explicit envp is the entire
+ * LISTEN_FDS/LISTEN_PID protocol, and there is no third way to hand a
+ * pre-opened listening socket to a process that has not yet called exec.
+ *
+ * One more thing found and fixed while landing S1, not from the quarry:
+ * step 5's fd sweep was a `close()` per fd number up to
+ * sysconf(_SC_OPEN_MAX). That is fine at a traditional RLIMIT_NOFILE
+ * (1024-4096), but a good few modern distros default it far higher --
+ * measured at 1,048,576 in this project's own Ubuntu 24.04 container image
+ * -- which turns EVERY service start (not just a socket-activated one) into
+ * that many close() syscalls, several real seconds each, discovered because
+ * it made this milestone's own multi-cycle S2 tests impractically slow, not
+ * from inspection. close_all_except() below uses close_range() (Linux 5.9+,
+ * glibc >= 2.34, so no new floor beyond what this project already assumes)
+ * to close whole gaps between kept fds in one syscall each, falling back to
+ * the original per-fd loop if close_range() itself is unavailable at
+ * runtime (an older kernel/glibc pairing) -- same fd set closed either way,
+ * just not one syscall per number. The insertion sort it needs first is
+ * hand-rolled rather than qsort(3): glibc's qsort can malloc a scratch
+ * buffer for large-enough inputs, which this async-signal-safe region must
+ * never do; n is at most PICO_MAX_SOCKET_FDS, where O(n^2) costs nothing.
  */
+
+/* close_range() is a glibc >= 2.34 wrapper; -std=gnu17 alone does not imply
+ * _GNU_SOURCE (same reasoning as socket.c's own note), and this has to be
+ * defined before any header is pulled in for it to take effect at all. */
+#define _GNU_SOURCE
 
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include "service.h"
+#include "socket.h"
+
+/* Declared explicitly rather than relying on <unistd.h> to have pulled it
+ * in under whatever feature-test macros happen to be active -- environ is
+ * used exactly once below, to build a service's inherited-plus-LISTEN_FDS
+ * envp. */
+extern char **environ;
+
+/* A generous, fixed bound on how many fds one paired socket unit (or several
+ * pairing to the same service) can hand to a single service start. No
+ * pico-init consumer needs more than a handful; a fixed stack array here
+ * keeps fd collection entirely allocation-free in the parent too. */
+#define PICO_MAX_SOCKET_FDS 16
+
+/*
+ * Renumber every fd in `fds` to a contiguous run starting at 3, in place --
+ * v30's execute.c:63-101, ported verbatim. F_DUPFD(fd, i+3) always returns
+ * the LOWEST free descriptor >= i+3, so when that target is already occupied
+ * by one of our OWN not-yet-processed fds, the dup lands somewhere higher
+ * instead; `restart_from` remembers the earliest index that happened to and
+ * the outer loop retries from there once the rest of the pass has freed up
+ * more of the low numbers. Converges because each retry pass strictly
+ * shrinks the set of fds not yet at their target. Async-signal-safe:
+ * fcntl()/close() only, no malloc. 0 or -errno.
+ */
+
+/* Hand-rolled ascending insertion sort -- see this file's header for why
+ * qsort(3) is not used here. `n` is at most PICO_MAX_SOCKET_FDS. */
+static void sort_fds_ascending(int *a, unsigned n) {
+        unsigned i, j;
+
+        for (i = 1; i < n; i++) {
+                int v = a[i];
+
+                j = i;
+                while (j > 0 && a[j - 1] > v) {
+                        a[j] = a[j - 1];
+                        j--;
+                }
+                a[j] = v;
+        }
+}
+
+/*
+ * Closes every fd in [0, max_fd) except those in `keep` -- one close_range()
+ * syscall per gap between kept fds, rather than one close() per fd number.
+ * See this file's header for why: at a traditional RLIMIT_NOFILE this
+ * hardly matters, but several modern distros default it into the six
+ * figures, turning the naive loop into that many syscalls on every single
+ * service start. Falls back to the original per-fd loop, from wherever
+ * close_range() itself first failed, if the kernel does not have it
+ * (pre-5.9) -- same fds end up closed either way. Async-signal-safe:
+ * close_range()/close() only, plus the insertion sort above (no malloc).
+ */
+static void close_all_except(const int *keep, unsigned n_keep, long max_fd) {
+        int sorted[PICO_MAX_SOCKET_FDS];
+        unsigned i, n, next;
+        bool use_close_range = true;
+
+        n = n_keep < PICO_MAX_SOCKET_FDS ? n_keep : PICO_MAX_SOCKET_FDS;
+        for (i = 0; i < n; i++)
+                sorted[i] = keep[i];
+        sort_fds_ascending(sorted, n);
+
+        next = 0;
+        for (i = 0; i < n; i++) {
+                unsigned target = (unsigned) sorted[i];
+
+                if (target < next)
+                        continue; /* duplicate entry, already covered */
+
+                if (use_close_range && target > next && close_range(next, target - 1, 0) < 0)
+                        use_close_range = false;
+
+                if (!use_close_range)
+                        for (; next < target; next++)
+                                close((int) next);
+
+                next = target + 1;
+        }
+
+        if (use_close_range && close_range(next, UINT_MAX, 0) < 0)
+                use_close_range = false;
+
+        if (!use_close_range)
+                for (; (long) next < max_fd; next++)
+                        close((int) next);
+}
+
+static int shift_fds(int *fds, unsigned n_fds) {
+        int start, restart_from;
+
+        if (n_fds == 0)
+                return 0;
+
+        start = 0;
+        for (;;) {
+                int i;
+
+                restart_from = -1;
+
+                for (i = start; i < (int) n_fds; i++) {
+                        int nfd;
+
+                        if (fds[i] == i + 3)
+                                continue;
+
+                        nfd = fcntl(fds[i], F_DUPFD, i + 3);
+                        if (nfd < 0)
+                                return -errno;
+
+                        close(fds[i]);
+                        fds[i] = nfd;
+
+                        if (nfd != i + 3 && restart_from < 0)
+                                restart_from = i;
+                }
+
+                if (restart_from < 0)
+                        break;
+
+                start = restart_from;
+        }
+
+        return 0;
+}
+
+/*
+ * Clears O_NONBLOCK and FD_CLOEXEC on every renumbered fd. O_NONBLOCK:
+ * socket_open_fds() opens every listening socket SOCK_NONBLOCK for PID 1's
+ * own epoll loop, but sd_listen_fds()'s documented default hands a consumer
+ * a BLOCKING fd unless it asks otherwise (no NonBlocking= directive exists
+ * in this MVP to override that). FD_CLOEXEC: opened SOCK_CLOEXEC for the
+ * same PID-1-hygiene reason execute.c:63-101's own fd sweep exists at all --
+ * cleared here because this is the one fd this exact execve() must keep.
+ * Async-signal-safe: fcntl() only. 0 or -errno.
+ */
+static int flags_fds(const int *fds, unsigned n_fds) {
+        unsigned i;
+
+        for (i = 0; i < n_fds; i++) {
+                int fl;
+
+                fl = fcntl(fds[i], F_GETFL, 0);
+                if (fl < 0)
+                        return -errno;
+                if ((fl & O_NONBLOCK) && fcntl(fds[i], F_SETFL, fl & ~O_NONBLOCK) < 0)
+                        return -errno;
+
+                fl = fcntl(fds[i], F_GETFD, 0);
+                if (fl < 0)
+                        return -errno;
+                if ((fl & FD_CLOEXEC) && fcntl(fds[i], F_SETFD, fl & ~FD_CLOEXEC) < 0)
+                        return -errno;
+        }
+
+        return 0;
+}
+
+/*
+ * Builds the child's envp: environ's own pointers (borrowed -- those strings
+ * outlive both fork() and this process's own execve(), so copying the
+ * pointer array is enough) plus "LISTEN_FDS=<n>", plus one reserved trailing
+ * slot child_exec() fills in with LISTEN_PID after fork(). *ret_pid_slot is
+ * that slot's index. Called only in the parent, before fork() -- malloc here
+ * is fine, this is exactly the "everything that can be computed in the
+ * parent is computed there instead" this file's header promises. NULL on
+ * OOM.
+ */
+static char **build_socket_envp(unsigned n_fds, size_t *ret_pid_slot) {
+        size_t n = 0, i;
+        char **envp;
+        char buf[32];
+        int r;
+
+        while (environ[n])
+                n++;
+
+        /* +1 LISTEN_FDS, +1 reserved LISTEN_PID slot, +1 NUL terminator */
+        envp = calloc(n + 3, sizeof(char *));
+        if (!envp)
+                return NULL;
+
+        for (i = 0; i < n; i++)
+                envp[i] = environ[i];
+
+        r = snprintf(buf, sizeof(buf), "LISTEN_FDS=%u", n_fds);
+        if (r < 0 || (size_t) r >= sizeof(buf)) {
+                free(envp);
+                return NULL;
+        }
+
+        envp[n] = pico_strdup(buf);
+        if (!envp[n]) {
+                free(envp);
+                return NULL;
+        }
+
+        *ret_pid_slot = n + 1;
+        envp[n + 1] = NULL; /* filled by the child, post-fork -- see child_exec() */
+        envp[n + 2] = NULL; /* terminator */
+
+        return envp;
+}
+
+/* Frees only what build_socket_envp() itself allocated: the LISTEN_FDS
+ * string and the array. Every other slot is either borrowed from environ or
+ * (the reserved one) never written by the parent at all. Safe to call from
+ * the parent right after fork() returns -- the child already has its own
+ * COW copy of this same memory, so freeing the parent's does not touch it. */
+static void free_socket_envp(char **envp) {
+        size_t i;
+
+        if (!envp)
+                return;
+
+        for (i = 0; envp[i]; i++)
+                if (strncmp(envp[i], "LISTEN_FDS=", strlen("LISTEN_FDS=")) == 0) {
+                        free(envp[i]);
+                        break;
+                }
+
+        free(envp);
+}
 
 /*
  * Reopens the unit's cgroup.procs by path rather than reusing any fd the
@@ -111,8 +378,17 @@ static void child_attach_cgroup(const struct pico_cgroup *cg) {
  * no NSS, no dlopen: a failure has exactly one channel back to the parent,
  * _exit() with one of the codes in service.h, matching systemd.exec(5)
  * numerically. Never returns.
+ *
+ * `sock_fds`/`n_sock_fds` (computed and owned by the PARENT, in
+ * service_spawn(), before fork()) are the fds this start is passing via
+ * LISTEN_FDS -- excluded from the close-everything sweep at step 5, then
+ * renumbered and unflagged at step 5b. `envp`/`pid_slot` are likewise
+ * parent-built (build_socket_envp()); NULL/0 together mean "no fds, use the
+ * inherited environ unchanged", the same behaviour this function always had.
  */
-static _Noreturn void child_exec(Service *s, char **argv) {
+static _Noreturn void child_exec(
+                Service *s, char **argv, char **envp, int *sock_fds, unsigned n_sock_fds, size_t pid_slot) {
+        char pidbuf[32];
         sigset_t empty;
         int sig, fd;
         long max_fd;
@@ -146,14 +422,41 @@ static _Noreturn void child_exec(Service *s, char **argv) {
         if (sigprocmask(SIG_SETMASK, &empty, NULL) < 0)
                 _exit(PICO_EXIT_SIGNAL_MASK);
 
-        /* 5. Close everything this process inherited. No keep-list: the
-         * cgroup control file (step 7) and the console (step 8) are both
-         * reopened fresh by path below, so nothing needs to survive this. */
+        /* 5. Close everything this process inherited, except the fds being
+         * passed for socket activation (sock_fds -- LISTEN_FDS). The cgroup
+         * control file (step 7) and the console (step 8) are both reopened
+         * fresh by path below, so nothing else needs to survive this. See
+         * close_all_except()'s own comment for why this is not simply a
+         * close() per fd number any more. */
         max_fd = sysconf(_SC_OPEN_MAX);
         if (max_fd < 0)
                 max_fd = 1024; /* sane fallback if the syscall itself fails */
-        for (fd = 0; fd < (int) max_fd; fd++)
-                close(fd); /* EBADF for an fd that was never open is expected */
+        close_all_except(sock_fds, n_sock_fds, max_fd);
+
+        /* 5b. LISTEN_FDS/sd_listen_fds(): renumber the kept fds to a
+         * contiguous run starting at 3, then clear the flags PID 1 needed
+         * but this child's own consumer does not (O_NONBLOCK, FD_CLOEXEC).
+         * Fatal on failure -- a partially-renumbered or still-CLOEXEC'd fd
+         * is worse than not starting at all, since a consumer trusting
+         * LISTEN_FDS would silently read or write the wrong descriptor. */
+        if (n_sock_fds > 0) {
+                if (shift_fds(sock_fds, n_sock_fds) < 0)
+                        _exit(PICO_EXIT_FDS);
+                if (flags_fds(sock_fds, n_sock_fds) < 0)
+                        _exit(PICO_EXIT_FDS);
+
+                /*
+                 * LISTEN_PID has to be THIS process's own pid, which does
+                 * not exist until after fork() -- the one variable-length
+                 * string this file ever builds post-fork, and the reason
+                 * this whole function's constraint (no malloc past this
+                 * point) matters: snprintf() into automatic (stack) storage
+                 * is async-signal-safe, a heap string built the same way
+                 * would not be.
+                 */
+                snprintf(pidbuf, sizeof(pidbuf), "LISTEN_PID=%d", (int) getpid());
+                envp[pid_slot] = pidbuf;
+        }
 
         /* 6. Session leader with no controlling terminal -- the exact
          * precondition TIOCSCTTY checks for at step 9. Must come after the
@@ -201,15 +504,21 @@ static _Noreturn void child_exec(Service *s, char **argv) {
                 ioctl(STDIN_FILENO, TIOCSCTTY, 0);
 
         /* 10. Does not return on success. Its failure is reported purely by
-         * exit code -- there is no other channel back to the parent. Uses
-         * the inherited `environ` rather than a constructed envp: pico-init
-         * has no Environment= directive to honour in this MVP. */
-        execv(argv[0], argv);
+         * exit code -- there is no other channel back to the parent. envp is
+         * NULL exactly when this start passes no fds (no Environment=
+         * directive exists in this MVP to need one otherwise), in which case
+         * the inherited `environ` is used unchanged, same as always. */
+        execve(argv[0], argv, envp ? envp : environ);
         _exit(PICO_EXIT_EXEC);
 }
 
 int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
+        int sock_fds[PICO_MAX_SOCKET_FDS];
+        int n_sock_fds = 0;
+        char **envp = NULL;
+        size_t pid_slot = 0;
         pid_t pid;
+        int r;
 
         if (!s || !ret_pid)
                 return -EINVAL;
@@ -221,12 +530,54 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
         if (!argv || !argv[0] || argv[0][0] == '\0')
                 return -ENOEXEC;
 
+        /*
+         * Only the main command inherits socket-activation fds, matching
+         * v30: an ExecStartPre= control command never gets LISTEN_FDS, only
+         * ExecStart= does. Fd collection happens on ANY service start, not
+         * just a socket-triggered one -- this call does not care whether
+         * socket_trigger() ran or the socket was merely already listening
+         * when boot order reached this service.
+         */
+        if (argv == s->exec_start) {
+                r = socket_collect_fds(UNIT(s), sock_fds, PICO_MAX_SOCKET_FDS);
+                if (r < 0) {
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s: could not collect socket fds (%s), starting without them",
+                                 UNIT(s)->id,
+                                 strerror(-r));
+                } else
+                        n_sock_fds = r;
+        }
+
+        if (n_sock_fds > 0) {
+                /* d137a488af: before fork(), synchronously -- see
+                 * socket_notify_service_starting()'s own header comment for
+                 * why this matters for a boot-ordered (non-triggered) start. */
+                socket_notify_service_starting(UNIT(s));
+
+                envp = build_socket_envp((unsigned) n_sock_fds, &pid_slot);
+                if (!envp) {
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s: could not build a LISTEN_FDS environment, starting without it",
+                                 UNIT(s)->id);
+                        n_sock_fds = 0;
+                }
+        }
+
         pid = fork();
-        if (pid < 0)
-                return -errno; /* 74129a1276: never a stale success value */
+        if (pid < 0) {
+                r = -errno; /* 74129a1276: never a stale success value */
+                free_socket_envp(envp);
+                return r;
+        }
 
         if (pid == 0)
-                child_exec(s, argv); /* never returns */
+                child_exec(s, argv, envp, sock_fds, (unsigned) n_sock_fds, pid_slot); /* never returns */
+
+        /* COW: the child already has its own copy of everything envp points
+         * to, made at fork() -- freeing the parent's copy here cannot affect
+         * it. See build_socket_envp()'s and free_socket_envp()'s own notes. */
+        free_socket_envp(envp);
 
         *ret_pid = pid;
         return 0;

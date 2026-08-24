@@ -78,11 +78,16 @@
 #include "conf-scan.h"
 #include "manager.h"
 #include "service.h"
+#include "socket.h"
 #include "util.h"
+
+#include <sys/socket.h> /* AF_UNIX/AF_UNSPEC/SOCK_STREAM/SOCK_DGRAM, for ListenStream=/ListenDatagram= */
+#include <sys/un.h>     /* sizeof(sun_path), for the ListenStream=/ListenDatagram= length check */
 
 typedef enum ConfigSection {
         SECTION_UNIT,
         SECTION_SERVICE,
+        SECTION_SOCKET,
         SECTION_INSTALL,
         SECTION_UNKNOWN,
 } ConfigSection;
@@ -682,6 +687,188 @@ static int config_parse_timeout_stop_sec(
         return 0;
 }
 
+/* --- [Socket] handlers --- */
+
+/* Targets/services are real unit types too, so a [Socket] directive on one
+ * is a misplaced-directive warning rather than an impossible case, matching
+ * unit_to_service()'s own shape above. */
+static Socket *unit_to_socket(Unit *u, const char *path, unsigned line) {
+        if (u->type != UNIT_SOCKET) {
+                pico_log(PICO_LOG_WARNING,
+                         "%s:%u: [Socket] directive on a %s unit, ignoring",
+                         path,
+                         line,
+                         unit_type_to_string(u->type));
+                return NULL;
+        }
+        return SOCKET(u);
+}
+
+static void socket_port_append(Socket *s, SocketPort *p) {
+        SocketPort **tail = &s->ports;
+
+        while (*tail)
+                tail = &(*tail)->next;
+
+        *tail = p; /* tail-appended: fd order == declared Listen* order (H12) */
+}
+
+/*
+ * "/path" -> AF_UNIX; a bare 1-65535 decimal -> a port, family resolved
+ * later at bind time (629abfc23f -- see socket.c). Anything else is logged
+ * and dropped, same non-fatal-per-directive policy as every other handler
+ * in this file.
+ */
+static int config_parse_listen(Unit *u, const char *path, unsigned line, const char *rvalue, int type) {
+        Socket *s = unit_to_socket(u, path, line);
+        SocketPort *p;
+
+        if (!s)
+                return 0;
+
+        p = calloc(1, sizeof(SocketPort));
+        if (!p)
+                return -ENOMEM;
+
+        p->fd = -1;
+        p->socket = s;
+        p->type = type;
+
+        if (rvalue[0] == '/') {
+                if (strlen(rvalue) >= sizeof(((struct sockaddr_un *) 0)->sun_path)) {
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s:%u: socket path '%s' too long, ignoring",
+                                 path,
+                                 line,
+                                 rvalue);
+                        free(p);
+                        return 0;
+                }
+
+                p->family = AF_UNIX;
+                p->path = pico_strdup(rvalue);
+                if (!p->path) {
+                        free(p);
+                        return -ENOMEM;
+                }
+        } else {
+                char *end;
+                unsigned long v;
+
+                errno = 0;
+                v = strtoul(rvalue, &end, 10);
+                if (end == rvalue || *end != '\0' || errno == ERANGE || v == 0 || v > 65535) {
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s:%u: '%s' is neither an absolute path nor a port number, ignoring",
+                                 path,
+                                 line,
+                                 rvalue);
+                        free(p);
+                        return 0;
+                }
+
+                p->family = AF_UNSPEC; /* resolved at bind time */
+                p->port = (uint16_t) v;
+        }
+
+        socket_port_append(s, p);
+        return 0;
+}
+
+static int config_parse_listen_stream(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        (void) lvalue;
+        return config_parse_listen(u, path, line, rvalue, SOCK_STREAM);
+}
+
+static int config_parse_listen_datagram(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        (void) lvalue;
+        return config_parse_listen(u, path, line, rvalue, SOCK_DGRAM);
+}
+
+static int config_parse_socket_service(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        Socket *s = unit_to_socket(u, path, line);
+        (void) lvalue;
+
+        if (!s)
+                return 0;
+
+        if (!unit_name_is_valid(rvalue) || unit_type_from_name(rvalue) != UNIT_SERVICE) {
+                pico_log(PICO_LOG_WARNING,
+                         "%s:%u: Service= value '%s' is not a valid service name, ignoring",
+                         path,
+                         line,
+                         rvalue);
+                return 0;
+        }
+
+        s->service_name = pico_mfree(s->service_name);
+        s->service_name = pico_strdup(rvalue);
+        return s->service_name ? 0 : -ENOMEM;
+}
+
+static int config_parse_socket_accept(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        Socket *s = unit_to_socket(u, path, line);
+        bool b;
+        (void) lvalue;
+
+        if (!s)
+                return 0;
+
+        if (parse_boolean_value(rvalue, &b) < 0) {
+                pico_log(PICO_LOG_WARNING, "%s:%u: invalid Accept= value '%s', ignoring", path, line, rvalue);
+                return 0;
+        }
+
+        s->accept = b;
+        return 0;
+}
+
+static int config_parse_socket_mode(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        Socket *s = unit_to_socket(u, path, line);
+        char *end;
+        unsigned long v;
+        (void) lvalue;
+
+        if (!s)
+                return 0;
+
+        errno = 0;
+        v = strtoul(rvalue, &end, 8);
+        if (end == rvalue || *end != '\0' || errno == ERANGE || v > 07777) {
+                pico_log(PICO_LOG_WARNING, "%s:%u: invalid SocketMode= value '%s', ignoring", path, line, rvalue);
+                return 0;
+        }
+
+        s->socket_mode = (mode_t) v;
+        return 0;
+}
+
+static int config_parse_socket_backlog(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        Socket *s = unit_to_socket(u, path, line);
+        char *end;
+        long v;
+        (void) lvalue;
+
+        if (!s)
+                return 0;
+
+        errno = 0;
+        v = strtol(rvalue, &end, 10);
+        if (end == rvalue || *end != '\0' || errno == ERANGE || v <= 0) {
+                pico_log(PICO_LOG_WARNING, "%s:%u: invalid Backlog= value '%s', ignoring", path, line, rvalue);
+                return 0;
+        }
+
+        s->backlog = (int) v;
+        return 0;
+}
+
 /* --- [Install] handlers --- */
 
 /*
@@ -753,6 +940,12 @@ static const ConfigItem config_items[] = {
         { SECTION_SERVICE, "RemainAfterExit", config_parse_remain_after_exit },
         { SECTION_SERVICE, "TimeoutStartSec", config_parse_timeout_start_sec },
         { SECTION_SERVICE,  "TimeoutStopSec",  config_parse_timeout_stop_sec },
+        {  SECTION_SOCKET,    "ListenStream",     config_parse_listen_stream },
+        {  SECTION_SOCKET,  "ListenDatagram",   config_parse_listen_datagram },
+        {  SECTION_SOCKET,         "Service",    config_parse_socket_service },
+        {  SECTION_SOCKET,          "Accept",     config_parse_socket_accept },
+        {  SECTION_SOCKET,      "SocketMode",       config_parse_socket_mode },
+        {  SECTION_SOCKET,         "Backlog",    config_parse_socket_backlog },
         { SECTION_INSTALL,        "WantedBy",         config_parse_wanted_by },
         { SECTION_INSTALL,      "RequiredBy",       config_parse_required_by },
 };
@@ -786,6 +979,8 @@ static int unit_conf_handler(
                 sec = SECTION_UNIT;
         else if (strcmp(section, "Service") == 0)
                 sec = SECTION_SERVICE;
+        else if (strcmp(section, "Socket") == 0)
+                sec = SECTION_SOCKET;
         else if (strcmp(section, "Install") == 0)
                 sec = SECTION_INSTALL;
 
@@ -822,6 +1017,11 @@ int unit_parse_file(Unit *u, const char *path) {
          */
         if (r == 0 && u->type == UNIT_SERVICE)
                 r = service_verify(SERVICE(u));
+        else if (r == 0 && u->type == UNIT_SOCKET)
+                /* Gated on r == 0 for the same reason as service_verify()
+                 * above (75193d4128, see socket.c's header): this must never
+                 * run against a stub or errored unit. */
+                r = socket_verify_and_pair(SOCKET(u));
 
         return r;
 }
