@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: 2026 Koen Kooi
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# devd's own unit (plans/31, Part 2). Exactly netd.service's shape, which is
+# the owner decision that put devd outside PID 1 in the first place: a separate
+# supervised daemon whose crash costs a unit restart rather than the machine.
+#
+# Restart=on-failure is what makes that true, and the coldplug walk is what
+# makes it complete -- a restarted devd re-derives every device it missed from
+# /sys, so there is no state to lose. Enablement follows the preset flow like
+# every other unit; this ships WantedBy=default.target and
+# 20-angstrom-pico.preset alone decides whether it is actually enabled.
+
+[Unit]
+Description=pico device hotplug daemon
+
+[Service]
+ExecStart=/usr/sbin/devd
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

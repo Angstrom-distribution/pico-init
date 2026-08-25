@@ -279,6 +279,74 @@ foreach t : netd_tests
   test(t, exe)
 endforeach
 
+# ---------------------------------------------------------------------------
+# devd -- the device hotplug daemon (plans/31, Part 2, milestone H1). A third
+# executable in the same tree, built exactly like netd, and a separate daemon
+# rather than PID 1 code by owner decision: its crash costs a unit restart
+# rather than the machine.
+#
+# It links pico-init-core for two different reasons at once. The event plumbing
+# (timer.c, signal.c, util.c) is the same share netd takes. gpt-scan.c is the
+# other, and is the whole point of that file's two-consumer split: PID 1's
+# boot-time swap activation and devd's removable-media policy read the same
+# partition table through the same parser.
+#
+# 'src/devd' only on the include path, never 'src' -- see netd_includes above
+# for what putting src/ there does to a daemon's own <signal.h>.
+# ---------------------------------------------------------------------------
+devd_includes = include_directories('src/devd')
+
+devd_core_sources = files(
+  'src/devd/devd-loop.c',
+  'src/devd/devd-uevent.c',
+  'src/devd/devd-block.c',
+  'src/devd/devd-probe.c',
+  'src/devd/devd-symlink.c',
+  'src/devd/devd-media.c',
+)
+
+devd_core = static_library(
+  'devd-core',
+  devd_core_sources,
+  include_directories: devd_includes,
+)
+
+devd_exe = executable(
+  'devd',
+  'src/devd/devd.c',
+  include_directories: devd_includes,
+  link_whole: devd_core,
+  link_with: pico_init_core,
+  install: true,
+  install_dir: get_option('sbindir'),
+)
+
+install_data(
+  'src/devd/devd.service',
+  install_dir: get_option('prefix') / 'lib' / 'systemd' / 'system',
+)
+
+# The four acceptance areas H1 is measured against: uevent parsing, the
+# debounce state machine, the GPT/ext4 field extraction, and the symlink
+# create/remove/reconcile lifecycle. Registered up front, same as netd's and
+# PID 1's lists and for the same reason.
+devd_tests = [
+  'test-devd-uevent',
+  'test-devd-block',
+  'test-devd-probe',
+  'test-devd-symlink',
+]
+
+foreach t : devd_tests
+  exe = executable(
+    t,
+    ['src/devd/' + t + '.c'] + pico_test_sources,
+    include_directories: devd_includes,
+    link_with: [devd_core, pico_init_core],
+  )
+  test(t, exe)
+endforeach
+
 # picoctl is defined after logd below, because it links logd's ring reader.
 
 # ---------------------------------------------------------------------------
