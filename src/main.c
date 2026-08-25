@@ -14,6 +14,7 @@
 #include <sys/reboot.h>
 #include <unistd.h>
 
+#include "gpt-scan.h"
 #include "manager.h"
 #include "mount-setup.h"
 #include "status.h"
@@ -117,6 +118,24 @@ int main(void) {
          */
         status_enable();
         status_welcome(NULL);
+
+        /*
+         * Swap, off the partition table alone. Placed here for three separate
+         * reasons rather than by taste: it needs the /proc and /sys that
+         * mount_setup() mounted and the /dev nodes devtmpfs put there, it wants
+         * the kmsg sink already installed so its record survives into logd's
+         * backfill, and swap should exist before the first service does -- on a
+         * 64 MiB machine the units started moments from now are exactly the
+         * ones that would benefit.
+         *
+         * Before manager_new() and not a unit: gpt-scan.h says why the whole
+         * mechanism is a function call.
+         */
+        r = dps_scan();
+        if (r < 0)
+                pico_log(PICO_LOG_WARNING, "dps_scan: %s", strerror(-r));
+        else if (r > 0)
+                pico_log(PICO_LOG_DEBUG, "dps_scan: %d discovered swap partition(s) activated", r);
 
         r = manager_new(&m);
         if (r < 0) {

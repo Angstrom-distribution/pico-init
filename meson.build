@@ -43,6 +43,10 @@ pico_init_core_sources = files(
   'src/manager-shutdown.c',
   'src/manager-startup.c',
   'src/mount-setup.c',
+  # The GPT reader and the Discoverable-Partitions swap activation on top of
+  # it (plans/31, Slice A). In the core library rather than beside main.c
+  # because the parser half is meant to have a second consumer later.
+  'src/gpt-scan.c',
   'src/unit.c',
   'src/unit-load.c',
   'src/conf-scan.c',
@@ -129,6 +133,9 @@ pico_tests = [
   # The boot console channel: the os-release parser behind the greeting, and
   # the byte-level shape of what lands on the console.
   'test-status',
+  # The GPT reader (plans/31, Slice A), against real partition tables built
+  # byte by byte in the test itself.
+  'test-gpt-scan',
 ]
 
 foreach t : pico_tests
