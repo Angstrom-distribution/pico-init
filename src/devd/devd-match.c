@@ -182,7 +182,8 @@ int devd_rule_device_from_uevent(
 /* Read <path> and return the basename of what it points at. 1/0/-errno. */
 static int link_basename(const char *path, char *ret, size_t size) {
         char target[PATH_MAX];
-        const char *slash;
+        const char *slash, *base;
+        size_t len;
         ssize_t k;
 
         k = readlink(path, target, sizeof(target) - 1);
@@ -192,9 +193,19 @@ static int link_basename(const char *path, char *ret, size_t size) {
         target[k] = '\0';
 
         slash = strrchr(target, '/');
-        if ((size_t) snprintf(ret, size, "%s", slash ? slash + 1 : target) >= size)
+        base = slash ? slash + 1 : target;
+
+        /* strlen()+memcpy() rather than snprintf(), even though the truncation
+         * IS detected either way. -Wformat-truncation looks through the inline
+         * to the caller, and this function's one caller discards the result --
+         * on purpose, because an unreadable `subsystem` link just leaves
+         * d->subsystem empty. Not reproducible on an -O0 host gate: the
+         * diagnostic needs optimisation to run at all. */
+        len = strlen(base);
+        if (len >= size)
                 return -ENAMETOOLONG;
 
+        memcpy(ret, base, len + 1);
         return 1;
 }
 

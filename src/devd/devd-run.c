@@ -90,10 +90,23 @@ int devd_run_split(const char *cmd, char argv[][DEVD_RUN_ARG_MAX], size_t max) {
 
 static void child_record(DevdRun *r, pid_t pid, const char *path) {
         const char *slash = strrchr(path, '/');
+        const char *base = slash ? slash + 1 : path;
         DevdRunChild *c = &r->children[r->n_children++];
+        size_t len = strlen(base);
+
+        /* Clamped, not checked: this name is only ever printed on the exit
+         * line, so a truncated one costs a vaguer log record and nothing else
+         * -- unlike the paths d55275e had to make fail closed, which named a
+         * different file when they truncated. Written as a memcpy rather than
+         * an ignored snprintf() so -Wformat-truncation, which needs
+         * optimisation to run and so never fires on an -O0 host gate, has
+         * nothing to say about it. */
+        if (len >= sizeof(c->name))
+                len = sizeof(c->name) - 1;
 
         c->pid = pid;
-        (void) snprintf(c->name, sizeof(c->name), "%s", slash ? slash + 1 : path);
+        memcpy(c->name, base, len);
+        c->name[len] = '\0';
 }
 
 int devd_run_spawn(DevdRun *r, const char *cmd, char * const *env) {
