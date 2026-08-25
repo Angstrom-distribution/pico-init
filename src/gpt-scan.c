@@ -62,14 +62,16 @@ enum {
 };
 
 /* And inside one partition entry. The UTF-16LE name occupies the remaining 72
- * bytes of a 128-byte entry; nothing here decodes it, because the partition
- * label belongs to the symlink consumer this file does not have yet. */
+ * bytes of a 128-byte entry -- 36 code units, decoded by gpt_name_to_utf8()
+ * below for devd's by-partlabel links and its /media/<partlabel> mount points. */
 enum {
         GPT_E_TYPE = 0,
         GPT_E_UUID = 16,
         GPT_E_FIRST_LBA = 32,
         GPT_E_LAST_LBA = 40,
         GPT_E_ATTRIBUTES = 48,
+        GPT_E_NAME = 56,
+        GPT_E_NAME_UNITS = 36,
         GPT_E_MIN_SIZE = 128,
 };
 
@@ -156,6 +158,78 @@ char *gpt_guid_to_string(const GptGuid *guid, char buf[static GPT_GUID_STRING_MA
                  b[15]);
 
         return buf;
+}
+
+/*
+ * Decode an entry's UTF-16LE name field into `ret` as UTF-8, stopping at the
+ * first NUL code unit or at the end of the 36-unit field.
+ *
+ * A name is data off a disk like every other field here, and a decoder is the
+ * usual place that goes wrong: a low surrogate with no high half in front of
+ * it, a high surrogate as the very last unit of the field, a pair that does not
+ * pair. Every one of those is dropped rather than emitted, so what comes out is
+ * always valid UTF-8 and always terminated -- and a name none of it survives
+ * comes back as "", which every caller already has to handle for the unnamed
+ * partitions that are the common case anyway.
+ */
+static void gpt_name_to_utf8(const uint8_t *field, char ret[static GPT_PARTITION_NAME_MAX]) {
+        size_t out = 0, i;
+
+        for (i = 0; i < GPT_E_NAME_UNITS; i++) {
+                uint32_t c = (uint32_t) field[i * 2] | ((uint32_t) field[i * 2 + 1] << 8);
+                size_t len;
+
+                if (c == 0)
+                        break;
+
+                if (c >= 0xdc00 && c <= 0xdfff)
+                        continue;
+
+                if (c >= 0xd800 && c <= 0xdbff) {
+                        uint32_t lo;
+
+                        if (i + 1 >= GPT_E_NAME_UNITS)
+                                break;
+
+                        lo = (uint32_t) field[(i + 1) * 2] | ((uint32_t) field[(i + 1) * 2 + 1] << 8);
+                        if (lo < 0xdc00 || lo > 0xdfff)
+                                continue;
+
+                        c = 0x10000 + ((c - 0xd800) << 10) + (lo - 0xdc00);
+                        i++;
+                }
+
+                len = c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
+
+                /* Cannot trigger for a 36-unit field (108 bytes at worst, one
+                 * under the buffer), and checked anyway: the bound is what
+                 * makes that arithmetic a fact rather than a belief. */
+                if (out + len >= GPT_PARTITION_NAME_MAX)
+                        break;
+
+                switch (len) {
+                case 1:
+                        ret[out++] = (char) c;
+                        break;
+                case 2:
+                        ret[out++] = (char) (0xc0 | (c >> 6));
+                        ret[out++] = (char) (0x80 | (c & 0x3f));
+                        break;
+                case 3:
+                        ret[out++] = (char) (0xe0 | (c >> 12));
+                        ret[out++] = (char) (0x80 | ((c >> 6) & 0x3f));
+                        ret[out++] = (char) (0x80 | (c & 0x3f));
+                        break;
+                default:
+                        ret[out++] = (char) (0xf0 | (c >> 18));
+                        ret[out++] = (char) (0x80 | ((c >> 12) & 0x3f));
+                        ret[out++] = (char) (0x80 | ((c >> 6) & 0x3f));
+                        ret[out++] = (char) (0x80 | (c & 0x3f));
+                        break;
+                }
+        }
+
+        ret[out] = '\0';
 }
 
 /*
@@ -347,14 +421,26 @@ static bool gpt_guid_is_null(const GptGuid *guid) {
         return memcmp(guid, &null_guid, sizeof(GptGuid)) == 0;
 }
 
-int gpt_scan(const char *device, const GptGuid *type, GptPartition **ret, size_t *ret_n) {
+/*
+ * The one scan, behind both entry points.
+ *
+ * `type` NULL means "every used entry", which is also when `skip_no_auto` is
+ * false: the two knobs move together because they express one distinction --
+ * gpt_scan() answers "what should be acted on automatically", gpt_scan_all()
+ * answers "what is on this disk". Keeping them as parameters of one function
+ * rather than two copies of the header/CRC/entry-array walk is the point; that
+ * walk is where every range check lives and it should exist exactly once.
+ */
+static int gpt_scan_internal(
+                const char *device, const GptGuid *type, bool skip_no_auto, GptPartition **ret, size_t *ret_n) {
+
         GptPartition *found = NULL;
         uint8_t *array = NULL;
         GptHeader h;
         size_t n = 0, pass;
         int fd, r;
 
-        if (!device || !type || !ret || !ret_n)
+        if (!device || !ret || !ret_n)
                 return -EINVAL;
 
         fd = open(device, O_RDONLY | O_CLOEXEC);
@@ -401,12 +487,12 @@ int gpt_scan(const char *device, const GptGuid *type, GptPartition **ret, size_t
                         if (gpt_guid_is_null(&t))
                                 continue;
 
-                        if (memcmp(&t, type, sizeof(GptGuid)) != 0)
+                        if (type && memcmp(&t, type, sizeof(GptGuid)) != 0)
                                 continue;
 
                         attributes = gpt_le64(e + GPT_E_ATTRIBUTES);
 
-                        if (attributes & GPT_ATTR_NO_AUTO) {
+                        if (skip_no_auto && (attributes & GPT_ATTR_NO_AUTO)) {
                                 if (pass == 0)
                                         pico_log(PICO_LOG_INFO,
                                                  "%s: partition %zu matches but is marked no-auto, skipping it",
@@ -422,6 +508,7 @@ int gpt_scan(const char *device, const GptGuid *type, GptPartition **ret, size_t
                                 found[n].first_lba = gpt_le64(e + GPT_E_FIRST_LBA);
                                 found[n].last_lba = gpt_le64(e + GPT_E_LAST_LBA);
                                 found[n].attributes = attributes;
+                                gpt_name_to_utf8(e + GPT_E_NAME, found[n].name);
                         }
 
                         n++;
@@ -445,6 +532,17 @@ int gpt_scan(const char *device, const GptGuid *type, GptPartition **ret, size_t
         *ret_n = n;
 
         return 1;
+}
+
+int gpt_scan(const char *device, const GptGuid *type, GptPartition **ret, size_t *ret_n) {
+        if (!type)
+                return -EINVAL;
+
+        return gpt_scan_internal(device, type, true, ret, ret_n);
+}
+
+int gpt_scan_all(const char *device, GptPartition **ret, size_t *ret_n) {
+        return gpt_scan_internal(device, NULL, false, ret, ret_n);
 }
 
 /*

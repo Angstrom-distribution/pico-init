@@ -19,9 +19,9 @@
  *
  * Two halves live in this file, and the seam between them is deliberate:
  *
- *  - gpt_scan() and its helpers are the parser, and are the reusable half. The
- *    hotplug daemon this project has scoped but not built (plans/31, Part 2)
- *    is the second consumer, for removable-media policy and for the
+ *  - gpt_scan()/gpt_scan_all() and their helpers are the parser, and are the
+ *    reusable half. devd (plans/31, Part 2, milestone H1) is the second
+ *    consumer, for removable-media policy and for the
  *    /dev/disk/by-partuuid|by-partlabel families that come out of the same
  *    entry this already reads.
  *  - dps_scan() is PID 1's own boot-time consumer: find the boot disk, find the
@@ -52,6 +52,13 @@ typedef struct GptGuid {
 
 /* "0657fd6d-a4ab-43c4-84e5-0933c84b4f4f" plus its NUL. */
 #define GPT_GUID_STRING_MAX 37
+
+/*
+ * A partition name (udev's PARTLABEL) decoded to UTF-8, plus its NUL. The name
+ * field is the last 72 bytes of a 128-byte entry, so 36 UTF-16 code units; the
+ * worst case is 36 non-surrogate code points at three UTF-8 bytes each.
+ */
+#define GPT_PARTITION_NAME_MAX 109
 
 /*
  * The Discoverable Partitions Specification's Linux swap type,
@@ -89,6 +96,14 @@ typedef struct GptPartition {
         uint64_t first_lba;
         uint64_t last_lba;
         uint64_t attributes;
+
+        /*
+         * The entry's UTF-16LE name, decoded to UTF-8; "" when the partition
+         * has none. Inline rather than a pointer so a GptPartition array stays
+         * one allocation the caller frees with one free() -- the same reason
+         * every other field here is by value.
+         */
+        char name[GPT_PARTITION_NAME_MAX];
 } GptPartition;
 
 /*
@@ -109,6 +124,19 @@ typedef struct GptPartition {
  * point rather than a flag here.
  */
 int gpt_scan(const char *device, const GptGuid *type, GptPartition **ret, size_t *ret_n);
+
+/*
+ * The entry point the comment above promises: every used entry of `device`'s
+ * table, whatever its type, no-auto ones included and flagged rather than
+ * dropped. Same return convention and same ownership as gpt_scan().
+ *
+ * devd wants this and gpt_scan() does not fit it. A hotplug daemon has to name
+ * every partition it sees (by-partuuid, by-partlabel) before it decides what to
+ * do with any of them, and it has to see a no-auto partition in order to
+ * deliberately not mount it -- a search that silently drops entries can only
+ * answer questions about one type at a time.
+ */
+int gpt_scan_all(const char *device, GptPartition **ret, size_t *ret_n);
 
 /* Format `guid` into `buf` in the canonical 8-4-4-4-12 spelling. Returns buf. */
 char *gpt_guid_to_string(const GptGuid *guid, char buf[static GPT_GUID_STRING_MAX]);

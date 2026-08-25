@@ -160,6 +160,18 @@ static void
         put_le64(e + 48, attributes);
 }
 
+/*
+ * Write an entry's UTF-16LE name field, at offset 56 of the 128-byte entry.
+ * ASCII only in the helper; the non-ASCII and surrogate cases below poke the
+ * code units in directly, since that is the whole point of testing a decoder.
+ */
+static void entry_name_write(uint8_t *disk, unsigned nr, const char *name) {
+        uint8_t *e = entries_of(disk) + (nr - 1) * FIX_ENTRY_SIZE;
+
+        for (size_t i = 0; i < 36 && name[i]; i++)
+                e[56 + i * 2] = (uint8_t) name[i];
+}
+
 /* Recompute the header's own checksum over its declared size, with the CRC
  * field zeroed -- the format's own rule, and the step every corruption case
  * below either repeats (to test something other than the CRC) or skips (to test
@@ -219,6 +231,20 @@ static int scan_image(const uint8_t *disk, size_t size, const GptGuid *type, Gpt
 
         dir = disk_fixture(disk, size, path, sizeof(path));
         r = gpt_scan(path, type, ret, ret_n);
+        test_rm_rf(dir);
+        free(dir);
+
+        return r;
+}
+
+/* The same, through the enumerate-everything entry point devd uses. */
+static int scan_all_image(const uint8_t *disk, size_t size, GptPartition **ret, size_t *ret_n) {
+        char path[PATH_MAX];
+        char *dir;
+        int r;
+
+        dir = disk_fixture(disk, size, path, sizeof(path));
+        r = gpt_scan_all(path, ret, ret_n);
         test_rm_rf(dir);
         free(dir);
 
@@ -566,6 +592,127 @@ static void test_boot_disk(void) {
         }
 }
 
+/*
+ * gpt_scan_all(): every used entry, whatever its type, no-auto ones included
+ * and flagged rather than dropped.
+ *
+ * The two differences from gpt_scan() are exactly what devd needs and exactly
+ * what a type-filtered search cannot give it. It has to name every partition it
+ * sees before deciding what to do with any of them, and it has to be able to
+ * SEE a no-auto partition in order to deliberately not mount it -- an entry
+ * silently dropped by the parser is one the daemon cannot decline.
+ */
+static void test_scan_all(void) {
+        GptPartition *parts = NULL;
+        size_t n = 0;
+        uint8_t *disk;
+
+        disk = disk_root_and_swap(GPT_ATTR_NO_AUTO);
+        entry_name_write(disk, 1, "rootfs");
+        entry_name_write(disk, 2, "swap");
+        gpt_finalize(disk);
+
+        ASSERT_EQ_INT(scan_all_image(disk, FIX_SIZE, &parts, &n), 1);
+        ASSERT_EQ_INT(n, 2);
+
+        ASSERT_EQ_INT(parts[0].nr, 1);
+        ASSERT_STREQ(parts[0].name, "rootfs");
+        ASSERT_EQ_INT(parts[0].attributes, 0);
+
+        /* The no-auto partition gpt_scan() would have dropped, present with
+         * the bit still set for the caller to act on. */
+        ASSERT_EQ_INT(parts[1].nr, 2);
+        ASSERT_STREQ(parts[1].name, "swap");
+        ASSERT_TRUE((parts[1].attributes & GPT_ATTR_NO_AUTO) != 0);
+
+        free(parts);
+        free(disk);
+
+        /* A disk with no table answers 0 here too, rather than differently
+         * from gpt_scan() -- devd's "no GPT, leave it alone" path depends on
+         * the two agreeing. */
+        disk = disk_new();
+        ASSERT_EQ_INT(scan_all_image(disk, FIX_SIZE, &parts, &n), 0);
+        ASSERT_EQ_INT(n, 0);
+        ASSERT_TRUE(parts == NULL);
+        free(disk);
+}
+
+/*
+ * The partition-name decoder, which is the field /dev/disk/by-partlabel and
+ * /media/<partlabel> are both built out of.
+ *
+ * UTF-16LE in, UTF-8 out, and the interesting cases are all the ones a disk can
+ * carry but a well-formed name cannot: a lone low surrogate, a high surrogate
+ * with nothing after it, a name filling the field with no terminator. Every one
+ * of those has to produce valid UTF-8 or nothing, because what comes out is
+ * used as a path component.
+ */
+static void test_partition_name(void) {
+        GptPartition *parts = NULL;
+        uint8_t *disk, *e;
+        size_t n = 0;
+
+        disk = disk_root_and_swap(0);
+        e = entries_of(disk);
+
+        /* Entry 1: "Ångström" -- two-byte and three-byte UTF-8 output from
+         * plain BMP code units, which is the ordinary non-ASCII case. */
+        {
+                static const uint16_t units[] = { 0x00c5, 'n', 'g', 's', 't', 'r', 0x00f6, 'm', 0 };
+
+                for (size_t i = 0; units[i]; i++) {
+                        e[56 + i * 2] = (uint8_t) (units[i] & 0xff);
+                        e[56 + i * 2 + 1] = (uint8_t) (units[i] >> 8);
+                }
+        }
+
+        /* Entry 2: a surrogate pair (U+1F4BE) followed by a lone low
+         * surrogate, which must be dropped rather than emitted. */
+        {
+                static const uint16_t units[] = { 0xd83d, 0xdcbe, 0xdc00, 'x', 0 };
+                uint8_t *e2 = e + FIX_ENTRY_SIZE;
+
+                for (size_t i = 0; units[i]; i++) {
+                        e2[56 + i * 2] = (uint8_t) (units[i] & 0xff);
+                        e2[56 + i * 2 + 1] = (uint8_t) (units[i] >> 8);
+                }
+        }
+
+        gpt_finalize(disk);
+
+        ASSERT_EQ_INT(scan_all_image(disk, FIX_SIZE, &parts, &n), 1);
+        ASSERT_EQ_INT(n, 2);
+        ASSERT_STREQ(parts[0].name, "\xc3\x85ngstr\xc3\xb6m");
+        ASSERT_STREQ(parts[1].name, "\xf0\x9f\x92\xbex");
+
+        free(parts);
+        free(disk);
+
+        /* A name filling all 36 code units, with no terminator in the field --
+         * legal on disk, and the case a decoder that trusts a NUL walks off
+         * the end of. */
+        disk = disk_root_and_swap(0);
+
+        for (size_t i = 0; i < 36; i++)
+                entries_of(disk)[56 + i * 2] = 'A';
+
+        gpt_finalize(disk);
+
+        ASSERT_EQ_INT(scan_all_image(disk, FIX_SIZE, &parts, &n), 1);
+        ASSERT_EQ_INT(strlen(parts[0].name), 36);
+
+        free(parts);
+        free(disk);
+
+        /* An unnamed partition is "", not a link name nobody asked for. */
+        disk = disk_root_and_swap(0);
+        ASSERT_EQ_INT(scan_all_image(disk, FIX_SIZE, &parts, &n), 1);
+        ASSERT_STREQ(parts[0].name, "");
+        free(parts);
+        free(disk);
+}
+
 int main(void) {
         test_crc32();
         test_guid_string();
@@ -576,6 +723,8 @@ int main(void) {
         test_corrupt_header();
         test_missing_device();
         test_boot_disk();
+        test_scan_all();
+        test_partition_name();
 
         printf("test-gpt-scan: all checks passed\n");
         return 0;
