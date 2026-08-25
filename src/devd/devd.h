@@ -27,17 +27,32 @@
  * socket seam exists (src/manager-ctrl.h) for the day something wants unit-
  * shaped visibility into a device; nothing here needs it.
  *
- * What is deliberately NOT here: the udev-rules engine (H2, the next
- * milestone), MBR/FAT probing (v1 is GPT-prepared media only), by-path links,
- * and DPS swap activation -- which stays in PID 1's boot-time dps_scan()
- * precisely because it is scoped to the boot disk, and moving it here would
- * only make swap arrive later for no gain.
+ * H2 adds the third reaction, and it is the one devd does not decide itself:
+ *
+ *  - any device at all appears or disappears -> run the udev rules files
+ *    /usr/lib/udev/rules.d and friends really contain, and do what they say --
+ *    node permissions, alias symlinks, and starting a tool.
+ *
+ * That milestone exists because a consumer was already on the image and inert:
+ * usb-modeswitch's 421-rule file, its dispatcher wrapper and its binary all
+ * ship, and nothing has been firing them since eudev was removed. devd consumes
+ * that file unmodified rather than a translated copy -- see devd-rules.h for
+ * the subset, and for the one semantic (skip a rule whole, never clause by
+ * clause) that keeps a partly-understood file from matching more than its
+ * author meant.
+ *
+ * What is deliberately NOT here: MBR/FAT probing (v1 is GPT-prepared media
+ * only), by-path links, and DPS swap activation -- which stays in PID 1's
+ * boot-time dps_scan() precisely because it is scoped to the boot disk, and
+ * moving it here would only make swap arrive later for no gain.
  *
  * Implemented across devd.c (main), devd-loop.c (the object lifecycle, the
  * epoll loop, startup, coldplug and the reactions), devd-uevent.c (the netlink
  * listener and its parser), devd-block.c (the debounce state machine),
  * devd-probe.c (the ext superblock and by-id sysfs reads), devd-symlink.c (the
- * by-* families) and devd-media.c (the mount policy).
+ * by-* families and the links rules name), devd-media.c (the mount policy),
+ * devd-rules.c (the rules parser), devd-match.c (what a rule means) and
+ * devd-run.c (the RUN+= child).
  */
 
 #pragma once
@@ -50,6 +65,9 @@
 #include "../util.h"
 #include "devd-block.h"
 #include "devd-loop.h"
+#include "devd-match.h"
+#include "devd-rules.h"
+#include "devd-run.h"
 
 typedef struct Devd Devd;
 
@@ -73,6 +91,29 @@ typedef struct DevdMount {
         char devname[DEVD_NAME_MAX];
         char dir[DEVD_MOUNT_PATH_MAX];
 } DevdMount;
+
+/*
+ * Where the coldplug walk looks, relative to sys_root. /sys/class/block is the
+ * block core's own; /sys/bus/usb/devices is what the rule engine needs, because
+ * a modem or a HID-proxy dongle already attached at boot needs its mode switch
+ * as much as one plugged in later does. Deliberately still far short of the
+ * every-subsystem uevent-file replay a full device manager does.
+ */
+#define DEVD_COLDPLUG_BLOCK "class/block"
+#define DEVD_COLDPLUG_USB "bus/usb/devices"
+
+/*
+ * One symlink a SYMLINK+= rule made, remembered so it can be removed when the
+ * device goes. Bounded like every other table here; over the bound the link is
+ * still created and simply not tracked, which is what coldplug's dangling sweep
+ * is the backstop for.
+ */
+#define DEVD_MAX_RULE_LINKS 32
+
+typedef struct DevdRuleLink {
+        char devname[DEVD_NAME_MAX];
+        char path[DEVD_RULE_LINK_MAX];
+} DevdRuleLink;
 
 typedef enum DevdObjective {
         DEVD_RUNNING,
@@ -105,9 +146,24 @@ struct Devd {
         PicoTimerEvent *settle_event;
         usec_t settle_at;
 
+        /* --- the rule engine (devd-rules.c, devd-match.c, devd-run.c) --- */
+        DevdRuleSet *rules;
+        DevdRun run;
+
+        /*
+         * One reusable device context rather than one per event. It is about
+         * eleven kilobytes -- the property table dominates -- which is a large
+         * stack frame to build and tear down on every uevent of a coldplug
+         * burst, and there is never more than one event in flight.
+         */
+        DevdRuleDevice *rule_device;
+
         /* --- what has been done --- */
         DevdMount mounts[DEVD_MAX_MOUNTS];
         size_t n_mounts;
+
+        DevdRuleLink rule_links[DEVD_MAX_RULE_LINKS];
+        size_t n_rule_links;
 
         /*
          * The whole-disk device the root filesystem is on, or "" when the root

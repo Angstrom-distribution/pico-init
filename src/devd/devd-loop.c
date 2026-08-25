@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "../gpt-scan.h"
@@ -40,6 +41,15 @@
 #include "devd-uevent.h"
 
 #define DEVD_EPOLL_MAX_EVENTS 8
+
+/* Where OWNER= and GROUP= names are resolved. Numeric values never reach
+ * these, which is what makes both keys work on an image that has neither
+ * file -- the state every pico image is in today. */
+#define DEVD_PASSWD_PATH "/etc/passwd"
+#define DEVD_GROUP_PATH "/etc/group"
+
+/* How many SYMLINK+= directories the coldplug sweep will look at. */
+#define DEVD_RULE_SYMLINK_DIRS_MAX 8
 
 /* --- object lifecycle --- */
 
@@ -75,6 +85,17 @@ int devd_new(Devd **ret) {
         d->settle_at = USEC_INFINITY;
 
         devd_block_init(&d->block, 0, 0);
+        devd_run_init(&d->run);
+
+        r = devd_ruleset_new(&d->rules);
+        if (r < 0)
+                goto fail;
+
+        d->rule_device = calloc(1, sizeof(*d->rule_device));
+        if (!d->rule_device) {
+                r = -ENOMEM;
+                goto fail;
+        }
 
         r = set_string(&d->sys_root, DEVD_SYS_ROOT);
         if (r < 0)
@@ -130,6 +151,16 @@ Devd *devd_free(Devd *d) {
 
         d->timer = pico_timer_free(d->timer);
         d->signal = pico_signal_free(d->signal);
+
+        /*
+         * RUN+= children are left running, for the same reason the mounts are
+         * left mounted: devd stopping is not the device going away, and killing
+         * a usb_modeswitch halfway through a control transfer is how a modem
+         * ends up in neither mode. They are reparented to PID 1, which reaps
+         * them; devd's own next start starts from an empty table.
+         */
+        d->rules = devd_ruleset_free(d->rules);
+        free(d->rule_device);
 
         if (d->epoll_fd >= 0)
                 (void) close(d->epoll_fd);
@@ -195,6 +226,160 @@ static void mount_forget(Devd *d, const char *devname) {
                         d->n_mounts--;
                         return;
                 }
+}
+
+/* --- the rule engine's reaction --- */
+
+static void rule_link_record(Devd *d, const char *devname, const char *link) {
+        DevdRuleLink *l;
+
+        /* Keyed on the path, not the pair: the same link name arriving for a
+         * different device means devd_symlink_create_named() just repointed it,
+         * and the record has to follow -- otherwise removing the old device
+         * would unlink a link that now names the new one. */
+        for (size_t i = 0; i < d->n_rule_links; i++)
+                if (strcmp(d->rule_links[i].path, link) == 0) {
+                        if (strlen(devname) < sizeof(d->rule_links[i].devname))
+                                strcpy(d->rule_links[i].devname, devname);
+
+                        return;
+                }
+
+        if (d->n_rule_links >= DEVD_MAX_RULE_LINKS) {
+                pico_log(PICO_LOG_WARNING,
+                         "devd: tracking %d rule symlinks already, %s will only be cleaned up at coldplug",
+                         DEVD_MAX_RULE_LINKS,
+                         link);
+                return;
+        }
+
+        l = &d->rule_links[d->n_rule_links];
+
+        if (strlen(devname) >= sizeof(l->devname) || strlen(link) >= sizeof(l->path))
+                return;
+
+        strcpy(l->devname, devname);
+        strcpy(l->path, link);
+        d->n_rule_links++;
+}
+
+/* Every rule symlink devd made for `devname`, gone. */
+static void rule_links_drop(Devd *d, const char *devname) {
+        for (size_t i = 0; i < d->n_rule_links;)
+                if (strcmp(d->rule_links[i].devname, devname) == 0) {
+                        int r = devd_symlink_remove_named(d->dev_root, d->rule_links[i].path);
+
+                        if (r < 0)
+                                pico_log(PICO_LOG_WARNING,
+                                         "devd: cannot remove %s: %s",
+                                         d->rule_links[i].path,
+                                         strerror(-r));
+
+                        memmove(&d->rule_links[i],
+                                &d->rule_links[i + 1],
+                                (d->n_rule_links - i - 1) * sizeof(d->rule_links[0]));
+                        d->n_rule_links--;
+                } else
+                        i++;
+}
+
+/* MODE=/OWNER=/GROUP= against the device node itself. */
+static void rule_apply_perms(Devd *d, const DevdRuleDevice *dev, const DevdRuleResult *res) {
+        char node[PATH_MAX];
+        unsigned uid, gid;
+        bool chown_it = false;
+        int r;
+
+        if ((size_t) snprintf(node, sizeof(node), "%s/%s", d->dev_root, dev->devname) >= sizeof(node))
+                return;
+
+        if (res->have_mode && chmod(node, (mode_t) res->mode) < 0)
+                pico_log(PICO_LOG_WARNING, "devd: cannot chmod %s: %s", node, strerror(errno));
+
+        /* -1 leaves that half alone, which is what makes OWNER= without
+         * GROUP= (and the other way round) mean what it says. */
+        uid = (unsigned) -1;
+        gid = (unsigned) -1;
+
+        if (res->owner[0] != '\0') {
+                r = devd_rules_lookup_id(DEVD_PASSWD_PATH, res->owner, &uid);
+                if (r > 0)
+                        chown_it = true;
+                else
+                        pico_log(PICO_LOG_WARNING, "devd: no such user as %s, %s left alone", res->owner, node);
+        }
+
+        if (res->group[0] != '\0') {
+                r = devd_rules_lookup_id(DEVD_GROUP_PATH, res->group, &gid);
+                if (r > 0)
+                        chown_it = true;
+                else
+                        pico_log(PICO_LOG_WARNING, "devd: no such group as %s, %s left alone", res->group, node);
+        }
+
+        if (chown_it && chown(node, (uid_t) uid, (gid_t) gid) < 0)
+                pico_log(PICO_LOG_WARNING, "devd: cannot chown %s: %s", node, strerror(errno));
+}
+
+/*
+ * Run the ruleset over one device and carry out what it decided.
+ *
+ * The remove case is split out rather than folded in, and the split is the
+ * substance: on a remove the node is already gone, so permissions and new
+ * symlinks are meaningless and the links devd made for it are what has to
+ * happen. RUN+= still fires -- a rule that wants to hear about a device
+ * leaving is a rule, not a mistake.
+ */
+static void devd_rules_react(Devd *d, DevdRuleDevice *dev) {
+        DevdRuleResult res;
+        bool removing;
+        char **env = NULL;
+
+        if (!d->rules || d->rules->n_rules == 0)
+                return;
+
+        if (devd_rules_apply(d->rules, dev, &res) < 0)
+                return;
+
+        removing = strcmp(dev->action, "remove") == 0;
+
+        if (removing && dev->devname[0] != '\0')
+                rule_links_drop(d, dev->devname);
+
+        if (res.n_matched == 0)
+                return;
+
+        if (!removing && dev->devname[0] != '\0') {
+                if (res.have_mode || res.owner[0] != '\0' || res.group[0] != '\0')
+                        rule_apply_perms(d, dev, &res);
+
+                for (size_t i = 0; i < res.n_symlinks; i++) {
+                        int r = devd_symlink_create_named(d->dev_root, dev->devname, res.symlinks[i]);
+
+                        if (r < 0) {
+                                pico_log(PICO_LOG_WARNING,
+                                         "devd: cannot link %s -> %s: %s",
+                                         res.symlinks[i],
+                                         dev->devname,
+                                         strerror(-r));
+                                continue;
+                        }
+
+                        rule_link_record(d, dev->devname, res.symlinks[i]);
+                        pico_log(PICO_LOG_INFO, "devd: %s -> %s", res.symlinks[i], dev->devname);
+                }
+        }
+
+        if (res.n_runs == 0)
+                return;
+
+        if (devd_rules_environment(dev, &env) < 0)
+                return;
+
+        for (size_t i = 0; i < res.n_runs; i++)
+                (void) devd_run_spawn(&d->run, res.runs[i], env);
+
+        pico_strv_free(env);
 }
 
 /* --- sysfs lookups --- */
@@ -464,6 +649,16 @@ static void devd_process_uevent(Devd *d, const DevdUevent *u) {
         const char *disk = NULL, *part = NULL;
         int r;
 
+        /*
+         * The rules first, and for every subsystem rather than only for block:
+         * usb-modeswitch's whole file matches USB devices, which the block core
+         * below has no opinion about at all. The two reactions are independent
+         * -- a rule can name a symlink for a disk while the block core mounts
+         * it -- so neither waits for the other.
+         */
+        if (devd_rule_device_from_uevent(d->rule_device, d->sys_root, d->dev_root, u) == 0)
+                devd_rules_react(d, d->rule_device);
+
         r = devd_block_event(&d->block, u, now_monotonic(), &outcome, &disk, &part);
         if (r < 0) {
                 pico_log(PICO_LOG_DEBUG, "devd: unusable block uevent for %s", u->devpath);
@@ -526,6 +721,70 @@ static int coldplug_uevent(const Devd *d, const char *name, DevdUevent *u) {
 }
 
 /*
+ * Run the rules over everything already sitting under <sys_root>/<subdir>.
+ *
+ * The entries are usually symlinks into /sys/devices, so each is resolved
+ * first: a rule's ATTRS{} walk goes up parent directories, and the parents of
+ * /sys/class/block/sda are class/ and sys/, not the USB device it is plugged
+ * into.
+ */
+static void coldplug_rules_walk(Devd *d, const char *subdir) {
+        char dir[PATH_MAX];
+        struct dirent *e;
+        DIR *dd;
+
+        if (!d->rules || d->rules->n_rules == 0)
+                return;
+
+        if ((size_t) snprintf(dir, sizeof(dir), "%s/%s", d->sys_root, subdir) >= sizeof(dir))
+                return;
+
+        dd = opendir(dir);
+        if (!dd)
+                return;
+
+        while ((e = readdir(dd))) {
+                char link[PATH_MAX], real[PATH_MAX];
+
+                if (e->d_name[0] == '.')
+                        continue;
+
+                if ((size_t) snprintf(link, sizeof(link), "%s/%s", dir, e->d_name) >= sizeof(link))
+                        continue;
+
+                if (!realpath(link, real))
+                        continue;
+
+                if (devd_rule_device_from_sysfs(d->rule_device, d->sys_root, d->dev_root, real, "add") < 0)
+                        continue;
+
+                devd_rules_react(d, d->rule_device);
+        }
+
+        (void) closedir(dd);
+}
+
+/* Drop rule-made symlinks whose device is gone, the H2 counterpart of
+ * devd_symlink_reconcile(). Which directories to look in comes from the rules
+ * themselves, so this stays true for a rules file nobody here wrote. */
+static void coldplug_sweep_rule_links(Devd *d) {
+        char dirs[DEVD_RULE_SYMLINK_DIRS_MAX][DEVD_RULE_VALUE_MAX];
+        size_t n;
+
+        if (!d->rules)
+                return;
+
+        n = devd_ruleset_symlink_dirs(d->rules, dirs, DEVD_RULE_SYMLINK_DIRS_MAX);
+
+        for (size_t i = 0; i < n; i++) {
+                int r = devd_symlink_sweep_dangling(d->dev_root, dirs[i]);
+
+                if (r > 0)
+                        pico_log(PICO_LOG_INFO, "devd: removed %d stale /dev/%s symlink(s)", r, dirs[i]);
+        }
+}
+
+/*
  * The walk. Also the resync path: after an -ENOBUFS the event stream has
  * dropped messages and no amount of reading catches up, but everything those
  * messages would have said is still true of /sys, so redoing this is by
@@ -545,7 +804,14 @@ static int devd_coldplug(Devd *d) {
         else if (r > 0)
                 pico_log(PICO_LOG_INFO, "devd: removed %d stale /dev/disk symlink(s)", r);
 
-        if ((size_t) snprintf(dir, sizeof(dir), "%s/class/block", d->sys_root) >= sizeof(dir))
+        coldplug_sweep_rule_links(d);
+
+        /* Before the block core's own walk, so a rule that renames or
+         * permissions a disk has run by the time it is mounted. */
+        coldplug_rules_walk(d, DEVD_COLDPLUG_BLOCK);
+        coldplug_rules_walk(d, DEVD_COLDPLUG_USB);
+
+        if ((size_t) snprintf(dir, sizeof(dir), "%s/%s", d->sys_root, DEVD_COLDPLUG_BLOCK) >= sizeof(dir))
                 return -ENAMETOOLONG;
 
         dd = opendir(dir);
@@ -620,7 +886,28 @@ int devd_startup(Devd *d) {
         if (!d)
                 return -EINVAL;
 
+        static const char * const rules_dirs[] = {
+                DEVD_RULES_DIR_LIB,
+                DEVD_RULES_DIR_RUN,
+                DEVD_RULES_DIR_ETC,
+                NULL,
+        };
+
         devd_find_boot_disk(d);
+
+        /*
+         * Rules before the socket, because loading them is the one startup step
+         * that can fail on a file rather than on the kernel, and a devd that
+         * discovers that after subscribing has already started buffering events
+         * it may be about to exit over. Zero rules is not a failure: it is what
+         * an image with no rules files installed looks like, and devd is still
+         * the block core.
+         */
+        r = devd_ruleset_load_dirs(d->rules, rules_dirs);
+        if (r < 0)
+                pico_log(PICO_LOG_WARNING, "devd: cannot read the rules directories: %s", strerror(-r));
+        else if (r > 0)
+                pico_log(PICO_LOG_INFO, "devd: %d udev rule(s) loaded, %u skipped", r, d->rules->n_skipped);
 
         /*
          * Subscribe first. See devd.h and devd-uevent.h: a card inserted
@@ -804,6 +1091,14 @@ int devd_loop_dispatch_signal(Devd *d, int signo) {
         case SIGINT:
                 pico_log(PICO_LOG_INFO, "devd: %s, shutting down", strsignal(signo));
                 d->objective = DEVD_EXIT;
+                return 0;
+
+        case SIGCHLD:
+                /* A RUN+= child finished. This is the whole reason those are
+                 * started asynchronously: the loop hears about the exit here,
+                 * on a descriptor it was already watching, instead of standing
+                 * in a wait() while the uevent socket fills up. */
+                (void) devd_run_reap(&d->run);
                 return 0;
 
         default:

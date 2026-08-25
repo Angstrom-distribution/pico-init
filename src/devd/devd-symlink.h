@@ -86,3 +86,34 @@ int devd_symlink_remove(const char *dev_root, const char *devname);
  * happens to come back. Returns the number removed, or -errno.
  */
 int devd_symlink_reconcile(const char *dev_root);
+
+/*
+ * The same three operations for a link a SYMLINK+= rule named (H2), where the
+ * path is whatever the rule said rather than one of the five known families.
+ *
+ * `link` is relative to `dev_root` and may name directories that do not exist
+ * yet -- `serial/by-id/usb-FTDI_...` is the case this exists for. It may not
+ * contain a `..` component or start with a slash: a rules file is data, devd
+ * reads it as root, and a symlink name is the one field in it that turns into a
+ * path.
+ *
+ * The relative target is computed from the link's own depth, so a link two
+ * directories down points at `../../<devname>` -- the same relative form the
+ * by-* families use, and for the same reason.
+ */
+int devd_symlink_create_named(const char *dev_root, const char *devname, const char *link);
+
+/* Remove one such link, and any directory it leaves empty below dev_root. 0,
+ * or -errno; a link that is not there is not an error. */
+int devd_symlink_remove_named(const char *dev_root, const char *link);
+
+/*
+ * Remove every dangling symlink under <dev_root>/<subdir>, recursively.
+ *
+ * The rule-created half of what devd_symlink_reconcile() does for the by-*
+ * families, and needed for the same reason: devd can be stopped while a device
+ * is present and started after it is gone, and in that window its in-memory
+ * record of what it created is empty while the links are still on disk.
+ * Returns the number removed, or -errno.
+ */
+int devd_symlink_sweep_dangling(const char *dev_root, const char *subdir);

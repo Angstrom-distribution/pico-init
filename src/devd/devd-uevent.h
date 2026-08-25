@@ -46,6 +46,18 @@
 #define DEVD_UEVENT_BUF_MAX 4096
 
 /*
+ * How much of the message's KEY=VALUE tail is kept verbatim.
+ *
+ * H1 needed six named fields and nothing else. The rule engine needs the rest:
+ * ENV{} matches against whatever the kernel sent, and a RUN+= child is given
+ * the same properties in its environment -- which is how `usb_modeswitch`
+ * learns what it was called about. Keeping the tail as the wire's own
+ * NUL-separated blob rather than re-parsing it into a table here leaves the
+ * table's shape to devd-match.c, which is the file that has to bound it.
+ */
+#define DEVD_UEVENT_PROPS_MAX 2048
+
+/*
  * Only the actions devd distinguishes. Everything else the kernel can send
  * (change, move, bind, unbind, online, offline) collapses to _OTHER: none of
  * them create or destroy a block device, and treating an unknown future action
@@ -70,6 +82,11 @@ typedef struct DevdUevent {
         bool have_devno;
 
         unsigned partn; /* PARTN=, 0 when absent */
+
+        /* The message's property tail, NUL-separated exactly as received and
+         * truncated at the last whole pair that fits. */
+        char props[DEVD_UEVENT_PROPS_MAX];
+        size_t props_len;
 } DevdUevent;
 
 /*

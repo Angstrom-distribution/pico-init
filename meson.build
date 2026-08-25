@@ -303,6 +303,13 @@ devd_core_sources = files(
   'src/devd/devd-probe.c',
   'src/devd/devd-symlink.c',
   'src/devd/devd-media.c',
+  # H2, the rule engine: the parser, what a rule means, and the RUN+= child.
+  # Three files rather than one because they are three different kinds of
+  # code -- a tokenizer, a matcher that reads sysfs, and a fork/exec -- and
+  # each has its own test program.
+  'src/devd/devd-rules.c',
+  'src/devd/devd-match.c',
+  'src/devd/devd-run.c',
 )
 
 devd_core = static_library(
@@ -326,22 +333,43 @@ install_data(
   install_dir: get_option('prefix') / 'lib' / 'systemd' / 'system',
 )
 
+# devd's own rules file (H2), into the same directory usb-modeswitch-data's
+# already installs into -- /usr/lib/udev/rules.d under this distro's mandatory
+# usrmerge. Shipping a rules file rather than compiling the serial naming in is
+# the point: it is the same engine reading the same syntax as the vendor file
+# beside it.
+install_data(
+  'src/devd/60-pico-serial.rules',
+  install_dir: get_option('prefix') / 'lib' / 'udev' / 'rules.d',
+)
+
 # The four acceptance areas H1 is measured against: uevent parsing, the
 # debounce state machine, the GPT/ext4 field extraction, and the symlink
-# create/remove/reconcile lifecycle. Registered up front, same as netd's and
-# PID 1's lists and for the same reason.
+# create/remove/reconcile lifecycle. H2 adds three: the rules tokenizer against
+# verbatim excerpts of the real shipped usb-modeswitch file, the matcher and
+# substitutions against a sysfs tree built in the test, and the async RUN+=
+# path end to end. Registered up front, same as netd's and PID 1's lists and
+# for the same reason.
 devd_tests = [
   'test-devd-uevent',
   'test-devd-block',
   'test-devd-probe',
   'test-devd-symlink',
+  'test-devd-rules',
+  'test-devd-match',
+  'test-devd-run',
 ]
 
+# PICO_SOURCE_DIR lets test-devd-match.c parse the very file meson installs
+# above, rather than a copy of its one rule pasted into the test. A rules file
+# that ships is only correct if the engine that ships with it reads it, and a
+# retyped copy could not catch an edit to one and not the other.
 foreach t : devd_tests
   exe = executable(
     t,
     ['src/devd/' + t + '.c'] + pico_test_sources,
     include_directories: devd_includes,
+    c_args: ['-DPICO_SOURCE_DIR="' + meson.current_source_dir() + '"'],
     link_with: [devd_core, pico_init_core],
   )
   test(t, exe)

@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: 2026 Koen Kooi
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Persistent names for USB serial adapters (plans/31, Part 2, H2).
+#
+# /dev/ttyUSB0 is whichever adapter enumerated first, which is not a fact about
+# the adapter. This file gives each one a name derived from what it says about
+# itself, so a script can open the same device across reboots and across which
+# port it happens to be in.
+#
+# It ships with devd and is written in devd's own subset of udev-rules syntax,
+# which is the dogfooding half of the drop-in-compatibility decision: the engine
+# that consumes usb-modeswitch's file also consumes one this project wrote, in
+# the same syntax, with no pico-only extension anywhere in it.
+#
+# Upstream builds the same name in 60-serial.rules out of three udev builtins
+# (usb_id, hwdb, path_id). Reading usb_id shows every input it needs is a plain
+# sysfs attribute -- manufacturer, product and serial on the USB device,
+# bInterfaceNumber on the interface -- so $attr{} substitution, which walks the
+# parent chain for each, replaces all three builtins here.
+#
+# The named divergences from upstream's link, both recorded rather than silent:
+# a device whose descriptors carry no strings gets no link at all (upstream's
+# usb_id falls back to hex vendor:product IDs), and there is no by-path link
+# (path_id is topology-walking C with no sysfs shortcut).
+
+ACTION=="remove", GOTO="pico_serial_end"
+
+SUBSYSTEM=="tty", KERNEL=="ttyUSB*|ttyACM*", SYMLINK+="serial/by-id/usb-$attr{manufacturer}_$attr{product}_$attr{serial}-if$attr{bInterfaceNumber}"
+
+LABEL="pico_serial_end"

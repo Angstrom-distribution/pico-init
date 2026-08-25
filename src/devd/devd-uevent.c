@@ -123,6 +123,7 @@ int devd_uevent_parse(const char *buf, size_t n, DevdUevent *ret) {
          */
         for (off = first + 1; off < n; off += strlen(buf + off) + 1) {
                 const char *p = buf + off, *eq;
+                size_t len = strlen(p);
 
                 if (*p == '\0')
                         continue;
@@ -130,6 +131,17 @@ int devd_uevent_parse(const char *buf, size_t n, DevdUevent *ret) {
                 eq = strchr(p, '=');
                 if (!eq)
                         continue;
+
+                /*
+                 * Kept verbatim as well as decoded, for the rule engine. The
+                 * bound is applied a whole pair at a time: half a KEY=VALUE is
+                 * not a property, and a truncated MODALIAS that still matched a
+                 * glob would be worse than one that is simply not there.
+                 */
+                if (u.props_len + len + 1 <= sizeof(u.props)) {
+                        memcpy(u.props + u.props_len, p, len + 1);
+                        u.props_len += len + 1;
+                }
 
                 if (strncmp(p, "SUBSYSTEM=", 10) == 0)
                         (void) field_set(u.subsystem, sizeof(u.subsystem), eq + 1);

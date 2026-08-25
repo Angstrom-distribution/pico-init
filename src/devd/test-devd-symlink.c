@@ -305,6 +305,79 @@ static void test_missing_tree(void) {
         free(dev);
 }
 
+/*
+ * The links a SYMLINK+= rule names (H2), which differ from the five families in
+ * one way that matters: their path comes out of a rules file rather than out of
+ * this code, so the depth of the relative target is computed rather than fixed,
+ * and the name has to be checked before it is used as one.
+ */
+static void test_named_links(void) {
+        char *dev = test_tmpdir_new(), path[PATH_MAX], target[PATH_MAX];
+        struct stat st;
+        ssize_t k;
+
+        ASSERT_TRUE(dev != NULL);
+        make_node(dev, "ttyUSB0");
+
+        ASSERT_EQ_INT(devd_symlink_create_named(dev, "ttyUSB0", "serial/by-id/usb-FTDI_x-if00"), 0);
+
+        ASSERT_TRUE((size_t) snprintf(path, sizeof(path), "%s/serial/by-id/usb-FTDI_x-if00", dev) <
+                    sizeof(path));
+
+        k = readlink(path, target, sizeof(target) - 1);
+        ASSERT_TRUE(k > 0);
+        target[k] = '\0';
+
+        /* Two directories down, so two levels of ../ -- not the fixed ../../
+         * the by-* families can hard-code. */
+        ASSERT_STREQ(target, "../../ttyUSB0");
+
+        /* Removing it takes the directories it created with it, so /dev does
+         * not slowly fill with empty serial/by-id trees. */
+        ASSERT_EQ_INT(devd_symlink_remove_named(dev, "serial/by-id/usb-FTDI_x-if00"), 0);
+        ASSERT_TRUE((size_t) snprintf(path, sizeof(path), "%s/serial", dev) < sizeof(path));
+        ASSERT_TRUE(stat(path, &st) < 0);
+
+        /* A rules file is data devd reads as root, and a link name is its one
+         * field that becomes a path. */
+        ASSERT_EQ_INT(devd_symlink_create_named(dev, "ttyUSB0", "../escape"), -EINVAL);
+        ASSERT_EQ_INT(devd_symlink_create_named(dev, "ttyUSB0", "a/../../escape"), -EINVAL);
+        ASSERT_EQ_INT(devd_symlink_create_named(dev, "ttyUSB0", "/absolute"), -EINVAL);
+        ASSERT_EQ_INT(devd_symlink_remove_named(dev, "../escape"), -EINVAL);
+
+        test_rm_rf(dev);
+        free(dev);
+}
+
+/* The restart case: devd stopped while a device was present and started after
+ * it was gone, so its memory of what it created is empty while the links are
+ * still on disk. */
+static void test_sweep_dangling(void) {
+        char *dev = test_tmpdir_new(), path[PATH_MAX];
+        struct stat st;
+
+        ASSERT_TRUE(dev != NULL);
+        make_node(dev, "ttyUSB0");
+
+        ASSERT_EQ_INT(devd_symlink_create_named(dev, "ttyUSB0", "serial/by-id/here"), 0);
+        ASSERT_EQ_INT(devd_symlink_create_named(dev, "ttyUSB1", "serial/by-id/gone"), 0);
+
+        ASSERT_EQ_INT(devd_symlink_sweep_dangling(dev, "serial"), 1);
+
+        ASSERT_TRUE((size_t) snprintf(path, sizeof(path), "%s/serial/by-id/here", dev) < sizeof(path));
+        ASSERT_EQ_INT(stat(path, &st), 0);
+
+        ASSERT_TRUE((size_t) snprintf(path, sizeof(path), "%s/serial/by-id/gone", dev) < sizeof(path));
+        ASSERT_TRUE(lstat(path, &st) < 0);
+
+        /* Nothing to sweep is not an error: it is what every first boot looks
+         * like. */
+        ASSERT_EQ_INT(devd_symlink_sweep_dangling(dev, "nothing/here"), 0);
+
+        test_rm_rf(dev);
+        free(dev);
+}
+
 int main(void) {
         test_escape();
         test_create();
@@ -314,6 +387,8 @@ int main(void) {
         test_reconcile();
         test_awkward_label();
         test_missing_tree();
+        test_named_links();
+        test_sweep_dangling();
 
         printf("test-devd-symlink: all checks passed\n");
         return 0;

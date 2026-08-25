@@ -268,3 +268,196 @@ int devd_symlink_reconcile(const char *dev_root) {
 
         return sweep_all(dev_root, keep_if_target_exists, NULL);
 }
+
+/* --- links a SYMLINK+= rule named --- */
+
+/* How deep a sweep will recurse below the directory it was handed. Three is
+ * already one more than `serial/by-id/` needs. */
+#define DEVD_SWEEP_DEPTH_MAX 3
+
+/*
+ * Is this a link name devd will write? Relative, no `..` anywhere, no empty
+ * component. A rules file is root-read data and this is its one field that
+ * becomes a path, so the check is here rather than at the call sites.
+ */
+static bool link_name_is_safe(const char *link) {
+        const char *p = link;
+
+        if (!link || link[0] == '\0' || link[0] == '/')
+                return false;
+
+        for (;;) {
+                const char *slash = strchr(p, '/');
+                size_t n = slash ? (size_t) (slash - p) : strlen(p);
+
+                if (n == 0 || (n == 2 && p[0] == '.' && p[1] == '.'))
+                        return false;
+
+                if (!slash)
+                        return true;
+
+                p = slash + 1;
+        }
+}
+
+/* mkdir every directory component of `link` under dev_root. 0 or -errno. */
+static int link_parents(const char *dev_root, const char *link) {
+        char path[PATH_MAX];
+        size_t base;
+
+        if ((size_t) snprintf(path, sizeof(path), "%s/%s", dev_root, link) >= sizeof(path))
+                return -ENAMETOOLONG;
+
+        base = strlen(dev_root) + 1;
+
+        for (char *p = path + base; *p; p++) {
+                if (*p != '/')
+                        continue;
+
+                *p = '\0';
+
+                if (mkdir(path, 0755) < 0 && errno != EEXIST)
+                        return -errno;
+
+                *p = '/';
+        }
+
+        return 0;
+}
+
+int devd_symlink_create_named(const char *dev_root, const char *devname, const char *link) {
+        char path[PATH_MAX], target[PATH_MAX];
+        size_t depth = 0, n = 0;
+        int r;
+
+        if (!dev_root || !devname || !link_name_is_safe(link))
+                return -EINVAL;
+
+        for (const char *p = link; *p; p++)
+                if (*p == '/')
+                        depth++;
+
+        for (size_t i = 0; i < depth; i++) {
+                if (n + 3 >= sizeof(target))
+                        return -ENAMETOOLONG;
+
+                memcpy(target + n, "../", 3);
+                n += 3;
+        }
+
+        if ((size_t) snprintf(target + n, sizeof(target) - n, "%s", devname) >= sizeof(target) - n)
+                return -ENAMETOOLONG;
+
+        r = link_parents(dev_root, link);
+        if (r < 0)
+                return r;
+
+        if ((size_t) snprintf(path, sizeof(path), "%s/%s", dev_root, link) >= sizeof(path))
+                return -ENAMETOOLONG;
+
+        if (symlink(target, path) == 0)
+                return 0;
+
+        if (errno != EEXIST)
+                return -errno;
+
+        /* Replaced rather than kept, exactly as the by-* families are: the same
+         * name pointing at a different device means the old link is wrong. */
+        if (unlink(path) < 0 && errno != ENOENT)
+                return -errno;
+
+        return symlink(target, path) < 0 ? -errno : 0;
+}
+
+int devd_symlink_remove_named(const char *dev_root, const char *link) {
+        char path[PATH_MAX];
+
+        if (!dev_root || !link_name_is_safe(link))
+                return -EINVAL;
+
+        if ((size_t) snprintf(path, sizeof(path), "%s/%s", dev_root, link) >= sizeof(path))
+                return -ENAMETOOLONG;
+
+        if (unlink(path) < 0 && errno != ENOENT)
+                return -errno;
+
+        /* Take the now-empty directories with it, deepest first. rmdir() on a
+         * directory something else still uses fails with ENOTEMPTY, which is
+         * the whole check. */
+        for (char *slash = strrchr(path, '/'); slash && slash > path + strlen(dev_root);
+             slash = strrchr(path, '/')) {
+                *slash = '\0';
+
+                if (rmdir(path) < 0)
+                        break;
+        }
+
+        return 0;
+}
+
+static int sweep_dangling(const char *dev_root, const char *dir, unsigned depth) {
+        struct dirent *e;
+        int removed = 0;
+        DIR *d;
+
+        d = opendir(dir);
+        if (!d)
+                return errno == ENOENT ? 0 : -errno;
+
+        while ((e = readdir(d))) {
+                char path[PATH_MAX];
+                struct stat st;
+
+                if (e->d_name[0] == '.')
+                        continue;
+
+                if ((size_t) snprintf(path, sizeof(path), "%s/%s", dir, e->d_name) >= sizeof(path))
+                        continue;
+
+                if (lstat(path, &st) < 0)
+                        continue;
+
+                if (S_ISDIR(st.st_mode)) {
+                        if (depth < DEVD_SWEEP_DEPTH_MAX) {
+                                int r = sweep_dangling(dev_root, path, depth + 1);
+
+                                if (r > 0)
+                                        removed += r;
+                        }
+
+                        (void) rmdir(path); /* only succeeds once it is empty */
+                        continue;
+                }
+
+                if (!S_ISLNK(st.st_mode))
+                        continue; /* not a symlink: not devd's to remove */
+
+                /* stat() rather than lstat(): the question is whether what the
+                 * link points at is still there, which is exactly what a stat
+                 * through the link answers. */
+                if (stat(path, &st) == 0)
+                        continue;
+
+                if (unlink(path) < 0) {
+                        pico_log(PICO_LOG_WARNING, "devd: cannot remove %s: %s", path, strerror(errno));
+                        continue;
+                }
+
+                removed++;
+        }
+
+        (void) closedir(d);
+        return removed;
+}
+
+int devd_symlink_sweep_dangling(const char *dev_root, const char *subdir) {
+        char dir[PATH_MAX];
+
+        if (!dev_root || !link_name_is_safe(subdir))
+                return -EINVAL;
+
+        if ((size_t) snprintf(dir, sizeof(dir), "%s/%s", dev_root, subdir) >= sizeof(dir))
+                return -ENAMETOOLONG;
+
+        return sweep_dangling(dev_root, dir, 0);
+}
