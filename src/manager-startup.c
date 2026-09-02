@@ -129,6 +129,11 @@ int manager_startup(Manager *m, const char *default_target) {
          * reports the target actually being booted rather than the default. */
         pico_mfree(m->default_target);
         m->default_target = pico_strdup(default_target);
+        /* On allocation failure this stays NULL -- do not point it at
+         * PICO_DEFAULT_TARGET's static storage, pico_mfree() above will
+         * later free() it unconditionally. manager_state_notify_manager()'s
+         * own `?: PICO_DEFAULT_TARGET` fallback already covers reporting a
+         * NULL default_target correctly. */
 
         /*
          * 0. Bring up the runtime state directory and the control socket

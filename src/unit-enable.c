@@ -332,11 +332,36 @@ static int preset_file_query(const char *path, const char *unit_name, int *decis
         return 0;
 }
 
+/*
+ * Query an already-collected, already-sorted entry list for unit_name.
+ * Returns 1 with *decision set when a rule matched, 0 when none of the
+ * entries had a matching line, or -errno from the first unreadable file.
+ * Split out of manager_preset_query() so manager_apply_presets() can collect
+ * the entry list once and run every unit's query against that same list,
+ * instead of re-collecting it (opendir/readdir/sort of every preset
+ * directory) on every single unit.
+ */
+static int preset_entries_query(PresetEntry *entries, size_t n, const char *unit_name, int *decision) {
+        size_t i;
+
+        /* entries is sorted by basename, i.e. by filename across every
+         * directory at once -- the lexicographically earliest filename with
+         * a matching line wins, per systemd.preset(5) */
+        for (i = 0; i < n; i++) {
+                int r = preset_file_query(entries[i].path, unit_name, decision);
+
+                if (r != 0)
+                        return r; /* r < 0: read error; r == 1: matched */
+        }
+
+        return 0; /* no rule matched */
+}
+
 int manager_preset_query(Manager *m, const char *unit_name) {
         PresetEntry *entries = NULL;
         size_t n = 0;
-        size_t i;
-        int rc;
+        int decision = 0;
+        int rc, r;
 
         if (!m || !unit_name)
                 return -EINVAL;
@@ -345,34 +370,37 @@ int manager_preset_query(Manager *m, const char *unit_name) {
         if (rc < 0)
                 return rc;
 
-        /* entries is sorted by basename, i.e. by filename across every
-         * directory at once -- the lexicographically earliest filename with
-         * a matching line wins, per systemd.preset(5) */
-        for (i = 0; i < n; i++) {
-                int decision = 0;
-                int r = preset_file_query(entries[i].path, unit_name, &decision);
-
-                if (r < 0) {
-                        preset_entries_free(entries, n);
-                        return r;
-                }
-
-                if (r == 1) {
-                        preset_entries_free(entries, n);
-                        return decision;
-                }
-        }
-
+        r = preset_entries_query(entries, n, unit_name, &decision);
         preset_entries_free(entries, n);
-        return -ENOENT; /* no rule matched */
+
+        if (r < 0)
+                return r;
+        return r == 1 ? decision : -ENOENT; /* 0 matches: no rule matched */
 }
 
 int manager_apply_presets(Manager *m) {
+        PresetEntry *entries = NULL;
+        size_t n = 0;
         int n_enabled = 0;
         size_t i;
+        int collect_rc;
 
         if (!m)
                 return -EINVAL;
+
+        /*
+         * Collected exactly once for the whole boot, not per unit: the
+         * preset rule set is identical for every unit, so the directory
+         * scan and per-file parse collect_preset_entries() does must not be
+         * repeated U times for U units. A collection failure here (anything
+         * but a missing directory, which collect_preset_entries() already
+         * treats as empty) is logged once below and every eligible unit is
+         * skipped, the same outcome the old per-unit collect would have hit
+         * on every single call.
+         */
+        collect_rc = collect_preset_entries(m, &entries, &n);
+        if (collect_rc < 0)
+                pico_log(PICO_LOG_WARNING, "collecting preset files: %s", strerror(-collect_rc));
 
         /*
          * Index freshly and re-read m->n_units every iteration:
@@ -385,6 +413,7 @@ int manager_apply_presets(Manager *m) {
          */
         for (i = 0; i < m->n_units; i++) {
                 Unit *u = m->units[i];
+                int decision = 0;
                 int r;
 
                 if (u->enabled)
@@ -393,15 +422,20 @@ int manager_apply_presets(Manager *m) {
                 if (!u->wanted_by && !u->required_by)
                         continue; /* no [Install] data for a preset to act on */
 
-                r = manager_preset_query(m, u->id);
-                if (r < 0 && r != -ENOENT) {
+                if (collect_rc < 0) {
+                        pico_log(PICO_LOG_WARNING, "%s: preset query failed: %s", u->id, strerror(-collect_rc));
+                        continue;
+                }
+
+                r = preset_entries_query(entries, n, u->id, &decision);
+                if (r < 0) {
                         pico_log(PICO_LOG_WARNING, "%s: preset query failed: %s", u->id, strerror(-r));
                         continue;
                 }
 
                 /*
-                 * -ENOENT ("no rule matched") means ENABLE, not disable. This
-                 * is upstream systemd's own default -- `systemctl preset`
+                 * No match (r == 0) means ENABLE, not disable. This is
+                 * upstream systemd's own default -- `systemctl preset`
                  * enables any unit no rule speaks for -- and it is what OE
                  * images already get from systemd-preset at rootfs build
                  * time, so matching it is what the drop-in-compatibility goal
@@ -409,7 +443,7 @@ int manager_apply_presets(Manager *m) {
                  * catch-all "disable *" rule, exactly as it would under real
                  * systemd.
                  */
-                if (r == 1 || r == -ENOENT) {
+                if (r == 0 || (r == 1 && decision == 1)) {
                         int ir = unit_install_enablement(u);
 
                         if (ir < 0) {
@@ -421,8 +455,9 @@ int manager_apply_presets(Manager *m) {
                         }
                         n_enabled++;
                 }
-                /* r == 0: disable -- leave u->enabled false */
+                /* r == 1 && decision == 0: disable -- leave u->enabled false */
         }
 
+        preset_entries_free(entries, n);
         return n_enabled;
 }

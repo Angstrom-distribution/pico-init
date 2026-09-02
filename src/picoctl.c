@@ -299,7 +299,8 @@ static int cmd_list_units(int argc, char *argv[]) {
         }
         closedir(d);
 
-        qsort(names, n, sizeof(char *), name_cmp);
+        if (names && n > 1)
+                qsort(names, n, sizeof(char *), name_cmp);
 
         printf("%-32s %-8s %-10s %-13s %s\n", "UNIT", "LOAD", "ACTIVE", "SUB", "DESCRIPTION");
         for (i = 0; i < n; i++) {

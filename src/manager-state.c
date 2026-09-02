@@ -339,23 +339,16 @@ void manager_state_notify_manager(Manager *m) {
         }
 
         /*
-         * DefaultTarget is always PICO_DEFAULT_TARGET. manager_startup()
-         * takes a default_target argument but never stores it anywhere on
-         * Manager, and manager.h is frozen for this milestone, so there is
-         * no live field to read here. Every real caller (main.c) passes
-         * NULL, which manager_startup() itself resolves to
-         * PICO_DEFAULT_TARGET, so this is correct in practice; only a test
-         * or future caller that boots a genuinely different target would see
-         * this go stale. Worth a Manager field in a later change -- flagged
-         * for the coordinator rather than worked around by touching
-         * manager.h here.
+         * DefaultTarget reports the actual target this boot is using,
+         * which is stored by manager_startup() in m->default_target.
+         * Fall back to the macro only if default_target is somehow NULL.
          */
         fprintf(f,
                 "Objective=%s\n"
                 "DefaultTarget=%s\n"
                 "NUnits=%zu\n",
                 manager_objective_to_string(m->objective),
-                PICO_DEFAULT_TARGET,
+                m->default_target ?: PICO_DEFAULT_TARGET,
                 m->n_units);
 
         if (fclose(f) != 0) {
