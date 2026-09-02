@@ -310,15 +310,31 @@ static int flags_fds(const int *fds, unsigned n_fds) {
 /*
  * Builds the child's envp: environ's own pointers (borrowed -- those strings
  * outlive both fork() and this process's own execve(), so copying the
- * pointer array is enough) plus "LISTEN_FDS=<n>", plus one reserved trailing
+ * pointer array is enough, minus any inherited LISTEN_* entry, see the scrub
+ * below) plus "LISTEN_FDS=<n>", plus one reserved trailing
  * slot child_exec() fills in with LISTEN_PID after fork(). *ret_pid_slot is
  * that slot's index. Called only in the parent, before fork() -- malloc here
  * is fine, this is exactly the "everything that can be computed in the
  * parent is computed there instead" this file's header promises. NULL on
  * OOM.
  */
+static bool is_listen_var(const char *e) {
+        static const char *const names[] = {
+                "LISTEN_FDS=",
+                "LISTEN_PID=",
+                "LISTEN_FDNAMES=",
+        };
+        size_t i;
+
+        for (i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+                if (strncmp(e, names[i], strlen(names[i])) == 0)
+                        return true;
+
+        return false;
+}
+
 static char **build_socket_envp(unsigned n_fds, size_t *ret_pid_slot) {
-        size_t n = 0, i;
+        size_t n = 0, i, kept = 0;
         char **envp;
         char buf[32];
         int r;
@@ -331,8 +347,25 @@ static char **build_socket_envp(unsigned n_fds, size_t *ret_pid_slot) {
         if (!envp)
                 return NULL;
 
-        for (i = 0; i < n; i++)
-                envp[i] = environ[i];
+        /*
+         * Drop any INHERITED LISTEN_* entry while copying (upstream scrubs
+         * the same three names for the same reason). PID 1's own environment
+         * really can contain one: the kernel hands init every unrecognised
+         * name=value boot-cmdline parameter as an environment variable, so a
+         * stray LISTEN_FDS=1 on the command line lands here. Left in place it
+         * would be the entry getenv() in the child returns (getenv() takes
+         * the FIRST match, and the real value is appended after), and the
+         * entry free_socket_envp() later frees -- a pointer into the initial
+         * stack's env block, never malloc()'d. After this loop each name
+         * appears exactly once: the one built below.
+         */
+        for (i = 0; i < n; i++) {
+                if (is_listen_var(environ[i]))
+                        continue;
+
+                envp[kept++] = environ[i];
+        }
+        n = kept;
 
         r = snprintf(buf, sizeof(buf), "LISTEN_FDS=%u", n_fds);
         if (r < 0 || (size_t) r >= sizeof(buf)) {
@@ -568,6 +601,27 @@ static _Noreturn void
          * is worse than not starting at all, since a consumer trusting
          * LISTEN_FDS would silently read or write the wrong descriptor. */
         if (n_sock_fds > 0) {
+                /*
+                 * shift_fds() renumbers into [3, n_sock_fds + 2] and assumes
+                 * every fd still open in that range is one of its OWN. The
+                 * logd stdout socket (step 5 keeps it open, step 8 needs it)
+                 * is not, and if it happens to sit inside that range F_DUPFD
+                 * can never place the last socket into the slot it occupies:
+                 * the restart-from-collision loop then spins forever. Move it
+                 * above the range first -- one fcntl(), no effect at all when
+                 * it already sits high enough. A failure here is treated the
+                 * same as create_stdout_socket() having failed in the parent:
+                 * fall back to the console (step 8) rather than fail the
+                 * start or, worse, enter shift_fds() with the collision
+                 * still in place.
+                 */
+                if (stdout_fd >= 0 && stdout_fd < (int) n_sock_fds + 3) {
+                        int nfd = fcntl(stdout_fd, F_DUPFD, (int) n_sock_fds + 3);
+
+                        close(stdout_fd);
+                        stdout_fd = nfd; /* -1 on failure: console fallback */
+                }
+
                 if (shift_fds(sock_fds, n_sock_fds) < 0)
                         _exit(PICO_EXIT_FDS);
                 if (flags_fds(sock_fds, n_sock_fds) < 0)
