@@ -120,9 +120,10 @@ void netd_rtnl_set_link_handler(NetdRtnl *rtnl, netd_rtnl_link_handler_t handler
  * -errno.
  *
  * Synchronous, on the request socket. A dump of a busy machine can exceed the
- * socket buffer and come back with ENOBUFS/NLM_F_DUMP_INTR; that is retried
- * rather than reported, because a partially-observed link table is worse than
- * a slow one.
+ * socket buffer and come back with ENOBUFS/NLM_F_DUMP_INTR -- and a single
+ * dump entry that exceeds nl_recv()'s fixed receive buffer surfaces the same
+ * way -- either is retried rather than reported, because a partially-observed
+ * link table is worse than a slow one.
  */
 int netd_rtnl_enumerate_links(NetdRtnl *rtnl);
 
@@ -132,9 +133,10 @@ int netd_rtnl_enumerate_links(NetdRtnl *rtnl);
  * dispatched, or -errno.
  *
  * A multicast socket that overruns returns ENOBUFS and the kernel has thrown
- * messages away. That is unrecoverable by reading harder, so this reports it
- * to the caller, which re-enumerates -- the only way to get back to a correct
- * link table.
+ * messages away -- as does a single event datagram bigger than nl_recv()'s
+ * fixed receive buffer, already discarded by the time that's detected. Either
+ * is unrecoverable by reading harder, so this reports it to the caller, which
+ * re-enumerates -- the only way to get back to a correct link table.
  */
 int netd_rtnl_process(NetdRtnl *rtnl);
 

@@ -15,10 +15,12 @@
  * NLMSG_NEXT() and RTA_OK()/RTA_NEXT() -- never by hand-adding offsets -- so
  * every pointer this file dereferences is 4-byte aligned by construction of
  * the netlink framing itself (NLMSG_ALIGN/RTA_ALIGN round every message and
- * every attribute up to a 4-byte boundary, and the receive buffer is
- * malloc()'d, which is more aligned than that floor requires). Fixed-offset
- * struct field access (struct ifinfomsg, struct nlmsgerr) is therefore safe
- * without a copy. Attribute *payloads* of unpredictable length (an
+ * every attribute up to a 4-byte boundary, and the receive buffer is a
+ * `union nl_recv_buf`, the same nlmsghdr-typed-member trick struct
+ * nl_request uses below, so its stack storage is never less aligned than
+ * that floor requires -- a bare uint8_t[] on the stack would not be).
+ * Fixed-offset struct field access (struct ifinfomsg, struct nlmsgerr) is
+ * therefore safe without a copy. Attribute *payloads* of unpredictable length (an
  * interface name, a hardware address) are still copied byte-wise with
  * memcpy() rather than cast-and-dereferenced, because their length is
  * kernel-supplied and reading past what RTA_PAYLOAD() actually reports would
@@ -33,7 +35,6 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
-#include <limits.h>
 #include <linux/if_addr.h>
 #include <linux/if_link.h>
 #include <linux/netlink.h>
@@ -66,11 +67,31 @@
 #define NL_REQUEST_BUFSZ 512
 
 /* Best-effort SO_RCVBUF on the request socket, so a link dump on a busy
- * machine is less likely to overrun. Not load-bearing: the receive path
- * below sizes its buffer per-datagram via MSG_PEEK|MSG_TRUNC, so it never
- * loses data to a buffer that guessed too small -- this only reduces how
- * often ENOBUFS forces a whole dump to be retried. */
+ * machine is less likely to overrun. Not load-bearing: it only reduces how
+ * often a dump has to be retried whole -- see NL_RECV_BUFSZ and nl_recv(). */
 #define NETD_RTNL_RCVBUF (1 << 20)
+
+/* Real rtnetlink traffic on this target -- one link/addr/route event, one
+ * dump entry, or an ACK -- comfortably fits a single page; 8KiB is the
+ * commonly-cited practical bound for one netlink recv() batch. nl_recv()
+ * reads into a buffer this size that every caller keeps on its own stack
+ * and reuses across calls, rather than sizing and malloc()'ing one per
+ * datagram. */
+#define NL_RECV_BUFSZ 8192
+
+/*
+ * Storage for nl_recv(): a plain `uint8_t buf[NL_RECV_BUFSZ]` on the stack
+ * is not guaranteed better than 1-byte alignment, but every message inside
+ * it is walked as struct nlmsghdr -- so, same trick as struct nl_request
+ * above, `hdr` pins the union (and therefore `buf`) at whatever alignment
+ * the compiler gives struct nlmsghdr, comfortably over the 4-byte floor the
+ * file banner's ALIGNMENT note requires. `hdr` itself is never accessed;
+ * callers address the storage through `buf`.
+ */
+union nl_recv_buf {
+        struct nlmsghdr hdr;
+        uint8_t buf[NL_RECV_BUFSZ];
+};
 
 /* A dump interrupted mid-flight (ENOBUFS, or NLM_F_DUMP_INTR on the closing
  * NLMSG_DONE) is retried from scratch rather than reported: a partially
@@ -185,23 +206,43 @@ static int nl_send(int fd, const void *buf, size_t len) {
 }
 
 /*
- * Allocate exactly as much as the next pending datagram needs (via
- * MSG_PEEK|MSG_TRUNC) and read it in whole, so a message is never silently
- * truncated by a fixed-size guess. *ret_buf is malloc()'d and owned by the
- * caller on a non-negative return; left untouched otherwise.
+ * Read the next pending datagram into `rb->buf` -- every caller keeps one
+ * `union nl_recv_buf` on its own stack and passes the same one in across
+ * every call, so there is no per-datagram malloc()/free() and, in the
+ * common case below, no second syscall either.
+ *
+ * One recv() with MSG_TRUNC covers that common case: MSG_TRUNC makes the
+ * kernel report the datagram's real length even when only part of it got
+ * copied, so a message that fits inside NL_RECV_BUFSZ -- which is
+ * effectively all real rtnetlink traffic, see NL_RECV_BUFSZ's comment -- is
+ * both sized and fully captured by that single syscall, no prior peek
+ * needed.
+ *
+ * A datagram that does *not* fit is the rare/exceptional case, and unlike
+ * the old peek-then-allocate code this cannot recover it by reading again
+ * bigger: a netlink socket dequeues (and discards whatever didn't fit) on
+ * every non-peek recv() regardless of the buffer supplied, so by the time
+ * MSG_TRUNC's return value reveals the overflow the excess bytes are
+ * already gone -- there is nothing left to re-peek. Rather than hand a
+ * silently truncated message up into the NLMSG_OK/NLMSG_NEXT parsing loop
+ * (the real bug, per this file's ALIGNMENT comment), that case is reported
+ * as -ENOBUFS: the same code this file already uses for a genuine
+ * receive-queue overrun, so it drives the exact same resync-and-retry
+ * handling documented in netd-rtnl.h -- the whole dump is retried in
+ * netd_rtnl_enumerate_links(), and it is propagated as an ordinary error
+ * everywhere else. Correctness over speed: a lost datagram is reported and
+ * recovered from at the protocol level, never quietly mis-parsed.
  *
  * Returns the message length (>= 0), or -errno -- including -EAGAIN when
- * `nonblock` and nothing is pending, and -ENOBUFS when the kernel reports the
- * socket's receive queue overran (from either the peek or the real read).
+ * `nonblock` and nothing is pending, and -ENOBUFS both for a real
+ * receive-queue overrun and for the oversized-datagram case above.
  */
-static ssize_t nl_recv_alloc(int fd, bool nonblock, uint8_t **ret_buf) {
-        int peek_flags = MSG_PEEK | MSG_TRUNC | (nonblock ? MSG_DONTWAIT : 0);
-        int flags = nonblock ? MSG_DONTWAIT : 0;
+static ssize_t nl_recv(int fd, bool nonblock, union nl_recv_buf *rb) {
+        int flags = MSG_TRUNC | (nonblock ? MSG_DONTWAIT : 0);
         ssize_t len;
-        uint8_t *buf;
 
         for (;;) {
-                len = recv(fd, NULL, 0, peek_flags);
+                len = recv(fd, rb->buf, NL_RECV_BUFSZ, flags);
                 if (len < 0) {
                         if (errno == EINTR)
                                 continue;
@@ -210,33 +251,16 @@ static ssize_t nl_recv_alloc(int fd, bool nonblock, uint8_t **ret_buf) {
                 break;
         }
 
-        if (len == 0) {
-                *ret_buf = NULL;
-                return 0;
+        if (len > NL_RECV_BUFSZ) {
+                pico_log(PICO_LOG_WARNING,
+                         "netd: rtnl: datagram of %zd bytes exceeds the %d-byte receive "
+                         "buffer -- kernel already discarded the excess, treating as a "
+                         "receive-queue overrun",
+                         len,
+                         NL_RECV_BUFSZ);
+                return -ENOBUFS;
         }
 
-        if (len > INT_MAX)
-                return -EMSGSIZE;
-
-        buf = malloc((size_t) len);
-        if (!buf)
-                return -ENOMEM;
-
-        for (;;) {
-                ssize_t n = recv(fd, buf, (size_t) len, flags);
-
-                if (n < 0) {
-                        if (errno == EINTR)
-                                continue;
-                        free(buf);
-                        return -errno;
-                }
-
-                len = n;
-                break;
-        }
-
-        *ret_buf = buf;
         return len;
 }
 
@@ -323,18 +347,18 @@ static int nl_execute(NetdRtnl *rtnl, struct nl_request *req) {
                 return r;
 
         for (;;) {
-                uint8_t *buf = NULL;
+                union nl_recv_buf rb;
                 ssize_t len;
                 struct nlmsghdr *m;
                 int rem;
 
-                len = nl_recv_alloc(rtnl->req_fd, false, &buf);
+                len = nl_recv(rtnl->req_fd, false, &rb);
                 if (len < 0)
                         return (int) len;
                 if (len == 0)
                         return -EIO;
 
-                m = (struct nlmsghdr *) buf;
+                m = (struct nlmsghdr *) rb.buf;
                 rem = (int) len;
 
                 /*
@@ -363,11 +387,8 @@ static int nl_execute(NetdRtnl *rtnl, struct nl_request *req) {
                         }
 
                         result = nl_parse_error(m);
-                        free(buf);
                         return result;
                 }
-
-                free(buf);
         }
 }
 
@@ -664,12 +685,12 @@ int netd_rtnl_enumerate_links(NetdRtnl *rtnl) {
                         return r;
 
                 while (!done) {
-                        uint8_t *buf = NULL;
+                        union nl_recv_buf rb;
                         ssize_t len;
                         struct nlmsghdr *m;
                         int rem;
 
-                        len = nl_recv_alloc(rtnl->req_fd, false, &buf);
+                        len = nl_recv(rtnl->req_fd, false, &rb);
                         if (len == -ENOBUFS) {
                                 retry = true;
                                 break;
@@ -679,7 +700,7 @@ int netd_rtnl_enumerate_links(NetdRtnl *rtnl) {
                         if (len == 0)
                                 return -EIO;
 
-                        m = (struct nlmsghdr *) buf;
+                        m = (struct nlmsghdr *) rb.buf;
                         rem = (int) len;
 
                         /* int rem, NLMSG_OK sign-compare: see nl_execute(). */
@@ -689,7 +710,6 @@ int netd_rtnl_enumerate_links(NetdRtnl *rtnl) {
 
                                 if (m->nlmsg_type == NLMSG_ERROR) {
                                         r = nl_parse_error(m);
-                                        free(buf);
                                         return r;
                                 }
 
@@ -705,8 +725,6 @@ int netd_rtnl_enumerate_links(NetdRtnl *rtnl) {
                                         count++;
                                 }
                         }
-
-                        free(buf);
                 }
 
                 if (retry)
@@ -725,12 +743,12 @@ int netd_rtnl_process(NetdRtnl *rtnl) {
                 return -EINVAL;
 
         for (;;) {
-                uint8_t *buf = NULL;
+                union nl_recv_buf rb;
                 ssize_t len;
                 struct nlmsghdr *m;
                 int rem;
 
-                len = nl_recv_alloc(rtnl->event_fd, true, &buf);
+                len = nl_recv(rtnl->event_fd, true, &rb);
                 if (len == -EAGAIN)
                         break;
                 if (len < 0)
@@ -738,7 +756,7 @@ int netd_rtnl_process(NetdRtnl *rtnl) {
                 if (len == 0)
                         break;
 
-                m = (struct nlmsghdr *) buf;
+                m = (struct nlmsghdr *) rb.buf;
                 rem = (int) len;
 
                 /* int rem, NLMSG_OK sign-compare: see nl_execute(). */
@@ -764,8 +782,6 @@ int netd_rtnl_process(NetdRtnl *rtnl) {
                                 break;
                         }
                 }
-
-                free(buf);
         }
 
         return dispatched;

@@ -269,10 +269,23 @@ static inline void *netd_memdup(const void *p, size_t n) {
         return memcpy(q, p, n);
 }
 
+static inline void *netd_memdup_multiply(const void *p, size_t size, size_t need) {
+        void *q;
+
+        if (!p)
+                return NULL;
+
+        q = netd_malloc_multiply(size, need);
+        if (!q)
+                return NULL;
+
+        return memcpy(q, p, size * need);
+}
+
 /* new() is uninitialized, new0() is zeroed -- same split as upstream. */
 #define new(t, n) ((t *) netd_malloc_multiply(sizeof(t), (n)))
 #define new0(t, n) ((t *) netd_calloc_multiply(sizeof(t), (n)))
-#define newdup(t, p, n) ((t *) netd_memdup((p), sizeof(t) * (n)))
+#define newdup(t, p, n) ((t *) netd_memdup_multiply((p), sizeof(t), (n)))
 #define malloc0(n) calloc(1, (n))
 #define memdup(p, n) netd_memdup((p), (n))
 #define mfree(p) pico_mfree(p)
