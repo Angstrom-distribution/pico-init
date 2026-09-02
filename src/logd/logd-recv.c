@@ -709,18 +709,27 @@ int logd_recv_process_stdout(
 
         update_stream_identity(r, s, cred);
 
-        combined_len = s->tail_len + payload_len;
-        combined = malloc(combined_len > 0 ? combined_len : 1);
-        if (!combined)
-                return -ENOMEM;
+        if (s->tail_len == 0) {
+                /* Overwhelmingly the common case (most datagrams already
+                 * end in a newline, leaving no partial-line tail to stitch
+                 * onto): nothing to combine, so scan straight out of the
+                 * caller's own receive buffer instead of paying for a
+                 * malloc()+memcpy() of the whole payload first. */
+                scan_and_emit(r, s, payload, payload_len);
+        } else {
+                combined_len = s->tail_len + payload_len;
+                combined = malloc(combined_len);
+                if (!combined)
+                        return -ENOMEM;
 
-        memcpy(combined, s->tail, s->tail_len);
-        if (payload_len > 0)
-                memcpy(combined + s->tail_len, payload, payload_len);
-        s->tail_len = 0; /* consumed into `combined`; scan_and_emit() repopulates it */
+                memcpy(combined, s->tail, s->tail_len);
+                if (payload_len > 0)
+                        memcpy(combined + s->tail_len, payload, payload_len);
+                s->tail_len = 0; /* consumed into `combined`; scan_and_emit() repopulates it */
 
-        scan_and_emit(r, s, combined, combined_len);
-        free(combined);
+                scan_and_emit(r, s, combined, combined_len);
+                free(combined);
+        }
 
         s->last_seen = now_monotonic();
 
@@ -733,7 +742,7 @@ int logd_recv_process_syslog(LogdRecv *r, const void *payload, size_t payload_le
         int priority = 6; /* LOG_INFO: journald-syslog.c's own default (LOG_USER|LOG_INFO) once facility is masked off */
         const char *ident = NULL;
         size_t ident_len = 0;
-        LogdField fields[8];
+        LogdField fields[9];
         size_t n = 0;
         char prio_buf[4], pid_buf[16], uid_buf[16], gid_buf[16];
         char comm[LOGD_COMM_MAX] = "", unit[LOGD_UNIT_NAME_MAX + 1] = "";
