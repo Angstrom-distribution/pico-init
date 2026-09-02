@@ -37,6 +37,7 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -150,15 +151,48 @@ char *gpt_guid_to_string(const GptGuid *guid, char buf[static GPT_GUID_STRING_MA
 uint32_t gpt_crc32(const void *data, size_t n);
 
 /*
- * The whole-disk device backing the mounted root filesystem, read out of
- * `mountinfo` (/proc/self/mountinfo in production; a fixture in tests).
+ * Everything the mounted root filesystem's own mountinfo line can say about
+ * where it lives and how it is mounted, read out of `mountinfo`
+ * (/proc/self/mountinfo in production; a fixture in tests).
  *
- * `ret_node` gets the device node path ("/dev/vda"), `ret_sysfs` the sysfs
- * directory of that disk ("/sys/devices/.../block/vda"), which is what turns a
- * partition number back into a device node. Either may be NULL.
+ * Every out-parameter is optional, so a caller asks for exactly the answers it
+ * has a use for:
  *
- * Returns 0, or -errno -- notably -ENOENT when the root filesystem is not on a
- * block device at all, which is an ordinary answer on an initramfs.
+ *  - `ret_node`   the containing DISK's device node ("/dev/vda"). Swap
+ *                 discovery and devd's boot-disk policy both want the disk,
+ *                 because what they go on to read is its partition table.
+ *  - `ret_sysfs`  the sysfs directory of that disk
+ *                 ("/sys/devices/.../block/vda"), which is what turns a
+ *                 partition number back into a device node.
+ *  - `ret_part_node`  the PARTITION's own node ("/dev/vda1") -- the block
+ *                 device the root filesystem is actually on. A filesystem
+ *                 checker has to be pointed at this and never at the disk.
+ *                 Equal to `ret_node` when root is on a whole unpartitioned
+ *                 device, which is the right answer for the same reason.
+ *  - `ret_read_only`  whether root carries the "ro" mount option right now.
+ *                 Set from the mountinfo line as soon as one is found, so it is
+ *                 still filled in when the function goes on to return -ENOENT
+ *                 for a root with no block device under it.
+ *
+ * Returns 0, or -errno -- notably -ENOENT when there is no "/" line at all or
+ * when the root filesystem is not on a block device, which is an ordinary
+ * answer on an initramfs.
+ */
+int gpt_boot_root(
+                const char *mountinfo,
+                char *ret_node,
+                size_t node_size,
+                char *ret_sysfs,
+                size_t sysfs_size,
+                char *ret_part_node,
+                size_t part_size,
+                bool *ret_read_only);
+
+/*
+ * The disk half of the above, which is what every caller predating the root
+ * check wants: gpt_boot_root() with the partition node and the read-only flag
+ * left unasked for. Kept as its own entry point rather than open-coded at those
+ * call sites so that "the boot disk" stays one named idea.
  */
 int gpt_boot_disk(const char *mountinfo, char *ret_node, size_t node_size, char *ret_sysfs, size_t sysfs_size);
 

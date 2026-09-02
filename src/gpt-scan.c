@@ -570,21 +570,64 @@ static int gpt_split_fields(char *line, char **field, size_t n) {
 }
 
 /*
- * The device number of whatever is mounted on "/", from a mountinfo file.
+ * Is `name` one of the comma-separated tokens in a mountinfo option list?
+ *
+ * Whole tokens, never substrings, and that is the entire point of writing this
+ * out rather than reaching for strstr(): "errors=remount-ro" ends in the three
+ * letters this is usually asked about, "rootflags=ro" contains them, and
+ * neither of those mounts is read-only. A read-only root is spelled by an "ro"
+ * token standing on its own between commas.
+ *
+ * An empty list, an empty token from a doubled comma, a trailing comma: none of
+ * them match anything and none of them run past the end of the string.
+ */
+static bool gpt_option_present(const char *options, const char *name) {
+        size_t len = strlen(name);
+        const char *p = options;
+
+        if (!options || len == 0)
+                return false;
+
+        for (;;) {
+                size_t n = strcspn(p, ",");
+
+                if (n == len && memcmp(p, name, len) == 0)
+                        return true;
+
+                if (p[n] == '\0')
+                        return false;
+
+                p += n + 1;
+        }
+}
+
+/*
+ * The device number of whatever is mounted on "/", from a mountinfo file, and
+ * whether that mount is read-only right now.
  *
  * Fields, per proc(5): id, parent id, "major:minor", root within the
- * filesystem, mount point, then options and the " - " separator this never
- * reaches. The last matching line wins, because that is the mount a path lookup
- * of "/" would actually land on if something was mounted over an earlier one.
+ * filesystem, mount point, per-mount options, then the optional fields and the
+ * " - " separator this never reaches. The last matching line wins, because that
+ * is the mount a path lookup of "/" would actually land on if something was
+ * mounted over an earlier one.
+ *
+ * Six fields rather than five because field 6 is the per-mount option list, and
+ * that list is where "am I read-only" is answered. Reading it is strictly
+ * better than upstream systemd's write probe on the same question: it reports
+ * the mount flags the kernel actually holds, and it attempts no write to a
+ * filesystem whose integrity is the thing in doubt.
+ *
+ * A line with fewer than six fields is skipped, as one with fewer than five
+ * always was. Real mountinfo lines carry at least ten.
  *
  * Mount points are octal-escaped in this file (a space is \040), which nothing
  * here undoes: the only mount point it compares against is "/", which has
  * nothing to escape.
  */
-static int gpt_mountinfo_root_devno(const char *mountinfo, unsigned *ret_maj, unsigned *ret_min) {
+static int gpt_mountinfo_root(const char *mountinfo, unsigned *ret_maj, unsigned *ret_min, bool *ret_ro) {
         char *line = NULL;
         size_t cap = 0;
-        bool found = false;
+        bool found = false, ro = false;
         unsigned maj = 0, min = 0;
         FILE *f;
 
@@ -593,7 +636,7 @@ static int gpt_mountinfo_root_devno(const char *mountinfo, unsigned *ret_maj, un
                 return -errno;
 
         for (;;) {
-                char *field[5];
+                char *field[6];
                 unsigned a, b;
 
                 if (getline(&line, &cap, f) < 0)
@@ -610,6 +653,7 @@ static int gpt_mountinfo_root_devno(const char *mountinfo, unsigned *ret_maj, un
 
                 maj = a;
                 min = b;
+                ro = gpt_option_present(field[5], "ro");
                 found = true;
         }
 
@@ -621,22 +665,42 @@ static int gpt_mountinfo_root_devno(const char *mountinfo, unsigned *ret_maj, un
 
         *ret_maj = maj;
         *ret_min = min;
+        *ret_ro = ro;
 
         return 0;
 }
 
-int gpt_boot_disk(const char *mountinfo, char *ret_node, size_t node_size, char *ret_sysfs, size_t sysfs_size) {
+int gpt_boot_root(
+                const char *mountinfo,
+                char *ret_node,
+                size_t node_size,
+                char *ret_sysfs,
+                size_t sysfs_size,
+                char *ret_part_node,
+                size_t part_size,
+                bool *ret_read_only) {
+
         char link[PATH_MAX], real[PATH_MAX], probe[PATH_MAX];
         /* Initialized because gcc cannot see across the call below that they
          * are only read after it returned 0, and warns under the target's own
          * optimization level while a -O0 host build stays silent. */
         unsigned maj = 0, min = 0;
+        bool ro = false;
         char *slash;
         int r;
 
-        r = gpt_mountinfo_root_devno(mountinfo, &maj, &min);
+        r = gpt_mountinfo_root(mountinfo, &maj, &min, &ro);
         if (r < 0)
                 return r;
+
+        /*
+         * Published before the guards below, and deliberately: "root is
+         * read-only" is an answer the mountinfo line alone settles, and a
+         * caller that only wants that must still get it when the guards go on
+         * to say there is no block device to name.
+         */
+        if (ret_read_only)
+                *ret_read_only = ro;
 
         /*
          * Major 0 is the kernel's marker for a filesystem with no block device
@@ -659,6 +723,22 @@ int gpt_boot_disk(const char *mountinfo, char *ret_node, size_t node_size, char 
          */
         if (!realpath(link, real))
                 return -errno;
+
+        /*
+         * The partition, before the strip below turns `real` into its disk.
+         * This is the node the root filesystem actually lives on, which is what
+         * a filesystem checker has to be pointed at -- the disk would hand it
+         * the partition table instead. When root is on a whole unpartitioned
+         * device there is nothing to strip and the two answers are the same
+         * node, which is still correct: that device IS what carries the
+         * filesystem.
+         */
+        slash = strrchr(real, '/');
+        if (!slash || slash[1] == '\0')
+                return -EINVAL;
+
+        if (ret_part_node && (size_t) snprintf(ret_part_node, part_size, "/dev/%s", slash + 1) >= part_size)
+                return -ENAMETOOLONG;
 
         if ((size_t) snprintf(probe, sizeof(probe), "%s/partition", real) >= sizeof(probe))
                 return -ENAMETOOLONG;
@@ -684,6 +764,10 @@ int gpt_boot_disk(const char *mountinfo, char *ret_node, size_t node_size, char 
                 return -ENAMETOOLONG;
 
         return 0;
+}
+
+int gpt_boot_disk(const char *mountinfo, char *ret_node, size_t node_size, char *ret_sysfs, size_t sysfs_size) {
+        return gpt_boot_root(mountinfo, ret_node, node_size, ret_sysfs, sysfs_size, NULL, 0, NULL);
 }
 
 /*

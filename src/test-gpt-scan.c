@@ -20,12 +20,19 @@
  * a truncated header are all exercised deliberately here rather than left to a
  * board to discover.
  *
+ * The mountinfo half is fixture-driven in the same spirit: a file written here
+ * and handed to the real parser, which is what lets the read-only detection and
+ * the disk-vs-partition answers be tested against option lists and device
+ * numbers a build host would never produce on its own.
+ *
  * What is NOT covered, on purpose and following the same split as
  * test-dev-setup.c: swapon(2) itself, and the sysfs walk from a partition
  * number back to a device node. Both need a real kernel with a real block
  * device, so they are proven by a qemuarmv5 boot capture showing /proc/swaps
  * with the discovered partition in it, not by a unit test that would have to
- * mount something on the machine running it.
+ * mount something on the machine running it. The two sysfs-resolving cases
+ * below skip themselves rather than fail where the machine running the test has
+ * no block device of the kind they need.
  */
 
 #include <dirent.h>
@@ -36,6 +43,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "gpt-scan.h"
 #include "test-util.h"
@@ -517,9 +525,17 @@ static int boot_disk_of(const char *content, char *node, size_t node_size) {
         return r;
 }
 
-/* The first real entry under /sys/dev/block, or false if sysfs is not
- * available -- which it is not on every machine this suite might run on. */
-static bool find_real_block_device(char *ret, size_t size) {
+/*
+ * The first real entry under /sys/dev/block of the requested kind -- a
+ * partition, or a whole disk -- or false when there is none, which is the
+ * ordinary case on a build host for partitions and can be the case for
+ * everything at all when sysfs is not there.
+ *
+ * The kind matters because the disk-vs-partition distinction is exactly what
+ * gpt_boot_root()'s two node answers differ on, and asking sysfs which is which
+ * is how the test avoids guessing from a device name.
+ */
+static bool find_real_block_device(bool want_partition, char *ret, size_t size) {
         struct dirent *e;
         bool found = false;
         DIR *d;
@@ -529,7 +545,21 @@ static bool find_real_block_device(char *ret, size_t size) {
                 return false;
 
         while ((e = readdir(d))) {
+                char link[PATH_MAX], real[PATH_MAX], probe[PATH_MAX];
+
                 if (e->d_name[0] == '.')
+                        continue;
+
+                if ((size_t) snprintf(link, sizeof(link), "/sys/dev/block/%s", e->d_name) >= sizeof(link))
+                        continue;
+
+                if (!realpath(link, real))
+                        continue;
+
+                if ((size_t) snprintf(probe, sizeof(probe), "%s/partition", real) >= sizeof(probe))
+                        continue;
+
+                if ((access(probe, F_OK) == 0) != want_partition)
                         continue;
 
                 found = (size_t) snprintf(ret, size, "%s", e->d_name) < size;
@@ -578,7 +608,7 @@ static void test_boot_disk(void) {
          * is the major-0 case that returns -ENOENT just above. Skipped where
          * there is no sysfs to point at.
          */
-        if (find_real_block_device(devno, sizeof(devno))) {
+        if (find_real_block_device(false, devno, sizeof(devno))) {
                 char mountinfo[256];
 
                 snprintf(mountinfo,
@@ -590,6 +620,165 @@ static void test_boot_disk(void) {
                 ASSERT_EQ_INT(boot_disk_of(mountinfo, node, sizeof(node)), 0);
                 ASSERT_TRUE(strncmp(node, "/dev/", 5) == 0);
         }
+}
+
+/* gpt_boot_root() over a fixture, with every out-parameter asked for. */
+static int boot_root_of(
+                const char *content, char *node, size_t node_size, char *part, size_t part_size, bool *ro) {
+
+        char path[PATH_MAX];
+        char *dir;
+        int r;
+
+        dir = mountinfo_fixture(content, path, sizeof(path));
+        r = gpt_boot_root(path, node, node_size, NULL, 0, part, part_size, ro);
+        test_rm_rf(dir);
+        free(dir);
+
+        return r;
+}
+
+/* Shorthand for the cases that only care about the read-only answer, which the
+ * major-0 fixtures below all are: the flag is settled by the mountinfo line
+ * alone, so it is filled in even though the call then returns -ENOENT. */
+static bool root_is_ro(const char *options) {
+        char mountinfo[256];
+        bool ro = false;
+
+        snprintf(mountinfo, sizeof(mountinfo), "1 1 0:2 / / %s - rootfs rootfs rw\n", options);
+        ASSERT_EQ_INT(boot_root_of(mountinfo, NULL, 0, NULL, 0, &ro), -ENOENT);
+
+        return ro;
+}
+
+/*
+ * Read-only detection, which is the whole reason the field split went from five
+ * fields to six.
+ *
+ * The option list is a comma-separated set of tokens and "ro" has to be one of
+ * them, not a substring of one. That is not a hypothetical distinction: two of
+ * the most ordinary options a root filesystem carries -- "errors=remount-ro"
+ * and a "rootflags=ro" propagated onto the mount -- both end in those two
+ * letters while describing a filesystem that is mounted read-write. A substring
+ * test would fsck and refuse to remount a perfectly healthy root on every boot.
+ */
+static void test_root_read_only(void) {
+        /* the two ordinary answers */
+        ASSERT_TRUE(!root_is_ro("rw,relatime"));
+        ASSERT_TRUE(root_is_ro("ro,relatime"));
+
+        /* position within the list is not the point; being a token is */
+        ASSERT_TRUE(root_is_ro("relatime,ro"));
+        ASSERT_TRUE(root_is_ro("rw,nosuid,ro,nodev"));
+
+        /* a list that is nothing but the flag, i.e. a line with exactly the
+         * six fields the split now asks for */
+        ASSERT_TRUE(root_is_ro("ro"));
+        ASSERT_TRUE(!root_is_ro("rw"));
+
+        /* the substring traps, all of them read-write */
+        ASSERT_TRUE(!root_is_ro("rw,errors=remount-ro"));
+        ASSERT_TRUE(!root_is_ro("rw,rootflags=ro"));
+        ASSERT_TRUE(!root_is_ro("rw,rootcontext=ro"));
+        ASSERT_TRUE(!root_is_ro("rw,ro_something"));
+        ASSERT_TRUE(!root_is_ro("rw,something_ro"));
+
+        /* malformed lists: an empty token, a trailing comma, a leading one.
+         * None of them match, and none of them run off the end. */
+        ASSERT_TRUE(!root_is_ro("rw,"));
+        ASSERT_TRUE(!root_is_ro(",rw"));
+        ASSERT_TRUE(!root_is_ro("rw,,relatime"));
+        ASSERT_TRUE(!root_is_ro("r"));
+        ASSERT_TRUE(!root_is_ro("rot"));
+
+        /* ...and the same malformations with the flag really present */
+        ASSERT_TRUE(root_is_ro("rw,,ro"));
+        ASSERT_TRUE(root_is_ro(",ro,"));
+
+        /* Last line wins here as it does for the device number, because it is
+         * read off the same line: a read-only root mounted over by a
+         * read-write one is read-write. */
+        {
+                bool ro = true;
+
+                ASSERT_EQ_INT(boot_root_of("1 1 0:2 / / ro - rootfs rootfs ro\n"
+                                           "2 1 0:2 / / rw - rootfs rootfs rw\n",
+                                           NULL,
+                                           0,
+                                           NULL,
+                                           0,
+                                           &ro),
+                              -ENOENT);
+                ASSERT_TRUE(!ro);
+        }
+
+        /* A line with only five fields no longer parses, and a file with
+         * nothing but such lines has no root mount in it at all. The flag is
+         * left exactly as the caller set it, since no line was believed. */
+        {
+                bool ro = false;
+                char node[PATH_MAX];
+
+                ASSERT_EQ_INT(boot_root_of("1 1 0:2 / /\n", node, sizeof(node), NULL, 0, &ro), -ENOENT);
+                ASSERT_TRUE(!ro);
+        }
+}
+
+/*
+ * The partition node, which is the other half of R0: the same call that hands
+ * dps_scan() the containing disk hands the root check the partition the
+ * filesystem is actually on.
+ *
+ * Both halves need a real sysfs to resolve against, so each is skipped where
+ * the machine running the test has nothing of that kind -- a build host
+ * ordinarily has whole block devices and no partitions at all.
+ */
+static void test_boot_root_partition(void) {
+        char devno[64], mountinfo[256];
+        char node[PATH_MAX], part[PATH_MAX];
+
+        /*
+         * A whole unpartitioned device: the partition answer is the device
+         * itself, because that device IS what carries the filesystem. Asserting
+         * they are equal is what says the un-stripped path is being reported
+         * rather than a truncated one.
+         */
+        if (find_real_block_device(false, devno, sizeof(devno))) {
+                snprintf(mountinfo, sizeof(mountinfo), "1 1 %s / / ro - ext4 /dev/real ro\n", devno);
+
+                node[0] = part[0] = '\0';
+                ASSERT_EQ_INT(boot_root_of(mountinfo, node, sizeof(node), part, sizeof(part), NULL), 0);
+                ASSERT_TRUE(strncmp(node, "/dev/", 5) == 0);
+                ASSERT_STREQ(part, node);
+        }
+
+        /*
+         * A partition: the two answers differ, the disk is the partition's
+         * parent, and the disk-only entry point still returns exactly what it
+         * returned before this parameter existed.
+         */
+        if (find_real_block_device(true, devno, sizeof(devno))) {
+                char disk_only[PATH_MAX];
+
+                snprintf(mountinfo, sizeof(mountinfo), "1 1 %s / / ro - ext4 /dev/real ro\n", devno);
+
+                node[0] = part[0] = '\0';
+                ASSERT_EQ_INT(boot_root_of(mountinfo, node, sizeof(node), part, sizeof(part), NULL), 0);
+                ASSERT_TRUE(strncmp(part, "/dev/", 5) == 0);
+                ASSERT_TRUE(strcmp(part, node) != 0);
+
+                ASSERT_EQ_INT(boot_disk_of(mountinfo, disk_only, sizeof(disk_only)), 0);
+                ASSERT_STREQ(disk_only, node);
+        }
+
+        /* A device number nothing in sysfs answers to reaches neither. */
+        ASSERT_EQ_INT(boot_root_of("1 1 4095:4095 / / ro - ext4 /dev/nope ro\n",
+                                   node,
+                                   sizeof(node),
+                                   part,
+                                   sizeof(part),
+                                   NULL),
+                      -ENOENT);
 }
 
 /*
@@ -723,6 +912,8 @@ int main(void) {
         test_corrupt_header();
         test_missing_device();
         test_boot_disk();
+        test_root_read_only();
+        test_boot_root_partition();
         test_scan_all();
         test_partition_name();
 
