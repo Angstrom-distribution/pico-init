@@ -2,135 +2,25 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The ext superblock decode, the sysfs by-id walk, and the sanitizer both need.
- * devd-probe.h has the reasoning and the verified offsets.
+ * The sysfs by-id walk and the sanitizer it needs. devd-probe.h has the
+ * reasoning; the ext superblock half this file used to carry lives in
+ * ../ext-super.c, which PID 1 reads too.
  */
 
 #include "devd-probe.h"
 
 #include <errno.h>
-#include <fcntl.h>
 #include <limits.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
 
 #include "../util.h"
-
-/* Where the label ends: the shortest buffer that can answer every question
- * this file asks of a superblock. */
-#define DEVD_EXT_MIN_SUPER (DEVD_EXT_LABEL_OFF + 16)
 
 /* How far up the sysfs chain the by-id walk will look. A USB block device sits
  * six levels under its usb_device; a bound stops a symlinked or malformed tree
  * from walking forever. */
 #define DEVD_SYSFS_WALK_MAX 12
-
-static bool bytes_all_zero(const uint8_t *p, size_t n) {
-        for (size_t i = 0; i < n; i++)
-                if (p[i])
-                        return false;
-
-        return true;
-}
-
-int devd_probe_ext_super(const uint8_t *sb, size_t n, DevdFsInfo *ret) {
-        const uint8_t *u;
-        size_t i;
-
-        if (!sb || !ret || n < DEVD_EXT_MIN_SUPER)
-                return -EINVAL;
-
-        /* s_magic is little-endian, like every other ext field. */
-        if (((uint32_t) sb[DEVD_EXT_MAGIC_OFF] | ((uint32_t) sb[DEVD_EXT_MAGIC_OFF + 1] << 8)) !=
-            DEVD_EXT_MAGIC)
-                return 0;
-
-        memset(ret, 0, sizeof(*ret));
-
-        /*
-         * s_uuid is a plain big-endian UUID, unlike GPT's mixed-endian one --
-         * printed straight through, which is why this does not reuse
-         * gpt_guid_to_string(). Getting that wrong would produce a by-uuid link
-         * no fstab or bootloader entry written by anything else would match.
-         */
-        u = sb + DEVD_EXT_UUID_OFF;
-        if (!bytes_all_zero(u, 16))
-                snprintf(ret->uuid,
-                         sizeof(ret->uuid),
-                         "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-                         u[0],
-                         u[1],
-                         u[2],
-                         u[3],
-                         u[4],
-                         u[5],
-                         u[6],
-                         u[7],
-                         u[8],
-                         u[9],
-                         u[10],
-                         u[11],
-                         u[12],
-                         u[13],
-                         u[14],
-                         u[15]);
-
-        /* s_volume_name is 16 bytes and is NOT required to be terminated, so a
-         * 16-character label has no NUL at all -- copying by length rather than
-         * with strncpy() is the whole point. */
-        for (i = 0; i < 16; i++) {
-                if (sb[DEVD_EXT_LABEL_OFF + i] == '\0')
-                        break;
-
-                ret->label[i] = (char) sb[DEVD_EXT_LABEL_OFF + i];
-        }
-
-        ret->label[i] = '\0';
-
-        return 1;
-}
-
-int devd_probe_ext(const char *device, DevdFsInfo *ret) {
-        uint8_t sb[DEVD_EXT_SUPER_SIZE];
-        size_t done = 0;
-        int fd, r;
-
-        if (!device || !ret)
-                return -EINVAL;
-
-        fd = open(device, O_RDONLY | O_CLOEXEC);
-        if (fd < 0)
-                return -errno;
-
-        while (done < sizeof(sb)) {
-                ssize_t k = pread(fd, sb + done, sizeof(sb) - done, (off_t) (DEVD_EXT_SUPER_OFFSET + done));
-
-                if (k < 0) {
-                        if (errno == EINTR)
-                                continue;
-
-                        r = -errno;
-                        goto done;
-                }
-
-                if (k == 0) {
-                        /* Shorter than a superblock: not a filesystem devd can
-                         * name, and not an I/O error either. */
-                        r = 0;
-                        goto done;
-                }
-
-                done += (size_t) k;
-        }
-
-        r = devd_probe_ext_super(sb, sizeof(sb), ret);
-
-done:
-        (void) close(fd);
-        return r;
-}
 
 size_t devd_sanitize(const char *in, char *out, size_t size) {
         size_t n = 0;

@@ -33,6 +33,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "../ext-super.h"
 #include "../gpt-scan.h"
 #include "../util.h"
 #include "devd-media.h"
@@ -485,7 +486,7 @@ static void react_disk(Devd *d, const char *disk, const char *only_part) {
                 const char *part = names[i];
                 const GptPartition *p = NULL;
                 char part_node[PATH_MAX], dir[PATH_MAX];
-                DevdFsInfo fs;
+                PicoExtInfo fs;
                 DevdLinks l;
                 int nr;
 
@@ -513,7 +514,7 @@ static void react_disk(Devd *d, const char *disk, const char *only_part) {
                 gpt_guid_to_string(&p->uuid, l.partuuid);
                 (void) snprintf(l.partlabel, sizeof(l.partlabel), "%s", p->name);
 
-                if (devd_probe_ext(part_node, &fs) > 0) {
+                if (ext_super_read(part_node, &fs) > 0) {
                         (void) snprintf(l.fsuuid, sizeof(l.fsuuid), "%s", fs.uuid);
                         (void) snprintf(l.fslabel, sizeof(l.fslabel), "%s", fs.label);
                 }

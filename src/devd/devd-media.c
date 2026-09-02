@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "../ext-super.h"
 #include "../util.h"
 #include "devd-probe.h"
 
@@ -81,7 +82,7 @@ int devd_media_mount(
                 size_t size) {
 
         char dir[PATH_MAX];
-        DevdFsInfo fs;
+        PicoExtInfo fs;
         unsigned long flags = DEVD_MEDIA_FLAGS;
         int r;
 
@@ -95,7 +96,7 @@ int devd_media_mount(
          * to guess the meaning of. A FAT card and an unreadable card both fail
          * mount(2) with the same errno; only one of them is worth a warning.
          */
-        r = devd_probe_ext(node, &fs);
+        r = ext_super_read(node, &fs);
         if (r < 0)
                 return r;
 

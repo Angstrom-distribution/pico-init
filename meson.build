@@ -47,6 +47,11 @@ pico_init_core_sources = files(
   # it (plans/31, Slice A). In the core library rather than beside main.c
   # because the parser half is meant to have a second consumer later.
   'src/gpt-scan.c',
+  # The ext superblock reader (plan §10). Here rather than under src/devd/
+  # because it has two consumers that are two different binaries: devd names a
+  # removable partition from it, and PID 1's root check gates a filesystem
+  # checker on it.
+  'src/ext-super.c',
   'src/unit.c',
   'src/unit-load.c',
   'src/conf-scan.c',
@@ -136,6 +141,9 @@ pico_tests = [
   # The GPT reader (plans/31, Slice A), against real partition tables built
   # byte by byte in the test itself.
   'test-gpt-scan',
+  # The ext superblock reader, moved here with the code it covers when that
+  # code left src/devd/ to gain its second consumer (plan §10).
+  'test-ext-super',
 ]
 
 foreach t : pico_tests
@@ -286,10 +294,12 @@ endforeach
 # rather than the machine.
 #
 # It links pico-init-core for two different reasons at once. The event plumbing
-# (timer.c, signal.c, util.c) is the same share netd takes. gpt-scan.c is the
-# other, and is the whole point of that file's two-consumer split: PID 1's
-# boot-time swap activation and devd's removable-media policy read the same
-# partition table through the same parser.
+# (timer.c, signal.c, util.c) is the same share netd takes. gpt-scan.c and
+# ext-super.c are the other, and are the whole point of those files' two-consumer
+# split: PID 1's boot-time swap activation and devd's removable-media policy read
+# the same partition table through the same parser, and PID 1's root check and
+# devd's by-uuid/by-label naming read the same ext superblock through the same
+# decoder.
 #
 # 'src/devd' only on the include path, never 'src' -- see netd_includes above
 # for what putting src/ there does to a daemon's own <signal.h>.

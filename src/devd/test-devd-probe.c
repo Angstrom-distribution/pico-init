@@ -2,30 +2,20 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The field extraction behind by-uuid, by-label and by-id.
- *
- * Two very different things get tested here because they answer the same
- * question -- "what is this device called" -- from two different places.
- *
- * The ext superblock half is built byte by byte, in test-gpt-scan.c's style and
- * for its reason: a checked-in binary blob is a fixture nobody can review. The
- * particular bytes are not invented, though. They reproduce a real
- * `mke2fs -t ext4 -U 12345678-90ab-cdef-1234-567890abcdef -L PICOTEST` image
- * whose superblock was read at those three offsets and cross-checked against
- * dumpe2fs before any of this code was written -- so the offsets under test are
- * a verified property of ext4, not a citation this test agrees with because it
- * was written from the same citation.
+ * The field extraction behind by-id, and the sanitizer in front of it.
  *
  * The by-id half builds a sysfs tree in a temporary directory, because the real
  * one describes whatever is plugged into the machine running the test, which is
  * nothing predictable and on a build host is nothing at all. That is what
  * devd_probe_bus_id()'s sys_root parameter is for.
+ *
+ * The ext superblock half of this probe lives outside devd now -- PID 1 reads
+ * the same fields for its own root check -- and so do its tests: see
+ * ../test-ext-super.c.
  */
 
 #include <errno.h>
-#include <fcntl.h>
 #include <limits.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,123 +24,6 @@
 
 #include "../test-util.h"
 #include "devd-probe.h"
-
-/* --- the ext superblock --- */
-
-/*
- * The bytes read out of the real image, at the three offsets this project's
- * plan cites and this milestone re-verified:
- *
- *   magic  @+56  : 0xef53
- *   uuid   @+104 : 1234567890abcdef1234567890abcdef
- *   label  @+120 : "PICOTEST" NUL-padded to 16
- */
-static const uint8_t real_uuid[16] = { 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef,
-                                       0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef };
-
-static void build_super(uint8_t sb[DEVD_EXT_SUPER_SIZE], const uint8_t uuid[16], const char *label) {
-        memset(sb, 0, DEVD_EXT_SUPER_SIZE);
-
-        /* s_magic, little-endian like every other ext field. */
-        sb[DEVD_EXT_MAGIC_OFF] = 0x53;
-        sb[DEVD_EXT_MAGIC_OFF + 1] = 0xef;
-
-        if (uuid)
-                memcpy(sb + DEVD_EXT_UUID_OFF, uuid, 16);
-
-        if (label)
-                /* Not strncpy: a 16-character label has no terminator on disk,
-                 * and the copy below must be able to produce that case. */
-                memcpy(sb + DEVD_EXT_LABEL_OFF, label, strlen(label) > 16 ? 16 : strlen(label));
-}
-
-static void test_ext_super(void) {
-        uint8_t sb[DEVD_EXT_SUPER_SIZE];
-        DevdFsInfo fs;
-
-        build_super(sb, real_uuid, "PICOTEST");
-        ASSERT_EQ_INT(devd_probe_ext_super(sb, sizeof(sb), &fs), 1);
-        ASSERT_STREQ(fs.uuid, "12345678-90ab-cdef-1234-567890abcdef");
-        ASSERT_STREQ(fs.label, "PICOTEST");
-
-        /* An unlabelled filesystem, which is the common case: a uuid and
-         * nothing else, and no by-label link to make. */
-        build_super(sb, real_uuid, NULL);
-        ASSERT_EQ_INT(devd_probe_ext_super(sb, sizeof(sb), &fs), 1);
-        ASSERT_STREQ(fs.label, "");
-        ASSERT_STREQ(fs.uuid, "12345678-90ab-cdef-1234-567890abcdef");
-
-        /* An all-zero uuid is "none", not a link called
-         * 00000000-0000-0000-0000-000000000000 that every unformatted image
-         * on the machine would collide on. */
-        build_super(sb, NULL, "NOUUID");
-        ASSERT_EQ_INT(devd_probe_ext_super(sb, sizeof(sb), &fs), 1);
-        ASSERT_STREQ(fs.uuid, "");
-        ASSERT_STREQ(fs.label, "NOUUID");
-
-        /* A label filling the whole 16-byte field, with no terminator on disk.
-         * Copying it with a string function would read into s_last_mounted. */
-        build_super(sb, real_uuid, "SIXTEENCHARSLONG");
-        ASSERT_EQ_INT(devd_probe_ext_super(sb, sizeof(sb), &fs), 1);
-        ASSERT_STREQ(fs.label, "SIXTEENCHARSLONG");
-        ASSERT_EQ_INT(strlen(fs.label), 16);
-
-        /* No magic: not an ext filesystem, which is an answer rather than a
-         * failure -- a FAT card gets exactly this. */
-        memset(sb, 0, sizeof(sb));
-        ASSERT_EQ_INT(devd_probe_ext_super(sb, sizeof(sb), &fs), 0);
-
-        /* Magic in the right place but the wrong value. */
-        build_super(sb, real_uuid, "X");
-        sb[DEVD_EXT_MAGIC_OFF] = 0x54;
-        ASSERT_EQ_INT(devd_probe_ext_super(sb, sizeof(sb), &fs), 0);
-
-        /* A buffer too short to reach the label field cannot answer either
-         * way, and says so rather than reading past its end. */
-        build_super(sb, real_uuid, "PICOTEST");
-        ASSERT_EQ_INT(devd_probe_ext_super(sb, DEVD_EXT_LABEL_OFF + 4, &fs), -EINVAL);
-        ASSERT_EQ_INT(devd_probe_ext_super(NULL, sizeof(sb), &fs), -EINVAL);
-}
-
-/* The read path: a real file with a real superblock at byte 1024. */
-static void test_ext_device(void) {
-        uint8_t sb[DEVD_EXT_SUPER_SIZE];
-        char *dir, path[PATH_MAX];
-        DevdFsInfo fs;
-        int fd;
-
-        dir = test_tmpdir_new();
-        ASSERT_TRUE(dir != NULL);
-
-        snprintf(path, sizeof(path), "%s/image", dir);
-
-        fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-        ASSERT_TRUE(fd >= 0);
-
-        /* The 1024 bytes before the superblock: a boot block on a real
-         * filesystem, and never looked at here. */
-        memset(sb, 0xa5, sizeof(sb));
-        ASSERT_EQ_INT(write(fd, sb, DEVD_EXT_SUPER_OFFSET), DEVD_EXT_SUPER_OFFSET);
-
-        build_super(sb, real_uuid, "PICOTEST");
-        ASSERT_EQ_INT(write(fd, sb, sizeof(sb)), (ssize_t) sizeof(sb));
-        ASSERT_EQ_INT(close(fd), 0);
-
-        ASSERT_EQ_INT(devd_probe_ext(path, &fs), 1);
-        ASSERT_STREQ(fs.uuid, "12345678-90ab-cdef-1234-567890abcdef");
-        ASSERT_STREQ(fs.label, "PICOTEST");
-
-        /* Shorter than a superblock: not a filesystem, and not an I/O error. */
-        snprintf(path, sizeof(path), "%s/tiny", dir);
-        ASSERT_EQ_INT(test_write_file(dir, "tiny", "not a filesystem"), 0);
-        ASSERT_EQ_INT(devd_probe_ext(path, &fs), 0);
-
-        snprintf(path, sizeof(path), "%s/absent", dir);
-        ASSERT_EQ_INT(devd_probe_ext(path, &fs), -ENOENT);
-
-        test_rm_rf(dir);
-        free(dir);
-}
 
 /* --- the sanitizer --- */
 
@@ -345,8 +218,6 @@ static void test_no_identity(void) {
 }
 
 int main(void) {
-        test_ext_super();
-        test_ext_device();
         test_sanitize();
         test_usb_id();
         test_usb_id_no_serial();

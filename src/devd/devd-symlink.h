@@ -8,7 +8,7 @@
  * Five families, three sources, one lifecycle:
  *
  *   by-partuuid, by-partlabel   the GPT entry gpt-scan.c already parsed
- *   by-uuid, by-label           the ext superblock devd-probe.c reads
+ *   by-uuid, by-label           the ext superblock ext-super.c reads
  *   by-id                       the sysfs bus walk devd-probe.c does
  *
  * The lifecycle is why this belongs to a daemon and not to PID 1's boot-time
@@ -35,6 +35,7 @@
 
 #include <stddef.h>
 
+#include "../ext-super.h"
 #include "../gpt-scan.h"
 #include "devd-probe.h"
 
@@ -43,8 +44,8 @@
 typedef struct DevdLinks {
         char partuuid[GPT_GUID_STRING_MAX];
         char partlabel[GPT_PARTITION_NAME_MAX];
-        char fsuuid[DEVD_FS_UUID_MAX];
-        char fslabel[DEVD_FS_LABEL_MAX];
+        char fsuuid[EXT_FS_UUID_MAX];
+        char fslabel[EXT_FS_LABEL_MAX];
         char id[DEVD_ID_MAX]; /* already carries its -partN suffix */
 } DevdLinks;
 
