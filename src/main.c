@@ -17,6 +17,7 @@
 #include "gpt-scan.h"
 #include "manager.h"
 #include "mount-setup.h"
+#include "root-check.h"
 #include "status.h"
 #include "util.h"
 
@@ -118,6 +119,29 @@ int main(void) {
          */
         status_enable();
         status_welcome(NULL);
+
+        /*
+         * The root filesystem's integrity, before anything is allowed to write
+         * to it -- which means before swap discovery and before the first
+         * service, not merely before the first service. Needs everything above
+         * it: /proc for the mountinfo, /sys for the block topology, /dev for
+         * the node to check, and the kmsg sink already installed so what it
+         * finds survives into logd's backfill.
+         *
+         * The reboot is done here rather than inside the check because this is
+         * where PID 1's one sync()/reboot() path lives, and because freeze() --
+         * the thing that must catch a reboot() that came back -- belongs to
+         * this file. root-check.h has the decision table behind the verdict.
+         */
+        r = pico_root_check();
+        if (r < 0)
+                pico_log(PICO_LOG_WARNING, "pico_root_check: %s", strerror(-r));
+        else if (r == PICO_ROOT_REBOOT) {
+                pico_log(PICO_LOG_INFO, "rebooting after the root filesystem check");
+                sync();
+                reboot(RB_AUTOBOOT);
+                freeze("reboot() returned");
+        }
 
         /*
          * Swap, off the partition table alone. Placed here for three separate
