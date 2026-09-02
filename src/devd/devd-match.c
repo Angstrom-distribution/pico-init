@@ -807,9 +807,7 @@ static void
                         /* Same reasoning as SYMLINK+= above: a truncated
                          * command would spawn the wrong thing. Refuse. */
                         if (devd_rules_substitute(d, raw, value, sizeof(value)) >= sizeof(value) - 1) {
-                                pico_log(PICO_LOG_WARNING,
-                                         "devd: RUN+= expansion too long, dropping %s",
-                                         raw);
+                                pico_log(PICO_LOG_WARNING, "devd: RUN+= expansion too long, dropping %s", raw);
                                 break;
                         }
 

@@ -319,7 +319,7 @@ static int flags_fds(const int *fds, unsigned n_fds) {
  * OOM.
  */
 static bool is_listen_var(const char *e) {
-        static const char *const names[] = {
+        static const char * const names[] = {
                 "LISTEN_FDS=",
                 "LISTEN_PID=",
                 "LISTEN_FDNAMES=",

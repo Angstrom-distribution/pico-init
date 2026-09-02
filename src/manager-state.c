@@ -348,7 +348,7 @@ void manager_state_notify_manager(Manager *m) {
                 "DefaultTarget=%s\n"
                 "NUnits=%zu\n",
                 manager_objective_to_string(m->objective),
-                m->default_target ?: PICO_DEFAULT_TARGET,
+                m->default_target ? m->default_target : PICO_DEFAULT_TARGET,
                 m->n_units);
 
         if (fclose(f) != 0) {
