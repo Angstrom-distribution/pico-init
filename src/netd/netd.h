@@ -74,6 +74,16 @@ struct Netd {
         struct netd_epoll_tag signal_tag;
         struct netd_epoll_tag timer_tag;
 
+        /*
+         * Objects handed to netd_loop_defer_free() (netd-loop.h) because
+         * their epoll tag may still be sitting in the batch netd_loop_run()
+         * is dispatching. Reused across batches: the drain resets the count
+         * and keeps the capacity, so the steady state allocates nothing.
+         */
+        struct netd_pending_free *pending_free; /* owned */
+        size_t n_pending_free;
+        size_t n_pending_free_allocated;
+
         /* --- kernel interface (netd-rtnl.c) --- */
         NetdRtnl *rtnl;
         struct netd_epoll_tag rtnl_tag;

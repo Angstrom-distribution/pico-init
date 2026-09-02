@@ -182,8 +182,15 @@ int netd_rtnl_address_del(NetdRtnl *rtnl, int ifindex, const struct in_addr *add
  * `destination` NULL with prefixlen 0 is the default route, which is the case
  * that actually matters and which netd_rtnl_route_add_default() exists to
  * make unmistakable at the call site. `gateway` NULL means an on-link route.
- * `metric` goes into RTA_PRIORITY, so a second interface's default route can
- * coexist with the first instead of colliding with it.
+ * `metric` goes into RTA_PRIORITY, which is part of what the kernel matches a
+ * route by (table+prefix+priority) -- and NLM_F_REPLACE means two default
+ * routes offered at the same metric are one route that the second add
+ * overwrites, not two. So coexistence is the caller's to arrange, not
+ * something this call provides: a distinct metric per interface makes two
+ * default routes genuinely distinct routes, individually replaceable and
+ * individually deletable, with the kernel preferring the lowest metric. That
+ * is exactly what netd-link.c's link_route_metric() derives from the ifindex;
+ * a caller reusing one metric across interfaces gets silent replacement.
  */
 int netd_rtnl_route_add(
                 NetdRtnl *rtnl,

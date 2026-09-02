@@ -128,15 +128,57 @@ int netd_loop_modify_io(Netd *n, struct netd_epoll_tag *tag, uint32_t events);
  */
 int netd_loop_remove_io(Netd *n, struct netd_epoll_tag *tag);
 
+/* How a deferred object is destroyed once the batch that may still name it is
+ * over. Takes void* so an owner's own unref can be wrapped in one line. */
+typedef void (*netd_free_func_t)(void *object);
+
+/* One entry of Netd.pending_free; see netd_loop_defer_free(). */
+struct netd_pending_free {
+        void *object;
+        netd_free_func_t free_func;
+};
+
+/*
+ * Hand ownership of `object` to the loop, to be destroyed once the current
+ * epoll batch has been fully dispatched rather than now.
+ *
+ * A struct netd_epoll_tag is embedded in whatever owns the fd, so freeing the
+ * owner frees the tag -- and epoll_wait() hands netd_loop_run() a whole array
+ * of tag pointers before the first callback in the batch runs.
+ * netd_loop_run() skips a tag whose `registered` is false, but reading that
+ * flag needs the tag's memory to still exist. It always does for the
+ * signal/timer/rtnl tags, which live in Netd itself; it does *not* for a DHCP
+ * client/server tag, which lives in the per-link object
+ * (dhcp-client-internal.h, dhcp-server-internal.h). One batch carrying both
+ * an RTM_DELLINK for a link and that link's DHCP socket becoming
+ * readable/HUP -- an ordinary hot-unplug of a USB gadget interface -- would
+ * otherwise have the rtnl callback free the DHCP object and the loop read
+ * tag->registered out of freed memory a few events later.
+ *
+ * Deferring only the free is enough: the caller stops the object first, so
+ * its fd is already deregistered and closed and its timers cancelled, and the
+ * tag it still holds reads back as unregistered for the rest of the batch.
+ *
+ * 0, or -ENOMEM with `object` *not* destroyed -- the caller must then leak it
+ * rather than free it, since a stopped DHCP object is inert memory whereas
+ * freeing it here is exactly the use-after-free this queue exists to prevent.
+ */
+int netd_loop_defer_free(Netd *n, void *object, netd_free_func_t free_func);
+
+/* Destroy everything netd_loop_defer_free() queued. netd_loop_run() calls it
+ * once per batch, and netd_free() calls it so a teardown outside the loop does
+ * not strand the queue. */
+void netd_loop_drain_pending_frees(Netd *n);
+
 /*
  * The loop. Blocks until objective != NETD_RUNNING; returns 0 on a clean exit
  * or -errno.
  *
  * Per iteration: epoll_wait(), dispatch every ready tag's callback, then --
- * after the whole batch, not inside it -- act on a pending reload. Deferring
- * the reload is the same rule the manager applies to its cgroup-empty queue:
- * a reload frees every Network, and a callback still holding a borrowed
- * Network* would be reading freed memory.
+ * after the whole batch, not inside it -- drain the deferred-free queue and
+ * act on a pending reload. Deferring the reload is the same rule the manager
+ * applies to its cgroup-empty queue: a reload frees every Network, and a
+ * callback still holding a borrowed Network* would be reading freed memory.
  */
 int netd_loop_run(Netd *n);
 

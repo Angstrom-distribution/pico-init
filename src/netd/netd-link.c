@@ -36,13 +36,32 @@
  * Shared by static Gateway= and by a lease's default route: a link has one
  * "the route netd put in" slot (Link.gateway/gateway_configured), so
  * whichever source configured it, removing it later needs the same metric to
- * find the same kernel route again. RTA_PRIORITY lets a second interface's
- * default route coexist rather than collide (netd-rtnl.h) -- one fixed
- * metric is enough for netd's own routes to stay out of each other's way; a
- * link with more than one default route source at once is not a shape any
- * real .network file here produces.
+ * find the same kernel route again.
+ *
+ * The metric is per link, not one fixed value for all of them. The kernel
+ * identifies a route by table+prefix+priority, and netd adds with
+ * NLM_F_CREATE|NLM_F_REPLACE: two managed uplinks (eth0 and usb0, say) at one
+ * shared metric are the *same* route to the kernel, so the second link's add
+ * silently replaces the first link's default route while both links'
+ * gateway_configured still say they have one -- and the first link's later
+ * delete then no-ops on -ESRCH. Deriving the metric from the ifindex is what
+ * actually makes netd-rtnl.h's "a second interface's default route can
+ * coexist" true: distinct metric, distinct route, both individually
+ * removable, and the kernel picks the lowest metric as primary.
+ *
+ * ifindex rather than registration order because it is the link identity that
+ * survives everything that matters here: it is assigned once in link_new()
+ * and never rewritten (link_update_snapshot() leaves it alone), so a teardown
+ * always computes the same metric the add did, and a restarted netd that
+ * re-enumerates the same interfaces derives the same metrics again.
  */
-#define NETD_LINK_ROUTE_METRIC 100
+#define NETD_LINK_ROUTE_METRIC_BASE 100
+
+static uint32_t link_route_metric(const Link *l) {
+        /* ifindex is a small positive int from the kernel (netd_rtnl_route_
+         * add() itself rejects <= 0), so this cannot realistically wrap. */
+        return NETD_LINK_ROUTE_METRIC_BASE + (uint32_t) l->ifindex;
+}
 
 /* --- idempotent rtnl wrappers ---
  *
@@ -368,7 +387,7 @@ static int apply_static_gateway(Link *l, const Network *nw) {
                 if (!l->gateway_configured)
                         return 0;
 
-                r = route_del_default_idempotent(n->rtnl, l->ifindex, &l->gateway, NETD_LINK_ROUTE_METRIC);
+                r = route_del_default_idempotent(n->rtnl, l->ifindex, &l->gateway, link_route_metric(l));
                 if (r < 0)
                         return r;
 
@@ -379,12 +398,12 @@ static int apply_static_gateway(Link *l, const Network *nw) {
         if (l->gateway_configured && l->gateway.s_addr == nw->gateway.s_addr)
                 return 0;
 
-        r = route_add_default_idempotent(n->rtnl, l->ifindex, &nw->gateway, NETD_LINK_ROUTE_METRIC);
+        r = route_add_default_idempotent(n->rtnl, l->ifindex, &nw->gateway, link_route_metric(l));
         if (r < 0)
                 return r;
 
         if (l->gateway_configured)
-                (void) route_del_default_idempotent(n->rtnl, l->ifindex, &l->gateway, NETD_LINK_ROUTE_METRIC);
+                (void) route_del_default_idempotent(n->rtnl, l->ifindex, &l->gateway, link_route_metric(l));
 
         l->gateway = nw->gateway;
         l->gateway_configured = true;
@@ -792,7 +811,7 @@ static int link_teardown_kernel_state(Link *l) {
         int r, ret = 0;
 
         if (l->gateway_configured) {
-                r = route_del_default_idempotent(n->rtnl, l->ifindex, &l->gateway, NETD_LINK_ROUTE_METRIC);
+                r = route_del_default_idempotent(n->rtnl, l->ifindex, &l->gateway, link_route_metric(l));
                 if (r < 0) {
                         pico_log(PICO_LOG_WARNING,
                                  "netd: %s: failed to remove route: %s",
@@ -825,31 +844,80 @@ static int link_teardown_kernel_state(Link *l) {
         return ret;
 }
 
-/* dhcp_client_stop() before dhcp_client_unref(): the client's own doc asks
- * for that order (a running client refuses a second start otherwise, and a
- * stopped-but-still-refcounted client would leak its socket/timers if this
+static void dhcp_client_unref_void(void *p) {
+        (void) dhcp_client_unref(p);
+}
+
+static void dhcp_server_unref_void(void *p) {
+        (void) dhcp_server_unref(p);
+}
+
+/*
+ * Drop this link's reference to an already-stopped DHCP object -- through the
+ * loop's post-batch queue, never inline. Both stop functions below can run
+ * from inside an epoll callback (link_configure() off an RTM_NEWLINK,
+ * link_free() off an RTM_DELLINK), and the object carries the netd_epoll_tag
+ * that epoll_wait() may already have reported for a later event in the same
+ * batch; freeing it here is exactly what netd_loop_defer_free() exists to
+ * stop (see its comment in netd-loop.h).
+ *
+ * -ENOMEM is the one case where the reference is dropped on the floor: the
+ * object is stopped, so it holds no fd, no timer and no epoll registration,
+ * and leaking that inert memory is strictly better than handing the rest of
+ * the batch a freed tag.
+ */
+static void link_release_dhcp_object(Link *l, void *object, netd_free_func_t free_func, const char *what) {
+        int r = netd_loop_defer_free(l->netd, object, free_func);
+
+        if (r < 0)
+                pico_log(PICO_LOG_WARNING,
+                         "netd: %s: cannot queue the %s for release, leaking it: %s",
+                         l->ifname,
+                         what,
+                         strerror(-r));
+}
+
+/* dhcp_client_stop() before the reference is dropped: the client's own doc
+ * asks for that order (a running client refuses a second start otherwise, and
+ * a stopped-but-still-refcounted client would leak its socket/timers if this
  * were the only reference). Safe to call from inside that same client's own
  * callback -- upstream's DHCP_CLIENT_DONT_DESTROY (carried, dhcp-client-
  * internal.h) keeps the object alive through the notify call that got us
  * here, and the client re-checks its own state afterwards. Idempotent: a
  * NULL l->dhcp_client is a no-op. */
 static void link_stop_dhcp_client(Link *l) {
-        if (!l->dhcp_client)
+        DhcpClient *client = l->dhcp_client;
+
+        if (!client)
                 return;
 
-        (void) dhcp_client_stop(l->dhcp_client);
-        l->dhcp_client = dhcp_client_unref(l->dhcp_client);
+        (void) dhcp_client_stop(client);
+
+        /* stop() notifies, and a notify callback is allowed to re-enter here;
+         * if one did, this link's reference is already queued. */
+        if (l->dhcp_client != client)
+                return;
+
+        l->dhcp_client = NULL;
+        link_release_dhcp_object(l, client, dhcp_client_unref_void, "DHCP client");
 }
 
 /* Same shape for the server side; DHCP_SERVER_DONT_DESTROY (dhcp-server-
  * internal.h) is this milestone's own addition to a defect upstream never
  * fixed -- see that header's comment. */
 static void link_stop_dhcp_server(Link *l) {
-        if (!l->dhcp_server)
+        DhcpServer *server = l->dhcp_server;
+
+        if (!server)
                 return;
 
-        (void) dhcp_server_stop(l->dhcp_server);
-        l->dhcp_server = dhcp_server_unref(l->dhcp_server);
+        (void) dhcp_server_stop(server);
+
+        if (l->dhcp_server != server)
+                return;
+
+        l->dhcp_server = NULL;
+        link_release_dhcp_object(l, server, dhcp_server_unref_void, "DHCP server");
 }
 
 int link_deconfigure(Link *l) {
@@ -934,12 +1002,12 @@ int link_apply_lease(Link *l, DhcpLease *lease) {
                 if (nrouters > 0 && routers[0].s_addr != 0 &&
                     (!l->gateway_configured || l->gateway.s_addr != routers[0].s_addr)) {
                         int rr = route_add_default_idempotent(
-                                        n->rtnl, l->ifindex, &routers[0], NETD_LINK_ROUTE_METRIC);
+                                        n->rtnl, l->ifindex, &routers[0], link_route_metric(l));
 
                         if (rr == 0) {
                                 if (l->gateway_configured)
                                         (void) route_del_default_idempotent(
-                                                        n->rtnl, l->ifindex, &l->gateway, NETD_LINK_ROUTE_METRIC);
+                                                        n->rtnl, l->ifindex, &l->gateway, link_route_metric(l));
                                 l->gateway = routers[0];
                                 l->gateway_configured = true;
                         } else

@@ -160,6 +160,12 @@ Netd *netd_free(Netd *n) {
                 (void) link_free(n->links[n->n_links - 1]);
         free(n->links);
 
+        /* Those link_free()s queue their DHCP objects rather than freeing
+         * them (netd_loop_defer_free()); nothing will run the loop again, so
+         * drain here, while the epoll fd they deregister against is open. */
+        netd_loop_drain_pending_frees(n);
+        free(n->pending_free);
+
         n->sntp = netd_sntp_free(n->sntp);
 
         network_free_all(n);
@@ -347,8 +353,13 @@ static void netd_apply_static_ntp(Netd *n) {
                 }
         }
 
-        if (count == 0)
+        if (count == 0) {
+                /* No NTP= left anywhere: stop querying rather than leave a
+                 * stale server list running (netd-sntp.h). */
+                if (n->sntp)
+                        (void) netd_sntp_set_servers(n->sntp, NULL, 0);
                 return;
+        }
 
         if (!n->sntp) {
                 int r = netd_sntp_new(n, &n->sntp);
@@ -632,6 +643,43 @@ int netd_loop_remove_io(Netd *n, struct netd_epoll_tag *tag) {
         return 0;
 }
 
+int netd_loop_defer_free(Netd *n, void *object, netd_free_func_t free_func) {
+        if (!n || !object || !free_func)
+                return -EINVAL;
+
+        if (n->n_pending_free == n->n_pending_free_allocated) {
+                size_t want = n->n_pending_free_allocated ? n->n_pending_free_allocated * 2 : 4;
+                struct netd_pending_free *grown;
+
+                grown = realloc(n->pending_free, want * sizeof(*grown));
+                if (!grown)
+                        return -ENOMEM;
+
+                n->pending_free = grown;
+                n->n_pending_free_allocated = want;
+        }
+
+        n->pending_free[n->n_pending_free++] = (struct netd_pending_free){
+                .object = object,
+                .free_func = free_func,
+        };
+        return 0;
+}
+
+void netd_loop_drain_pending_frees(Netd *n) {
+        if (!n)
+                return;
+
+        /* Re-read the array and the count every iteration rather than
+         * caching either: a free_func may itself defer something (the last
+         * reference to a DHCP object can be the one a link teardown drops),
+         * appending here and possibly reallocating the array underneath us. */
+        for (size_t i = 0; i < n->n_pending_free; i++)
+                n->pending_free[i].free_func(n->pending_free[i].object);
+
+        n->n_pending_free = 0;
+}
+
 int netd_loop_dispatch_signal(Netd *n, int signo) {
         if (!n)
                 return -EINVAL;
@@ -683,6 +731,16 @@ int netd_loop_run(Netd *n) {
                          * this cast is always valid -- but a source removed
                          * by an earlier callback in the same batch can still
                          * appear later in it, and its tag is then cleared.
+                         *
+                         * Reading the cleared tag is only safe because the
+                         * memory is still there: a tag lives inside the
+                         * object that owns the fd, and for the DHCP
+                         * client/server sources that object is per-link and
+                         * can be destroyed by an earlier callback in this
+                         * very batch (an RTM_DELLINK reaching link_free()).
+                         * Those destructions go through
+                         * netd_loop_defer_free(), which is why the queue is
+                         * drained below rather than inside the loop.
                          */
                         if (!tag || !tag->callback || !tag->registered)
                                 continue;
@@ -694,6 +752,10 @@ int netd_loop_run(Netd *n) {
                                          netd_epoll_source_to_string(tag->source),
                                          strerror(-r));
                 }
+
+                /* No tag pointer from this batch is live any more, so
+                 * anything a callback deferred can finally go away. */
+                netd_loop_drain_pending_frees(n);
 
                 if (n->reload_requested) {
                         n->reload_requested = false;
