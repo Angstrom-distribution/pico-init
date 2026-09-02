@@ -783,7 +783,15 @@ static void
                         break;
 
                 case DEVD_RULE_KEY_SYMLINK:
-                        (void) devd_rules_substitute(d, raw, value, sizeof(value));
+                        /* A truncated symlink name, like a truncated %b,
+                         * would point a tool at the wrong device. Refuse
+                         * the action instead -- the safe direction. */
+                        if (devd_rules_substitute(d, raw, value, sizeof(value)) >= sizeof(value) - 1) {
+                                pico_log(PICO_LOG_WARNING,
+                                         "devd: SYMLINK+= expansion too long, dropping %s",
+                                         raw);
+                                break;
+                        }
 
                         if (cl[i].op == DEVD_RULE_OP_ASSIGN)
                                 ret->n_symlinks = 0;
@@ -796,7 +804,14 @@ static void
                         break;
 
                 case DEVD_RULE_KEY_RUN:
-                        (void) devd_rules_substitute(d, raw, value, sizeof(value));
+                        /* Same reasoning as SYMLINK+= above: a truncated
+                         * command would spawn the wrong thing. Refuse. */
+                        if (devd_rules_substitute(d, raw, value, sizeof(value)) >= sizeof(value) - 1) {
+                                pico_log(PICO_LOG_WARNING,
+                                         "devd: RUN+= expansion too long, dropping %s",
+                                         raw);
+                                break;
+                        }
 
                         if (cl[i].op == DEVD_RULE_OP_ASSIGN)
                                 ret->n_runs = 0;
