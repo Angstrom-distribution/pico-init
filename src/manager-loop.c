@@ -157,6 +157,19 @@ static void manager_note_cgroup_event(Manager *m, struct pico_cgroup *cg) {
 }
 
 static int manager_dispatch_epoll_event(Manager *m, struct pico_epoll_tag *tag, bool cgroup_pass) {
+        /*
+         * Retired earlier in this very batch. epoll_wait() fills events[] in
+         * one shot, so dispatching event i can destroy the owner of event j>i
+         * -- a picoctl connection whose job finishes here is torn down by
+         * manager_ctrl_notify_job_finished() while its own EPOLLHUP is still
+         * queued further down the array. Such an owner keeps its allocation
+         * until manager_ctrl_release_dead() at the end of the iteration
+         * precisely so this read is valid; the flag is what stops us
+         * dispatching into a half-dismantled object.
+         */
+        if (tag->dead)
+                return 0;
+
         switch (tag->source) {
         case PICO_EPOLL_CGROUP:
                 if (cgroup_pass)
@@ -289,6 +302,15 @@ int manager_loop(Manager *m) {
 
                 /* 5: and only then start whatever became runnable */
                 manager_dispatch_run_queue(m);
+
+                /*
+                 * 6: reclaim. events[] is done with, so anything retired
+                 * while it was being walked -- steps 2 through 5 can all
+                 * finish a job and so retire a picoctl connection -- can
+                 * finally be freed. Doing it at the point of retirement
+                 * instead is the use-after-free this defers away from.
+                 */
+                manager_ctrl_release_dead(m);
 
                 /*
                  * A shutdown only takes effect once its stop jobs have

@@ -115,6 +115,11 @@ struct pico_manager_ctrl {
         struct ctrl_conn *conns;
         size_t n_conns;
 
+        /* Torn-down connections awaiting their free(), linked via ->next.
+         * Drained by ctrl_release_dead_conns() once the current
+         * epoll batch is fully dispatched -- see ctrl_conn_free(). */
+        struct ctrl_conn *dead_conns;
+
         struct ctrl_pending *pending;
 };
 
@@ -137,17 +142,30 @@ static void ctrl_pending_unlink(struct pico_manager_ctrl *ctrl, struct ctrl_pend
 }
 
 /*
- * Unregister, close, unlink from ctrl->conns, and free -- the one exit path
+ * Unregister, close, unlink from ctrl->conns, and retire -- the one exit path
  * every connection goes through, whichever of the several reasons got it
  * here. A still-pending deferred reply loses its home right here: the job
  * itself is unaffected (nothing in job.c is tied to this connection), but
  * nobody is listening for the result any more, which is exactly "a client
  * disconnect just drops the pending record" (plan §1.7).
+ *
+ * Everything observable happens now -- the fd leaves the epoll set and is
+ * closed, the connection stops being tracked, n_conns drops -- but the
+ * free() itself is DEFERRED onto ctrl->dead_conns. This is called from
+ * inside an epoll batch (manager_ctrl_notify_job_finished(), reached from
+ * job_finish_full() via a SIGCHLD or a displaced job), and epoll_wait()
+ * hands manager-loop.c a whole array of events at once: a later event in
+ * that same array can still name THIS connection's tag (its EPOLLHUP,
+ * typically, since picoctl exits as soon as it has its reply). Freeing here
+ * would leave the loop reading tag->source out of freed -- and possibly
+ * already reused -- memory. ctrl_release_dead_conns() does the
+ * actual free once the batch is fully dispatched; ->dead makes any further
+ * event on it in the meantime a no-op, and makes this idempotent.
  */
 static void ctrl_conn_free(struct ctrl_conn *conn) {
         struct pico_manager_ctrl *ctrl;
 
-        if (!conn)
+        if (!conn || conn->tag.dead)
                 return;
 
         ctrl = conn->ctrl;
@@ -160,6 +178,7 @@ static void ctrl_conn_free(struct ctrl_conn *conn) {
         if (conn->tag.fd >= 0) {
                 epoll_ctl(ctrl->manager->epoll_fd, EPOLL_CTL_DEL, conn->tag.fd, NULL);
                 close(conn->tag.fd);
+                conn->tag.fd = -1;
         }
 
         if (conn->prev)
@@ -170,7 +189,22 @@ static void ctrl_conn_free(struct ctrl_conn *conn) {
                 conn->next->prev = conn->prev;
 
         ctrl->n_conns--;
-        free(conn);
+
+        conn->tag.dead = true;
+        conn->prev = NULL;
+        conn->next = ctrl->dead_conns;
+        ctrl->dead_conns = conn;
+}
+
+/* Drain ctrl->dead_conns. Only ever called from outside an epoll batch --
+ * manager_loop()'s end-of-iteration reclaim, and teardown. */
+static void ctrl_release_dead_conns(struct pico_manager_ctrl *ctrl) {
+        while (ctrl->dead_conns) {
+                struct ctrl_conn *conn = ctrl->dead_conns;
+
+                ctrl->dead_conns = conn->next;
+                free(conn);
+        }
 }
 
 /* Best-effort, never blocking: MSG_DONTWAIT so a full send buffer (a client
@@ -429,6 +463,16 @@ static void ctrl_handle_request(struct ctrl_conn *conn, const char *buf, size_t 
                         return;
                 }
 
+                /* manager_add_job() can reach job_finish_full() (a displaced
+                 * job), and so back into ctrl_conn_free(). It cannot be THIS
+                 * connection -- it owns no pending record yet, so nothing can
+                 * find it -- but the deferred free means the check is cheap
+                 * and the alternative would be a dangling pending->conn. */
+                if (conn->tag.dead) {
+                        free(pending);
+                        return;
+                }
+
                 pending->job_id = job->id;
                 pending->conn = conn;
                 pending->next = ctrl->pending;
@@ -661,6 +705,7 @@ void manager_ctrl_done(Manager *m) {
 
         while (ctrl->conns)
                 ctrl_conn_free(ctrl->conns); /* drops any pending record too */
+        ctrl_release_dead_conns(ctrl);       /* including anything a last batch retired */
 
         if (ctrl->listen_fd >= 0) {
                 epoll_ctl(m->epoll_fd, EPOLL_CTL_DEL, ctrl->listen_fd, NULL);
@@ -685,7 +730,19 @@ int manager_ctrl_dispatch(Manager *m, struct pico_epoll_tag *tag) {
         if (tag == &ctrl->listen_tag)
                 return ctrl_accept(ctrl);
 
+        /* Retired earlier in this same batch: the memory is deliberately
+         * still here, but there is nothing left to dispatch on. */
+        if (tag->dead)
+                return 0;
+
         return ctrl_conn_dispatch((struct ctrl_conn *) tag);
+}
+
+void manager_ctrl_release_dead(Manager *m) {
+        if (!m || !m->ctrl)
+                return;
+
+        ctrl_release_dead_conns(m->ctrl);
 }
 
 void manager_ctrl_notify_job_finished(Job *j, JobResult result) {

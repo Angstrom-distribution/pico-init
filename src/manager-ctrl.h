@@ -46,8 +46,17 @@ void manager_ctrl_done(Manager *m);
 int manager_ctrl_dispatch(Manager *m, struct pico_epoll_tag *tag);
 
 /* Resolve any deferred reply waiting on this job. Called from
- * job_finish_full(), which is the only place a job result becomes final. */
+ * job_finish_full(), which is the only place a job result becomes final.
+ *
+ * This can retire the client's connection from deep inside an epoll batch,
+ * so the connection is unregistered and closed here but not freed --
+ * epoll_wait() may still have a later event in the same batch naming it.
+ * manager_loop() calls manager_ctrl_release_dead() once the batch is done. */
 void manager_ctrl_notify_job_finished(Job *j, JobResult result);
+
+/* Free every connection retired during the batch just dispatched. Must only
+ * be called when no epoll event array is still being walked. */
+void manager_ctrl_release_dead(Manager *m);
 
 /*
  * Test-only introspection: the number of currently-tracked connections and

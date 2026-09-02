@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -62,6 +63,24 @@ typedef enum PicoEpollSource {
 struct pico_epoll_tag {
         PicoEpollSource source;
         int fd; /* for logging only; dispatch reaches the real owner via a cast back to the containing struct */
+
+        /*
+         * Torn down, but not yet freed. One epoll_wait() returns a whole
+         * batch of events, and dispatching an earlier one can destroy the
+         * owner of a later one in the same batch -- a picoctl connection
+         * whose job finishes (or is displaced) is freed by manager_ctrl_
+         * notify_job_finished() while its own EPOLLHUP still sits further
+         * down events[]. Reading tag->source out of that freed tag is a
+         * use-after-free, and with the allocation reused it dispatches on
+         * whatever now occupies those bytes.
+         *
+         * So an owner that can die mid-batch unregisters and closes
+         * immediately but defers its free() to the end of the batch, and
+         * marks the tag dead here on the way out. manager-loop.c skips a
+         * dead tag; the memory stays valid until the batch is fully
+         * dispatched.
+         */
+        bool dead;
 };
 
 typedef enum PicoLogLevel {
