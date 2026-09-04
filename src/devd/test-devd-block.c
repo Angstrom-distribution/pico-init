@@ -33,6 +33,10 @@
  * name. */
 #define DISK_PATH "/devices/platform/scsi/host0/target0:0:0/0:0:0:0/block/sda"
 
+/* The real MTD shape: two class glue directories, mtd/ then block/, between
+ * the flash device and the disk. */
+#define MTD_PATH "/devices/platform/physmap-flash.0/mtd/mtd0/block/mtdblock0"
+
 static DevdUevent ev(DevdAction action, const char *devpath, const char *devname, const char *devtype) {
         DevdUevent u;
 
@@ -116,6 +120,38 @@ static void test_ignores(void) {
                       DEVD_BLOCK_IGNORED);
 
         ASSERT_TRUE(devd_block_next_settle(&b) == USEC_INFINITY);
+}
+
+/*
+ * MTD flash is tracked like any other disk and never probed. Both halves
+ * matter: h2200 boots from NAND, so making mtdblock0 vanish from the table the
+ * way a ram device does would take the boot disk with it.
+ */
+static void test_mtd_tracked_but_not_probed(void) {
+        const char(*parts)[DEVD_NAME_MAX] = NULL;
+        DevdBlock b;
+
+        devd_block_init(&b, T_SETTLE, T_CEILING);
+
+        ASSERT_EQ_INT(feed(&b, ev(DEVD_ACTION_ADD, MTD_PATH, "mtdblock0", "disk"), 0),
+                      DEVD_BLOCK_DISK_PENDING);
+        ASSERT_STREQ(devd_block_take_settled(&b, T_SETTLE), "mtdblock0");
+        ASSERT_TRUE(devd_block_probe_excluded(&b, "mtdblock0"));
+        ASSERT_EQ_INT(devd_block_partitions(&b, "mtdblock0", &parts), 0);
+
+        /* An ordinary disk sharing the table is still probed. */
+        ASSERT_EQ_INT(feed(&b, ev(DEVD_ACTION_ADD, DISK_PATH, "sda", "disk"), 0), DEVD_BLOCK_DISK_PENDING);
+        ASSERT_STREQ(devd_block_take_settled(&b, T_SETTLE), "sda");
+        ASSERT_TRUE(!devd_block_probe_excluded(&b, "sda"));
+
+        /* A disk nobody is tracking is not excluded by default. */
+        ASSERT_TRUE(!devd_block_probe_excluded(&b, "sdz"));
+
+        /* Removal still works on it: the record went away, so did the flag. */
+        ASSERT_EQ_INT(feed(&b, ev(DEVD_ACTION_REMOVE, MTD_PATH, "mtdblock0", "disk"), T_SETTLE),
+                      DEVD_BLOCK_DISK_GONE);
+        devd_block_forget(&b, "mtdblock0");
+        ASSERT_TRUE(!devd_block_probe_excluded(&b, "mtdblock0"));
 }
 
 /*
@@ -337,6 +373,7 @@ static void test_bounds(void) {
 int main(void) {
         test_names();
         test_ignores();
+        test_mtd_tracked_but_not_probed();
         test_burst_settles_once();
         test_ceiling();
         test_late_partition();
