@@ -450,6 +450,11 @@ static void react_disk(Devd *d, const char *disk, const char *only_part) {
         if ((size_t) snprintf(node, sizeof(node), "%s/%s", d->dev_root, disk) >= sizeof(node))
                 return;
 
+        if (devd_block_probe_excluded(&d->block, disk)) {
+                pico_log(PICO_LOG_DEBUG, "devd: %s is MTD flash, not probing it", node);
+                return;
+        }
+
         id_stem[0] = '\0';
 
         if (block_sysfs(d, disk, sysfs, sizeof(sysfs)) == 0) {
