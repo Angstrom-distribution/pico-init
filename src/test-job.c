@@ -672,6 +672,60 @@ static void test_unit_free_cancels_its_job(void) {
         free(dir);
 }
 
+/*
+ * The job-layer half of "condition-failed is not failure", proven with
+ * targets so nothing here forks: a Requires=/After= dependent of a unit
+ * whose condition is unmet still reaches ACTIVE, and the skipped unit's own
+ * job completes DONE rather than sitting in JOB_RUNNING forever -- the
+ * regression job.c's job_run() -EALREADY mapping guards. This is the direct
+ * analogue of usb-multi-gadget-dhcp-fallback.service's real Requires= on
+ * usb-multi-gadget.service on a UDC-less machine.
+ */
+static void test_condition_skipped_job_completes_done(void) {
+        Manager *m;
+        char *dir;
+        Unit *a;
+        Unit *b;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir, "a.target", "[Unit]\nRequires=b.target\nAfter=b.target\n"), 0);
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "b.target",
+                                      "[Unit]\nDescription=B\nConditionPathExists=/nonexistent/pico-init-test\n"),
+                      0);
+
+        m = manager_for(dir);
+        ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+
+        a = manager_get_unit(m, "a.target");
+        ASSERT_TRUE(a != NULL);
+        b = manager_get_unit(m, "b.target");
+        ASSERT_TRUE(b != NULL);
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, a, NULL), 0);
+        ASSERT_TRUE(manager_dispatch_run_queue(m) > 0);
+
+        /* b was skipped, left inactive */
+        ASSERT_EQ_INT(unit_active_state(b), UNIT_INACTIVE);
+        ASSERT_TRUE(!b->condition_result);
+
+        /* its job completed rather than hanging in JOB_RUNNING forever */
+        ASSERT_TRUE(b->job == NULL);
+
+        /* the skip did not propagate as a failure, and did not deadlock the
+         * ordering: a Requires=/After= dependent still ran to completion */
+        ASSERT_EQ_INT(unit_active_state(a), UNIT_ACTIVE);
+        ASSERT_TRUE(a->job == NULL);
+
+        ASSERT_TRUE(m->run_queue == NULL);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
         test_ordering_c_b_a();
         test_unit_free_cancels_its_job();
@@ -686,6 +740,7 @@ int main(void) {
         test_conflicting_job_types();
         test_target_start_completes();
         test_redundant_job_dropped();
+        test_condition_skipped_job_completes_done();
 
         printf("test-job: all checks passed\n");
         return 0;

@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "job.h"
 #include "manager-state.h"
@@ -59,6 +60,10 @@ int unit_new(Manager *m, UnitType type, const char *id, Unit **ret) {
         u->type = type;
         u->vtable = vtable;
         u->load_state = UNIT_STUB;
+
+        /* Explicitly, not by relying on calloc: a unit with no conditions at
+         * all must read as having passed them. */
+        u->condition_result = true;
 
         u->id = pico_strdup(id);
         if (!u->id) {
@@ -155,6 +160,9 @@ Unit *unit_free(Unit *u) {
         u->wanted_by = pico_strv_free(u->wanted_by);
         u->required_by = pico_strv_free(u->required_by);
 
+        u->condition_path_exists = pico_strv_free(u->condition_path_exists);
+        u->condition_path_is_directory = pico_strv_free(u->condition_path_is_directory);
+
         free(u);
 
         return NULL;
@@ -165,6 +173,37 @@ UnitActiveState unit_active_state(Unit *u) {
                 return UNIT_INACTIVE;
 
         return u->vtable->active_state(u);
+}
+
+/*
+ * All conditions must pass -- systemd's AND semantics for the non-triggering
+ * ones. Evaluated at start time, not load time: the paths these name are
+ * created by other units during the boot (/dev/ttyGS0 exists only once
+ * usb-multi-gadget.service has run), so a load-time answer would be the wrong
+ * one for exactly the case this exists to serve.
+ */
+static bool unit_condition_test(Unit *u) {
+        char **p;
+
+        for (p = u->condition_path_exists; p && *p; p++) {
+                struct stat st;
+
+                if (stat(*p, &st) < 0) {
+                        pico_log(PICO_LOG_INFO, "%s: ConditionPathExists=%s not met, skipping", u->id, *p);
+                        return false;
+                }
+        }
+
+        for (p = u->condition_path_is_directory; p && *p; p++) {
+                struct stat st;
+
+                if (stat(*p, &st) < 0 || !S_ISDIR(st.st_mode)) {
+                        pico_log(PICO_LOG_INFO, "%s: ConditionPathIsDirectory=%s not met, skipping", u->id, *p);
+                        return false;
+                }
+        }
+
+        return true;
 }
 
 int unit_start(Unit *u) {
@@ -178,6 +217,19 @@ int unit_start(Unit *u) {
                          unit_load_state_to_string(u->load_state));
                 return -ENOENT;
         }
+
+        /*
+         * -EALREADY, not a failure and not 0: an unmet condition means the
+         * unit was never meant to run here, so job_run() completes its job
+         * successfully (systemd's own return for this case). Nothing is
+         * exec'd, so Restart= never enters the picture either.
+         */
+        if (!unit_condition_test(u)) {
+                u->condition_result = false;
+                return -EALREADY;
+        }
+
+        u->condition_result = true;
 
         return u->vtable->start(u);
 }

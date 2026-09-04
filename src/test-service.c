@@ -24,6 +24,7 @@
  */
 
 #include <errno.h>
+#include <limits.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -603,6 +604,86 @@ static void test_b1_zero_timeout_means_infinity(void) {
         free(dir);
 }
 
+/*
+ * unit_start()'s condition check (unit.c) is evaluated at start time, not
+ * load time -- the same unit gets a different answer on the same call site
+ * once the path it names shows up, exactly like ConditionPathExists=/dev/
+ * ttyGS0 only becoming true once usb-multi-gadget.service has run. Also
+ * covers the ConditionPathIsDirectory= trap a plain stat() would miss: an
+ * existing regular file is not a directory.
+ */
+static void test_condition_skips_start_without_failing(void) {
+        Manager *m;
+        Service *cond;
+        Service *isdir;
+        Service *isdir_ok;
+        char *dir;
+        char svc[PATH_MAX + 128];
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        snprintf(svc,
+                 sizeof(svc),
+                 "[Unit]\nDescription=cond\nConditionPathExists=%s/marker\n"
+                 "[Service]\nType=simple\nExecStart=/bin/sleep 100\n",
+                 dir);
+        cond = load_service(m, dir, "cond.service", svc);
+
+        snprintf(svc,
+                 sizeof(svc),
+                 "[Unit]\nDescription=isdir\nConditionPathIsDirectory=%s/marker\n"
+                 "[Service]\nType=simple\nExecStart=/bin/sleep 100\n",
+                 dir);
+        isdir = load_service(m, dir, "isdir.service", svc);
+
+        snprintf(svc,
+                 sizeof(svc),
+                 "[Unit]\nDescription=isdir-ok\nConditionPathIsDirectory=%s\n"
+                 "[Service]\nType=simple\nExecStart=/bin/sleep 100\n",
+                 dir);
+        isdir_ok = load_service(m, dir, "isdir-ok.service", svc);
+
+        /* Phase 1: marker absent. */
+        ASSERT_EQ_INT(unit_start(UNIT(cond)), -EALREADY);
+        ASSERT_EQ_INT(cond->state, SERVICE_DEAD);
+        ASSERT_EQ_INT(unit_active_state(UNIT(cond)), UNIT_INACTIVE);
+        ASSERT_TRUE(cond->main_pid == 0);
+        ASSERT_TRUE(!UNIT(cond)->condition_result);
+
+        /* An existing directory passes on the very first check. */
+        ASSERT_EQ_INT(unit_start(UNIT(isdir_ok)), 0);
+        ASSERT_EQ_INT(isdir_ok->state, SERVICE_RUNNING);
+        ASSERT_TRUE(isdir_ok->main_pid > 0);
+        ASSERT_TRUE(UNIT(isdir_ok)->condition_result);
+
+        /* Phase 2: the marker now exists. */
+        ASSERT_EQ_INT(test_write_file(dir, "marker", "x"), 0);
+
+        /* Same unit, same call -- a different answer because the check runs
+         * at start time, not load time. */
+        ASSERT_EQ_INT(unit_start(UNIT(cond)), 0);
+        ASSERT_EQ_INT(cond->state, SERVICE_RUNNING);
+        ASSERT_TRUE(cond->main_pid > 0);
+        ASSERT_TRUE(UNIT(cond)->condition_result);
+
+        /* The marker exists now, but as a regular file -- proves S_ISDIR()
+         * is actually tested rather than mere existence. */
+        ASSERT_EQ_INT(unit_start(UNIT(isdir)), -EALREADY);
+        ASSERT_EQ_INT(isdir->state, SERVICE_DEAD);
+        ASSERT_TRUE(!UNIT(isdir)->condition_result);
+
+        ASSERT_EQ_INT(unit_stop(UNIT(cond)), 0);
+        ASSERT_TRUE(reap_for(cond, 3000));
+        ASSERT_EQ_INT(unit_stop(UNIT(isdir_ok)), 0);
+        ASSERT_TRUE(reap_for(isdir_ok, 3000));
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
         test_lifecycle_simple();
         test_oneshot_completes_only_on_exit();
@@ -614,6 +695,7 @@ int main(void) {
         test_bug_running_timer_not_cancelled();
         test_b9_service_verify_refuses_no_execstart();
         test_b1_zero_timeout_means_infinity();
+        test_condition_skips_start_without_failing();
 
         printf("test-service: all checks passed\n");
         return 0;

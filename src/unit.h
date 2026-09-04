@@ -103,6 +103,21 @@ struct Unit {
         size_t n_dependencies[_UNIT_DEPENDENCY_MAX];
 
         /*
+         * [Unit] Condition* checks, each an owned list of absolute paths that
+         * must all pass. Only the two spellings this project's own units carry
+         * are implemented; negation ('!') and triggering ('|') are not, and
+         * unit-parse.c drops a value using either rather than mistaking it for
+         * a literal path that can never exist.
+         */
+        char **condition_path_exists;       /* ConditionPathExists=, owned, may be NULL */
+        char **condition_path_is_directory; /* ConditionPathIsDirectory=, owned, may be NULL */
+
+        /* Result of the last unit_start() condition check. False means the
+         * unit was deliberately left inactive, which is what job.c reads to
+         * decide the unit gets no "Started ..." console line. */
+        bool condition_result;
+
+        /*
          * [Install] section, kept as raw names rather than resolved edges: at
          * parse time the named target may not be loaded yet, and whether these
          * are honoured at all depends on enablement (a .wants/ symlink or a

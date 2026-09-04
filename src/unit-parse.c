@@ -400,6 +400,62 @@ static int config_parse_after(Unit *u, const char *path, unsigned line, const ch
         return config_parse_unit_deps(u, path, line, UNIT_AFTER, rvalue);
 }
 
+/*
+ * One path per assignment, taken verbatim: Condition* values are single paths,
+ * not whitespace-separated lists, and repeated assignments accumulate (all
+ * must pass). An empty value resets the list, as upstream.
+ *
+ * Bad values are dropped with a warning rather than returned as an error: a
+ * handler returning < 0 aborts the rest of the scan (conf-scan.c) and leaves
+ * the unit UNIT_ERROR, so a real unit file carrying a '!'-negated condition
+ * this MVP does not implement would drop out of the boot entirely over a
+ * directive it does not need. Dropping is also exactly what these spellings
+ * already did before this handler existed, so it is no regression -- but it
+ * does mean a negated condition is ignored rather than honoured, which is the
+ * named limitation of this minimal support.
+ */
+static int config_parse_condition_path(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue, char ***target) {
+        (void) u;
+
+        if (rvalue[0] == '\0') {
+                *target = pico_strv_free(*target);
+                return 0;
+        }
+
+        if (rvalue[0] == '!' || rvalue[0] == '|') {
+                pico_log(PICO_LOG_WARNING,
+                         "%s:%u: %s=%s: negated and triggering conditions are not supported, ignoring",
+                         path,
+                         line,
+                         lvalue,
+                         rvalue);
+                return 0;
+        }
+
+        if (rvalue[0] != '/') {
+                pico_log(PICO_LOG_WARNING,
+                         "%s:%u: %s= path '%s' is not absolute, ignoring",
+                         path,
+                         line,
+                         lvalue,
+                         rvalue);
+                return 0;
+        }
+
+        return pico_strv_extend(target, rvalue);
+}
+
+static int config_parse_condition_path_exists(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        return config_parse_condition_path(u, path, line, lvalue, rvalue, &u->condition_path_exists);
+}
+
+static int config_parse_condition_path_is_directory(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        return config_parse_condition_path(u, path, line, lvalue, rvalue, &u->condition_path_is_directory);
+}
+
 /* --- [Service] handlers --- */
 
 /* Targets are a real unit type now, so a [Service] directive on one is a
@@ -927,27 +983,29 @@ static int config_parse_required_by(
 }
 
 static const ConfigItem config_items[] = {
-        {    SECTION_UNIT,     "Description",       config_parse_description },
-        {    SECTION_UNIT,        "Requires",          config_parse_requires },
-        {    SECTION_UNIT,           "Wants",             config_parse_wants },
-        {    SECTION_UNIT,          "Before",            config_parse_before },
-        {    SECTION_UNIT,           "After",             config_parse_after },
-        { SECTION_SERVICE,            "Type",              config_parse_type },
-        { SECTION_SERVICE,       "ExecStart",        config_parse_exec_start },
-        { SECTION_SERVICE,    "ExecStartPre",    config_parse_exec_start_pre },
-        { SECTION_SERVICE,         "Restart",           config_parse_restart },
-        { SECTION_SERVICE,      "RestartSec",       config_parse_restart_sec },
-        { SECTION_SERVICE, "RemainAfterExit", config_parse_remain_after_exit },
-        { SECTION_SERVICE, "TimeoutStartSec", config_parse_timeout_start_sec },
-        { SECTION_SERVICE,  "TimeoutStopSec",  config_parse_timeout_stop_sec },
-        {  SECTION_SOCKET,    "ListenStream",     config_parse_listen_stream },
-        {  SECTION_SOCKET,  "ListenDatagram",   config_parse_listen_datagram },
-        {  SECTION_SOCKET,         "Service",    config_parse_socket_service },
-        {  SECTION_SOCKET,          "Accept",     config_parse_socket_accept },
-        {  SECTION_SOCKET,      "SocketMode",       config_parse_socket_mode },
-        {  SECTION_SOCKET,         "Backlog",    config_parse_socket_backlog },
-        { SECTION_INSTALL,        "WantedBy",         config_parse_wanted_by },
-        { SECTION_INSTALL,      "RequiredBy",       config_parse_required_by },
+        {    SECTION_UNIT,              "Description",                 config_parse_description },
+        {    SECTION_UNIT,                 "Requires",                    config_parse_requires },
+        {    SECTION_UNIT,                    "Wants",                       config_parse_wants },
+        {    SECTION_UNIT,                   "Before",                      config_parse_before },
+        {    SECTION_UNIT,                    "After",                       config_parse_after },
+        {    SECTION_UNIT,      "ConditionPathExists",       config_parse_condition_path_exists },
+        {    SECTION_UNIT, "ConditionPathIsDirectory", config_parse_condition_path_is_directory },
+        { SECTION_SERVICE,                     "Type",                        config_parse_type },
+        { SECTION_SERVICE,                "ExecStart",                  config_parse_exec_start },
+        { SECTION_SERVICE,             "ExecStartPre",              config_parse_exec_start_pre },
+        { SECTION_SERVICE,                  "Restart",                     config_parse_restart },
+        { SECTION_SERVICE,               "RestartSec",                 config_parse_restart_sec },
+        { SECTION_SERVICE,          "RemainAfterExit",           config_parse_remain_after_exit },
+        { SECTION_SERVICE,          "TimeoutStartSec",           config_parse_timeout_start_sec },
+        { SECTION_SERVICE,           "TimeoutStopSec",            config_parse_timeout_stop_sec },
+        {  SECTION_SOCKET,             "ListenStream",               config_parse_listen_stream },
+        {  SECTION_SOCKET,           "ListenDatagram",             config_parse_listen_datagram },
+        {  SECTION_SOCKET,                  "Service",              config_parse_socket_service },
+        {  SECTION_SOCKET,                   "Accept",               config_parse_socket_accept },
+        {  SECTION_SOCKET,               "SocketMode",                 config_parse_socket_mode },
+        {  SECTION_SOCKET,                  "Backlog",              config_parse_socket_backlog },
+        { SECTION_INSTALL,                 "WantedBy",                   config_parse_wanted_by },
+        { SECTION_INSTALL,               "RequiredBy",                 config_parse_required_by },
 };
 
 /*

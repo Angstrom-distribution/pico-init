@@ -474,6 +474,93 @@ static void test_huge_requires_line_does_not_crash(void) {
         free(dir);
 }
 
+/*
+ * ConditionPathExists=/ConditionPathIsDirectory= accumulate across repeated
+ * assignments, and the two directives keep genuinely separate lists rather
+ * than sharing one.
+ */
+static void test_conditions_are_parsed(void) {
+        Manager *m;
+        char *dir;
+        Unit *u;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "cond.service",
+                                      "[Unit]\n"
+                                      "Description=Cond\n"
+                                      "ConditionPathExists=/a/one\n"
+                                      "ConditionPathIsDirectory=/a/dir\n"
+                                      "ConditionPathExists=/a/two\n"
+                                      "\n"
+                                      "[Service]\n"
+                                      "ExecStart=/bin/true\n"),
+                      0);
+
+        m = manager_for(dir);
+        u = load_one(m, "cond.service");
+
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+
+        ASSERT_EQ_INT((int) pico_strv_length(u->condition_path_exists), 2);
+        ASSERT_STREQ(u->condition_path_exists[0], "/a/one");
+        ASSERT_STREQ(u->condition_path_exists[1], "/a/two");
+
+        ASSERT_EQ_INT((int) pico_strv_length(u->condition_path_is_directory), 1);
+        ASSERT_STREQ(u->condition_path_is_directory[0], "/a/dir");
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * The three spellings this MVP does not implement -- negated, triggering,
+ * relative -- are dropped with a warning rather than failing the unit, and an
+ * empty value resets whatever the same directive had already accumulated.
+ */
+static void test_unsupported_condition_values_are_dropped(void) {
+        Manager *m;
+        char *dir;
+        Unit *u;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "bad.service",
+                                      "[Unit]\n"
+                                      "Description=Bad\n"
+                                      "ConditionPathExists=!/a/neg\n"
+                                      "ConditionPathExists=|/a/trigger\n"
+                                      "ConditionPathExists=relative/path\n"
+                                      "ConditionPathIsDirectory=/a/dir\n"
+                                      "ConditionPathIsDirectory=\n"
+                                      "\n"
+                                      "[Service]\n"
+                                      "ExecStart=/bin/true\n"),
+                      0);
+
+        m = manager_for(dir);
+        u = load_one(m, "bad.service");
+
+        /* A handler returning < 0 would abort the rest of the scan and leave
+         * the unit UNIT_ERROR -- this is the assertion that matters. */
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+
+        ASSERT_TRUE(u->condition_path_exists == NULL);
+        /* the trailing empty value reset the list the line above had filled */
+        ASSERT_TRUE(u->condition_path_is_directory == NULL);
+
+        ASSERT_STREQ(((Service *) u)->exec_start[0], "/bin/true");
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
         test_service_fields();
         test_unknown_directives_are_tolerated();
@@ -482,6 +569,8 @@ int main(void) {
         test_quoting_and_trailing_garbage();
         test_invalid_dependency_names_are_rejected();
         test_huge_requires_line_does_not_crash();
+        test_conditions_are_parsed();
+        test_unsupported_condition_values_are_dropped();
 
         printf("test-unit-parse: all checks passed\n");
         return 0;

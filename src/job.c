@@ -399,6 +399,17 @@ int job_run(Job *j) {
         if (u->job != j)
                 return 0;
 
+        /*
+         * An unmet start condition (unit.c). The unit is deliberately still
+         * inactive, so the redundancy check below would not fire and nothing
+         * called unit_notify() -- without this the job would sit in
+         * JOB_RUNNING forever with everything ordered after it blocked.
+         */
+        if (r == -EALREADY) {
+                job_finish_full(j, JOB_DONE, true);
+                return 0;
+        }
+
         if (r < 0) {
                 job_finish_full(j, JOB_FAILED, true);
                 return r;
@@ -512,8 +523,11 @@ int job_finish_full(Job *j, JobResult result, bool recursive) {
          * the generic "Started %s." (src/core/job.c) for the rest. The name
          * is Description= where the unit has one and its id otherwise, which
          * is what unit_status_string() resolves to by default upstream.
+         *
+         * A unit skipped by an unmet condition never started, so it gets no line at
+         * all -- unit.c already logged which condition and why.
          */
-        if (j->type == JOB_START && result == JOB_DONE) {
+        if (j->type == JOB_START && result == JOB_DONE && u->condition_result) {
                 const char *verb = u->type == UNIT_TARGET ? "Reached target" :
                                 u->type == UNIT_SOCKET    ? "Listening on" :
                                                             "Started";
