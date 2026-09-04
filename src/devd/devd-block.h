@@ -68,6 +68,20 @@
  */
 #define DEVD_VIRTUAL_PREFIX "/devices/virtual/"
 
+/*
+ * MTD flash, which devd tracks but never probes.
+ *
+ * Reading a GPT off NAND costs orders of magnitude more than off a real block
+ * device, and there is never one there to find -- raw flash carries JFFS2/UBI,
+ * not a partition table. The match is the MTD class directory the kernel puts
+ * between the flash device and its block device
+ * (/devices/platform/<flash>/mtd/mtd0/block/mtdblock0), not the node name.
+ *
+ * Excluded from the probe only, not from the disk table: h2200 boots from NAND,
+ * so mtdblock0 has to stay visible here.
+ */
+#define DEVD_MTD_INFIX "/mtd/"
+
 /* How long the window stays open after the last event of a burst, and how far
  * past the first event it may ever run. */
 #define DEVD_SETTLE_USEC (250 * USEC_PER_MSEC)
@@ -90,6 +104,7 @@ typedef struct DevdDisk {
 
         bool settling;   /* the window is open */
         bool settled;    /* the reaction has run at least once */
+        bool no_probe;   /* MTD flash: tracked, never read from */
         usec_t deadline; /* when the window closes; extended by each event */
         usec_t ceiling;  /* the latest that deadline may ever be pushed to */
 } DevdDisk;
@@ -147,6 +162,10 @@ const char *devd_block_take_settled(DevdBlock *b, usec_t now);
  * the count, or 0 for an unknown disk.
  */
 size_t devd_block_partitions(const DevdBlock *b, const char *disk, const char (**ret)[DEVD_NAME_MAX]);
+
+/* Whether `disk` is a class devd records but does not read from -- see
+ * DEVD_MTD_INFIX. False for a disk it is not tracking. */
+bool devd_block_probe_excluded(const DevdBlock *b, const char *disk);
 
 /* Drop `disk` and everything recorded under it. Called once a DISK_GONE has
  * been acted on -- after its partitions have been read, not before. */

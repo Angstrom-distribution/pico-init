@@ -242,6 +242,12 @@ int devd_block_event(
                         return 0;
         }
 
+        /* Recomputed on every add rather than latched: a slot whose disk name
+         * is reused by different hardware must not inherit the last one's
+         * answer. Partition devpaths carry their disk's prefix, so both event
+         * kinds agree. */
+        d->no_probe = strstr(u->devpath, DEVD_MTD_INFIX) != NULL;
+
         if (!is_partition) {
                 /*
                  * A disk re-announcing itself reopens the window even if it
@@ -309,6 +315,17 @@ size_t devd_block_partitions(const DevdBlock *b, const char *disk, const char (*
                 }
 
         return 0;
+}
+
+bool devd_block_probe_excluded(const DevdBlock *b, const char *disk) {
+        if (!b || !disk)
+                return false;
+
+        for (size_t i = 0; i < b->n_disks; i++)
+                if (strcmp(b->disks[i].name, disk) == 0)
+                        return b->disks[i].no_probe;
+
+        return false;
 }
 
 void devd_block_forget(DevdBlock *b, const char *disk) {
