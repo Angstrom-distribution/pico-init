@@ -57,6 +57,9 @@ pico_init_core_sources = files(
   # once, and the two decision tables inside it are what the tests link.
   'src/root-check.c',
   'src/unit.c',
+  # Template/instance name parsing (G2), split out of unit.c because it
+  # needs nothing from Unit itself -- unit.c calls into it, not vice versa.
+  'src/unit-name.c',
   'src/unit-load.c',
   'src/conf-scan.c',
   'src/unit-parse.c',
@@ -124,6 +127,7 @@ pico_test_sources = files('src/test-util.c')
 # editing it.
 pico_tests = [
   'test-unit-dependency',
+  'test-unit-name',
   'test-job',
   'test-boot-root',
   'test-service',
