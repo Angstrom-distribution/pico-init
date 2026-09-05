@@ -60,6 +60,9 @@ pico_init_core_sources = files(
   # Template/instance name parsing (G2), split out of unit.c because it
   # needs nothing from Unit itself -- unit.c calls into it, not vice versa.
   'src/unit-name.c',
+  # %x-specifier substitution engine (G2): knows nothing about Unit, so it
+  # is its own file rather than folded into unit.c, mirroring v30's split.
+  'src/specifier.c',
   'src/unit-load.c',
   'src/conf-scan.c',
   'src/unit-parse.c',
@@ -128,6 +131,7 @@ pico_test_sources = files('src/test-util.c')
 pico_tests = [
   'test-unit-dependency',
   'test-unit-name',
+  'test-specifier',
   'test-job',
   'test-boot-root',
   'test-service',
