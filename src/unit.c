@@ -14,6 +14,8 @@
 
 #include "job.h"
 #include "manager-state.h"
+#include "specifier.h"
+#include "unit-name.h"
 #include "unit.h"
 #include "util.h"
 
@@ -33,6 +35,7 @@ const UnitVTable *unit_vtable_for(UnitType t) {
 int unit_new(Manager *m, UnitType type, const char *id, Unit **ret) {
         const UnitVTable *vtable;
         Unit *u;
+        int r;
 
         if (!ret)
                 return -EINVAL;
@@ -69,6 +72,16 @@ int unit_new(Manager *m, UnitType type, const char *id, Unit **ret) {
         if (!u->id) {
                 free(u);
                 return -ENOMEM;
+        }
+
+        /* Derived from the owned u->id, not the caller's `id` -- and once,
+         * here, rather than re-parsed by every specifier lookup and the
+         * unit-load.c fallback that need it. */
+        r = unit_name_to_instance(u->id, &u->instance);
+        if (r < 0) {
+                free(u->id);
+                free(u);
+                return r;
         }
 
         if (vtable->init)
@@ -148,6 +161,7 @@ Unit *unit_free(Unit *u) {
         manager_state_forget_unit(u);
 
         u->id = pico_mfree(u->id);
+        u->instance = pico_mfree(u->instance);
         u->description = pico_mfree(u->description);
         u->fragment_path = pico_mfree(u->fragment_path);
 
@@ -411,9 +425,109 @@ bool unit_name_is_valid(const char *name) {
         if (strspn(name, UNIT_NAME_VALID_CHARS) != len)
                 return false;
 
+        /*
+         * '@' is already in UNIT_NAME_VALID_CHARS above, so only its
+         * structural placement is left to check: an '@' before the last '.'
+         * is a template/instance separator, and an empty prefix
+         * ("@.service", "@bar.service") is not a name anyone could have
+         * meant. Both spellings that DO have a prefix stay valid here --
+         * "foo@.service" (a template) and "foo@bar.service" (an instance) --
+         * see the header comment for why rejecting a template is not this
+         * function's job.
+         */
+        {
+                const char *e = strrchr(name, '.'); /* guaranteed by the type check below, but test anyway */
+                const char *at;
+
+                if (e) {
+                        at = memchr(name, '@', (size_t) (e - name));
+                        if (at == name)
+                                return false;
+                }
+        }
+
         /* and it has to name a type we can actually instantiate */
         if (unit_type_from_name(name) == _UNIT_TYPE_INVALID)
                 return false;
 
         return true;
+}
+
+/*
+ * Specifier lookups, quarried from systemd's v30 unit.c (:1955-1994) down to
+ * the five this project's two tables actually reference. %P (unescaped
+ * prefix) is not carried: nothing here ever escapes a prefix, so it would
+ * have no consumer. %f/%c/%r/%R/%t (cgroup/runtime-dir specifiers) are not
+ * carried either -- no analog exists yet -- and reach a unit file as literal
+ * pass-through, same as any other specifier neither table recognizes.
+ *
+ * File-static because only unit_name_printf()/unit_full_printf() below ever
+ * build a table entry pointing at one; unit-parse.c calls only those two.
+ */
+
+static int specifier_prefix(char specifier, const void *data, const void *userdata, char **ret) {
+        Unit *u = (Unit *) userdata;
+        (void) specifier;
+        (void) data;
+
+        *ret = unit_name_to_prefix(u->id);
+        return *ret ? 0 : -ENOMEM;
+}
+
+static int specifier_prefix_and_instance(char specifier, const void *data, const void *userdata, char **ret) {
+        Unit *u = (Unit *) userdata;
+        (void) specifier;
+        (void) data;
+
+        *ret = unit_name_to_prefix_and_instance(u->id);
+        return *ret ? 0 : -ENOMEM;
+}
+
+/* %I: the instance, unescaped -- e.g. a device node instance "dev-ttyGS0"
+ * becomes "dev/ttyGS0". "" for a non-instanced unit, matching v30 unit.c's
+ * own specifier_instance_unescaped() (:1985-1993) rather than aborting the
+ * way carrying its assert(u->meta.instance) forward would have. */
+static int specifier_instance_unescaped(char specifier, const void *data, const void *userdata, char **ret) {
+        Unit *u = (Unit *) userdata;
+        (void) specifier;
+        (void) data;
+
+        if (!u->instance) {
+                *ret = pico_strdup("");
+                return *ret ? 0 : -ENOMEM;
+        }
+
+        *ret = unit_name_unescape(u->instance);
+        return *ret ? 0 : -ENOMEM;
+}
+
+int unit_name_printf(Unit *u, const char *format, char **ret) {
+        const PicoSpecifier table[] = {
+                { 'n',         pico_specifier_string,       u->id },
+                { 'N', specifier_prefix_and_instance,        NULL },
+                { 'p',              specifier_prefix,        NULL },
+                { 'i',         pico_specifier_string, u->instance },
+                {   0,                          NULL,        NULL },
+        };
+
+        if (!u || !format || !ret)
+                return -EINVAL;
+
+        return pico_specifier_printf(format, table, u, ret);
+}
+
+int unit_full_printf(Unit *u, const char *format, char **ret) {
+        const PicoSpecifier table[] = {
+                { 'n',         pico_specifier_string,       u->id },
+                { 'N', specifier_prefix_and_instance,        NULL },
+                { 'p',              specifier_prefix,        NULL },
+                { 'i',         pico_specifier_string, u->instance },
+                { 'I',  specifier_instance_unescaped,        NULL },
+                {   0,                          NULL,        NULL },
+        };
+
+        if (!u || !format || !ret)
+                return -EINVAL;
+
+        return pico_specifier_printf(format, table, u, ret);
 }

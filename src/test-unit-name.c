@@ -40,8 +40,8 @@ static void test_invalid_names(void) {
 
         ASSERT_TRUE(!unit_name_is_valid(NULL));
         ASSERT_TRUE(!unit_name_is_valid(""));
-        /* "@.service"/"@bar.service" (empty prefix) are added once unit.c's
-         * structural name rule lands -- see that commit's edit to this file. */
+        ASSERT_TRUE(!unit_name_is_valid("@.service"));    /* empty prefix */
+        ASSERT_TRUE(!unit_name_is_valid("@bar.service")); /* empty prefix */
         ASSERT_TRUE(!unit_name_is_valid(".service"));
         ASSERT_TRUE(!unit_name_is_valid(".hidden.service"));
         ASSERT_TRUE(!unit_name_is_valid("foo")); /* no suffix */

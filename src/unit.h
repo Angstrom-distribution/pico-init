@@ -94,6 +94,11 @@ struct Unit {
         const UnitVTable *vtable;
 
         char *id;            /* "foo.service" */
+        char *instance;      /* the part between the first '@' and the last '.', owned;
+                              * NULL unless this is an instance. Set once at unit_new()
+                              * time from u->id and never changes afterwards, so every
+                              * specifier lookup and the template fallback can read it
+                              * without re-parsing the name. */
         char *description;   /* [Unit] Description=, may be NULL */
         char *fragment_path; /* absolute path of the parsed file, NULL until found */
         UnitLoadState load_state;
@@ -175,8 +180,28 @@ UnitType unit_type_from_name(const char *id); /* by suffix; _UNIT_TYPE_INVALID i
  * Unit files are root-owned config, so this is not a privilege boundary -- but
  * "Requires=../../tmp/evil.service" resolving to a path outside the search
  * directories is still a bug, and one directory separator is all it takes.
+ *
+ * Both spellings of an instantiable name are valid here: a template
+ * ("foo@.service") and an instance ("foo@bar.service"). A template is not
+ * startable, and manager_load_unit()/manager.c's boot scan (unit-name.h's
+ * unit_name_is_template()) are where that is actually enforced -- rejecting
+ * it here would also break the boot scan's ability to recognise and skip one,
+ * and would make unit_name_template()'s own output un-validatable.
  */
 bool unit_name_is_valid(const char *name);
+
+/*
+ * %n %N %p %i -- safe to put in a dependency or install name, since none of
+ * them can introduce whitespace or a path separator. %I additionally
+ * unescapes the instance, which can (a device node like "dev-ttyGS0"
+ * unescapes to "dev/ttyGS0"), so it is reserved for unit_full_printf()
+ * below, never for a name-safe context. 0 or -ENOMEM.
+ */
+int unit_name_printf(Unit *u, const char *format, char **ret);
+
+/* unit_name_printf()'s table plus %I; for ExecStart=/ExecStartPre=/Description=,
+ * never for a value that becomes part of a unit name. 0 or -ENOMEM. */
+int unit_full_printf(Unit *u, const char *format, char **ret);
 
 /* --- unit-load.c --- */
 /* Find u->id's fragment in the manager's unit search path, parse it, resolve to
