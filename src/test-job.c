@@ -12,12 +12,19 @@
  */
 
 #include <errno.h>
+#include <limits.h>
+#include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include "job.h"
 #include "manager.h"
+#include "service.h"
 #include "test-util.h"
 #include "unit.h"
 
@@ -427,12 +434,19 @@ static void test_superseded_job_is_finished(void) {
         ASSERT_TRUE(first != NULL);
         first_id = first->id;
         ASSERT_TRUE(a->job != NULL);
+        ASSERT_EQ_INT(m->n_jobs, 1);
+        ASSERT_EQ_INT(m->n_installed_jobs, 1);
 
-        /* Supersede it before it ran. */
+        /* Supersede it before it ran. The old job's cancel (job_finish_full()
+         * -> job_uninstall()) must decrement n_jobs before the new job's
+         * install increments it, so n_jobs stays exact (1, not 2) while
+         * n_installed_jobs counts both installs ever made (2). */
         ASSERT_EQ_INT(manager_add_job(m, JOB_STOP, a, NULL), 0);
         ASSERT_TRUE(a->job != NULL);
         ASSERT_TRUE(a->job->id != first_id); /* genuinely a different job */
         ASSERT_EQ_INT(a->job->type, JOB_STOP);
+        ASSERT_EQ_INT(m->n_jobs, 1);
+        ASSERT_EQ_INT(m->n_installed_jobs, 2);
 
         /* At most one job for this unit may remain queued: if the displaced
          * one were still on the run queue the manager would run a freed job. */
@@ -478,19 +492,179 @@ static void test_restart_completes(void) {
         ASSERT_EQ_INT(manager_add_job(m, JOB_START, a, NULL), 0);
         manager_dispatch_run_queue(m);
         ASSERT_EQ_INT(unit_active_state(a), UNIT_ACTIVE);
+        ASSERT_EQ_INT(m->n_jobs, 0);
+        ASSERT_EQ_INT(m->n_installed_jobs, 1);
 
         ASSERT_EQ_INT(manager_add_job(m, JOB_RESTART, a, NULL), 0);
+        ASSERT_EQ_INT(m->n_jobs, 1);
+        ASSERT_EQ_INT(m->n_installed_jobs, 2);
 
-        /* Two dispatches: one for the stop half, one for the start half the
-         * conversion queues. Before the fix the unit stayed INACTIVE and
-         * a->job never cleared. */
+        /*
+         * A target completes synchronously, so manager_dispatch_run_queue()
+         * drains both the stop half and the conversion's start half in this
+         * one call (it loops until the queue is empty -- see its own
+         * comment) -- there is no dispatch boundary at which to observe the
+         * mid-conversion state here. test_restart_conversion_counters()
+         * below uses a real service instead, precisely to get that
+         * boundary: an async unit_stop() leaves the job in JOB_RUNNING
+         * until the process is actually reaped.
+         *
+         * Two dispatches: harmless if the first already finished
+         * everything; before the fix the unit stayed INACTIVE and a->job
+         * never cleared regardless. */
         manager_dispatch_run_queue(m);
         manager_dispatch_run_queue(m);
+
+        ASSERT_EQ_INT(m->n_jobs, 0);
+        ASSERT_EQ_INT(m->n_installed_jobs, 2);
 
         ASSERT_EQ_INT(unit_active_state(a), UNIT_ACTIVE);
         ASSERT_TRUE(a->job == NULL);
 
         manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * test_restart_completes() above uses a target, which reaches its target
+ * state synchronously -- so a single manager_dispatch_run_queue() drains a
+ * restart's stop half AND the conversion's start half in one call, with no
+ * dispatch boundary at which to observe the mid-conversion counters.
+ *
+ * A real service gives that boundary: unit_stop() only sends SIGTERM and
+ * returns, so the job sits in JOB_RUNNING -- still installed, uncounted as
+ * done -- until the process is actually reaped and unit_notify() drives
+ * job_finish_full()'s JOB_RESTART/JOB_DONE conversion. This is the plan's
+ * "n_jobs/n_installed_jobs unchanged across the conversion" case.
+ */
+static void test_restart_conversion_counters(void) {
+        char cgroup_root[PATH_MAX];
+        Manager *m;
+        char *dir;
+        Unit *a;
+        Service *s;
+        pid_t first_pid;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        /* Restart=no: this is a job-driven restart, not the service's own
+         * auto-restart engine, so no crash-loop bookkeeping should fire. */
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "a.service",
+                                      "[Service]\nType=simple\nExecStart=/bin/sleep 300\nRestart=no\n"),
+                      0);
+
+        m = manager_for(dir);
+
+        /* A private cgroup root: meson test runs binaries concurrently, and
+         * this unit's id would otherwise collide with another test binary's
+         * own /sys/fs/cgroup/system.slice/a.service, exactly the flake
+         * test-manager-state.c's use_private_cgroup_root() exists to avoid. */
+        {
+                int n = snprintf(
+                                cgroup_root,
+                                sizeof(cgroup_root),
+                                "/sys/fs/cgroup/pico-job-test-restart-%lld",
+                                (long long) getpid());
+
+                ASSERT_TRUE(n > 0 && (size_t) n < sizeof(cgroup_root));
+                if (mkdir(cgroup_root, 0755) < 0)
+                        ASSERT_TRUE(errno == EEXIST);
+                ASSERT_EQ_INT(manager_set_cgroup_root(m, cgroup_root), 0);
+        }
+
+        ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+        a = manager_get_unit(m, "a.service");
+        ASSERT_TRUE(a != NULL);
+        s = SERVICE(a);
+
+        /* Start: Type=simple reaches RUNNING synchronously with the fork, so
+         * this job finishes within the one dispatch. */
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, a, NULL), 0);
+        manager_dispatch_run_queue(m);
+        ASSERT_EQ_INT(s->state, SERVICE_RUNNING);
+        ASSERT_TRUE(s->main_pid > 0);
+        first_pid = s->main_pid;
+        ASSERT_EQ_INT(m->n_jobs, 0);
+        ASSERT_EQ_INT(m->n_installed_jobs, 1);
+
+        /* Restart: installed, not yet run. */
+        ASSERT_EQ_INT(manager_add_job(m, JOB_RESTART, a, NULL), 0);
+        ASSERT_EQ_INT(m->n_jobs, 1);
+        ASSERT_EQ_INT(m->n_installed_jobs, 2);
+
+        /* Dispatch the stop half: unit_stop() sends SIGTERM and returns --
+         * the real process is still alive, so the job cannot have finished. */
+        manager_dispatch_run_queue(m);
+        ASSERT_TRUE(a->job != NULL);
+        ASSERT_EQ_INT(a->job->type, JOB_RESTART); /* not yet converted */
+        ASSERT_EQ_INT(a->job->state, JOB_RUNNING);
+        ASSERT_EQ_INT(m->n_jobs, 1);
+        ASSERT_EQ_INT(m->n_installed_jobs, 2);
+
+        /* Reap the real SIGTERM exit -- same signalfd + waitid() pattern
+         * test-manager-state.c's test_killed_service_shows_failure() uses --
+         * which drives service_sigchld_event() -> unit_notify() ->
+         * job_finish_full()'s restart conversion. */
+        {
+                struct pollfd pfd = { .fd = pico_signal_fd(m->signal), .events = POLLIN };
+                bool reaped = false;
+                int tries;
+
+                for (tries = 0; tries < 50 && !reaped; tries++) {
+                        int r = poll(&pfd, 1, 100);
+
+                        if (r <= 0)
+                                continue;
+
+                        for (;;) {
+                                int signo;
+                                int rr = pico_signal_read(m->signal, &signo);
+
+                                if (rr == -EAGAIN)
+                                        break;
+                                ASSERT_TRUE(rr >= 0);
+                                if (signo != SIGCHLD)
+                                        continue;
+
+                                for (;;) {
+                                        siginfo_t info;
+
+                                        memset(&info, 0, sizeof(info));
+                                        if (waitid(P_ALL, 0, &info, WEXITED | WNOHANG) < 0 || info.si_pid == 0)
+                                                break;
+                                        if (info.si_pid != first_pid)
+                                                continue;
+
+                                        service_sigchld_event(s, info.si_pid, info.si_code, info.si_status);
+                                        reaped = true;
+                                }
+                        }
+                }
+                ASSERT_TRUE(reaped);
+        }
+
+        /* The conversion happened: same job, now a start, still installed --
+         * neither counter moved. */
+        ASSERT_TRUE(a->job != NULL);
+        ASSERT_EQ_INT(a->job->type, JOB_START);
+        ASSERT_EQ_INT(a->job->state, JOB_WAITING);
+        ASSERT_EQ_INT(m->n_jobs, 1);
+        ASSERT_EQ_INT(m->n_installed_jobs, 2);
+
+        /* Dispatch the converted start: Type=simple forks and reaches
+         * RUNNING synchronously again, finishing the job -- only now does
+         * n_jobs drop. */
+        manager_dispatch_run_queue(m);
+        ASSERT_EQ_INT(s->state, SERVICE_RUNNING);
+        ASSERT_TRUE(a->job == NULL);
+        ASSERT_EQ_INT(m->n_jobs, 0);
+        ASSERT_EQ_INT(m->n_installed_jobs, 2);
+
+        manager_free(m);
+        rmdir(cgroup_root); /* system.slice/a.service leaf is gone via manager_free() */
         test_rm_rf(dir);
         free(dir);
 }
@@ -733,6 +907,7 @@ int main(void) {
         test_redundant_anchor_job_finishes();
         test_superseded_job_is_finished();
         test_restart_completes();
+        test_restart_conversion_counters();
         test_transaction_dedup();
         test_cycle_does_not_deadlock();
         test_transaction_ownership();

@@ -80,6 +80,51 @@ static int read_property(
         return -ENOENT;
 }
 
+/* Same KEY=VALUE scan as read_property(), but against <runtime_dir>/manager
+ * itself rather than a per-unit file -- the boot-progress counters live
+ * there, not under units/. */
+static int read_manager_property(const char *runtime_dir, const char *key, char *out, size_t out_size) {
+        char path[PATH_MAX];
+        size_t klen = strlen(key);
+        char line[1024];
+        FILE *f;
+        int n;
+
+        n = snprintf(path, sizeof(path), "%s/manager", runtime_dir);
+        if (n < 0 || (size_t) n >= sizeof(path))
+                return -ENAMETOOLONG;
+
+        f = fopen(path, "re");
+        if (!f)
+                return -ENOENT;
+
+        while (fgets(line, sizeof(line), f)) {
+                char *nl = strchr(line, '\n');
+
+                if (!nl) {
+                        fclose(f);
+                        return -EPROTO;
+                }
+                *nl = '\0';
+
+                if (strncmp(line, key, klen) == 0 && line[klen] == '=') {
+                        snprintf(out, out_size, "%s", line + klen + 1);
+                        fclose(f);
+                        return 0;
+                }
+        }
+
+        fclose(f);
+        return -ENOENT;
+}
+
+static unsigned read_manager_uint(const char *runtime_dir, const char *key) {
+        char val[32];
+
+        ASSERT_EQ_INT(read_manager_property(runtime_dir, key, val, sizeof(val)), 0);
+        return (unsigned) strtoul(val, NULL, 10);
+}
+
 static bool unit_file_exists(const char *runtime_dir, const char *unit_id) {
         char path[PATH_MAX];
         struct stat st;
@@ -688,12 +733,88 @@ static void test_reader_never_sees_partial_file(void) {
         free(rtdir);
 }
 
+/* --- test 6: the boot-progress counters, from setup through a drained transaction --- */
+
+/*
+ * Three checkpoints in one fixture, each keying off a state manager_state_*
+ * publishes at a different, verifiable moment:
+ *
+ *  (c) manager_state_setup() itself does the first publish (see its own
+ *      comment), before manager_load_units()/manager_startup() have created
+ *      a single job -- the consumer's "0%, don't quit" case.
+ *  (a) manager_startup() installs the boot transaction's jobs but never runs
+ *      them itself -- manager_dispatch_run_queue() is only ever called from
+ *      manager_loop() (manager-loop.c) -- so immediately after it returns,
+ *      every installed job is still queued: NInstalledJobs=N>0, NJobs=N.
+ *  (b) driving the real loop to completion (same stop_the_loop() timer the
+ *      other real-boot tests here use) empties the run queue: NJobs=0 while
+ *      NInstalledJobs stays at N -- the consumer's "boot done" condition.
+ */
+static void test_job_counters_publish(void) {
+        char *unitdir, *rtdir;
+        char cgroup_root[PATH_MAX];
+        Manager *m = NULL;
+        unsigned n_installed_after_startup;
+        int objective;
+
+        unitdir = test_tmpdir_new();
+        rtdir = test_tmpdir_new();
+        ASSERT_TRUE(unitdir != NULL && rtdir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(unitdir, "default.target", "[Unit]\nDescription=Default\n"), 0);
+        ASSERT_EQ_INT(test_write_file(unitdir, "sysinit.service", sysinit_service), 0);
+        ASSERT_EQ_INT(test_write_file(unitdir, "console.service", console_service), 0);
+
+        ASSERT_EQ_INT(manager_new(&m), 0);
+        {
+                const char * const up[] = { unitdir, NULL };
+                const char * const pd[] = { NULL };
+
+                ASSERT_EQ_INT(manager_set_unit_path(m, up), 0);
+                ASSERT_EQ_INT(manager_set_preset_path(m, pd), 0);
+        }
+        ASSERT_EQ_INT(manager_set_runtime_dir(m, rtdir), 0);
+        use_private_cgroup_root(m, "jobcount", cgroup_root, sizeof(cgroup_root));
+
+        /* (c) setup's own first publish: no unit loaded, no job installed yet. */
+        ASSERT_EQ_INT(manager_state_setup(m), 0);
+        ASSERT_EQ_INT(read_manager_uint(rtdir, "NJobs"), 0);
+        ASSERT_EQ_INT(read_manager_uint(rtdir, "NInstalledJobs"), 0);
+
+        ASSERT_EQ_INT(manager_startup(m, NULL), 0);
+
+        /* (a) the boot transaction is installed but not yet run. */
+        ASSERT_EQ_INT(m->n_jobs, m->n_installed_jobs);
+        ASSERT_TRUE(m->n_installed_jobs > 0);
+        ASSERT_EQ_INT(read_manager_uint(rtdir, "NJobs"), m->n_jobs);
+        ASSERT_EQ_INT(read_manager_uint(rtdir, "NInstalledJobs"), m->n_installed_jobs);
+        n_installed_after_startup = m->n_installed_jobs;
+
+        ASSERT_EQ_INT(pico_timer_add(m->timer, now_monotonic() + 3 * USEC_PER_SEC, stop_the_loop, m, NULL), 0);
+        objective = manager_loop(m);
+        ASSERT_EQ_INT(objective, MANAGER_EXIT);
+
+        /* (b) the transaction has drained: NJobs=0, NInstalledJobs unchanged. */
+        ASSERT_EQ_INT(m->n_jobs, 0);
+        ASSERT_EQ_INT(m->n_installed_jobs, n_installed_after_startup);
+        ASSERT_EQ_INT(read_manager_uint(rtdir, "NJobs"), 0);
+        ASSERT_EQ_INT(read_manager_uint(rtdir, "NInstalledJobs"), n_installed_after_startup);
+
+        manager_free(m);
+        free_private_cgroup_root(cgroup_root);
+        test_rm_rf(unitdir);
+        test_rm_rf(rtdir);
+        free(unitdir);
+        free(rtdir);
+}
+
 int main(void) {
         test_boot_files_match_reality();
         test_killed_service_shows_failure();
         test_file_vanishes_with_unit();
         test_unwritable_runtime_dir_never_fails_boot();
         test_reader_never_sees_partial_file();
+        test_job_counters_publish();
 
         printf("test-manager-state: all checks passed\n");
         return 0;
