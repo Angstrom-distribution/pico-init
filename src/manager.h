@@ -112,6 +112,8 @@ struct Manager {
         /* runnable jobs, linked via job->run_queue_next */
         Job *run_queue;
         uint32_t next_job_id;
+        unsigned n_jobs;           /* jobs currently installed */
+        unsigned n_installed_jobs; /* cumulative installs since boot; see job_install() */
 
         int epoll_fd;
         PicoSignal *signal;

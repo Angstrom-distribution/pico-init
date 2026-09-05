@@ -18,6 +18,11 @@
  *
  * Updates are atomic tmp+rename(): a reader polling during transition churn
  * must never observe a partial file.
+ *
+ * The <runtime_dir>/manager file also carries NJobs (jobs currently
+ * installed) and NInstalledJobs (cumulative installs since boot): the raw
+ * inputs to a boot-progress fraction, published for a separate consumer to
+ * turn into a percentage -- PID 1 itself never computes one.
  */
 
 #pragma once
@@ -44,5 +49,6 @@ void manager_state_notify_job(Job *j);
 /* Drop u's file. Called from unit_free(): the file must not outlive the unit. */
 void manager_state_forget_unit(Unit *u);
 
-/* Re-write <runtime_dir>/manager (objective, default target, unit count). */
+/* Re-write <runtime_dir>/manager (objective, default target, unit count,
+ * and the NJobs/NInstalledJobs boot-progress counters). */
 void manager_state_notify_manager(Manager *m);

@@ -318,6 +318,19 @@ static void job_install(Job *j) {
         j->unit->job = j;
         j->installed = true;
 
+        /*
+         * Quarried shape: v30 src/manager.c:1238 increments n_installed_jobs
+         * at exactly this point in transaction_apply()'s install loop (tag
+         * v30, commit 501c92c); pico's job_install() is that loop's body.
+         *
+         * Ordering note -- do not move these above the superseded-job cancel
+         * a few lines up: that job_finish_full() runs job_uninstall() on the
+         * OLD job first, so its decrement lands before this increment and
+         * n_jobs stays exact.
+         */
+        j->manager->n_jobs++;
+        j->manager->n_installed_jobs++;
+
         job_add_to_run_queue(j);
 
         /* A unit with a job enqueued must report it (Job= in the published
@@ -334,6 +347,13 @@ static void job_uninstall(Job *j) {
 
         job_unlink_run_queue(j);
         j->installed = false;
+
+        /* Defensive guard rather than an assert: job_uninstall() is already
+         * gated on !j->installed above so double-decrement cannot happen in
+         * practice, but a zero-initialized manager in a unit test should not
+         * be able to underflow this. */
+        if (j->manager->n_jobs > 0)
+                j->manager->n_jobs--;
 }
 
 Job *job_free(Job *j) {

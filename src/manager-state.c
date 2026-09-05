@@ -18,6 +18,10 @@
  * -errno so manager_startup() can log it once, at WARNING, rather than the
  * per-transition DEBUG spam every subsequent no-op write would otherwise
  * produce.
+ *
+ * The manager file also carries NJobs/NInstalledJobs, the two boot-progress
+ * counters Manager.n_jobs/n_installed_jobs -- see manager_state_notify_manager()
+ * for what they mean and who consumes them.
  */
 
 #include <dirent.h>
@@ -342,14 +346,25 @@ void manager_state_notify_manager(Manager *m) {
          * DefaultTarget reports the actual target this boot is using,
          * which is stored by manager_startup() in m->default_target.
          * Fall back to the macro only if default_target is somehow NULL.
+         *
+         * NJobs/NInstalledJobs are the inputs to systemd's Manager.Progress
+         * (v30 src/dbus-manager.c bus_manager_append_progress(): 1.0 minus
+         * jobs/installed). PID 1 publishes the raw counters only -- the
+         * percentage arithmetic deliberately lives in the consumer
+         * (a separate binary), so the fraction's semantics can change
+         * without touching PID 1.
          */
         fprintf(f,
                 "Objective=%s\n"
                 "DefaultTarget=%s\n"
-                "NUnits=%zu\n",
+                "NUnits=%zu\n"
+                "NJobs=%u\n"
+                "NInstalledJobs=%u\n",
                 manager_objective_to_string(m->objective),
                 m->default_target ? m->default_target : PICO_DEFAULT_TARGET,
-                m->n_units);
+                m->n_units,
+                m->n_jobs,
+                m->n_installed_jobs);
 
         if (fclose(f) != 0) {
                 pico_log(PICO_LOG_DEBUG, "manager: could not finish writing state file: %s", strerror(errno));
