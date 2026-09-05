@@ -171,11 +171,24 @@ Unit *manager_get_unit_by_pid(Manager *m, pid_t pid);
  * forever on a dependency cycle. The dispatching_load_queue guard makes those
  * re-entrant calls enqueue and return instead, so the outermost call drains
  * everything iteratively.
+ *
+ * `id` naming a template ("foo@.service") is rejected with -EINVAL before
+ * any of that: a template has no startable identity. See unit-name.h's
+ * unit_name_is_template() and manager.c's boot scan, which has its own skip
+ * for the same reason.
  */
 int manager_load_unit(Manager *m, const char *id, Unit **ret);
 
 /* Append u to the unit table (ownership transfers to the manager). 0 or -errno. */
 int manager_add_unit(Manager *m, Unit *u);
+
+/*
+ * Drop u from the table and free it. ONLY for a unit that never loaded and
+ * so has no fragment, no edges and nothing pointing at it -- see
+ * manager.c's own header comment on this function for why that is the one
+ * safe condition. 0, or -ENOENT if u is not in the table.
+ */
+int manager_remove_unit(Manager *m, Unit *u);
 
 /* Push u onto the load queue if it is not already there. */
 void manager_enqueue_load(Manager *m, Unit *u);

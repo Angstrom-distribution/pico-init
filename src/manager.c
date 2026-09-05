@@ -18,6 +18,7 @@
 #include "manager-state.h"
 #include "manager.h"
 #include "service.h"
+#include "unit-name.h"
 
 static const char * const default_unit_path[] = {
         PICO_UNIT_DIR,
@@ -254,6 +255,37 @@ int manager_add_unit(Manager *m, Unit *u) {
         return 0;
 }
 
+/*
+ * Drop u from the table and free it. ONLY for a unit that failed to load and
+ * therefore has no fragment, no edges and nothing pointing at it -- unit_
+ * free()'s own header comment explains why a unit with live edges must
+ * never be dropped this way. manager-ctrl.c's start-fallback is the one
+ * caller: a "picoctl start nonexistent.service" creates a UNIT_ERROR node
+ * with no fragment and no edges (nothing else could have referenced a name
+ * that had never been seen before), and without this it would sit in
+ * m->units forever, walked by every future manager_apply_presets() and
+ * manager_dispatch_run_queue() pass.
+ */
+int manager_remove_unit(Manager *m, Unit *u) {
+        size_t i;
+
+        if (!m || !u)
+                return -EINVAL;
+
+        for (i = 0; i < m->n_units; i++)
+                if (m->units[i] == u)
+                        break;
+
+        if (i == m->n_units)
+                return -ENOENT;
+
+        memmove(&m->units[i], &m->units[i + 1], (m->n_units - i - 1) * sizeof(Unit *));
+        m->n_units--;
+
+        unit_free(u);
+        return 0;
+}
+
 void manager_enqueue_load(Manager *m, Unit *u) {
         if (!m || !u || u->in_load_queue)
                 return;
@@ -398,6 +430,19 @@ int manager_load_unit(Manager *m, const char *id, Unit **ret) {
         if (!unit_name_is_valid(id))
                 return -EINVAL;
 
+        /*
+         * A template has no startable identity -- covers every load-by-name
+         * route at once: "picoctl start foo@.service", a Requires= that
+         * somehow survived specifier expansion still bare, a .wants symlink
+         * misnamed as a template. manager_load_units_one_dir()'s boot scan
+         * has its own skip below, for the same reason but a different
+         * failure shape (silent omission, not a rejected load).
+         */
+        if (unit_name_is_template(id)) {
+                pico_log(PICO_LOG_WARNING, "%s: a template has no startable identity, refusing to load", id);
+                return -EINVAL;
+        }
+
         u = manager_get_unit(m, id);
         if (!u) {
                 UnitType type = unit_type_from_name(id);
@@ -465,6 +510,16 @@ static int manager_load_units_one_dir(Manager *m, const char *dir) {
                  * and anything containing a path separator.
                  */
                 if (!unit_name_is_valid(de->d_name))
+                        continue;
+
+                /*
+                 * A template is not a unit: it loads only under an
+                 * instance's name, through unit_load()'s fallback (see
+                 * unit-load.c). Without this, "serial-getty@.service" -- a
+                 * structurally valid name -- would load as an ordinary unit
+                 * here and hand %I to exec verbatim, unexpanded.
+                 */
+                if (unit_name_is_template(de->d_name))
                         continue;
 
                 r = manager_load_unit(m, de->d_name, NULL);

@@ -132,6 +132,7 @@ pico_tests = [
   'test-unit-dependency',
   'test-unit-name',
   'test-specifier',
+  'test-unit-load',
   'test-job',
   'test-boot-root',
   'test-service',
