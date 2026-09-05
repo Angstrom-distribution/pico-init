@@ -260,8 +260,11 @@ static int parse_exec_line(Unit *u, const char *path, unsigned line, const char 
          * path, and so a %I that unescapes to something containing a space
          * (e.g. an instance "a\x20b") stays one argv element instead of
          * being split by a whole-rvalue expansion done before word-splitting
-         * ever ran. v30 expands per-word for exactly this reason
-         * (load-fragment.c:1122).
+         * ever ran. v30 itself expands ExecStart= at spawn time instead
+         * (unit_full_printf_strv() from service.c, already-tokenized argv
+         * in hand by then) rather than here at parse time -- pico expands
+         * earlier for the same per-word-not-per-line reason, just applied
+         * sooner, since pico has no separate spawn-time expansion pass.
          */
         r = expand_word(u, &word);
         if (r < 0)

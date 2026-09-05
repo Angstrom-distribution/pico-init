@@ -10,11 +10,12 @@
  * .device/.mount name -- unit types pico has none of -- is not carried.
  *
  * Backported fix:
- *  - b9a3302630 "unit-name: various modernizations" -- unit_name_replace_
- *    instance() below tests for the no-'@' case before touching the '@'
- *    pointer, not after computing an offset from it; the v30 original did
- *    the arithmetic first, which is undefined behaviour on a name with no
- *    '@' at all. See the function body for the shape of the bug.
+ *  - 8556879e0d "unit-name: rework unit_name_replace_instance function()"
+ *    (2012-09-12, RH#855863) -- unit_name_replace_instance() below tests
+ *    for the no-'@' case before touching the '@' pointer, not after
+ *    computing an offset from it; the v30 original did the arithmetic
+ *    first, which is undefined behaviour on a name with no '@' at all.
+ *    See the function body for the shape of the bug.
  *
  * Deliberate deviation from upstream, not a bug carried forward:
  *  - unit_name_to_instance() sets *ret to NULL for a template name

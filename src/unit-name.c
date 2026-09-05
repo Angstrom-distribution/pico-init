@@ -136,7 +136,7 @@ char *unit_name_replace_instance(const char *n, const char *instance) {
         p = strchr(n, '@');
         if (!p)
                 /*
-                 * b9a3302630: tested before any arithmetic on `p`, not
+                 * 8556879e0d: tested before any arithmetic on `p`, not
                  * after -- v30 computed `a = p - f` unconditionally and
                  * only checked `if (p)` afterwards, undefined behaviour on
                  * exactly this input. There is no instance slot to
