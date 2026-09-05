@@ -403,6 +403,50 @@ static void ctrl_handle_request(struct ctrl_conn *conn, const char *buf, size_t 
         }
 
         u = manager_get_unit(ctrl->manager, req.unit);
+
+        /*
+         * The instancing entry point: "picoctl start serial-getty@ttyUSB0.
+         * service" against a tty no unit file was ever shipped for. stop/
+         * reset-failed deliberately do not fall back -- loading a unit in
+         * order to stop or reset one that was never running is nonsense,
+         * and would otherwise let an unauthenticated-by-name typo silently
+         * create a table entry on every miss.
+         *
+         * A template id never reaches here: ctrl_parse_request() already
+         * validated req.unit through unit_name_is_valid(), and manager_
+         * load_unit() itself refuses a template with -EINVAL, so
+         * "picoctl start foo@.service" falls straight into the no-such-unit
+         * reply below with the real reason logged at WARNING.
+         */
+        if (!u && (req.verb == CTRL_VERB_START || req.verb == CTRL_VERB_RESTART)) {
+                if (manager_load_unit(ctrl->manager, req.unit, &u) < 0)
+                        u = NULL;
+                else if (u && u->load_state != UNIT_LOADED) {
+                        /*
+                         * manager_load_unit() returns 0 with *ret set even
+                         * when no fragment was found -- the node lands in
+                         * UNIT_ERROR. Left in the table, "start
+                         * nonexistent.service" would reply "ok" today and
+                         * leave a permanent UNIT_ERROR node for every future
+                         * manager_apply_presets()/manager_dispatch_run_
+                         * queue()/manager_free() pass to walk -- a
+                         * client-driven table leak the parse path never had,
+                         * since the ctrl socket lets anyone with a shell
+                         * spell a unit name that was never going to exist.
+                         *
+                         * Removing it here is provably safe for this node
+                         * specifically, which is the only condition under
+                         * which manager_remove_unit() may ever be called
+                         * (see its own header): UNIT_ERROR means no fragment
+                         * was parsed, so it has no outgoing edges, and
+                         * nothing else can have referenced a name that
+                         * manager_get_unit() just reported as absent.
+                         */
+                        manager_remove_unit(ctrl->manager, u);
+                        u = NULL;
+                }
+        }
+
         if (!u) {
                 ctrl_send_err(conn->tag.fd, "no-such-unit");
                 ctrl_conn_free(conn);

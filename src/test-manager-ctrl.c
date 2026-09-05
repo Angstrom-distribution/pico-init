@@ -196,6 +196,12 @@ static bool ctrl_two_clients_done(void *userdata) {
         return da && db;
 }
 
+static const char *basename_of(const char *path) {
+        const char *slash = strrchr(path, '/');
+
+        return slash ? slash + 1 : path;
+}
+
 /* --- fixture plumbing --- */
 
 /*
@@ -588,6 +594,133 @@ static void test_malformed_requests_rejected_without_allocating(void) {
         ctrl_fixture_teardown(&f);
 }
 
+/*
+ * G2: the ctrl-side instancing fallback. Every case here needs a template
+ * (foo@.service) in the fixture tree so req.unit can name an instance
+ * nothing ever shipped a fragment for -- exactly the "picoctl start
+ * serial-getty@ttyUSB0.service" shape manager-ctrl.c's own header comment
+ * on the fallback describes.
+ */
+
+static void ctrl_fixture_write_template(struct ctrl_fixture *f) {
+        ASSERT_EQ_INT(test_write_file(f->unitdir, "foo@.service", "[Service]\nExecStart=/bin/sleep 300\n"), 0);
+}
+
+/* The headline capability: a unit never in the table at all, loaded and
+ * started in one round trip. */
+static void test_start_loads_an_uninstantiated_template(void) {
+        struct ctrl_fixture f;
+        Unit *u;
+
+        ctrl_fixture_setup(&f);
+        ctrl_fixture_write_template(&f);
+        ctrl_fixture_boot(&f);
+
+        ASSERT_TRUE(manager_get_unit(f.m, "foo@ttyUSB0.service") == NULL);
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 start foo@ttyUSB0.service", "ok done\n", 400);
+
+        u = manager_get_unit(f.m, "foo@ttyUSB0.service");
+        ASSERT_TRUE(u != NULL);
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        ASSERT_STREQ(u->instance, "ttyUSB0");
+        ASSERT_STREQ(basename_of(u->fragment_path), "foo@.service");
+        ASSERT_EQ_INT(unit_active_state(u), UNIT_ACTIVE);
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 stop foo@ttyUSB0.service", "ok done\n", 800);
+        ctrl_fixture_teardown(&f);
+}
+
+static void test_restart_also_falls_back(void) {
+        struct ctrl_fixture f;
+        Unit *u;
+
+        ctrl_fixture_setup(&f);
+        ctrl_fixture_write_template(&f);
+        ctrl_fixture_boot(&f);
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 restart foo@ttyUSB1.service", "ok done\n", 400);
+
+        u = manager_get_unit(f.m, "foo@ttyUSB1.service");
+        ASSERT_TRUE(u != NULL);
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        ASSERT_EQ_INT(unit_active_state(u), UNIT_ACTIVE);
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 stop foo@ttyUSB1.service", "ok done\n", 800);
+        ctrl_fixture_teardown(&f);
+}
+
+/* The deliberate asymmetry: stopping or resetting a unit that was never
+ * running must stay a plain lookup miss, never an implicit load -- checked
+ * on both the wire reply and the table, since a silent table growth on
+ * every stop of a typo'd name would be invisible from the reply alone. */
+static void test_stop_does_not_fall_back(void) {
+        struct ctrl_fixture f;
+        size_t n_before;
+
+        ctrl_fixture_setup(&f);
+        ctrl_fixture_write_template(&f);
+        ctrl_fixture_boot(&f);
+
+        n_before = f.m->n_units;
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 stop foo@ttyUSB2.service", "err no-such-unit\n", 100);
+        ASSERT_EQ_INT((long long) f.m->n_units, (long long) n_before);
+
+        ctrl_fixture_teardown(&f);
+}
+
+static void test_reset_failed_does_not_fall_back(void) {
+        struct ctrl_fixture f;
+        size_t n_before;
+
+        ctrl_fixture_setup(&f);
+        ctrl_fixture_write_template(&f);
+        ctrl_fixture_boot(&f);
+
+        n_before = f.m->n_units;
+        ctrl_roundtrip_assert(
+                        f.m, f.rtdir, "PICO1 reset-failed foo@ttyUSB3.service", "err no-such-unit\n", 100);
+        ASSERT_EQ_INT((long long) f.m->n_units, (long long) n_before);
+
+        ctrl_fixture_teardown(&f);
+}
+
+/* The manager_remove_unit() test: without it, a start against a name that
+ * genuinely does not exist (no literal file, no template) would leave a
+ * permanent UNIT_ERROR node behind on every single miss. */
+static void test_start_unknown_name_leaves_no_junk_unit(void) {
+        struct ctrl_fixture f;
+        size_t n_before;
+
+        ctrl_fixture_setup(&f);
+        ctrl_fixture_boot(&f); /* no template in this tree at all */
+
+        n_before = f.m->n_units;
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 start nope.service", "err no-such-unit\n", 100);
+        ASSERT_EQ_INT((long long) f.m->n_units, (long long) n_before);
+        ASSERT_TRUE(manager_get_unit(f.m, "nope.service") == NULL);
+
+        ctrl_fixture_teardown(&f);
+}
+
+/* A template id is rejected by manager_load_unit() itself before the
+ * fallback ever gets a fragment to find -- covered here as the ctrl-visible
+ * consequence, not a retest of manager.c's own rejection. */
+static void test_start_template_is_refused(void) {
+        struct ctrl_fixture f;
+        size_t n_before;
+
+        ctrl_fixture_setup(&f);
+        ctrl_fixture_write_template(&f);
+        ctrl_fixture_boot(&f);
+
+        n_before = f.m->n_units;
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 start foo@.service", "err no-such-unit\n", 100);
+        ASSERT_EQ_INT((long long) f.m->n_units, (long long) n_before);
+
+        ctrl_fixture_teardown(&f);
+}
+
 int main(void) {
         test_start_stop_restart_active_and_inactive();
         test_start_failing_unit_replies_with_real_result();
@@ -596,6 +729,13 @@ int main(void) {
         test_early_disconnect_leaks_nothing();
         test_displaced_job_gets_canceled_reply();
         test_malformed_requests_rejected_without_allocating();
+
+        test_start_loads_an_uninstantiated_template();
+        test_restart_also_falls_back();
+        test_stop_does_not_fall_back();
+        test_reset_failed_does_not_fall_back();
+        test_start_unknown_name_leaves_no_junk_unit();
+        test_start_template_is_refused();
 
         printf("test-manager-ctrl: all checks passed\n");
         return 0;

@@ -54,8 +54,18 @@
  * (9fd8d678b, da46a1bc3) -- unit_parse_file() has no mtime out-param in
  * the M0 header contract; the ';'-multi-command ExecStart fixes
  * (3851c51ad, 598c47c86) -- multi-command ExecStart= is out of MVP scope,
- * Type=simple takes exactly one command; specifier-expansion OOM-vs-syntax
- * distinction (487060c239) -- no specifier expansion (%i etc.) exists yet.
+ * Type=simple takes exactly one command.
+ *
+ * Specifier expansion (%i/%I/%n/%N/%p, G2): config_parse_unit_deps() and
+ * config_parse_install_names() expand per-token through unit_name_printf()
+ * (name-safe: no expansion here can introduce whitespace or a '/'), and
+ * parse_exec_line()/config_parse_description() expand through
+ * unit_full_printf() (adds %I, which unescapes and so can). Deliberately
+ * NOT expanded: config_parse_condition_path() -- verified against the
+ * quarry that v30 at this tag (load-fragment.c:1584-1620) does not run
+ * specifier_printf() on a condition value either, so staying unexpanded
+ * keeps this milestone at v30 fidelity rather than one that only looks
+ * complete. See that function's own comment for the practical consequence.
  *
  * The stack-overflow-class bug the M1 review found (a VLA sized by an
  * unbounded, attacker-controlled line length, reproduced with a 30MB
@@ -194,7 +204,21 @@ static int extract_first_word(const char **state, char **ret) {
  * directive to be rejected, same as c853953658's validate-and-reject
  * rework rather than the original assert-on-bad-input.
  */
-static int parse_exec_line(const char *path, unsigned line, const char *rvalue, char ***ret_argv) {
+/*
+ * Expand *word through the full table (%I included) and replace it in
+ * place, freeing the raw word either way -- the caller has nothing left to
+ * clean up on either return path.
+ */
+static int expand_word(Unit *u, char **word) {
+        char *expanded = NULL;
+        int r = unit_full_printf(u, *word, &expanded);
+
+        free(*word);
+        *word = r < 0 ? NULL : expanded;
+        return r;
+}
+
+static int parse_exec_line(Unit *u, const char *path, unsigned line, const char *rvalue, char ***ret_argv) {
         const char *p = rvalue;
         char **argv = NULL;
         char *word;
@@ -229,6 +253,19 @@ static int parse_exec_line(const char *path, unsigned line, const char *rvalue, 
                          r < 0 ? "malformed quoting" : "empty command line");
                 return r < 0 ? r : -EINVAL;
         }
+
+        /*
+         * Expanded here, after extract_first_word() and before the
+         * absolute-path check below -- so the check judges the expanded
+         * path, and so a %I that unescapes to something containing a space
+         * (e.g. an instance "a\x20b") stays one argv element instead of
+         * being split by a whole-rvalue expansion done before word-splitting
+         * ever ran. v30 expands per-word for exactly this reason
+         * (load-fragment.c:1122).
+         */
+        r = expand_word(u, &word);
+        if (r < 0)
+                return r;
 
         if (word[0] != '/') {
                 pico_log(PICO_LOG_WARNING,
@@ -267,6 +304,12 @@ static int parse_exec_line(const char *path, unsigned line, const char *rvalue, 
                 if (r == 0)
                         break;
 
+                r = expand_word(u, &word);
+                if (r < 0) {
+                        argv = pico_strv_free(argv);
+                        return r;
+                }
+
                 r = pico_strv_extend(&argv, word);
                 free(word);
                 if (r < 0) {
@@ -283,14 +326,18 @@ static int parse_exec_line(const char *path, unsigned line, const char *rvalue, 
 
 static int config_parse_description(
                 Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
-        char *d;
+        char *d = NULL;
+        int r;
         (void) path;
         (void) line;
         (void) lvalue;
 
-        d = pico_strdup(rvalue);
-        if (!d)
-                return -ENOMEM;
+        /* Full table (%I included): a Description= is free text, never a
+         * path or a name, so there is nothing here for an unescaped '/' to
+         * corrupt. */
+        r = unit_full_printf(u, rvalue, &d);
+        if (r < 0)
+                return r;
 
         u->description = pico_mfree(u->description);
         u->description = d;
@@ -317,7 +364,22 @@ static int config_parse_unit_deps(Unit *u, const char *path, unsigned line, Unit
 
         for (tok = strtok_r(names, " \t", &saveptr); tok; tok = strtok_r(NULL, " \t", &saveptr)) {
                 Unit *other;
+                char *expanded = NULL;
                 int r;
+
+                /*
+                 * Per token, before validation, not on the whole rvalue:
+                 * unit_name_printf()'s table (%n %N %p %i) cannot itself
+                 * introduce whitespace, but expanding per-word here anyway is
+                 * what keeps that true by construction rather than by an
+                 * accident of which specifiers happen to exist today -- the
+                 * same discipline parse_exec_line() needs for real, below.
+                 */
+                r = unit_name_printf(u, tok, &expanded);
+                if (r < 0) {
+                        pico_mfree(names);
+                        return r;
+                }
 
                 /*
                  * unit_name_is_valid() subsumes the old suffix check and adds
@@ -326,12 +388,13 @@ static int config_parse_unit_deps(Unit *u, const char *path, unsigned line, Unit
                  * "Requires=../../tmp/evil.service" must be rejected before it
                  * ever becomes a path.
                  */
-                if (!unit_name_is_valid(tok)) {
+                if (!unit_name_is_valid(expanded)) {
                         pico_log(PICO_LOG_WARNING,
                                  "%s:%u: '%s' is not a valid unit name, ignoring",
                                  path,
                                  line,
-                                 tok);
+                                 expanded);
+                        pico_mfree(expanded);
                         continue;
                 }
 
@@ -341,19 +404,21 @@ static int config_parse_unit_deps(Unit *u, const char *path, unsigned line, Unit
                                  "dependency on '%s'",
                                  path,
                                  line,
-                                 tok);
+                                 expanded);
+                        pico_mfree(expanded);
                         continue;
                 }
 
-                r = manager_load_unit(u->manager, tok, &other);
+                r = manager_load_unit(u->manager, expanded, &other);
                 if (r < 0) {
                         pico_log(PICO_LOG_WARNING,
                                  "%s:%u: failed to resolve dependency on '%s': %s, "
                                  "ignoring",
                                  path,
                                  line,
-                                 tok,
+                                 expanded,
                                  strerror(-r));
+                        pico_mfree(expanded);
                         continue;
                 }
 
@@ -371,8 +436,10 @@ static int config_parse_unit_deps(Unit *u, const char *path, unsigned line, Unit
                                  path,
                                  line,
                                  unit_dependency_to_string(d),
-                                 tok,
+                                 expanded,
                                  strerror(-r));
+
+                pico_mfree(expanded);
         }
 
         pico_mfree(names);
@@ -413,6 +480,18 @@ static int config_parse_after(Unit *u, const char *path, unsigned line, const ch
  * already did before this handler existed, so it is no regression -- but it
  * does mean a negated condition is ignored rather than honoured, which is the
  * named limitation of this minimal support.
+ *
+ * Deliberately not specifier-expanded (G2): verified at v30's own tag that
+ * this directive (load-fragment.c:1584-1620) is not run through
+ * specifier_printf() there either -- that only came later upstream. Staying
+ * at v30 fidelity here is a real, named limitation: a generic
+ * "serial-getty@.service" template cannot carry
+ * "ConditionPathExists=/dev/%I". Not needed for the units this project
+ * currently ships (SERIAL_CONSOLES-derived consoles always exist; the
+ * ttyGS0 override keeps its literal condition), and test-unit-parse.c pins
+ * this exact non-expanding behaviour so the choice stays visible rather than
+ * silently regressed if a future commit's search-and-replace ever reaches
+ * this function.
  */
 static int config_parse_condition_path(
                 Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue, char ***target) {
@@ -563,7 +642,7 @@ static int config_parse_exec_start(
          * ExecStart= at all is a validation problem, not a parse error --
          * not yet enforced (no post-load validation pass exists), tracked in
          * plans/29-pico-init.md. */
-        r = parse_exec_line(path, line, rvalue, &argv);
+        r = parse_exec_line(u, path, line, rvalue, &argv);
         if (r < 0)
                 return 0;
 
@@ -582,7 +661,7 @@ static int config_parse_exec_start_pre(
         if (!s)
                 return 0;
 
-        r = parse_exec_line(path, line, rvalue, &argv);
+        r = parse_exec_line(u, path, line, rvalue, &argv);
         if (r < 0)
                 return 0;
 
@@ -941,8 +1020,6 @@ static int config_parse_install_names(
         char *names;
         char *tok;
 
-        (void) u;
-
         /* heap, not a VLA: rvalue comes from conf-scan.c's unbounded
          * getline(), the same stack-overflow hazard config_parse_unit_deps()
          * documents above */
@@ -951,16 +1028,29 @@ static int config_parse_install_names(
                 return -ENOMEM;
 
         for (tok = strtok_r(names, " \t", &saveptr); tok; tok = strtok_r(NULL, " \t", &saveptr)) {
-                if (!unit_name_is_valid(tok)) {
+                char *expanded = NULL;
+                int r;
+
+                /* same name-safe, per-token expansion as config_parse_unit_deps() above */
+                r = unit_name_printf(u, tok, &expanded);
+                if (r < 0) {
+                        pico_mfree(names);
+                        return r;
+                }
+
+                if (!unit_name_is_valid(expanded)) {
                         pico_log(PICO_LOG_WARNING,
                                  "%s:%u: '%s' is not a valid unit name, ignoring",
                                  path,
                                  line,
-                                 tok);
+                                 expanded);
+                        pico_mfree(expanded);
                         continue;
                 }
 
-                if (pico_strv_extend(target, tok) < 0) {
+                r = pico_strv_extend(target, expanded);
+                pico_mfree(expanded);
+                if (r < 0) {
                         pico_mfree(names);
                         return -ENOMEM;
                 }

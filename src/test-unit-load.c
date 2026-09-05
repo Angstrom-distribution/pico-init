@@ -241,12 +241,9 @@ static void test_boot_scan_skips_templates(void) {
  * The end-to-end (g) confirmation: a .wants symlink named after an instance
  * nobody ever shipped a fragment for still resolves, purely by name, through
  * unit_load()'s template fallback -- nothing in unit-enable.c had to change
- * for this to work.
- *
- * The argv here is deliberately still "%I" unexpanded: specifier expansion
- * in ExecStart= is unit-parse.c's own commit, landing after this one. This
- * assertion is amended there once parse_exec_line() actually calls
- * unit_full_printf().
+ * for this to work. %I in the template's ExecStart= is expanded to the real
+ * instance by the time the unit is loaded, proving the fallback and
+ * unit-parse.c's specifier expansion compose correctly end to end.
  */
 static void test_wants_symlink_instantiates_template(void) {
         Manager *m;
@@ -294,7 +291,7 @@ static void test_wants_symlink_instantiates_template(void) {
 
         s = (Service *) inst;
         ASSERT_STREQ(s->exec_start[0], "/bin/echo");
-        ASSERT_STREQ(s->exec_start[1], "%I");
+        ASSERT_STREQ(s->exec_start[1], "ttyGS0");
         ASSERT_TRUE(s->exec_start[2] == NULL);
 
         /* the template itself never enters the table -- only its instance does */

@@ -45,6 +45,12 @@ static Manager *manager_for(const char *dir) {
         return m;
 }
 
+static const char *basename_of(const char *path) {
+        const char *slash = strrchr(path, '/');
+
+        return slash ? slash + 1 : path;
+}
+
 /* Load one fixture file and hand back the unit it produced. */
 static Unit *load_one(Manager *m, const char *id) {
         Unit *u;
@@ -561,6 +567,392 @@ static void test_unsupported_condition_values_are_dropped(void) {
         free(dir);
 }
 
+/*
+ * G2: specifier expansion through the real handler chain, not the engine's
+ * own synthetic table (test-specifier.c already covers that). Everything
+ * below this point is new; everything above is untouched by G2 -- see the
+ * two test_conditions_are_parsed()/test_unsupported_condition_values_are_
+ * dropped() cases above for the regression that matters most: neither
+ * function nor test needed a single edit for this milestone to land.
+ */
+
+/*
+ * The name-safe table (%n %N %p %i) in a dependency directive, expanded per
+ * token before validation. Two companion units so the resolved edges are
+ * to real, loaded targets rather than merely-created UNIT_ERROR stubs.
+ */
+static void test_name_safe_expansion_in_deps(void) {
+        Manager *m;
+        char *dir;
+        Unit *u;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "foo@a.service",
+                                      "[Unit]\n"
+                                      "After=other-%i.service\n"
+                                      "Requires=%p-common.service\n"
+                                      "\n"
+                                      "[Service]\n"
+                                      "ExecStart=/bin/true\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir, "other-a.service", "[Service]\nExecStart=/bin/true\n"), 0);
+        ASSERT_EQ_INT(test_write_file(dir, "foo-common.service", "[Service]\nExecStart=/bin/true\n"), 0);
+
+        m = manager_for(dir);
+        u = load_one(m, "foo@a.service");
+
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        ASSERT_TRUE(unit_has_dependency(u, UNIT_AFTER, manager_get_unit(m, "other-a.service")));
+        ASSERT_TRUE(unit_has_dependency(u, UNIT_REQUIRES, manager_get_unit(m, "foo-common.service")));
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* Same table, [Install] side: WantedBy=/RequiredBy= are stored as raw
+ * strings, so this proves expansion runs there too, not just on the
+ * edge-resolving directives. */
+static void test_name_safe_expansion_in_install(void) {
+        Manager *m;
+        char *dir;
+        Unit *u;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "foo@a.service",
+                                      "[Service]\nExecStart=/bin/true\n\n[Install]\nWantedBy=%p.target\n"),
+                      0);
+
+        m = manager_for(dir);
+        u = load_one(m, "foo@a.service");
+
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        ASSERT_TRUE(u->wanted_by != NULL);
+        ASSERT_STREQ(u->wanted_by[0], "foo.target");
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * Proves the two tables are genuinely different, not one table used twice:
+ * %I unescapes and so can introduce a '/', which is exactly why it is not
+ * in the name-safe table. "x-%I.service" is expanded through that table,
+ * finds no 'I' entry, and passes through literally -- then fails
+ * unit_name_is_valid() on the '%' and is dropped, same as any other
+ * malformed dependency token.
+ */
+static void test_name_safe_table_has_no_percent_I(void) {
+        Manager *m;
+        char *dir;
+        Unit *u;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "foo@a.service",
+                                      "[Unit]\nRequires=x-%I.service\n\n[Service]\nExecStart=/bin/true\n"),
+                      0);
+
+        m = manager_for(dir);
+        u = load_one(m, "foo@a.service");
+
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        ASSERT_EQ_INT(u->n_dependencies[UNIT_REQUIRES], 0);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * The full table in ExecStart=, and three things at once: %I really
+ * unescapes (not an alias of raw %i), %i is preserved raw, and per-word
+ * expansion keeps an unescaped instance containing a space as ONE argv
+ * element rather than letting it re-tokenize the command line.
+ */
+static void test_full_expansion_in_exec(void) {
+        Manager *m;
+        char *dir;
+        Unit *u;
+        Service *s;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "foo@a\\x20b.service",
+                                      "[Service]\nExecStart=/bin/echo %i %I %n %N %p\n"),
+                      0);
+
+        m = manager_for(dir);
+        u = load_one(m, "foo@a\\x20b.service");
+        s = (Service *) u;
+
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        ASSERT_STREQ(s->exec_start[0], "/bin/echo");
+        ASSERT_STREQ(s->exec_start[1], "a\\x20b");             /* %i: raw, unescaped instance */
+        ASSERT_STREQ(s->exec_start[2], "a b");                 /* %I: actually unescaped */
+        ASSERT_STREQ(s->exec_start[3], "foo@a\\x20b.service"); /* %n: full id */
+        ASSERT_STREQ(s->exec_start[4], "foo@a\\x20b");         /* %N: id without suffix */
+        ASSERT_STREQ(s->exec_start[5], "foo");                 /* %p: prefix */
+        ASSERT_TRUE(s->exec_start[6] == NULL);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+static void test_description_expansion(void) {
+        Manager *m;
+        char *dir;
+        Unit *u;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "serial-getty@ttyGS0.service",
+                                      "[Unit]\nDescription=Serial getty on %I\n\n[Service]\nExecStart=/bin/true\n"),
+                      0);
+
+        m = manager_for(dir);
+        u = load_one(m, "serial-getty@ttyGS0.service");
+
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        ASSERT_STREQ(u->description, "Serial getty on ttyGS0");
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * v30's specifier_string() does assert(data) -- an abort waiting to happen
+ * the moment a plain, non-instanced unit's ExecStart= carries a bare %i or
+ * %I. This reaches that exact path through the real handler chain, not
+ * specifier.c's own direct test of pico_specifier_string().
+ */
+static void test_specifiers_on_non_instanced_unit(void) {
+        Manager *m;
+        char *dir;
+        Unit *u;
+        Service *s;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir, "plain.service", "[Service]\nExecStart=/bin/echo [%i][%I]\n"), 0);
+
+        m = manager_for(dir);
+        u = load_one(m, "plain.service");
+        s = (Service *) u;
+
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        ASSERT_STREQ(s->exec_start[0], "/bin/echo");
+        ASSERT_STREQ(s->exec_start[1], "[][]");
+        ASSERT_TRUE(s->exec_start[2] == NULL);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* The drop-in-tolerance property, through the real handler chain: a
+ * specifier neither table implements passes through untouched, and "%%"
+ * still collapses to a literal '%'. */
+static void test_unknown_specifier_tolerated(void) {
+        Manager *m;
+        char *dir;
+        Unit *u;
+        Service *s;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "plain.service",
+                                      "[Unit]\nDescription=100%% done\n\n[Service]\nExecStart=/bin/echo %t %c\n"),
+                      0);
+
+        m = manager_for(dir);
+        u = load_one(m, "plain.service");
+        s = (Service *) u;
+
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        ASSERT_STREQ(u->description, "100% done");
+        ASSERT_STREQ(s->exec_start[0], "/bin/echo");
+        ASSERT_STREQ(s->exec_start[1], "%t");
+        ASSERT_STREQ(s->exec_start[2], "%c");
+        ASSERT_TRUE(s->exec_start[3] == NULL);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * Pins the v30-fidelity scope boundary named in this file's own header:
+ * verified against the quarry that v30 does not run specifier_printf() over
+ * a Condition* value either, so this stays unexpanded on purpose, not by
+ * omission. Makes the choice visible in the suite instead of implicit.
+ */
+static void test_condition_values_are_not_expanded(void) {
+        Manager *m;
+        char *dir;
+        Unit *u;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "foo@a.service",
+                                      "[Unit]\nConditionPathExists=/dev/%i\n\n[Service]\nExecStart=/bin/true\n"),
+                      0);
+
+        m = manager_for(dir);
+        u = load_one(m, "foo@a.service");
+
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        ASSERT_TRUE(u->condition_path_exists != NULL);
+        ASSERT_STREQ(u->condition_path_exists[0], "/dev/%i");
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * G1/G3(b) unaffected, half two of two: a byte-for-byte copy of the real
+ * shipped serial-getty@ttyGS0.service fixture (meta-angstrom's
+ * recipes-core/init-systems/pico-init-units/), asserted field by field.
+ * The file carries no '%' character at all (verified by grep over the whole
+ * pico-init-units/ directory before this milestone started), so
+ * introducing specifier expansion cannot have changed what it means.
+ */
+static void test_shipped_ttygs0_unit_is_unchanged(void) {
+        Manager *m;
+        char *dir;
+        Unit *u;
+        Service *s;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir, "usb-multi-gadget.service", "[Service]\nExecStart=/bin/true\n"), 0);
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "serial-getty@ttyGS0.service",
+                                      "[Unit]\n"
+                                      "Description=Serial getty on ttyGS0\n"
+                                      "After=usb-multi-gadget.service\n"
+                                      "ConditionPathExists=/dev/ttyGS0\n"
+                                      "\n"
+                                      "[Service]\n"
+                                      "Type=simple\n"
+                                      "ExecStart=/sbin/getty 115200 ttyGS0\n"
+                                      "Restart=on-failure\n"
+                                      "RestartSec=2\n"
+                                      "\n"
+                                      "[Install]\n"
+                                      "WantedBy=default.target\n"),
+                      0);
+
+        m = manager_for(dir);
+        u = load_one(m, "serial-getty@ttyGS0.service");
+        s = (Service *) u;
+
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        ASSERT_STREQ(u->instance, "ttyGS0");
+        ASSERT_STREQ(u->description, "Serial getty on ttyGS0");
+        ASSERT_TRUE(u->condition_path_exists != NULL);
+        ASSERT_STREQ(u->condition_path_exists[0], "/dev/ttyGS0");
+        ASSERT_STREQ(s->exec_start[0], "/sbin/getty");
+        ASSERT_STREQ(s->exec_start[1], "115200");
+        ASSERT_STREQ(s->exec_start[2], "ttyGS0");
+        ASSERT_TRUE(s->exec_start[3] == NULL);
+        ASSERT_EQ_INT(s->restart, SERVICE_RESTART_ON_FAILURE);
+        ASSERT_TRUE(s->restart_usec == 2 * USEC_PER_SEC);
+        ASSERT_TRUE(u->wanted_by != NULL);
+        ASSERT_STREQ(u->wanted_by[0], "default.target");
+        ASSERT_TRUE(unit_has_dependency(u, UNIT_AFTER, manager_get_unit(m, "usb-multi-gadget.service")));
+        ASSERT_STREQ(basename_of(u->fragment_path), "serial-getty@ttyGS0.service");
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * G1/G3(b) unaffected, and G2's own precedence rule in the same breath: the
+ * exact post-G3(a) on-disk layout (a real template alongside the literal
+ * override), tested before G3(a) itself is even written. Every assertion
+ * from test_shipped_ttygs0_unit_is_unchanged() must hold identically.
+ */
+static void test_shipped_ttygs0_unit_wins_over_template(void) {
+        Manager *m;
+        char *dir;
+        Unit *u;
+        Service *s;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir, "usb-multi-gadget.service", "[Service]\nExecStart=/bin/true\n"), 0);
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "serial-getty@ttyGS0.service",
+                                      "[Unit]\n"
+                                      "Description=Serial getty on ttyGS0\n"
+                                      "After=usb-multi-gadget.service\n"
+                                      "ConditionPathExists=/dev/ttyGS0\n"
+                                      "\n"
+                                      "[Service]\n"
+                                      "Type=simple\n"
+                                      "ExecStart=/sbin/getty 115200 ttyGS0\n"
+                                      "Restart=on-failure\n"
+                                      "RestartSec=2\n"
+                                      "\n"
+                                      "[Install]\n"
+                                      "WantedBy=default.target\n"),
+                      0);
+        /* the generic template: deliberately different ExecStart=, no
+         * After=/ConditionPathExists= -- if this ever won, every assertion
+         * below would fail loudly rather than silently degrade. */
+        ASSERT_EQ_INT(test_write_file(dir, "serial-getty@.service", "[Service]\nExecStart=/bin/false %I\n"),
+                      0);
+
+        m = manager_for(dir);
+        u = load_one(m, "serial-getty@ttyGS0.service");
+        s = (Service *) u;
+
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        ASSERT_STREQ(u->instance, "ttyGS0");
+        ASSERT_STREQ(u->description, "Serial getty on ttyGS0");
+        ASSERT_TRUE(u->condition_path_exists != NULL);
+        ASSERT_STREQ(u->condition_path_exists[0], "/dev/ttyGS0");
+        ASSERT_STREQ(s->exec_start[0], "/sbin/getty");
+        ASSERT_STREQ(s->exec_start[1], "115200");
+        ASSERT_STREQ(s->exec_start[2], "ttyGS0");
+        ASSERT_TRUE(s->exec_start[3] == NULL);
+        ASSERT_EQ_INT(s->restart, SERVICE_RESTART_ON_FAILURE);
+        ASSERT_TRUE(s->restart_usec == 2 * USEC_PER_SEC);
+        ASSERT_TRUE(u->wanted_by != NULL);
+        ASSERT_STREQ(u->wanted_by[0], "default.target");
+        ASSERT_TRUE(unit_has_dependency(u, UNIT_AFTER, manager_get_unit(m, "usb-multi-gadget.service")));
+        ASSERT_STREQ(basename_of(u->fragment_path), "serial-getty@ttyGS0.service");
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
         test_service_fields();
         test_unknown_directives_are_tolerated();
@@ -571,6 +963,17 @@ int main(void) {
         test_huge_requires_line_does_not_crash();
         test_conditions_are_parsed();
         test_unsupported_condition_values_are_dropped();
+
+        test_name_safe_expansion_in_deps();
+        test_name_safe_expansion_in_install();
+        test_name_safe_table_has_no_percent_I();
+        test_full_expansion_in_exec();
+        test_description_expansion();
+        test_specifiers_on_non_instanced_unit();
+        test_unknown_specifier_tolerated();
+        test_condition_values_are_not_expanded();
+        test_shipped_ttygs0_unit_is_unchanged();
+        test_shipped_ttygs0_unit_wins_over_template();
 
         printf("test-unit-parse: all checks passed\n");
         return 0;
