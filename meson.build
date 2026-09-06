@@ -514,15 +514,25 @@ picoctl_exe = executable(
 # against, not PID 1 code itself -- see sd-daemon.c's own header for why it
 # never calls into util.c/log.
 #
-# sd-daemon.h and sd-event.h are wired in so far; other real headers this
-# eventual shim will need to cover (sd-id128.h, sd-bus.h, ...) get their own
-# sources added to libsystemd_compat_sources as each one's own family lands.
+# sd-daemon.h, sd-event.h, sd-id128.h and sd-journal.h are wired in so far;
+# other real headers this eventual shim will need to cover (sd-bus.h, ...)
+# get their own sources added to libsystemd_compat_sources as each one's
+# own family lands.
 #
 # sd-event.c/sd-event-source.c split the sd_event_*() family in two: the
 # event object and its epoll-backed loop mechanics versus every
 # sd_event_source_*() property accessor. event-internal.h is the private
 # struct layout and helper set the two share; never installed, since a real
 # consumer only ever sees opaque sd_event/sd_event_source pointers.
+#
+# sd-journal's own sources are split by concern rather than upstream's
+# single sd-journal.c: -send/-sendv (printf-shaped write API funnelling
+# into one real sd_journal_sendv() choke point over logd's /dev/log
+# socket), -stream (the separate /run/logd/stdout mechanism), -open/
+# -navigate/-data/-info (the read side, a snapshot reader over logd's own
+# ring -- src/logd/logd-read.h -- never the binary .journal format), and
+# -util (helpers shared across the read side). sd-journal-internal.h is
+# their private struct sd_journal layout, never installed.
 # ---------------------------------------------------------------------------
 libsystemd_compat_includes = include_directories('src/compat/libsystemd')
 
@@ -530,6 +540,24 @@ libsystemd_compat_sources = files(
   'src/compat/libsystemd/sd-daemon.c',
   'src/compat/libsystemd/sd-event.c',
   'src/compat/libsystemd/sd-event-source.c',
+  'src/compat/libsystemd/sd-id128.c',
+  # sd_id128_get_app_specific()'s HMAC-SHA256: a small pico-original pair
+  # (see sha256.h/hmac-sha256.h's own comments for why this is written from
+  # the FIPS/RFC text rather than vendored from any existing source file),
+  # not a public sd-*.h family of its own.
+  'src/compat/libsystemd/sha256.c',
+  'src/compat/libsystemd/hmac-sha256.c',
+  'src/compat/libsystemd/sd-journal-util.c',
+  'src/compat/libsystemd/sd-journal-send.c',
+  'src/compat/libsystemd/sd-journal-sendv.c',
+  'src/compat/libsystemd/sd-journal-stream.c',
+  'src/compat/libsystemd/sd-journal-open.c',
+  'src/compat/libsystemd/sd-journal-navigate.c',
+  'src/compat/libsystemd/sd-journal-data.c',
+  'src/compat/libsystemd/sd-journal-info.c',
+  # src/logd/logd-read.h's LogdEntry/LogdReadField views and its ring
+  # reader (logd_ring_read() et al) are what sd-journal-open.c/-navigate.c/
+  # -data.c build the whole read side on; logd_core is linked below for it.
   #
   # sd-bus.h/sd-login.h/sd-hwdb.h family: split by behavioral bucket, not
   # upstream's file layout. sd-bus-validate.c/-path.c/-error.c are the
@@ -550,6 +578,30 @@ libsystemd_compat_sources = files(
   'src/compat/libsystemd/sd-login-cgroup.c',
   'src/compat/libsystemd/sd-login.c',
   'src/compat/libsystemd/sd-hwdb.c',
+  # sd-device/sd-network: device-new.c (refcounting, every
+  # sd_device_new_from_*() constructor, the parent walk), device-attr.c
+  # (readlink-/grammar-based identity: subsystem, driver, sysname),
+  # device-uevent.c (the property table and its uevent-derived getters),
+  # device-property.c (iteration plus the always-empty tag family),
+  # device-devlink.c/-sysattr.c/-child.c/-trigger.c (one real mechanism
+  # each), device-enumerator.c and device-monitor.c (the two subsystems
+  # big enough for their own file). device-internal.h is their shared
+  # private struct layout, never installed. network-resolv.c/-state.c/
+  # -monitor.c mirror the same split for sd-network; network-internal.h
+  # is its equivalent private (test-root-prefix) header.
+  'src/compat/libsystemd/device-new.c',
+  'src/compat/libsystemd/device-attr.c',
+  'src/compat/libsystemd/device-uevent.c',
+  'src/compat/libsystemd/device-property.c',
+  'src/compat/libsystemd/device-devlink.c',
+  'src/compat/libsystemd/device-sysattr.c',
+  'src/compat/libsystemd/device-child.c',
+  'src/compat/libsystemd/device-trigger.c',
+  'src/compat/libsystemd/device-enumerator.c',
+  'src/compat/libsystemd/device-monitor.c',
+  'src/compat/libsystemd/network-resolv.c',
+  'src/compat/libsystemd/network-state.c',
+  'src/compat/libsystemd/network-monitor.c',
 )
 
 libsystemd_compat = static_library(
@@ -559,16 +611,26 @@ libsystemd_compat = static_library(
   install: true,
 )
 
-# Real consumers expect "systemd/sd-daemon.h" (and now "systemd/sd-event.h")
-# on their include path, the same layout a real systemd-devel package ships.
+# Real consumers expect "systemd/sd-daemon.h" (etc.) on their include path,
+# the same layout a real systemd-devel package ships. _sd-common.h rides
+# along unconditionally, same as real systemd's own src/systemd/meson.build
+# does (install_headers(systemd_headers, '_sd-common.h', subdir: 'systemd'))
+# -- any public sd-*.h that #includes "_sd-common.h" needs it installed
+# beside itself, since that's a quoted include and resolves against the
+# installed file's own directory, not the source tree's.
 install_headers(
   'src/compat/libsystemd/sd-daemon.h',
   'src/compat/libsystemd/sd-event.h',
+  'src/compat/libsystemd/sd-id128.h',
+  'src/compat/libsystemd/sd-journal.h',
+  'src/compat/libsystemd/_sd-common.h',
   'src/compat/libsystemd/sd-bus.h',
   'src/compat/libsystemd/sd-bus-protocol.h',
   'src/compat/libsystemd/sd-bus-vtable.h',
   'src/compat/libsystemd/sd-login.h',
   'src/compat/libsystemd/sd-hwdb.h',
+  'src/compat/libsystemd/sd-device.h',
+  'src/compat/libsystemd/sd-network.h',
   subdir: 'systemd',
 )
 
@@ -587,6 +649,38 @@ test_sd_event_exe = executable(
   link_with: libsystemd_compat,
 )
 test('test-sd-event', test_sd_event_exe)
+
+test_sd_id128_exe = executable(
+  'test-sd-id128',
+  ['src/compat/libsystemd/test-sd-id128.c'] + pico_test_sources,
+  include_directories: libsystemd_compat_includes,
+  link_with: libsystemd_compat,
+)
+test('test-sd-id128', test_sd_id128_exe)
+
+# sd-journal's read side calls into logd_core (logd_ring_read() et al,
+# src/logd/logd-read.h) directly -- the first family here to need it. A
+# static_library() itself builds fine without it (unresolved symbols in an
+# archive are normal), but the executables below need the real objects at
+# final link time, same as picoctl_exe's own [pico_init_core, logd_core]
+# pairing above. Packaging the installed systemd-compat.a for an external
+# consumer that isn't already linking logd_core is a question for whoever
+# owns that story; not resolved here.
+test_sd_journal_read_exe = executable(
+  'test-sd-journal-read',
+  ['src/compat/libsystemd/test-sd-journal-read.c'] + pico_test_sources,
+  include_directories: [libsystemd_compat_includes, logd_includes],
+  link_with: [libsystemd_compat, logd_core, pico_init_core],
+)
+test('test-sd-journal-read', test_sd_journal_read_exe)
+
+test_sd_journal_send_exe = executable(
+  'test-sd-journal-send',
+  ['src/compat/libsystemd/test-sd-journal-send.c'] + pico_test_sources,
+  include_directories: libsystemd_compat_includes,
+  link_with: libsystemd_compat,
+)
+test('test-sd-journal-send', test_sd_journal_send_exe)
 
 
 # sd-bus.h/sd-login.h/sd-hwdb.h family tests. test-sd-bus-stubs/-noop
@@ -668,3 +762,30 @@ test_sd_hwdb_exe = executable(
   link_with: libsystemd_compat,
 )
 test('test-sd-hwdb', test_sd_hwdb_exe)
+
+# sd-device.c/sd-network.c getters against a real /sys or /dev fixture
+# (device-internal.h's device_set_sys_root_for_tests()/
+# device_set_dev_root_for_tests(), network-internal.h's
+# network_set_root_for_tests()), plus a handful of assertions against the
+# real host's own /sys, /dev/null and loopback interface where a fixture
+# would prove nothing (test-sd-device-new.c, test-sd-device-monitor.c).
+libsystemd_compat_device_tests = [
+  'test-sd-device-new',
+  'test-sd-device-uevent',
+  'test-sd-device-sysattr',
+  'test-sd-device-devlink',
+  'test-sd-device-enumerator',
+  'test-sd-device-monitor',
+  'test-sd-network',
+  'test-sd-network-monitor',
+]
+
+foreach t : libsystemd_compat_device_tests
+  exe = executable(
+    t,
+    ['src/compat/libsystemd/' + t + '.c'] + pico_test_sources,
+    include_directories: libsystemd_compat_includes,
+    link_with: libsystemd_compat,
+  )
+  test(t, exe)
+endforeach
