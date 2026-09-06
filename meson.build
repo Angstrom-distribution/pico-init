@@ -505,3 +505,43 @@ picoctl_exe = executable(
   install: true,
   install_dir: get_option('sbindir'),
 )
+
+# ---------------------------------------------------------------------------
+# libsystemd-compat -- a from-scratch, ABI-compatible reimplementation of
+# real systemd's public libsystemd surface, for OE recipes that were built
+# assuming a real systemd is present. Lives under its own directory rather
+# than beside PID 1's own code because it is a library other packages link
+# against, not PID 1 code itself -- see sd-daemon.c's own header for why it
+# never calls into util.c/log.
+#
+# Only the sd-daemon.h family is wired in here; other real headers this
+# eventual shim will need to cover (sd-id128.h, sd-bus.h, ...) get their own
+# sources added to libsystemd_compat_sources as each one's own family lands.
+# ---------------------------------------------------------------------------
+libsystemd_compat_includes = include_directories('src/compat/libsystemd')
+
+libsystemd_compat_sources = files(
+  'src/compat/libsystemd/sd-daemon.c',
+)
+
+libsystemd_compat = static_library(
+  'systemd-compat',
+  libsystemd_compat_sources,
+  include_directories: libsystemd_compat_includes,
+  install: true,
+)
+
+# Real consumers expect "systemd/sd-daemon.h" on their include path, the
+# same layout a real systemd-devel package ships.
+install_headers(
+  'src/compat/libsystemd/sd-daemon.h',
+  subdir: 'systemd',
+)
+
+test_sd_daemon_exe = executable(
+  'test-sd-daemon',
+  ['src/compat/libsystemd/test-sd-daemon.c'] + pico_test_sources,
+  include_directories: libsystemd_compat_includes,
+  link_with: libsystemd_compat,
+)
+test('test-sd-daemon', test_sd_daemon_exe)
