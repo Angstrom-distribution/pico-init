@@ -14,6 +14,7 @@
 #include "manager-ctrl.h"
 #include "manager-notify.h"
 #include "manager-state.h"
+#include "manager-watchdog.h"
 #include "manager.h"
 #include "unit-enable.h"
 #include "unit.h"
@@ -137,17 +138,29 @@ int manager_startup(Manager *m, const char *default_target) {
          * NULL default_target correctly. */
 
         /*
-         * 0. Bring up the runtime state directory, the control socket and
-         * the sd_notify() listener before anything can transition, so the
-         * very first unit_notify() of the boot is already published rather
-         * than silently dropped.
+         * 0. Arm the hardware watchdog first, before the runtime state
+         * directory, the control socket and the sd_notify() listener: it
+         * has no dependency on /run or on any unit state, and every line of
+         * boot from here on is then covered by it -- a hang during unit
+         * loading, preset application, or cycle detection on slow media is
+         * exactly the class of hang worth catching, so arming any later
+         * would throw away that coverage for free. Then bring up state/
+         * ctrl/notify, so the very first unit_notify() of the boot is
+         * already published rather than silently dropped.
          *
-         * None of the three is fatal: a read-only or absent /run costs
-         * picoctl its verbs and sd_notify() its listener, and an image
-         * without either is a supported configuration. A boot that fails
-         * because its status reporting failed would be strictly worse than
-         * one that boots quietly.
+         * None of the four is fatal: no /dev/watchdog (qemu/CI images have
+         * none) costs only watchdog protection, and a read-only or absent
+         * /run costs picoctl its verbs and sd_notify() its listener. A boot
+         * that fails because its own failure-recovery or status-reporting
+         * hardware was absent would be strictly worse than one that boots
+         * quietly without it.
          */
+        r = manager_watchdog_setup(m);
+        if (r < 0)
+                pico_log(r == -ENOENT ? PICO_LOG_INFO : PICO_LOG_WARNING,
+                         "hardware watchdog unavailable, continuing without: %s",
+                         strerror(-r));
+
         r = manager_state_setup(m);
         if (r < 0)
                 pico_log(PICO_LOG_WARNING,

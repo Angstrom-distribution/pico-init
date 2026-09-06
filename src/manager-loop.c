@@ -24,6 +24,13 @@
  * a zero-timeout re-poll between dispatches while anything stays pending
  * (sd-event.c). So within one batch:
  *
+ *   -20  watchdog feed    -- one WDIOC_KEEPALIVE ioctl + re-arm (manager-
+ *                            watchdog.c); carries no unit attribution and no
+ *                            exit status, so it has no ordering interaction
+ *                            with anything below. Placed first, ahead of
+ *                            everything, so no event storm at any other
+ *                            priority can ever starve the feed -- see
+ *                            manager-watchdog.c's starvation argument.
  *   -10  cgroup.events   -- verified and queued only, never acts
  *    -5  notify           -- sd_notify() datagrams applied here (manager-
  *                            notify.c), before SIGCHLD: service_sigchld_

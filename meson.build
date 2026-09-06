@@ -106,6 +106,10 @@ pico_init_core_sources = files(
   'src/manager-state.c',
   'src/manager-ctrl.c',
   'src/manager-notify.c',
+  # PID 1's hardware watchdog feeder. The per-service software watchdog
+  # (WatchdogSec=/Type=notify) is separate, deferred scope -- see
+  # manager-watchdog.h.
+  'src/manager-watchdog.c',
   'src/cgroups-v2.c',
   'src/timer.c',
   'src/signal.c',

@@ -17,6 +17,7 @@
 #include "manager-ctrl.h"
 #include "manager-notify.h"
 #include "manager-state.h"
+#include "manager-watchdog.h"
 #include "manager.h"
 #include "sd-event.h"
 #include "service.h"
@@ -111,6 +112,26 @@ int manager_set_runtime_dir(Manager *m, const char *dir) {
         return 0;
 }
 
+/* Unlike the setters above, NULL is legal here: it restores the default
+ * /dev/watchdog0 -> /dev/watchdog probe rather than being rejected. */
+int manager_set_watchdog_device(Manager *m, const char *path) {
+        char *copy = NULL;
+
+        if (!m)
+                return -EINVAL;
+
+        if (path) {
+                copy = pico_strdup(path);
+                if (!copy)
+                        return -ENOMEM;
+        }
+
+        pico_mfree(m->watchdog_device);
+        m->watchdog_device = copy;
+
+        return 0;
+}
+
 int manager_new(Manager **ret) {
         Manager *m;
         int r;
@@ -191,6 +212,7 @@ Manager *manager_free(Manager *m) {
         manager_ctrl_done(m);
         manager_notify_done(m);
         manager_state_done(m);
+        manager_watchdog_done(m);
 
         /* Jobs first: each one points at a unit and unlinks itself from the
          * run queue as it goes, so this terminates. Freeing units first would
@@ -213,6 +235,7 @@ Manager *manager_free(Manager *m) {
         m->preset_path = pico_strv_free(m->preset_path);
         m->cgroup_root = pico_mfree(m->cgroup_root);
         m->runtime_dir = pico_mfree(m->runtime_dir);
+        m->watchdog_device = pico_mfree(m->watchdog_device);
         m->default_target = pico_mfree(m->default_target);
 
         /*

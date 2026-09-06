@@ -34,6 +34,7 @@
  * pending. Patterned on real systemd's own table (src/core/manager.h).
  */
 enum {
+        EVENT_PRIORITY_WATCHDOG = SD_EVENT_PRIORITY_NORMAL - 20,      /* hardware watchdog feed: must outrank everything, see manager-loop.c */
         EVENT_PRIORITY_CGROUP_EVENTS = SD_EVENT_PRIORITY_NORMAL - 10, /* verify + queue only, never acts */
         EVENT_PRIORITY_NOTIFY = SD_EVENT_PRIORITY_NORMAL - 5,         /* before SIGCHLD: attribution needs main_pid still set */
         EVENT_PRIORITY_SIGNALS = SD_EVENT_PRIORITY_NORMAL - 4,        /* SIGCHLD reaped + attributed here */
@@ -106,21 +107,29 @@ struct Manager {
         char *cgroup_root;
         char *runtime_dir;
 
+        /* Device path override for manager_watchdog_setup(); NULL means the
+         * real default probe (/dev/watchdog0 then /dev/watchdog). For tests
+         * only -- see manager_set_watchdog_device(). */
+        char *watchdog_device;
+
         /* What manager_startup() was actually asked to boot into, recorded
          * because the published state file must report the real target rather
          * than re-assert the compile-time default. NULL before startup;
          * PICO_DEFAULT_TARGET once startup ran without an override. */
         char *default_target;
 
-        /* State publisher, control socket, and the sd_notify() listener
-         * (plan §1.7, manager-notify.h). All three are opaque here: their
-         * own .c files own their shapes, so landing one does not mean
-         * editing this header. NULL until the corresponding setup() has
-         * run, and NULL is a supported state -- an unwritable /run costs
-         * picoctl its verbs and sd_notify() its listener, never the boot. */
+        /* State publisher, control socket, sd_notify() listener, and the
+         * hardware watchdog feeder (plan §1.7, manager-notify.h; manager-
+         * watchdog.h). All four are opaque here: their own .c files own
+         * their shapes, so landing one does not mean editing this header.
+         * NULL until the corresponding setup() has run, and NULL is a
+         * supported state -- an unwritable /run costs picoctl its verbs and
+         * sd_notify() its listener, an absent /dev/watchdog costs only
+         * watchdog protection, never the boot. */
         struct pico_manager_state *state;
         struct pico_manager_ctrl *ctrl;
         struct pico_manager_notify *notify;
+        struct pico_manager_watchdog *watchdog;
 
         /* units waiting for unit_load(), linked via unit->load_queue_next */
         Unit *load_queue;
@@ -182,6 +191,7 @@ int manager_set_unit_path(Manager *m, const char * const *path);
 int manager_set_preset_path(Manager *m, const char * const *path);
 int manager_set_cgroup_root(Manager *m, const char *root);
 int manager_set_runtime_dir(Manager *m, const char *dir);
+int manager_set_watchdog_device(Manager *m, const char *path);
 
 /* Scan every unit_path entry (or just `dir` when non-NULL) for files whose
  * suffix names a known unit type, creating and loading each. 0 or -errno. */
