@@ -530,6 +530,26 @@ libsystemd_compat_sources = files(
   'src/compat/libsystemd/sd-daemon.c',
   'src/compat/libsystemd/sd-event.c',
   'src/compat/libsystemd/sd-event-source.c',
+  #
+  # sd-bus.h/sd-login.h/sd-hwdb.h family: split by behavioral bucket, not
+  # upstream's file layout. sd-bus-validate.c/-path.c/-error.c are the
+  # corner of sd-bus with a real, bus-free answer; -open.c is every way to
+  # obtain an sd_bus* (all fail, since no wire protocol exists); -stubs.c/
+  # -noop.c are the ~270 remaining sd_bus_*() entry points that need a
+  # live bus/message/slot/track/creds object that can never exist.
+  # sd-login-resolve.c is the shared pid/pidfd/peer-fd resolver both
+  # sd-login-cgroup.c's real cgroup/unit/slice getters and sd-login.c's
+  # honest_failure getters build on.
+  'src/compat/libsystemd/sd-bus-validate.c',
+  'src/compat/libsystemd/sd-bus-path.c',
+  'src/compat/libsystemd/sd-bus-error.c',
+  'src/compat/libsystemd/sd-bus-open.c',
+  'src/compat/libsystemd/sd-bus-stubs.c',
+  'src/compat/libsystemd/sd-bus-noop.c',
+  'src/compat/libsystemd/sd-login-resolve.c',
+  'src/compat/libsystemd/sd-login-cgroup.c',
+  'src/compat/libsystemd/sd-login.c',
+  'src/compat/libsystemd/sd-hwdb.c',
 )
 
 libsystemd_compat = static_library(
@@ -544,6 +564,11 @@ libsystemd_compat = static_library(
 install_headers(
   'src/compat/libsystemd/sd-daemon.h',
   'src/compat/libsystemd/sd-event.h',
+  'src/compat/libsystemd/sd-bus.h',
+  'src/compat/libsystemd/sd-bus-protocol.h',
+  'src/compat/libsystemd/sd-bus-vtable.h',
+  'src/compat/libsystemd/sd-login.h',
+  'src/compat/libsystemd/sd-hwdb.h',
   subdir: 'systemd',
 )
 
@@ -562,3 +587,84 @@ test_sd_event_exe = executable(
   link_with: libsystemd_compat,
 )
 test('test-sd-event', test_sd_event_exe)
+
+
+# sd-bus.h/sd-login.h/sd-hwdb.h family tests. test-sd-bus-stubs/-noop
+# exhaustively call every function in their respective mechanical bucket
+# (see sd-bus-stubs.c/sd-bus-noop.c's own headers) -- generated the same
+# way the stub bodies were, so a slipped signature or return value in
+# either shows up as a real test failure, not just a build success.
+test_sd_bus_validate_exe = executable(
+  'test-sd-bus-validate',
+  ['src/compat/libsystemd/test-sd-bus-validate.c'] + pico_test_sources,
+  include_directories: libsystemd_compat_includes,
+  link_with: libsystemd_compat,
+)
+test('test-sd-bus-validate', test_sd_bus_validate_exe)
+
+test_sd_bus_path_exe = executable(
+  'test-sd-bus-path',
+  ['src/compat/libsystemd/test-sd-bus-path.c'] + pico_test_sources,
+  include_directories: libsystemd_compat_includes,
+  link_with: libsystemd_compat,
+)
+test('test-sd-bus-path', test_sd_bus_path_exe)
+
+test_sd_bus_error_exe = executable(
+  'test-sd-bus-error',
+  ['src/compat/libsystemd/test-sd-bus-error.c'] + pico_test_sources,
+  include_directories: libsystemd_compat_includes,
+  link_with: libsystemd_compat,
+)
+test('test-sd-bus-error', test_sd_bus_error_exe)
+
+test_sd_bus_open_exe = executable(
+  'test-sd-bus-open',
+  ['src/compat/libsystemd/test-sd-bus-open.c'] + pico_test_sources,
+  include_directories: libsystemd_compat_includes,
+  link_with: libsystemd_compat,
+)
+test('test-sd-bus-open', test_sd_bus_open_exe)
+
+test_sd_bus_stubs_exe = executable(
+  'test-sd-bus-stubs',
+  ['src/compat/libsystemd/test-sd-bus-stubs.c'] + pico_test_sources,
+  include_directories: libsystemd_compat_includes,
+  link_with: libsystemd_compat,
+)
+test('test-sd-bus-stubs', test_sd_bus_stubs_exe)
+
+test_sd_bus_noop_exe = executable(
+  'test-sd-bus-noop',
+  ['src/compat/libsystemd/test-sd-bus-noop.c'] + pico_test_sources,
+  include_directories: libsystemd_compat_includes,
+  link_with: libsystemd_compat,
+)
+test('test-sd-bus-noop', test_sd_bus_noop_exe)
+
+# Real cgroups: creates/removes real /sys/fs/cgroup/system.slice/*.service
+# directories and moves a real forked child into them, so needs CAP_SYS_ADMIN
+# (root, same as every other privileged pico-init test already assumes).
+test_sd_login_cgroup_exe = executable(
+  'test-sd-login-cgroup',
+  ['src/compat/libsystemd/test-sd-login-cgroup.c'] + pico_test_sources,
+  include_directories: libsystemd_compat_includes,
+  link_with: libsystemd_compat,
+)
+test('test-sd-login-cgroup', test_sd_login_cgroup_exe)
+
+test_sd_login_exe = executable(
+  'test-sd-login',
+  ['src/compat/libsystemd/test-sd-login.c'] + pico_test_sources,
+  include_directories: libsystemd_compat_includes,
+  link_with: libsystemd_compat,
+)
+test('test-sd-login', test_sd_login_exe)
+
+test_sd_hwdb_exe = executable(
+  'test-sd-hwdb',
+  ['src/compat/libsystemd/test-sd-hwdb.c'] + pico_test_sources,
+  include_directories: libsystemd_compat_includes,
+  link_with: libsystemd_compat,
+)
+test('test-sd-hwdb', test_sd_hwdb_exe)
