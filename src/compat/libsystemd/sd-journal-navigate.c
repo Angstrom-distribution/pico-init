@@ -116,6 +116,24 @@ int sd_journal_next_skip(sd_journal *j, uint64_t skip) {
         if (!j)
                 return -EINVAL;
 
+        if (skip == 0) {
+                /* Real upstream (real_journal_next_skip()) still performs one
+                 * resolving step here when not already sitting on a discrete
+                 * entry -- skip==0 means "resolve position, advance nothing,"
+                 * not "no-op." A pending seek or BEFORE_HEAD/AFTER_TAIL
+                 * position is resolved via one real sd_journal_next(), but
+                 * the movement is never counted: upstream returns 0 for this
+                 * call either way. A prior version of this shim treated
+                 * skip==0 as a pure no-op, leaving position unresolved. */
+                if (j->loc != SD_J_ON_ENTRY || j->seek_pending) {
+                        int r = sd_journal_next(j);
+
+                        if (r < 0)
+                                return r;
+                }
+                return 0;
+        }
+
         while (count < skip) {
                 int r = sd_journal_next(j);
 
@@ -134,6 +152,18 @@ int sd_journal_previous_skip(sd_journal *j, uint64_t skip) {
 
         if (!j)
                 return -EINVAL;
+
+        if (skip == 0) {
+                /* See sd_journal_next_skip()'s identical reasoning, mirrored
+                 * for the previous() direction. */
+                if (j->loc != SD_J_ON_ENTRY || j->seek_pending) {
+                        int r = sd_journal_previous(j);
+
+                        if (r < 0)
+                                return r;
+                }
+                return 0;
+        }
 
         while (count < skip) {
                 int r = sd_journal_previous(j);

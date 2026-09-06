@@ -382,7 +382,7 @@ static int build_perror_message(int saved_errno, const char *message, char **ret
 int sd_journal_perror_with_location(const char *file, const char *line, const char *func, const char *message) {
         int saved_errno = errno;
         char *msg_text;
-        char msg_field[512];
+        char *msg_field;
         char errno_field[32];
         struct iovec iov[6];
         int r, rc;
@@ -393,7 +393,22 @@ int sd_journal_perror_with_location(const char *file, const char *line, const ch
                 return r;
         }
 
-        snprintf(msg_field, sizeof(msg_field), "MESSAGE=%s", msg_text);
+        /* msg_text is unbounded (caller-supplied message plus strerror()'s
+         * own text) -- a fixed-size buffer here would silently truncate it,
+         * exactly the class of loss this shim exists to avoid elsewhere
+         * (see sd_journal_printv()'s own stack-then-heap growth). */
+        {
+                size_t msg_field_len = strlen("MESSAGE=") + strlen(msg_text) + 1;
+
+                msg_field = malloc(msg_field_len);
+                if (!msg_field) {
+                        free(msg_text);
+                        errno = saved_errno;
+                        return -ENOMEM;
+                }
+                memcpy(msg_field, "MESSAGE=", 8);
+                memcpy(msg_field + 8, msg_text, strlen(msg_text) + 1);
+        }
         free(msg_text);
         snprintf(errno_field, sizeof(errno_field), "ERRNO=%d", saved_errno);
 
@@ -417,6 +432,7 @@ int sd_journal_perror_with_location(const char *file, const char *line, const ch
 
         rc = sd_journal_sendv(iov, 6);
 
+        free(msg_field);
         errno = saved_errno;
         return rc;
 }
@@ -424,7 +440,7 @@ int sd_journal_perror_with_location(const char *file, const char *line, const ch
 int sd_journal_perror(const char *message) {
         int saved_errno = errno;
         char *msg_text;
-        char msg_field[512];
+        char *msg_field;
         char errno_field[32];
         struct iovec iov[3];
         int r, rc;
@@ -435,7 +451,21 @@ int sd_journal_perror(const char *message) {
                 return r;
         }
 
-        snprintf(msg_field, sizeof(msg_field), "MESSAGE=%s", msg_text);
+        /* See sd_journal_perror_with_location()'s identical comment: msg_text
+         * is unbounded, so it is sized exactly rather than snprintf'd into a
+         * fixed buffer that would silently truncate it. */
+        {
+                size_t msg_field_len = strlen("MESSAGE=") + strlen(msg_text) + 1;
+
+                msg_field = malloc(msg_field_len);
+                if (!msg_field) {
+                        free(msg_text);
+                        errno = saved_errno;
+                        return -ENOMEM;
+                }
+                memcpy(msg_field, "MESSAGE=", 8);
+                memcpy(msg_field + 8, msg_text, strlen(msg_text) + 1);
+        }
         free(msg_text);
         snprintf(errno_field, sizeof(errno_field), "ERRNO=%d", saved_errno);
 
@@ -448,6 +478,7 @@ int sd_journal_perror(const char *message) {
 
         rc = sd_journal_sendv(iov, 3);
 
+        free(msg_field);
         errno = saved_errno;
         return rc;
 }
