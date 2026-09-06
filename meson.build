@@ -514,14 +514,22 @@ picoctl_exe = executable(
 # against, not PID 1 code itself -- see sd-daemon.c's own header for why it
 # never calls into util.c/log.
 #
-# Only the sd-daemon.h family is wired in here; other real headers this
+# sd-daemon.h and sd-event.h are wired in so far; other real headers this
 # eventual shim will need to cover (sd-id128.h, sd-bus.h, ...) get their own
 # sources added to libsystemd_compat_sources as each one's own family lands.
+#
+# sd-event.c/sd-event-source.c split the sd_event_*() family in two: the
+# event object and its epoll-backed loop mechanics versus every
+# sd_event_source_*() property accessor. event-internal.h is the private
+# struct layout and helper set the two share; never installed, since a real
+# consumer only ever sees opaque sd_event/sd_event_source pointers.
 # ---------------------------------------------------------------------------
 libsystemd_compat_includes = include_directories('src/compat/libsystemd')
 
 libsystemd_compat_sources = files(
   'src/compat/libsystemd/sd-daemon.c',
+  'src/compat/libsystemd/sd-event.c',
+  'src/compat/libsystemd/sd-event-source.c',
 )
 
 libsystemd_compat = static_library(
@@ -531,10 +539,11 @@ libsystemd_compat = static_library(
   install: true,
 )
 
-# Real consumers expect "systemd/sd-daemon.h" on their include path, the
-# same layout a real systemd-devel package ships.
+# Real consumers expect "systemd/sd-daemon.h" (and now "systemd/sd-event.h")
+# on their include path, the same layout a real systemd-devel package ships.
 install_headers(
   'src/compat/libsystemd/sd-daemon.h',
+  'src/compat/libsystemd/sd-event.h',
   subdir: 'systemd',
 )
 
@@ -545,3 +554,11 @@ test_sd_daemon_exe = executable(
   link_with: libsystemd_compat,
 )
 test('test-sd-daemon', test_sd_daemon_exe)
+
+test_sd_event_exe = executable(
+  'test-sd-event',
+  ['src/compat/libsystemd/test-sd-event.c'] + pico_test_sources,
+  include_directories: libsystemd_compat_includes,
+  link_with: libsystemd_compat,
+)
+test('test-sd-event', test_sd_event_exe)
