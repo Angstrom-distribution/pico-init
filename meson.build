@@ -201,6 +201,11 @@ pico_tests = [
   # m->event directly, one dispatch at a time, since manager_loop() itself
   # only exposes the final state once a whole batch has drained.
   'test-loop-order',
+  # The hardware watchdog feeder: graceful degrade with no device (the
+  # container/qemu case), event-priority placement, and the cannot-be-
+  # starved property. Real-device ioctl negotiation and reset-on-hang need
+  # target hardware -- see manager-watchdog.h and this test's own header.
+  'test-manager-watchdog',
 ]
 
 # manager.h now pulls in sd-event.h, so every test that reaches it
