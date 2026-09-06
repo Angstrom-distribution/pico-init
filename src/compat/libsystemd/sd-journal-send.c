@@ -267,8 +267,8 @@ int sd_journal_print(int priority, const char *format, ...) {
         return r;
 }
 
-int sd_journal_printv_with_location(int priority, const char *file, const char *line, const char *func,
-                                     const char *format, va_list ap) {
+int sd_journal_printv_with_location(
+                int priority, const char *file, const char *line, const char *func, const char *format, va_list ap) {
         /* CODE_FILE=/CODE_LINE=/CODE_FUNC= are forwarded to sd_journal_sendv()
          * and dropped there (not transportable); this file never special-
          * cases them, which keeps the no-location and with-location paths
@@ -349,8 +349,8 @@ int sd_journal_printv_with_location(int priority, const char *file, const char *
         return rc;
 }
 
-int sd_journal_print_with_location(int priority, const char *file, const char *line, const char *func,
-                                    const char *format, ...) {
+int sd_journal_print_with_location(
+                int priority, const char *file, const char *line, const char *func, const char *format, ...) {
         va_list ap;
         int r;
 
@@ -402,18 +402,24 @@ static void free_iov_strings(struct iovec *iov, size_t n_reserved, size_t n) {
  * the one real sd_journal_sendv() call and frees the strings this function
  * itself allocated -- never the caller's reserved (borrowed) location
  * pointers. `ap` must already be va_start()ed by the caller, who also owns
- * the matching va_end(). */
-static int scan_fields_and_send(struct iovec *iov, size_t cap, size_t n_reserved, const char *format, va_list ap) {
+ * the matching va_end().
+ *
+ * Takes va_list* rather than va_list: where va_list is an array type
+ * (x86-64), a by-value parameter decays to a pointer, so &ap yields the
+ * wrong type -- an error under -Werror there while building fine on
+ * aarch64, where va_list is a struct. */
+static int scan_fields_and_send(
+                struct iovec *iov, size_t cap, size_t n_reserved, const char *format, va_list *ap) {
         size_t n = n_reserved;
         const char *fmt;
         int r = 0, rc;
 
-        for (fmt = format; fmt; fmt = va_arg(ap, const char *)) {
+        for (fmt = format; fmt; fmt = va_arg(*ap, const char *)) {
                 if (n >= cap) {
                         r = -EOVERFLOW;
                         break;
                 }
-                r = send_one_field(fmt, &ap, iov, &n);
+                r = send_one_field(fmt, ap, iov, &n);
                 if (r < 0)
                         break;
         }
@@ -444,7 +450,7 @@ int sd_journal_send_with_location(const char *file, const char *line, const char
         iov[2].iov_len = strlen(funcbuf);
 
         va_start(ap, format);
-        rc = scan_fields_and_send(iov, sizeof(iov) / sizeof(iov[0]), 3, format, ap);
+        rc = scan_fields_and_send(iov, sizeof(iov) / sizeof(iov[0]), 3, format, &ap);
         va_end(ap);
 
         return rc;
@@ -456,7 +462,7 @@ int sd_journal_send(const char *format, ...) {
         int rc;
 
         va_start(ap, format);
-        rc = scan_fields_and_send(iov, sizeof(iov) / sizeof(iov[0]), 0, format, ap);
+        rc = scan_fields_and_send(iov, sizeof(iov) / sizeof(iov[0]), 0, format, &ap);
         va_end(ap);
 
         return rc;
