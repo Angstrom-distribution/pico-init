@@ -3,11 +3,10 @@
 
 /*
  * Real epoll/timerfd/signalfd/pidfd/inotify throughout -- no mocked kernel
- * objects. The one thing this cannot exercise from an ordinary test process
- * is sd_event_new()'s getpid()==1 guard, since driving that honestly needs a
- * real PID-1 process (a pid namespace, which this build environment cannot
- * assume); that path is exercised implicitly every time pico-init itself
- * boots and never calls into this shim.
+ * objects. sd_event_new() has no PID-1 restriction to exercise here any
+ * more: pico-init's own Manager is a real sd_event consumer now (see
+ * src/manager.h and src/test-loop-order.c, which covers the manager-level
+ * dispatch-order property this file cannot reach without a Manager).
  */
 #define _GNU_SOURCE
 
@@ -482,6 +481,214 @@ static void test_error_paths(void) {
         sd_event_unref(e);
 }
 
+/* --- batch dispatch order, disabled-while-pending, destroy-mid-batch --- */
+
+static int must_not_run_io_cb(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
+        int *ran = userdata;
+        (void) s;
+        (void) fd;
+        (void) revents;
+        *ran = 1;
+        return 0;
+}
+
+struct order_log {
+        int order[8];
+        int n;
+};
+
+static int order_io_cb(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
+        struct order_log *log = userdata;
+        int64_t prio = 0;
+        char c;
+
+        (void) revents;
+        ASSERT_EQ_INT(read(fd, &c, 1), 1);
+        sd_event_source_get_priority(s, &prio);
+        log->order[log->n++] = (int) prio;
+        return 0;
+}
+
+static int order_defer_cb(sd_event_source *s, void *userdata) {
+        struct order_log *log = userdata;
+        int64_t prio = 0;
+
+        sd_event_source_get_priority(s, &prio);
+        log->order[log->n++] = (int) prio;
+        return 0;
+}
+
+/*
+ * Real Manager priorities (manager.h's EVENT_PRIORITY_* table), registered
+ * in the REVERSE of dispatch order to prove sorting -- not insertion order
+ * -- decides it: CGROUP_EVENTS=-10, SIGNALS=-4, CGROUP_EMPTY=-2,
+ * RUN_QUEUE=IDLE+1=101. All four become pending in the SAME batch (three
+ * pipes written before the first prepare(), plus an ONESHOT defer, which
+ * prepare() itself marks pending and then folds into the same wait()).
+ */
+static void test_batch_dispatches_in_priority_order(void) {
+        sd_event *e = NULL;
+        sd_event_source *s_101 = NULL, *s_m2 = NULL, *s_m4 = NULL, *s_m10 = NULL;
+        int fds_m2[2], fds_m4[2], fds_m10[2];
+        struct order_log log = { { 0 }, 0 };
+
+        ASSERT_TRUE(pipe(fds_m2) == 0);
+        ASSERT_TRUE(pipe(fds_m4) == 0);
+        ASSERT_TRUE(pipe(fds_m10) == 0);
+        ASSERT_EQ_INT(sd_event_new(&e), 0);
+
+        ASSERT_EQ_INT(sd_event_add_defer(e, &s_101, order_defer_cb, &log), 0);
+        ASSERT_EQ_INT(sd_event_source_set_priority(s_101, 101), 0);
+        ASSERT_EQ_INT(sd_event_source_set_enabled(s_101, SD_EVENT_ONESHOT), 0);
+
+        ASSERT_EQ_INT(sd_event_add_io(e, &s_m2, fds_m2[0], EPOLLIN, order_io_cb, &log), 0);
+        ASSERT_EQ_INT(sd_event_source_set_priority(s_m2, -2), 0);
+
+        ASSERT_EQ_INT(sd_event_add_io(e, &s_m4, fds_m4[0], EPOLLIN, order_io_cb, &log), 0);
+        ASSERT_EQ_INT(sd_event_source_set_priority(s_m4, -4), 0);
+
+        ASSERT_EQ_INT(sd_event_add_io(e, &s_m10, fds_m10[0], EPOLLIN, order_io_cb, &log), 0);
+        ASSERT_EQ_INT(sd_event_source_set_priority(s_m10, -10), 0);
+
+        ASSERT_EQ_INT((int) write(fds_m2[1], "x", 1), 1);
+        ASSERT_EQ_INT((int) write(fds_m4[1], "x", 1), 1);
+        ASSERT_EQ_INT((int) write(fds_m10[1], "x", 1), 1);
+
+        /* sd_event_run() = prepare()+wait()+dispatch() in one, exactly what
+         * manager_loop() itself calls in a loop -- one dispatch per call, so
+         * four calls drain the whole batch in priority order. */
+        while (log.n < 4)
+                ASSERT_EQ_INT(sd_event_run(e, 0), 1);
+
+        ASSERT_EQ_INT(log.n, 4);
+        ASSERT_EQ_INT(log.order[0], -10);
+        ASSERT_EQ_INT(log.order[1], -4);
+        ASSERT_EQ_INT(log.order[2], -2);
+        ASSERT_EQ_INT(log.order[3], 101);
+
+        sd_event_source_unref(s_101);
+        sd_event_source_unref(s_m2);
+        sd_event_source_unref(s_m4);
+        sd_event_source_unref(s_m10);
+        close(fds_m2[1]);
+        close(fds_m4[1]);
+        close(fds_m10[1]);
+        sd_event_unref(e);
+}
+
+static int disable_other_io_cb(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
+        sd_event_source *other = userdata;
+        char c;
+
+        (void) s;
+        (void) revents;
+        ASSERT_EQ_INT(read(fd, &c, 1), 1);
+        ASSERT_EQ_INT(sd_event_source_set_enabled(other, SD_EVENT_OFF), 0);
+        return 0;
+}
+
+/*
+ * Regression test for the shim fix: event_source_apply_enabled(OFF) must
+ * clear s->pending, or a source already marked pending earlier in this same
+ * batch still fires once more after being disabled. `a` (priority -10)
+ * disables `b` (priority 0) before `b` is ever reached; without the fix,
+ * b's stale pending flag would survive the disable and a later dispatch
+ * would still call must_not_run_io_cb().
+ */
+static void test_disabled_while_pending_not_dispatched(void) {
+        sd_event *e = NULL;
+        sd_event_source *a = NULL, *b = NULL;
+        int fds_a[2], fds_b[2];
+        int b_ran = 0;
+
+        ASSERT_TRUE(pipe(fds_a) == 0);
+        ASSERT_TRUE(pipe(fds_b) == 0);
+        ASSERT_EQ_INT(sd_event_new(&e), 0);
+
+        ASSERT_EQ_INT(sd_event_add_io(e, &b, fds_b[0], EPOLLIN, must_not_run_io_cb, &b_ran), 0);
+        ASSERT_EQ_INT(sd_event_source_set_priority(b, 0), 0);
+
+        ASSERT_EQ_INT(sd_event_add_io(e, &a, fds_a[0], EPOLLIN, disable_other_io_cb, b), 0);
+        ASSERT_EQ_INT(sd_event_source_set_priority(a, -10), 0);
+
+        ASSERT_EQ_INT((int) write(fds_a[1], "x", 1), 1);
+        ASSERT_EQ_INT((int) write(fds_b[1], "y", 1), 1);
+
+        /* One wait() batch: both fds ready together, both marked pending. */
+        ASSERT_EQ_INT(sd_event_prepare(e), 0);
+        ASSERT_EQ_INT(sd_event_wait(e, 0), 1);
+
+        /* a (priority -10) dispatches first and disables b while b is still
+         * pending from this same wait(). */
+        ASSERT_EQ_INT(sd_event_dispatch(e), 1);
+        ASSERT_EQ_INT(sd_event_source_get_pending(b), 0); /* the fix: cleared, not left stale */
+
+        /* No further dispatch is possible, and no spin: a fresh run finds
+         * nothing left to do and returns 0 rather than re-discovering b. */
+        ASSERT_EQ_INT(sd_event_run(e, 0), 0);
+        ASSERT_EQ_INT(b_ran, 0);
+
+        sd_event_source_unref(a);
+        sd_event_source_unref(b);
+        close(fds_a[1]);
+        close(fds_b[1]);
+        sd_event_unref(e);
+}
+
+static int destroy_other_io_cb(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
+        sd_event_source *other = userdata;
+        char c;
+
+        (void) s;
+        (void) revents;
+        ASSERT_EQ_INT(read(fd, &c, 1), 1);
+        sd_event_source_unref(other); /* drops the caller's only ref: frees it now, mid-batch */
+        return 0;
+}
+
+/*
+ * The deterministic shim-level replacement for manager-ctrl.c's old
+ * dead-tag/dead_conns machinery: `hi` (priority -10) frees `lo` outright
+ * while `lo` is still pending in the same batch. sd_event_dispatch() must
+ * never crash (ASan-clean under -Db_sanitize=address) and lo's callback must
+ * never run -- proving the live-list re-scan on every dispatch (not a
+ * stale events[]-shaped snapshot) is what makes this safe.
+ */
+static void test_callback_destroys_other_pending_source(void) {
+        sd_event *e = NULL;
+        sd_event_source *hi = NULL, *lo = NULL;
+        int fds_hi[2], fds_lo[2];
+        int lo_ran = 0;
+
+        ASSERT_TRUE(pipe(fds_hi) == 0);
+        ASSERT_TRUE(pipe(fds_lo) == 0);
+        ASSERT_EQ_INT(sd_event_new(&e), 0);
+
+        ASSERT_EQ_INT(sd_event_add_io(e, &lo, fds_lo[0], EPOLLIN, must_not_run_io_cb, &lo_ran), 0);
+        ASSERT_EQ_INT(sd_event_source_set_priority(lo, 0), 0);
+
+        ASSERT_EQ_INT(sd_event_add_io(e, &hi, fds_hi[0], EPOLLIN, destroy_other_io_cb, lo), 0);
+        ASSERT_EQ_INT(sd_event_source_set_priority(hi, -10), 0);
+
+        ASSERT_EQ_INT((int) write(fds_hi[1], "x", 1), 1);
+        ASSERT_EQ_INT((int) write(fds_lo[1], "y", 1), 1);
+
+        ASSERT_EQ_INT(sd_event_prepare(e), 0);
+        ASSERT_EQ_INT(sd_event_wait(e, 0), 1);
+
+        ASSERT_EQ_INT(sd_event_dispatch(e), 1); /* hi runs, destroys lo */
+        ASSERT_EQ_INT(lo_ran, 0);
+
+        /* The loop keeps functioning: lo's fd is already gone (closed by
+         * its own teardown), so a fresh run finds nothing pending. */
+        ASSERT_EQ_INT(sd_event_run(e, 0), 0);
+
+        sd_event_source_unref(hi);
+        close(fds_hi[1]);
+        close(fds_lo[1]);
+        sd_event_unref(e);
+}
+
 int main(void) {
         test_new_ref_unref();
         test_default_query_then_create();
@@ -497,6 +704,9 @@ int main(void) {
         test_add_child_rejects_stopped_continued();
         test_inotify();
         test_error_paths();
+        test_batch_dispatches_in_priority_order();
+        test_disabled_while_pending_not_dispatched();
+        test_callback_destroys_other_pending_source();
 
         return 0;
 }

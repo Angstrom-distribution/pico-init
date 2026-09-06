@@ -32,6 +32,14 @@
  * possible.
  * Without that sharing there is nothing to gain from splitting the enum;
  * one SOURCE_TIME carries its own `clockid_t` field instead.
+ *
+ * run_prepare_callbacks() (sd-event.c) refs every entry of its scratch array
+ * before running any prepare callback and unrefs them all afterward, the
+ * same idiom sd_event_dispatch() uses around its one in-flight source: a
+ * prepare callback that destroys a different, still-unvisited source would
+ * otherwise leave that array holding a freed pointer for the rest of the
+ * scan -- the same batch-array hazard PID 1's own manager-loop.c used to
+ * guard against by hand before this migration.
  */
 
 #pragma once

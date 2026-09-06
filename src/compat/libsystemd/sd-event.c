@@ -236,6 +236,14 @@ int event_source_apply_enabled(sd_event_source *s, int enabled) {
         }
 
         s->enabled = enabled;
+
+        /* A disabled source must never be found pending: sd_event_dispatch()'s
+         * best-pending scan does not itself check `enabled`, so a source
+         * disabled after its event was already collected in the current
+         * batch would otherwise still fire once more before going quiet. */
+        if (enabled == SD_EVENT_OFF)
+                s->pending = false;
+
         return 0;
 }
 
@@ -257,12 +265,6 @@ int sd_event_new(sd_event **ret) {
 
         if (!ret)
                 return -EINVAL;
-
-        /* PID 1 already owns the sole epoll loop for this process
-         * (manager-loop.c); a second one here would be two owning loops
-         * fighting over the same process, not a nested or embeddable one. */
-        if (getpid() == 1)
-                return -EPERM;
 
         fd = epoll_create1(EPOLL_CLOEXEC);
         if (fd < 0)
@@ -1034,7 +1036,15 @@ static int priority_cmp(const void *a, const void *b) {
  * order; on OOM (only realistic on a rather large source count) it falls
  * back to list order rather than failing prepare() outright -- every
  * enabled callback still runs, just not guaranteed lowest-priority-first
- * relative to each other. */
+ * relative to each other.
+ *
+ * Every entry is ref'd before the loop and unref'd after, the same idiom
+ * sd_event_dispatch() already uses around its own single callback: without
+ * it, one source's prepare callback destroying a DIFFERENT still-unvisited
+ * entry would leave arr[] holding a freed pointer for the rest of this
+ * scan. Holding a ref merely defers the actual free (event_source_destroy())
+ * until this function's own unref drops it back to whatever the callback
+ * left it at -- it does not change what the callback observed. */
 static void run_prepare_callbacks(sd_event *e) {
         sd_event_source **arr, *s;
         size_t n = 0, i;
@@ -1052,7 +1062,7 @@ static void run_prepare_callbacks(sd_event *e) {
         }
 
         for (s = e->sources; s; s = s->sources_next)
-                arr[n++] = s;
+                arr[n++] = sd_event_source_ref(s);
 
         qsort(arr, n, sizeof(*arr), priority_cmp);
 
@@ -1064,6 +1074,9 @@ static void run_prepare_callbacks(sd_event *e) {
                                 event_source_apply_failure(s, r);
                 }
         }
+
+        for (i = 0; i < n; i++)
+                sd_event_source_unref(arr[i]);
 
         free(arr);
 }
@@ -1427,10 +1440,9 @@ int sd_event_now(sd_event *e, clockid_t clock, uint64_t *ret) {
 
 /* ---- misc accessors ---------------------------------------------------- */
 
-/* This is the function that makes the shim loop embeddable in a foreign
- * loop -- but even this must never be used to graft an sd_event onto
- * PID 1's own manager loop; the -EPERM constructor guard in sd_event_new()
- * already prevents creating one there in the first place. */
+/* What makes the shim loop embeddable in a foreign epoll loop, per
+ * sd_event_get_fd(3). PID 1 itself never needs this: the manager's loop IS
+ * an sd_event (src/manager.h), not a foreign loop grafted onto one. */
 int sd_event_get_fd(sd_event *e) {
         if (!e)
                 return -EINVAL;

@@ -20,12 +20,12 @@
  * sd_event_source_set_ratelimit() (plus its expire-callback companion) are
  * declared here for ABI completeness but always fail -- see sd-event.c.
  *
- * PID1-unsafe: sd_event_new() returns -EPERM when called from pico-init's
- * own PID 1 (manager-loop.c already owns the sole epoll loop for that
- * process; a second sd_event loop there would be two owning loops fighting
- * over the same process, not a nested or embeddable one). This shim is
- * meant for standalone helper processes linking libsystemd-compat, never
- * for code running inside pico-init's own manager.
+ * PID 1 is a first-class consumer: pico-init's own Manager embeds one
+ * sd_event as its main loop (src/manager.h), the same architecture as
+ * modern systemd's PID 1. One owning event loop per process is a
+ * convention, not an enforced guard -- whoever owns the process's signal
+ * mask and child reaping owns the loop, and a second sd_event in the same
+ * process must not add sources for resources the main loop owns.
  */
 
 #pragma once
