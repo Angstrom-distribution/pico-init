@@ -25,6 +25,12 @@
  * (sd-event.c). So within one batch:
  *
  *   -10  cgroup.events   -- verified and queued only, never acts
+ *    -5  notify           -- sd_notify() datagrams applied here (manager-
+ *                            notify.c), before SIGCHLD: service_sigchld_
+ *                            event() zeroes s->main_pid, so a service's
+ *                            final notify (sent moments before it exits)
+ *                            would be unattributable if SIGCHLD ran first
+ *                            in the same batch
  *    -4  signals         -- SIGCHLD reaped and attributed here, in full,
  *                            before anything at a higher priority runs
  *    -3  sockets / ctrl   -- may enqueue jobs, carry no exit status
