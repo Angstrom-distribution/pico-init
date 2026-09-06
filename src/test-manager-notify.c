@@ -93,9 +93,37 @@ static bool notify_n_unattributed_ge1(void *userdata) {
 
 /* --- fixture: no manager_startup(), no default.target -- see this file's header --- */
 
+/*
+ * A pid-tagged real cgroup path, duplicated from test-manager-ctrl.c's own
+ * use_private_cgroup_root() (that file's comment explains why: real cgroup
+ * v2 control files only exist under an actual cgroupfs mount, so this can't
+ * be relocated under the fixture tree, and the pid tag is what keeps two
+ * test binaries booting a same-named unit from colliding under a parallel
+ * `meson test` run). Needed here because service_start() unconditionally
+ * calls service_ensure_cgroup(), which mkdir()s under m->cgroup_root -- the
+ * PICO_CGROUP_ROOT default is the real system-wide /sys/fs/cgroup.
+ */
+static void use_private_cgroup_root(Manager *m, char *out, size_t out_size) {
+        int n = snprintf(out, out_size, "/sys/fs/cgroup/pico-notify-test-%lld", (long long) getpid());
+
+        ASSERT_TRUE(n > 0 && (size_t) n < out_size);
+        if (mkdir(out, 0755) < 0)
+                ASSERT_TRUE(errno == EEXIST);
+        ASSERT_EQ_INT(manager_set_cgroup_root(m, out), 0);
+}
+
+static void free_private_cgroup_root(const char *root) {
+        char slice[PATH_MAX];
+
+        snprintf(slice, sizeof(slice), "%s/system.slice", root);
+        rmdir(slice);
+        rmdir(root);
+}
+
 struct notify_fixture {
         char *unitdir;
         char *rtdir;
+        char cgroup_root[PATH_MAX];
         Manager *m;
 };
 
@@ -111,12 +139,14 @@ static void notify_fixture_setup(struct notify_fixture *f) {
                 ASSERT_EQ_INT(manager_set_unit_path(f->m, up), 0);
         }
         ASSERT_EQ_INT(manager_set_runtime_dir(f->m, f->rtdir), 0);
+        use_private_cgroup_root(f->m, f->cgroup_root, sizeof(f->cgroup_root));
         ASSERT_EQ_INT(manager_state_setup(f->m), 0); /* only test_notify_end_to_end_attributed reads it back */
         ASSERT_EQ_INT(manager_notify_setup(f->m), 0);
 }
 
 static void notify_fixture_teardown(struct notify_fixture *f) {
         manager_free(f->m); /* frees ctrl/state/notify too */
+        free_private_cgroup_root(f->cgroup_root);
         test_rm_rf(f->unitdir);
         test_rm_rf(f->rtdir);
         free(f->unitdir);
@@ -376,6 +406,7 @@ static void test_notify_setup_failure_not_fatal(void) {
         Manager *m = NULL;
         char *unitdir, *blockdir;
         char bogus_runtime[PATH_MAX];
+        char cgroup_root[PATH_MAX];
         Service *s;
 
         unitdir = test_tmpdir_new();
@@ -392,6 +423,7 @@ static void test_notify_setup_failure_not_fatal(void) {
                 ASSERT_EQ_INT(manager_set_unit_path(m, up), 0);
         }
         ASSERT_EQ_INT(manager_set_runtime_dir(m, bogus_runtime), 0);
+        use_private_cgroup_root(m, cgroup_root, sizeof(cgroup_root)); /* service_start() below mkdirs a real cgroup */
 
         ASSERT_TRUE(manager_notify_setup(m) < 0);
         ASSERT_TRUE(manager_notify_socket_path(m) == NULL);
@@ -403,6 +435,7 @@ static void test_notify_setup_failure_not_fatal(void) {
         ASSERT_TRUE(drive_until(m, always_true, NULL, 5)); /* the loop itself still runs fine */
 
         manager_free(m);
+        free_private_cgroup_root(cgroup_root);
         test_rm_rf(unitdir);
         test_rm_rf(blockdir);
         free(unitdir);
