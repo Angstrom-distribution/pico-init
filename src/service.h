@@ -153,6 +153,16 @@ typedef struct Service {
         PicoTimerEvent *timer_event;
 
         unsigned n_restarts; /* how many times Restart= has fired, for logging */
+
+        /*
+         * sd_notify() state (manager-notify.c). notify_ready does NOT gate
+         * the active transition -- that needs SERVICE_TYPE_NOTIFY, deferred
+         * scope, see manager-notify.h. All three reset on every fresh
+         * service_do_start() so a restart never carries a stale value.
+         */
+        bool notify_ready;
+        char *status_text; /* owned, STATUS= from sd_notify, bounded */
+        int status_errno;
 } Service;
 
 /* downcast/upcast helpers, valid because Unit is the first member */

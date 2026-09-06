@@ -523,6 +523,12 @@ static void service_do_start(Service *s) {
 
         s->result = SERVICE_SUCCESS;
 
+        /* A fresh start must never carry a stale READY/STATUS from a
+         * previous run forward -- see service.h's own comment on these. */
+        s->notify_ready = false;
+        s->status_text = pico_mfree(s->status_text);
+        s->status_errno = 0;
+
         r = service_ensure_cgroup(s);
         if (r < 0)
                 pico_log(PICO_LOG_WARNING,
@@ -984,6 +990,7 @@ static void service_done(Unit *u) {
 
         s->exec_start = pico_strv_free(s->exec_start);
         s->exec_start_pre = pico_strv_free(s->exec_start_pre);
+        s->status_text = pico_mfree(s->status_text);
 
         /*
          * Cancel before freeing, never after. A pending event holds

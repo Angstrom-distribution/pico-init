@@ -209,6 +209,7 @@ static void publish_unit_file(Unit *u) {
         char tmp[PATH_MAX];
         char final[PATH_MAX];
         char job_buf[80] = "";
+        char notify_buf[192] = "";
         Service *s = NULL;
         FILE *f;
         int n;
@@ -242,6 +243,27 @@ static void publish_unit_file(Unit *u) {
                          (unsigned) u->job->id,
                          job_type_to_string(u->job->type));
 
+        /* NotifyReady=/StatusText=/StatusErrno=: sd_notify()-derived fields
+         * (manager-notify.c), UNIT_SERVICE only. StatusText/StatusErrno are
+         * appended only when set -- unlike the fields above, absence is
+         * meaningful (no sd_notify() has arrived yet), not just a default. */
+        if (s) {
+                int w;
+
+                w = snprintf(notify_buf, sizeof(notify_buf), "NotifyReady=%s\n", s->notify_ready ? "yes" : "no");
+                if (w > 0 && (size_t) w < sizeof(notify_buf)) {
+                        size_t off = (size_t) w;
+
+                        if (s->status_text) {
+                                w = snprintf(notify_buf + off, sizeof(notify_buf) - off, "StatusText=%s\n", s->status_text);
+                                if (w > 0 && (size_t) w < sizeof(notify_buf) - off)
+                                        off += (size_t) w;
+                        }
+                        if (s->status_errno != 0)
+                                snprintf(notify_buf + off, sizeof(notify_buf) - off, "StatusErrno=%d\n", s->status_errno);
+                }
+        }
+
         fprintf(f,
                 "ActiveState=%s\n"
                 "SubState=%s\n"
@@ -254,7 +276,8 @@ static void publish_unit_file(Unit *u) {
                 "ExecMainCode=%s\n"
                 "ExecMainStatus=%d\n"
                 "NRestarts=%u\n"
-                "Job=%s\n",
+                "Job=%s\n"
+                "%s",
                 unit_active_state_to_string(unit_active_state(u)),
                 unit_substate(u),
                 unit_load_state_to_string(u->load_state),
@@ -266,7 +289,8 @@ static void publish_unit_file(Unit *u) {
                 s ? exec_main_code_to_string(s->main_exit_code) : "",
                 s ? s->main_exit_status : 0,
                 s ? s->n_restarts : 0u,
-                job_buf);
+                job_buf,
+                notify_buf);
 
         if (fclose(f) != 0) {
                 pico_log(PICO_LOG_DEBUG, "%s: could not finish writing state file: %s", u->id, strerror(errno));

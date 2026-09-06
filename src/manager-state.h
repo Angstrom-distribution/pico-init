@@ -39,7 +39,8 @@ int manager_state_setup(Manager *m);
 /* Remove the published state and free anything the publisher owns. */
 void manager_state_done(Manager *m);
 
-/* Re-publish u's file. Called from unit_notify() on every state change. */
+/* Re-publish u's file. Called from unit_notify() on every state change, and
+ * from manager-notify.c whenever an sd_notify() datagram changes something. */
 void manager_state_notify_unit(Unit *u);
 
 /* Re-publish the unit a job applies to, so Job= tracks reality. Called from
