@@ -111,7 +111,21 @@ static void job_unlink_run_queue(Job *j) {
 static void job_add_to_run_queue(Job *j) {
         Job **cur;
 
-        if (!j || j->in_run_queue)
+        if (!j)
+                return;
+
+        /*
+         * Unconditional, BEFORE the in_run_queue early-return below: the
+         * queue can hold a job that never left it (this same function's
+         * neighbour-wakeup callers re-add a job still sitting there waiting
+         * on another unit), and a trigger gated on insertion would never
+         * fire for that job once it actually becomes runnable -- deadlocking
+         * the boot rather than costing one extra dispatch. See
+         * manager_trigger_run_queue()'s own contract note in manager-loop.c.
+         */
+        manager_trigger_run_queue(j->manager);
+
+        if (j->in_run_queue)
                 return;
 
         for (cur = &j->manager->run_queue; *cur; cur = &(*cur)->run_queue_next)

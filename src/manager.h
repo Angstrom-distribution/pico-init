@@ -2,11 +2,12 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The Manager: owns the unit table, the load queue, the job run queue, and the
- * single epoll loop multiplexing signalfd + per-service cgroup.events + one
- * timerfd. Implemented across manager.c (lifecycle, unit table, load queue,
- * jobs), manager-loop.c (the epoll loop), manager-startup.c (the boot
- * sequence), manager-shutdown.c (orderly teardown).
+ * The Manager: owns the unit table, the load queue, the job run queue, and
+ * PID 1's own main loop -- one sd_event (src/compat/libsystemd/sd-event.h)
+ * embedded as m->event, the same architecture as modern systemd's PID 1.
+ * Implemented across manager.c (lifecycle, unit table, load queue, jobs),
+ * manager-loop.c (event source setup and the loop itself), manager-startup.c
+ * (the boot sequence), manager-shutdown.c (orderly teardown).
  */
 
 #pragma once
@@ -17,10 +18,31 @@
 #include <sys/types.h>
 
 #include "job.h"
+#include "sd-event.h"
 #include "signal.h"
 #include "timer.h"
 #include "unit.h"
 #include "util.h"
+
+/*
+ * Dispatch priorities for every PID1 event source, mirroring the load-
+ * bearing order manager-loop.c's own header lays out (cgroup verify, then
+ * signals, then cgroup-empty, then timers, then the run queue) -- now
+ * expressed as int64 priorities the shim's sd_event_dispatch() enforces
+ * itself: strictly lowest-priority-first, one source per dispatch, re-
+ * polling with a zero timeout between dispatches while anything stays
+ * pending. Patterned on real systemd's own table (src/core/manager.h).
+ */
+enum {
+        EVENT_PRIORITY_CGROUP_EVENTS = SD_EVENT_PRIORITY_NORMAL - 10, /* verify + queue only, never acts */
+        EVENT_PRIORITY_SIGNALS = SD_EVENT_PRIORITY_NORMAL - 4,        /* SIGCHLD reaped + attributed here */
+        EVENT_PRIORITY_SOCKET = SD_EVENT_PRIORITY_NORMAL - 3,
+        EVENT_PRIORITY_CTRL = SD_EVENT_PRIORITY_NORMAL - 3,
+        EVENT_PRIORITY_CGROUP_EMPTY = SD_EVENT_PRIORITY_NORMAL - 2,
+        EVENT_PRIORITY_PICO_TIMER = SD_EVENT_PRIORITY_NORMAL,
+        EVENT_PRIORITY_RUN_QUEUE = SD_EVENT_PRIORITY_IDLE + 1,
+        EVENT_PRIORITY_SHUTDOWN_CHECK = SD_EVENT_PRIORITY_IDLE + 2,
+};
 
 /* angstrom-pico-init adopts usrmerge (see plans/29-pico-init.md §4), so
  * this matches oe-core's real systemd_system_unitdir for that distro:
@@ -115,11 +137,15 @@ struct Manager {
         unsigned n_jobs;           /* jobs currently installed */
         unsigned n_installed_jobs; /* cumulative installs since boot; see job_install() */
 
-        int epoll_fd;
+        sd_event *event; /* the main loop; PID 1 is a real sd_event consumer, systemd-style */
         PicoSignal *signal;
         PicoTimer *timer;
-        struct pico_epoll_tag signal_tag; /* data.ptr for signal's epoll registration */
-        struct pico_epoll_tag timer_tag;  /* data.ptr for timer's epoll registration */
+        sd_event_source *signal_source;            /* io on pico_signal_fd(), EVENT_PRIORITY_SIGNALS */
+        sd_event_source *timer_source;              /* io on pico_timer_fd(), EVENT_PRIORITY_PICO_TIMER */
+        sd_event_source *run_queue_source;          /* defer, ONESHOT-gated by manager_trigger_run_queue() */
+        sd_event_source *cgroup_empty_source;       /* defer, ONESHOT-gated by manager_enqueue_cgroup_empty() */
+        sd_event_source *shutdown_check_source;     /* post, always ON; adopts pending_objective */
+        sd_event_source *shutdown_deadline_source;  /* time; NULL unless a shutdown is pending */
 
         /* true when running as PID 1. Decides whether MANAGER_EXIT is even a
          * legal outcome: returning from main() as PID 1 is a kernel panic. */
@@ -143,7 +169,8 @@ struct Manager {
 };
 
 /* --- manager.c --- */
-/* Allocate, create epoll/signalfd/timerfd, install the default search paths. 0 or -errno. */
+/* Allocate, create the sd_event loop + signalfd/timerfd and their event
+ * sources, install the default search paths. 0 or -errno. */
 int manager_new(Manager **ret);
 Manager *manager_free(Manager *m); /* frees all units and jobs; returns NULL */
 
@@ -228,7 +255,16 @@ int manager_dispatch_run_queue(Manager *m);
 int manager_startup(Manager *m, const char *default_target);
 
 /* --- manager-loop.c --- */
-/* The epoll loop; blocks until objective != MANAGER_RUNNING.
+
+/*
+ * Create every PID1 event source on m->event at its EVENT_PRIORITY_* and
+ * wire it to the right dispatch callback: signal_source, timer_source,
+ * run_queue_source, cgroup_empty_source, shutdown_check_source. Called once
+ * from manager_new(), after pico_signal_new()/pico_timer_new(). 0 or -errno.
+ */
+int manager_events_setup(Manager *m);
+
+/* The main loop; blocks until objective != MANAGER_RUNNING.
  * Returns the final ManagerObjective (>= 0), or -errno. */
 int manager_loop(Manager *m);
 
@@ -247,6 +283,24 @@ int manager_loop(Manager *m);
  * 0 or -errno.
  */
 int manager_dispatch_signal(Manager *m, int signo);
+
+/*
+ * A job just became (or may have become) runnable: arm the run-queue defer
+ * source ONESHOT so the next sd_event_run() drains it. Called unconditionally
+ * from job_add_to_run_queue(), before its in_run_queue early-return -- the
+ * queue can hold jobs that never left it (a neighbour re-add), so a trigger
+ * gated on insertion would never fire for those and the boot would hang. A
+ * NULL m->run_queue_source (not yet set up) is a silent no-op.
+ */
+void manager_trigger_run_queue(Manager *m);
+
+/*
+ * Arm the shutdown-deadline time source at m->shutdown_deadline. Called only
+ * by manager_shutdown()'s first-request branch. If arming fails (OOM), the
+ * objective is adopted immediately rather than risking an unbounded wait
+ * with no deadline wakeup at all.
+ */
+void manager_arm_shutdown_deadline(Manager *m);
 
 /* --- manager-shutdown.c --- */
 /* Queue stop jobs for everything and record where to go once they drain. 0 or -errno. */

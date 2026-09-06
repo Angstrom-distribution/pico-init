@@ -14,6 +14,7 @@
 #include <stdint.h>
 #include <sys/types.h>
 
+#include "sd-event.h"
 #include "unit.h"
 #include "util.h"
 
@@ -41,18 +42,17 @@ typedef enum SocketState {
  * one). `type` is SOCK_STREAM (ListenStream=) or SOCK_DGRAM (ListenDatagram=).
  */
 typedef struct SocketPort {
-        /* First member, so manager-loop.c's epoll dispatch can cast
-         * events[i].data.ptr straight back to this -- same discipline as
-         * struct pico_cgroup's epoll_tag (see cgroups-v2.h). */
-        struct pico_epoll_tag epoll_tag;
+        /* io source on fd, EVENT_PRIORITY_SOCKET (manager.h); NULL until
+         * socket_watch_port() runs, and again once socket_unwatch_port()
+         * tears it down -- see H7 for why unwatch never closes fd itself. */
+        sd_event_source *event_source;
 
         struct SocketPort *next; /* tail-appended: fd order == declared Listen* order (H12) */
         struct Socket *socket;   /* owning unit, borrowed */
 
-        int family;   /* AF_UNIX, or AF_UNSPEC until bound */
-        int type;     /* SOCK_STREAM or SOCK_DGRAM */
-        int fd;       /* -1 until socket_open_fds() binds it; H13: written only on success */
-        bool watched; /* epoll_ctl'd; guards a double ADD/DEL */
+        int family; /* AF_UNIX, or AF_UNSPEC until bound */
+        int type;   /* SOCK_STREAM or SOCK_DGRAM */
+        int fd;     /* -1 until socket_open_fds() binds it; H13: written only on success */
 
         char *path;    /* AF_UNIX only, owned, absolute */
         uint16_t port; /* AF_INET/AF_INET6 only, host byte order */
@@ -97,10 +97,11 @@ const char *socket_state_to_string(SocketState s);
  * EPOLLIN on a .socket unit's listening fd. Under Accept=no PID 1 never
  * accept()s -- the connection stays queued in the backlog and is handed to
  * the paired service, which is what makes the socket survive a service
- * restart. `tag` is the registration's data.ptr; the implementation casts it
- * back to its own containing struct. 0 or -errno.
+ * restart. The sd_event_io_handler_t shape itself, registered directly by
+ * socket_watch_port(); userdata is the SocketPort*. Always returns 0 -- see
+ * the definition's own callback-contract comment.
  */
-int socket_dispatch_io(Manager *m, struct pico_epoll_tag *tag);
+int socket_dispatch_io(sd_event_source *es, int fd, uint32_t revents, void *userdata);
 
 /*
  * Collect the fds a starting service should inherit from its paired

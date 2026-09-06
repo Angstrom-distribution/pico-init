@@ -29,7 +29,17 @@
 #include <unistd.h>
 
 #include "cgroups-v2.h"
+#include "sd-event.h"
 #include "util.h"
+
+/*
+ * Mirrors manager.h's EVENT_PRIORITY_CGROUP_EVENTS. Not pulled in from
+ * manager.h itself: that header pulls in unit.h via job.h, and this layer
+ * must stay unaware of Unit/Manager (struct pico_cgroup's own comment says
+ * why). A stale mismatch between the two would only ever change relative
+ * dispatch order within one epoll batch, never correctness on its own.
+ */
+#define CGROUP_EVENTS_PRIORITY (-10)
 
 /*
  * How many read-and-SIGKILL passes the fallback makes before giving up. A
@@ -100,12 +110,7 @@ int cgroup_v2_new(const char *path, struct pico_cgroup **ret) {
         if (!cg)
                 return -ENOMEM;
 
-        /* calloc() zero-inits epoll_tag.source to PICO_EPOLL_SIGNAL (enum
-         * value 0) -- set it explicitly so an un-monitored cgroup can never
-         * be mistaken for one if its pointer ever ends up read as a tag. */
-        cg->epoll_tag.source = PICO_EPOLL_CGROUP;
-        cg->epoll_tag.fd = -1;
-        cg->procs_fd = cg->events_fd = cg->kill_fd = cg->events_efd = -1;
+        cg->procs_fd = cg->events_fd = cg->kill_fd = -1;
 
         cg->path = pico_strdup(path);
         if (!cg->path) {
@@ -162,32 +167,28 @@ int cgroup_v2_add_process(struct pico_cgroup *cg, pid_t pid) {
         return write_all(cg->procs_fd, buf);
 }
 
-int cgroup_v2_monitor(struct pico_cgroup *cg, int epoll_fd) {
-        struct epoll_event ev = { 0 };
+int cgroup_v2_monitor(struct pico_cgroup *cg, sd_event *e) {
+        int r;
 
-        if (!cg)
+        if (!cg || !e)
                 return -EINVAL;
-
-        cg->epoll_tag.fd = cg->events_fd;
 
         /* EPOLLPRI, not EPOLLIN: cgroup.events signals a change through the
          * exceptional-condition path, the same way sysfs attributes do. */
-        ev.events = EPOLLPRI;
-        ev.data.ptr = &cg->epoll_tag; /* first member of *cg, so dispatch casts it straight back */
+        r = sd_event_add_io(e, &cg->events_source, cg->events_fd, EPOLLPRI, manager_dispatch_cgroup_events, cg);
+        if (r < 0)
+                return r;
 
-        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, cg->events_fd, &ev) < 0)
-                return -errno;
-
-        cg->events_efd = cg->events_fd;
+        sd_event_source_set_priority(cg->events_source, CGROUP_EVENTS_PRIORITY);
 
         /*
          * Arm, then poll once. EPOLLPRI fires on a *transition*, so a cgroup
          * that went empty in the window between opening cgroup.events and the
-         * epoll_ctl() above produces no wakeup -- ever. Reading emptiness once
-         * here, unconditionally, is the only thing that catches it; without
-         * this the supervisor waits forever for an edge that already happened.
-         * (systemd rediscovered this same bug three separate times:
-         * 3a11183858, a5a8776ae5, 869f52f218.)
+         * source registration above produces no wakeup -- ever. Reading
+         * emptiness once here, unconditionally, is the only thing that
+         * catches it; without this the supervisor waits forever for an edge
+         * that already happened. (systemd rediscovered this same bug three
+         * separate times: 3a11183858, a5a8776ae5, 869f52f218.)
          */
         return cgroup_v2_is_empty(cg);
 }

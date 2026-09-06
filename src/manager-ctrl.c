@@ -57,6 +57,7 @@
 #include "job.h"
 #include "manager-ctrl.h"
 #include "manager.h"
+#include "sd-event.h"
 #include "service.h"
 #include "socket.h"
 #include "unit.h"
@@ -84,13 +85,8 @@ struct ctrl_pending {
 };
 
 struct ctrl_conn {
-        /*
-         * MUST be first: manager-loop.c's epoll dispatch casts
-         * events[i].data.ptr straight back to this (util.h's tagging
-         * discipline -- see PicoEpollSource's own comment for why mixing
-         * data.fd/data.ptr registrations in one set is a real bug class).
-         */
-        struct pico_epoll_tag tag;
+        sd_event_source *source; /* io on fd, EVENT_PRIORITY_CTRL, io_fd_own: DEL+close ride its teardown */
+        int fd;
 
         struct pico_manager_ctrl *ctrl; /* owning ctrl, borrowed */
         struct ctrl_conn *next, *prev;  /* intrusive list, ctrl->conns */
@@ -108,17 +104,11 @@ struct ctrl_conn {
 struct pico_manager_ctrl {
         Manager *manager;
 
-        int listen_fd;
-        struct pico_epoll_tag listen_tag;
-        char *socket_path; /* owned, unlinked at teardown */
+        sd_event_source *listen_source; /* io on the listening fd, EVENT_PRIORITY_CTRL, io_fd_own */
+        char *socket_path;              /* owned, unlinked at teardown */
 
         struct ctrl_conn *conns;
         size_t n_conns;
-
-        /* Torn-down connections awaiting their free(), linked via ->next.
-         * Drained by ctrl_release_dead_conns() once the current
-         * epoll batch is fully dispatched -- see ctrl_conn_free(). */
-        struct ctrl_conn *dead_conns;
 
         struct ctrl_pending *pending;
 };
@@ -142,30 +132,36 @@ static void ctrl_pending_unlink(struct pico_manager_ctrl *ctrl, struct ctrl_pend
 }
 
 /*
- * Unregister, close, unlink from ctrl->conns, and retire -- the one exit path
+ * Unregister, close, unlink from ctrl->conns, and free -- the one exit path
  * every connection goes through, whichever of the several reasons got it
- * here. A still-pending deferred reply loses its home right here: the job
- * itself is unaffected (nothing in job.c is tied to this connection), but
- * nobody is listening for the result any more, which is exactly "a client
- * disconnect just drops the pending record" (plan §1.7).
+ * here, safe even from inside this very connection's own dispatch. A still-
+ * pending deferred reply loses its home right here: the job itself is
+ * unaffected (nothing in job.c is tied to this connection), but nobody is
+ * listening for the result any more, which is exactly "a client disconnect
+ * just drops the pending record" (plan §1.7).
  *
- * Everything observable happens now -- the fd leaves the epoll set and is
- * closed, the connection stops being tracked, n_conns drops -- but the
- * free() itself is DEFERRED onto ctrl->dead_conns. This is called from
- * inside an epoll batch (manager_ctrl_notify_job_finished(), reached from
- * job_finish_full() via a SIGCHLD or a displaced job), and epoll_wait()
- * hands manager-loop.c a whole array of events at once: a later event in
- * that same array can still name THIS connection's tag (its EPOLLHUP,
- * typically, since picoctl exits as soon as it has its reply). Freeing here
- * would leave the loop reading tag->source out of freed -- and possibly
- * already reused -- memory. ctrl_release_dead_conns() does the
- * actual free once the batch is fully dispatched; ->dead makes any further
- * event on it in the meantime a no-op, and makes this idempotent.
+ * No dead-list, no deferred free: the shim's own source refcounting is the
+ * deferral now. disable_unref() drops this connection's own ref; if the
+ * shim is mid-dispatch on conn->source right now (this function reached from
+ * inside that very source's own callback), sd_event_dispatch()'s own extra
+ * ref around the callback keeps the sd_event_source struct alive until the
+ * callback returns -- but conn->source's `enabled` is already OFF by then,
+ * so it can never be dispatched again, and event_source_free() never reads
+ * userdata (conn) at all. So conn itself can be freed immediately: nothing
+ * still alive ever dereferences it again. io_fd_own means EPOLL_CTL_DEL and
+ * close() ride the source's own teardown, always in that order (5dcadb4c83).
+ *
+ * If instead this runs from a DIFFERENT source's callback (e.g.
+ * manager_ctrl_notify_job_finished() reached via a SIGCHLD dispatch, while
+ * conn's own EPOLLHUP sits pending later in the same batch), conn->source
+ * holds no other ref and is unlinked from e->sources right here -- so that
+ * later dispatch of the same batch, which walks the live list fresh, simply
+ * never finds it. Nothing dispatches into freed memory either way.
  */
 static void ctrl_conn_free(struct ctrl_conn *conn) {
         struct pico_manager_ctrl *ctrl;
 
-        if (!conn || conn->tag.dead)
+        if (!conn)
                 return;
 
         ctrl = conn->ctrl;
@@ -173,12 +169,6 @@ static void ctrl_conn_free(struct ctrl_conn *conn) {
         if (conn->pending) {
                 ctrl_pending_unlink(ctrl, conn->pending);
                 conn->pending = NULL;
-        }
-
-        if (conn->tag.fd >= 0) {
-                epoll_ctl(ctrl->manager->epoll_fd, EPOLL_CTL_DEL, conn->tag.fd, NULL);
-                close(conn->tag.fd);
-                conn->tag.fd = -1;
         }
 
         if (conn->prev)
@@ -190,21 +180,8 @@ static void ctrl_conn_free(struct ctrl_conn *conn) {
 
         ctrl->n_conns--;
 
-        conn->tag.dead = true;
-        conn->prev = NULL;
-        conn->next = ctrl->dead_conns;
-        ctrl->dead_conns = conn;
-}
-
-/* Drain ctrl->dead_conns. Only ever called from outside an epoll batch --
- * manager_loop()'s end-of-iteration reclaim, and teardown. */
-static void ctrl_release_dead_conns(struct pico_manager_ctrl *ctrl) {
-        while (ctrl->dead_conns) {
-                struct ctrl_conn *conn = ctrl->dead_conns;
-
-                ctrl->dead_conns = conn->next;
-                free(conn);
-        }
+        conn->source = sd_event_source_disable_unref(conn->source);
+        free(conn);
 }
 
 /* Best-effort, never blocking: MSG_DONTWAIT so a full send buffer (a client
@@ -397,7 +374,7 @@ static void ctrl_handle_request(struct ctrl_conn *conn, const char *buf, size_t 
 
         err = ctrl_parse_request(buf, len, &req);
         if (err) {
-                ctrl_send_err(conn->tag.fd, err);
+                ctrl_send_err(conn->fd, err);
                 ctrl_conn_free(conn);
                 return;
         }
@@ -448,7 +425,7 @@ static void ctrl_handle_request(struct ctrl_conn *conn, const char *buf, size_t 
         }
 
         if (!u) {
-                ctrl_send_err(conn->tag.fd, "no-such-unit");
+                ctrl_send_err(conn->fd, "no-such-unit");
                 ctrl_conn_free(conn);
                 return;
         }
@@ -457,9 +434,9 @@ static void ctrl_handle_request(struct ctrl_conn *conn, const char *buf, size_t 
                 const char *reset_err = ctrl_reset_failed(u);
 
                 if (reset_err)
-                        ctrl_send_err(conn->tag.fd, reset_err);
+                        ctrl_send_err(conn->fd, reset_err);
                 else
-                        ctrl_send_line(conn->tag.fd, "ok\n");
+                        ctrl_send_line(conn->fd, "ok\n");
                 ctrl_conn_free(conn);
                 return;
         }
@@ -474,13 +451,13 @@ static void ctrl_handle_request(struct ctrl_conn *conn, const char *buf, size_t 
                         char line[96];
 
                         snprintf(line, sizeof(line), "err enqueue-failed: %s\n", strerror(-r));
-                        ctrl_send_line(conn->tag.fd, line);
+                        ctrl_send_line(conn->fd, line);
                         ctrl_conn_free(conn);
                         return;
                 }
 
                 if (req.no_block) {
-                        ctrl_send_line(conn->tag.fd, "ok queued\n");
+                        ctrl_send_line(conn->fd, "ok queued\n");
                         ctrl_conn_free(conn);
                         return;
                 }
@@ -502,21 +479,18 @@ static void ctrl_handle_request(struct ctrl_conn *conn, const char *buf, size_t 
                          * regardless -- tell the truth about what can no
                          * longer be promised rather than silently drop the
                          * connection while it is still live. */
-                        ctrl_send_err(conn->tag.fd, "out-of-memory");
+                        ctrl_send_err(conn->fd, "out-of-memory");
                         ctrl_conn_free(conn);
                         return;
                 }
 
-                /* manager_add_job() can reach job_finish_full() (a displaced
-                 * job), and so back into ctrl_conn_free(). It cannot be THIS
-                 * connection -- it owns no pending record yet, so nothing can
-                 * find it -- but the deferred free means the check is cheap
-                 * and the alternative would be a dangling pending->conn. */
-                if (conn->tag.dead) {
-                        free(pending);
-                        return;
-                }
-
+                /*
+                 * manager_add_job() can reach job_finish_full() (a displaced
+                 * job) and so into ctrl_conn_free() for SOME connection --
+                 * but never THIS one: it owns no pending record yet, so
+                 * manager_ctrl_notify_job_finished()'s job_id lookup cannot
+                 * find it to free. conn is guaranteed still alive here.
+                 */
                 pending->job_id = job->id;
                 pending->conn = conn;
                 pending->next = ctrl->pending;
@@ -527,21 +501,32 @@ static void ctrl_handle_request(struct ctrl_conn *conn, const char *buf, size_t 
 
 /* --- accept / per-connection dispatch --- */
 
-static int ctrl_accept(struct pico_manager_ctrl *ctrl) {
+static int ctrl_conn_io_cb(sd_event_source *es, int fd, uint32_t revents, void *userdata);
+
+/*
+ * The listen_source io callback (EVENT_PRIORITY_CTRL). Never returns < 0: a
+ * transient accept4() error must not permanently stop listening.
+ */
+static int ctrl_accept(sd_event_source *es, int fd, uint32_t revents, void *userdata) {
+        struct pico_manager_ctrl *ctrl = userdata;
+
+        (void) es;
+        (void) revents;
+
         for (;;) {
-                int fd;
+                int cfd, r;
                 struct ucred cred;
                 socklen_t credlen = sizeof(cred);
                 struct ctrl_conn *conn;
-                struct epoll_event ev;
 
-                fd = accept4(ctrl->listen_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
-                if (fd < 0) {
+                cfd = accept4(fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+                if (cfd < 0) {
                         if (errno == EAGAIN)
                                 return 0;
                         if (errno == ECONNABORTED || errno == EINTR)
                                 continue;
-                        return -errno;
+                        pico_log(PICO_LOG_WARNING, "picoctl accept: %s", strerror(errno));
+                        return 0;
                 }
 
                 /*
@@ -552,33 +537,35 @@ static int ctrl_accept(struct pico_manager_ctrl *ctrl) {
                  * ordinary user and a hardcoded 0 would reject the test
                  * suite's own client (plan §1.7's corrected text).
                  */
-                if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &credlen) < 0 || cred.uid != geteuid()) {
-                        ctrl_send_err(fd, "permission-denied");
-                        close(fd);
+                if (getsockopt(cfd, SOL_SOCKET, SO_PEERCRED, &cred, &credlen) < 0 || cred.uid != geteuid()) {
+                        ctrl_send_err(cfd, "permission-denied");
+                        close(cfd);
                         continue;
                 }
 
                 if (ctrl->n_conns >= PICO_CTRL_MAX_CONNS) {
-                        ctrl_send_err(fd, "too-many-connections");
-                        close(fd);
+                        ctrl_send_err(cfd, "too-many-connections");
+                        close(cfd);
                         continue;
                 }
 
                 conn = calloc(1, sizeof(*conn));
                 if (!conn) {
-                        close(fd);
+                        close(cfd);
                         continue; /* transient OOM: drop this one connection, not the manager */
                 }
 
-                conn->tag = (struct pico_epoll_tag){ .source = PICO_EPOLL_CONTROL, .fd = fd };
                 conn->ctrl = ctrl;
+                conn->fd = cfd;
 
-                ev = (struct epoll_event){ .events = EPOLLIN, .data.ptr = &conn->tag };
-                if (epoll_ctl(ctrl->manager->epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0) {
-                        close(fd);
+                r = sd_event_add_io(ctrl->manager->event, &conn->source, cfd, EPOLLIN, ctrl_conn_io_cb, conn);
+                if (r < 0) {
+                        close(cfd);
                         free(conn);
                         continue;
                 }
+                sd_event_source_set_priority(conn->source, EVENT_PRIORITY_CTRL);
+                sd_event_source_set_io_fd_own(conn->source, 1); /* DEL+close ride this source's teardown */
 
                 conn->next = ctrl->conns;
                 if (ctrl->conns)
@@ -588,9 +575,17 @@ static int ctrl_accept(struct pico_manager_ctrl *ctrl) {
         }
 }
 
-static int ctrl_conn_dispatch(struct ctrl_conn *conn) {
+/*
+ * One accepted connection's io callback (EVENT_PRIORITY_CTRL). Never
+ * returns < 0: see ctrl_accept()'s own note.
+ */
+static int ctrl_conn_io_cb(sd_event_source *es, int fd, uint32_t revents, void *userdata) {
+        struct ctrl_conn *conn = userdata;
         char buf[PICO_CTRL_LINE_MAX + 1];
         ssize_t n;
+
+        (void) es;
+        (void) revents;
 
         if (conn->pending) {
                 /*
@@ -611,7 +606,7 @@ static int ctrl_conn_dispatch(struct ctrl_conn *conn) {
          * request is detected -- and rejected -- without ever copying more
          * than PICO_CTRL_LINE_MAX bytes into buf, let alone allocating.
          */
-        n = recv(conn->tag.fd, buf, PICO_CTRL_LINE_MAX, MSG_DONTWAIT | MSG_TRUNC);
+        n = recv(fd, buf, PICO_CTRL_LINE_MAX, MSG_DONTWAIT | MSG_TRUNC);
         if (n < 0) {
                 if (errno == EAGAIN)
                         return 0;
@@ -628,13 +623,13 @@ static int ctrl_conn_dispatch(struct ctrl_conn *conn) {
         }
 
         if ((size_t) n > PICO_CTRL_LINE_MAX) {
-                ctrl_send_err(conn->tag.fd, "too-long");
+                ctrl_send_err(conn->fd, "too-long");
                 ctrl_conn_free(conn);
                 return 0;
         }
 
         if (memchr(buf, '\0', (size_t) n)) {
-                ctrl_send_err(conn->tag.fd, "embedded-nul");
+                ctrl_send_err(conn->fd, "embedded-nul");
                 ctrl_conn_free(conn);
                 return 0;
         }
@@ -651,7 +646,6 @@ int manager_ctrl_setup(Manager *m) {
         char path[PATH_MAX];
         struct stat st;
         mode_t old_mask;
-        struct epoll_event ev;
         int fd, n, r;
 
         if (!m || !m->runtime_dir)
@@ -722,18 +716,17 @@ int manager_ctrl_setup(Manager *m) {
         }
 
         ctrl->manager = m;
-        ctrl->listen_fd = fd;
-        ctrl->listen_tag = (struct pico_epoll_tag){ .source = PICO_EPOLL_CONTROL, .fd = fd };
 
-        ev = (struct epoll_event){ .events = EPOLLIN, .data.ptr = &ctrl->listen_tag };
-        if (epoll_ctl(m->epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0) {
-                r = -errno;
+        r = sd_event_add_io(m->event, &ctrl->listen_source, fd, EPOLLIN, ctrl_accept, ctrl);
+        if (r < 0) {
                 pico_mfree(ctrl->socket_path);
                 free(ctrl);
                 close(fd);
                 unlink(path);
                 return r;
         }
+        sd_event_source_set_priority(ctrl->listen_source, EVENT_PRIORITY_CTRL);
+        sd_event_source_set_io_fd_own(ctrl->listen_source, 1); /* DEL+close ride this source's teardown */
 
         m->ctrl = ctrl;
         return 0;
@@ -749,44 +742,15 @@ void manager_ctrl_done(Manager *m) {
 
         while (ctrl->conns)
                 ctrl_conn_free(ctrl->conns); /* drops any pending record too */
-        ctrl_release_dead_conns(ctrl);       /* including anything a last batch retired */
 
-        if (ctrl->listen_fd >= 0) {
-                epoll_ctl(m->epoll_fd, EPOLL_CTL_DEL, ctrl->listen_fd, NULL);
-                close(ctrl->listen_fd);
-        }
+        ctrl->listen_source = sd_event_source_disable_unref(ctrl->listen_source);
+
         if (ctrl->socket_path)
                 unlink(ctrl->socket_path);
 
         pico_mfree(ctrl->socket_path);
         free(ctrl);
         m->ctrl = NULL;
-}
-
-int manager_ctrl_dispatch(Manager *m, struct pico_epoll_tag *tag) {
-        struct pico_manager_ctrl *ctrl;
-
-        if (!m || !m->ctrl || !tag)
-                return -EINVAL;
-
-        ctrl = m->ctrl;
-
-        if (tag == &ctrl->listen_tag)
-                return ctrl_accept(ctrl);
-
-        /* Retired earlier in this same batch: the memory is deliberately
-         * still here, but there is nothing left to dispatch on. */
-        if (tag->dead)
-                return 0;
-
-        return ctrl_conn_dispatch((struct ctrl_conn *) tag);
-}
-
-void manager_ctrl_release_dead(Manager *m) {
-        if (!m || !m->ctrl)
-                return;
-
-        ctrl_release_dead_conns(m->ctrl);
 }
 
 void manager_ctrl_notify_job_finished(Job *j, JobResult result) {
@@ -834,7 +798,7 @@ void manager_ctrl_notify_job_finished(Job *j, JobResult result) {
                 break;
         }
 
-        ctrl_send_line(conn->tag.fd, line);
+        ctrl_send_line(conn->fd, line);
         ctrl_conn_free(conn);
 }
 

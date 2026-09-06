@@ -190,6 +190,7 @@
 
 #include "job.h"
 #include "manager.h"
+#include "sd-event.h"
 #include "service.h"
 #include "socket.h"
 #include "unit.h"
@@ -226,36 +227,37 @@ static bool socket_ipv6_supported(void) {
         return stat("/proc/net/if_inet6", &st) == 0;
 }
 
-/* --- epoll registration: one port at a time, mirroring manager.c's own
- * manager_epoll_add() (static there, so duplicated here rather than shared --
- * both are five lines built on the same tag contract in util.h). --- */
+/* --- event registration: one port at a time --- */
 
 static int socket_watch_port(Manager *m, SocketPort *p) {
-        struct epoll_event ev = { .events = EPOLLIN, .data.ptr = &p->epoll_tag };
+        int r;
 
-        if (p->watched)
+        if (p->event_source)
                 return 0;
 
         /* H8: bare EPOLLIN, never EPOLLET -- the RUNNING -> LISTENING
          * re-arm below depends on an already-readable fd re-firing the
          * instant it is re-armed, which edge-triggering would not do. */
-        p->epoll_tag = (struct pico_epoll_tag){ .source = PICO_EPOLL_SOCKET, .fd = p->fd };
+        r = sd_event_add_io(m->event, &p->event_source, p->fd, EPOLLIN, socket_dispatch_io, p);
+        if (r < 0)
+                return r;
 
-        if (epoll_ctl(m->epoll_fd, EPOLL_CTL_ADD, p->fd, &ev) < 0)
-                return -errno;
-
-        p->watched = true;
+        sd_event_source_set_priority(p->event_source, EVENT_PRIORITY_SOCKET);
         return 0;
 }
 
-/* 5dcadb4c83: always before the fd is closed. Safe to call on an fd that was
- * never watched (idempotent via p->watched) and on one that already is. */
+/* 5dcadb4c83: always before the fd is closed. Safe to call on a port never
+ * watched (idempotent via p->event_source) and on one that already is.
+ * disable_unref, never fd_own on the source itself: the fd stays open,
+ * ours to hand to the service or close later -- only the registration
+ * goes. */
 static void socket_unwatch_port(Manager *m, SocketPort *p) {
-        if (!p->watched)
+        (void) m;
+
+        if (!p->event_source)
                 return;
 
-        epoll_ctl(m->epoll_fd, EPOLL_CTL_DEL, p->fd, NULL);
-        p->watched = false;
+        p->event_source = sd_event_source_disable_unref(p->event_source);
 }
 
 static void socket_watch_fds(Socket *s) {
@@ -775,15 +777,25 @@ static int socket_trigger(Socket *s) {
         return 0;
 }
 
-int socket_dispatch_io(Manager *m, struct pico_epoll_tag *tag) {
-        SocketPort *p = (SocketPort *) tag;
+/*
+ * The events_source io callback (EVENT_PRIORITY_SOCKET). Manager is reached
+ * via p->socket's unit, never through a passed-in parameter -- this IS the
+ * sd_event_io_handler_t the source was registered with, so its shape is
+ * fixed. Never returns < 0: the shim disables a source whose callback fails,
+ * and a transient trigger failure must not permanently stop listening.
+ */
+int socket_dispatch_io(sd_event_source *es, int fd, uint32_t revents, void *userdata) {
+        SocketPort *p = userdata;
         Socket *s;
         Job *j;
+        int r;
 
-        (void) m;
+        (void) es;
+        (void) fd;
+        (void) revents;
 
         if (!p || !p->socket)
-                return -EINVAL;
+                return 0;
 
         s = p->socket;
 
@@ -818,7 +830,11 @@ int socket_dispatch_io(Manager *m, struct pico_epoll_tag *tag) {
                 return 0;
         }
 
-        return socket_trigger(s);
+        r = socket_trigger(s);
+        if (r < 0)
+                pico_log(PICO_LOG_WARNING, "%s: failed to trigger: %s", SOCKET_UNIT(s)->id, strerror(-r));
+
+        return 0;
 }
 
 /* --- fd collection and the service-side notifications --- */

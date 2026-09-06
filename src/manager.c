@@ -3,20 +3,21 @@
 
 /*
  * Manager lifecycle, search paths, the unit table and the load queue. The
- * epoll loop lives in manager-loop.c, the boot sequence in manager-startup.c,
- * orderly shutdown in manager-shutdown.c.
+ * main loop (event source setup, then the loop itself) lives in
+ * manager-loop.c, the boot sequence in manager-startup.c, orderly shutdown
+ * in manager-shutdown.c.
  */
 
 #include <dirent.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/epoll.h>
 #include <unistd.h>
 
 #include "manager-ctrl.h"
 #include "manager-state.h"
 #include "manager.h"
+#include "sd-event.h"
 #include "service.h"
 #include "unit-name.h"
 
@@ -31,20 +32,6 @@ static const char * const default_preset_path[] = {
         PICO_PACKAGED_PRESET_DIR,
         NULL,
 };
-
-/* tag->fd must already be set; tag is registered via data.ptr, never data.fd
- * -- see the PicoEpollSource comment in util.h for why the two must not mix. */
-static int manager_epoll_add(Manager *m, struct pico_epoll_tag *tag) {
-        struct epoll_event ev = {
-                .events = EPOLLIN,
-                .data.ptr = tag,
-        };
-
-        if (epoll_ctl(m->epoll_fd, EPOLL_CTL_ADD, tag->fd, &ev) < 0)
-                return -errno;
-
-        return 0;
-}
 
 /* Deep-copy a NULL-terminated path vector. An empty vector is legal and
  * returns a one-element array holding only the terminator. */
@@ -136,7 +123,6 @@ int manager_new(Manager **ret) {
 
         m->next_job_id = 1;
         m->objective = MANAGER_RUNNING;
-        m->epoll_fd = -1;
 
         /* Real init behaviour is gated on this rather than on getpid() being
          * re-checked all over the place; it also decides whether leaving the
@@ -159,18 +145,17 @@ int manager_new(Manager **ret) {
         if (r < 0)
                 goto fail;
 
-        m->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
-        if (m->epoll_fd < 0) {
-                r = -errno;
-                goto fail;
-        }
-
-        r = pico_signal_new(&m->signal);
+        /*
+         * sd_event_new(), deliberately NOT sd_event_default(): the manager's
+         * loop stays out of the thread-default slot so no future in-process
+         * libsystemd-compat consumer calling sd_event_default() can silently
+         * attach sources to PID 1's own loop.
+         */
+        r = sd_event_new(&m->event);
         if (r < 0)
                 goto fail;
 
-        m->signal_tag = (struct pico_epoll_tag){ .source = PICO_EPOLL_SIGNAL, .fd = pico_signal_fd(m->signal) };
-        r = manager_epoll_add(m, &m->signal_tag);
+        r = pico_signal_new(&m->signal);
         if (r < 0)
                 goto fail;
 
@@ -178,8 +163,7 @@ int manager_new(Manager **ret) {
         if (r < 0)
                 goto fail;
 
-        m->timer_tag = (struct pico_epoll_tag){ .source = PICO_EPOLL_TIMER, .fd = pico_timer_fd(m->timer) };
-        r = manager_epoll_add(m, &m->timer_tag);
+        r = manager_events_setup(m);
         if (r < 0)
                 goto fail;
 
@@ -229,11 +213,32 @@ Manager *manager_free(Manager *m) {
         m->runtime_dir = pico_mfree(m->runtime_dir);
         m->default_target = pico_mfree(m->default_target);
 
+        /*
+         * Every manager-owned source holds its own ref on m->event (the
+         * non-floating default -- see event_source_new() in sd-event.c), so
+         * each must be dropped explicitly before m->event itself, or the
+         * event's refcount never reaches zero. Dropped before pico_timer_
+         * free()/pico_signal_free() invalidate the fds signal_source/
+         * timer_source wrap, so their own EPOLL_CTL_DEL still targets a live
+         * registration rather than one epoll already dropped on its own.
+         */
+        if (m->run_queue_source)
+                sd_event_source_unref(m->run_queue_source);
+        if (m->cgroup_empty_source)
+                sd_event_source_unref(m->cgroup_empty_source);
+        if (m->shutdown_check_source)
+                sd_event_source_unref(m->shutdown_check_source);
+        if (m->shutdown_deadline_source)
+                sd_event_source_unref(m->shutdown_deadline_source);
+        if (m->signal_source)
+                sd_event_source_unref(m->signal_source);
+        if (m->timer_source)
+                sd_event_source_unref(m->timer_source);
+
         m->timer = pico_timer_free(m->timer);
         m->signal = pico_signal_free(m->signal);
 
-        if (m->epoll_fd >= 0)
-                close(m->epoll_fd);
+        m->event = sd_event_unref(m->event);
 
         free(m);
         return NULL;
@@ -332,6 +337,12 @@ void manager_enqueue_cgroup_empty(Manager *m, Unit *u) {
         u->cgroup_empty_queue_next = m->cgroup_empty_queue;
         m->cgroup_empty_queue = u;
         u->in_cgroup_empty_queue = true;
+
+        /* Arm the defer source ONESHOT so manager_on_cgroup_empty() actually
+         * runs on the next dispatch; harmless if it is already armed (a
+         * second unit queueing before the first has been popped). */
+        if (m->cgroup_empty_source)
+                sd_event_source_set_enabled(m->cgroup_empty_source, SD_EVENT_ONESHOT);
 }
 
 void manager_dequeue_cgroup_empty(Manager *m, Unit *u) {

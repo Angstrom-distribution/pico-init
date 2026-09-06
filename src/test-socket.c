@@ -1003,7 +1003,7 @@ static void test_connect_flood_bounded_by_socket_trigger_limit(void) {
                         s->state = SOCKET_LISTENING; /* re-arm for the next trigger, matching
                                                         notify_service_dead()'s own transition */
                 }
-                socket_dispatch_io(m, &s->ports->epoll_tag);
+                socket_dispatch_io(NULL, s->ports->fd, EPOLLIN, s->ports);
         }
 
         ASSERT_EQ_INT(s->state, SOCKET_FAILED);

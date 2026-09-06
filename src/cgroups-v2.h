@@ -12,23 +12,27 @@
 #include <stdbool.h>
 #include <sys/types.h>
 
+#include "sd-event.h"
 #include "util.h"
 
 struct pico_cgroup {
-        /* First member, so cgroup_v2_monitor()'s epoll registration can hand
-         * out &cg->epoll_tag and manager-loop.c's dispatch can cast it back
-         * to struct pico_cgroup * -- see the PicoEpollSource comment in
-         * util.h for why this must be tagged rather than registered by fd. */
-        struct pico_epoll_tag epoll_tag;
-        char *path;     /* absolute path under the cgroup root */
-        int procs_fd;   /* cgroup.procs, opened O_RDWR: written to add pids, read by the SIGKILL fallback */
-        int events_fd;  /* cgroup.events, kept open for epoll registration */
-        int kill_fd;    /* cgroup.kill, or -1 on kernels older than 5.14 */
-        int events_efd; /* fd registered in the manager's epoll for events changes */
+        char *path;    /* absolute path under the cgroup root */
+        int procs_fd;  /* cgroup.procs, opened O_RDWR: written to add pids, read by the SIGKILL fallback */
+        int events_fd; /* cgroup.events, opened O_RDONLY and read directly; also the events_source's fd */
 
-        /* The owning Unit, set by whoever created the cgroup, so a
-         * PICO_EPOLL_CGROUP wakeup can be routed back to a Service. Opaque
-         * here on purpose: this layer must not depend on unit.h. */
+        /* io source on events_fd, EVENT_PRIORITY_CGROUP_EVENTS (manager.h) --
+         * NULL until cgroup_v2_monitor() runs. Does not own events_fd
+         * (set_io_fd_own is never set): cgroup_v2_free() closes it, after
+         * the caller has disabled this source, same ordering the old
+         * epoll_ctl(DEL)-before-close discipline required. */
+        sd_event_source *events_source;
+
+        int kill_fd; /* cgroup.kill, or -1 on kernels older than 5.14 */
+
+        /* The owning Unit, set by whoever created the cgroup, so an
+         * events_source wakeup can be routed back to a Service. Opaque here
+         * on purpose: this layer must not depend on unit.h or manager.h
+         * (manager.h itself pulls in unit.h via job.h). */
         void *userdata;
 };
 
@@ -44,20 +48,29 @@ int cgroup_v2_new(const char *path, struct pico_cgroup **ret);
 int cgroup_v2_add_process(struct pico_cgroup *cg, pid_t pid);
 
 /*
- * Register events_efd on epoll_fd so "populated" transitions wake the loop.
- * Returns 1 if the cgroup is already empty at the moment monitoring starts,
- * 0 if it is populated and monitoring is now armed, or -errno.
+ * Create events_source (EVENT_PRIORITY_CGROUP_EVENTS, manager.h) on `e` so
+ * "populated" transitions wake the loop. Returns 1 if the cgroup is already
+ * empty at the moment monitoring starts, 0 if it is populated and monitoring
+ * is now armed, or -errno.
  *
  * That tri-state return is arm-then-poll-once (systemd 3a11183858,
  * a5a8776ae5, 869f52f218 -- three independent rediscoveries of the same
  * bug): the cgroup can go from populated to empty in the window between
- * opening cgroup.events and this epoll_ctl() call, and EPOLLPRI only fires
- * on a *transition* -- a cgroup that was already empty before registration
- * produces no wakeup, ever. Reading emptiness once, unconditionally, right
- * after arming catches that case synchronously instead of hanging forever
- * waiting for an edge that already happened.
+ * opening cgroup.events and the source's own registration, and EPOLLPRI
+ * only fires on a *transition* -- a cgroup that was already empty before
+ * registration produces no wakeup, ever. Reading emptiness once,
+ * unconditionally, right after arming catches that case synchronously
+ * instead of hanging forever waiting for an edge that already happened.
  */
-int cgroup_v2_monitor(struct pico_cgroup *cg, int epoll_fd);
+int cgroup_v2_monitor(struct pico_cgroup *cg, sd_event *e);
+
+/*
+ * The events_source io callback. Defined in manager-loop.c, declared here
+ * rather than pulled in transitively: this layer stays unaware of
+ * Unit/Manager (see struct pico_cgroup's own comment), reaching the owning
+ * Manager only via cg->userdata (a Unit*) -> u->manager once dispatched.
+ */
+int manager_dispatch_cgroup_events(sd_event_source *s, int fd, uint32_t revents, void *userdata);
 
 /* True when the kernel offers cgroup.kill for this cgroup (Linux >= 5.14). */
 bool cgroup_v2_kill_is_atomic(struct pico_cgroup *cg);

@@ -2,44 +2,75 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The single epoll loop.
+ * PID 1's own main loop: an sd_event (src/compat/libsystemd/sd-event.h)
+ * embedded as m->event, the same architecture as modern systemd's own PID 1
+ * (src/core/manager.c). manager_events_setup() creates every source once,
+ * at manager_new() time; manager_loop() is then the thin real-systemd-shaped
+ * wrapper `while (m->objective == MANAGER_RUNNING) sd_event_run(...)`.
  *
- * The dispatch ORDER within one wakeup batch is the load-bearing part of this
- * file, not an implementation detail. SIGCHLD carries an exit status;
- * cgroup-empty does not -- the process that happens to empty a cgroup is an
- * arbitrary descendant whose exit code says nothing about the service. So if
- * a cgroup-empty event is acted on before the SIGCHLD that accompanies it, the
- * exit status is thrown away: Restart=on-failure sees success and a crashed
- * service is reported as a clean exit.
+ * The dispatch ORDER across one epoll batch is still the load-bearing part
+ * of this file, not an implementation detail -- now expressed as the
+ * EVENT_PRIORITY_* table in manager.h rather than a hand-coded two-pass
+ * walk. SIGCHLD carries an exit status; cgroup-empty does not -- the
+ * process that happens to empty a cgroup is an arbitrary descendant whose
+ * exit code says nothing about the service. So if a cgroup-empty event were
+ * acted on before the SIGCHLD that accompanies it, the exit status would be
+ * thrown away: Restart=on-failure would see success and a crashed service
+ * would be reported as a clean exit.
  *
- * Hence the fixed order below, which mirrors systemd's own event priorities:
+ * The shim's own dispatch rule is what enforces this: sd_event_wait()
+ * marks every ready source pending together, and sd_event_dispatch() then
+ * drains pending sources strictly lowest-priority-first, one per call, with
+ * a zero-timeout re-poll between dispatches while anything stays pending
+ * (sd-event.c). So within one batch:
  *
- *   1. cgroup wakeups   -- verified only, never acted on
- *   2. signals          -- SIGCHLD reaped and attributed here
- *   3. cgroup-empty queue drained
- *   4. timers
- *   5. the job run queue
+ *   -10  cgroup.events   -- verified and queued only, never acts
+ *    -4  signals         -- SIGCHLD reaped and attributed here, in full,
+ *                            before anything at a higher priority runs
+ *    -3  sockets / ctrl   -- may enqueue jobs, carry no exit status
+ *    -2  cgroup-empty queue drained
+ *     0  timers
+ *   101  the job run queue
+ *   102  shutdown check
  *
- * Step 1 never calls into a service. A cgroup.events wakeup is unspecific and
- * fires for several reasons, so it is re-verified by reading `populated` and
- * merely queued; step 3 is where anything actually happens, by which time
- * every waitid() result for the batch has already been consumed.
+ * Two deliberate, strictly-tightening changes from the old hand-coded
+ * ordering: signals now always precede sockets/ctrl (the old code dispatched
+ * those in arbitrary events[] order); and because the shim re-polls with a
+ * zero timeout between dispatches, a SIGCHLD arriving mid-batch is picked up
+ * and, at -4 < -2, still beats a pending cgroup-empty -- the old code could
+ * only see it on the next batch.
+ *
+ * CALLBACK CONTRACT: every callback here returns 0, never a negative value,
+ * on anything short of "this source must never fire again." The shim
+ * disables a source whose callback returns < 0 (event_source_apply_failure()
+ * in sd-event.c) -- a transient -EIO from pico_signal_read() must never
+ * permanently kill PID 1's signal handling, so every real error is logged
+ * and swallowed instead of propagated.
+ *
+ * RUN-QUEUE CONTRACT: manager_trigger_run_queue() is the one choke point
+ * that makes queued-but-not-yet-runnable work eventually run: it is called
+ * unconditionally from job_add_to_run_queue(), covering every path that
+ * might make some job runnable (job_install(), a completed restart's
+ * start-conversion, a finished job's neighbour wakeup, manager_shutdown()'s
+ * stop sweep). A future runnability change that does not route through
+ * job_add_to_run_queue() will deadlock the boot instead of costing one
+ * spin -- the old brute-force "dispatch the run queue every iteration"
+ * masked exactly this class of bug, and the new design trades that safety
+ * net for not busy-polling once only unrunnable jobs are queued.
  */
 
 #include <errno.h>
 #include <signal.h>
 #include <string.h>
-#include <sys/epoll.h>
 #include <sys/wait.h>
 
 #include "cgroups-v2.h"
 #include "manager-ctrl.h"
 #include "manager.h"
+#include "sd-event.h"
 #include "service.h"
 #include "socket.h"
 #include "unit.h"
-
-#define MANAGER_MAX_EVENTS 16
 
 /*
  * Reap children: peek, attribute, then reap.
@@ -156,169 +187,232 @@ static void manager_note_cgroup_event(Manager *m, struct pico_cgroup *cg) {
                 manager_dequeue_cgroup_empty(m, u);
 }
 
-static int manager_dispatch_epoll_event(Manager *m, struct pico_epoll_tag *tag, bool cgroup_pass) {
-        /*
-         * Retired earlier in this very batch. epoll_wait() fills events[] in
-         * one shot, so dispatching event i can destroy the owner of event j>i
-         * -- a picoctl connection whose job finishes here is torn down by
-         * manager_ctrl_notify_job_finished() while its own EPOLLHUP is still
-         * queued further down the array. Such an owner keeps its allocation
-         * until manager_ctrl_release_dead() at the end of the iteration
-         * precisely so this read is valid; the flag is what stops us
-         * dispatching into a half-dismantled object.
-         */
-        if (tag->dead)
+/* io callback for one service's cgroup.events fd (EVENT_PRIORITY_CGROUP_EVENTS).
+ * Declared in cgroups-v2.h, defined here: cgroups-v2.c itself must stay
+ * unaware of Unit/Manager (its own header says why), so cgroup_v2_monitor()
+ * registers this by name and reaches the Manager only via cg->userdata. */
+int manager_dispatch_cgroup_events(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
+        struct pico_cgroup *cg = userdata;
+        Unit *u;
+
+        (void) s;
+        (void) fd;
+        (void) revents;
+
+        u = cg->userdata;
+        if (!u || !u->manager)
                 return 0;
 
-        switch (tag->source) {
-        case PICO_EPOLL_CGROUP:
-                if (cgroup_pass)
-                        manager_note_cgroup_event(m, (struct pico_cgroup *) tag);
-                return 0;
+        manager_note_cgroup_event(u->manager, cg);
+        return 0;
+}
 
-        case PICO_EPOLL_SIGNAL:
-                if (cgroup_pass)
+/* io callback for the signalfd (EVENT_PRIORITY_SIGNALS): drains it to
+ * -EAGAIN in one dispatch, so every waitid() result in the current batch is
+ * consumed and attributed before anything at a lower priority (cgroup-empty,
+ * the run queue) can act on it. */
+static int manager_dispatch_signal_io(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
+        Manager *m = userdata;
+
+        (void) s;
+        (void) fd;
+        (void) revents;
+
+        for (;;) {
+                int signo, r;
+
+                r = pico_signal_read(m->signal, &signo);
+                if (r == -EAGAIN)
                         return 0;
-
-                for (;;) {
-                        int signo;
-                        int r = pico_signal_read(m->signal, &signo);
-
-                        if (r == -EAGAIN)
-                                return 0;
-                        if (r < 0)
-                                return r;
-
-                        r = manager_dispatch_signal(m, signo);
-                        if (r < 0)
-                                return r;
+                if (r < 0) {
+                        pico_log(PICO_LOG_WARNING, "signalfd read: %s", strerror(-r));
+                        return 0;
                 }
 
-        case PICO_EPOLL_TIMER:
-                /* drained after the queue, in manager_loop() */
-                return 0;
-
-        /*
-         * Both of the arms below run in pass 2 only, alongside signals and
-         * for the same reason the cgroup arm does not: neither carries an
-         * exit status, and both may enqueue a job. Queueing work during the
-         * cgroup-verification pass would let a job run before the SIGCHLDs in
-         * the same batch had been reaped.
-         */
-        case PICO_EPOLL_SOCKET:
-                if (cgroup_pass)
-                        return 0;
-
-                return socket_dispatch_io(m, tag);
-
-        case PICO_EPOLL_CONTROL:
-                if (cgroup_pass)
-                        return 0;
-
-                return manager_ctrl_dispatch(m, tag);
+                r = manager_dispatch_signal(m, signo);
+                if (r < 0)
+                        pico_log(PICO_LOG_WARNING, "signal %d dispatch: %s", signo, strerror(-r));
         }
+}
+
+/* io callback for PicoTimer's timerfd (EVENT_PRIORITY_PICO_TIMER). */
+static int manager_dispatch_timer_io(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
+        Manager *m = userdata;
+        int r;
+
+        (void) s;
+        (void) fd;
+        (void) revents;
+
+        r = pico_timer_dispatch(m->timer);
+        if (r < 0)
+                pico_log(PICO_LOG_WARNING, "timer dispatch: %s", strerror(-r));
+
+        return 0;
+}
+
+/* defer callback for the run queue (EVENT_PRIORITY_RUN_QUEUE), ONESHOT-armed
+ * by manager_trigger_run_queue(). manager_dispatch_run_queue() already loops
+ * until nothing is runnable, so one dispatch drains everything that can run
+ * right now. */
+static int manager_on_run_queue(sd_event_source *s, void *userdata) {
+        Manager *m = userdata;
+
+        (void) s;
+
+        manager_dispatch_run_queue(m);
+        return 0;
+}
+
+/*
+ * defer callback for the cgroup-empty queue (EVENT_PRIORITY_CGROUP_EMPTY),
+ * ONESHOT-armed by manager_enqueue_cgroup_empty(). Pops exactly ONE unit and
+ * re-arms itself if more remain, the same shape real systemd's own
+ * manager_dispatch_cgroup_empty_queue() dispatch takes (quarry
+ * src/core/cgroup.c) -- manager_dispatch_cgroup_empty_queue() in manager.c
+ * still drains the whole queue in one call and is kept for direct test use,
+ * but is not what this source calls.
+ */
+static int manager_on_cgroup_empty(sd_event_source *s, void *userdata) {
+        Manager *m = userdata;
+        Unit *u;
+
+        u = m->cgroup_empty_queue;
+        if (!u)
+                return 0; /* dequeued after being marked pending but before this ran */
+
+        m->cgroup_empty_queue = u->cgroup_empty_queue_next;
+        u->cgroup_empty_queue_next = NULL;
+        u->in_cgroup_empty_queue = false;
+
+        if (m->cgroup_empty_queue)
+                sd_event_source_set_enabled(s, SD_EVENT_ONESHOT); /* more queued: re-arm */
+
+        if (u->type == UNIT_SERVICE)
+                service_cgroup_empty_event(SERVICE(u));
+
+        return 0;
+}
+
+/* post callback (EVENT_PRIORITY_SHUTDOWN_CHECK), always ON: the shim marks
+ * every enabled post source pending after any non-post dispatch, so this
+ * runs after the run-queue defer (101 < 102) -- a shutdown only takes effect
+ * once its stop jobs have actually run, which is what makes it orderly
+ * rather than immediate. */
+static int manager_on_shutdown_check(sd_event_source *s, void *userdata) {
+        Manager *m = userdata;
+
+        (void) s;
+
+        if (manager_shutdown_finished(m))
+                m->objective = m->pending_objective;
+
+        return 0;
+}
+
+/* time callback for the shutdown deadline: the callback itself does nothing
+ * -- dispatching it at all is what re-marks the shutdown-check post source
+ * pending, which is what then observes the passed deadline. */
+static int manager_on_shutdown_deadline(sd_event_source *s, uint64_t usec, void *userdata) {
+        (void) s;
+        (void) usec;
+        (void) userdata;
+        return 0;
+}
+
+void manager_arm_shutdown_deadline(Manager *m) {
+        int r;
+
+        if (!m || !m->event)
+                return;
+
+        r = sd_event_add_time(m->event,
+                               &m->shutdown_deadline_source,
+                               CLOCK_MONOTONIC,
+                               m->shutdown_deadline,
+                               0,
+                               manager_on_shutdown_deadline,
+                               m);
+        if (r < 0) {
+                /* No deadline wakeup at all beats an unbounded wait: adopt
+                 * the objective directly rather than risk a shutdown that
+                 * never notices its own timeout passed. */
+                pico_log(PICO_LOG_ERR,
+                         "failed to arm the shutdown deadline timer: %s, adopting the objective now",
+                         strerror(-r));
+                m->objective = m->pending_objective;
+        }
+}
+
+void manager_trigger_run_queue(Manager *m) {
+        if (!m || !m->run_queue_source)
+                return;
+
+        sd_event_source_set_enabled(m->run_queue_source, SD_EVENT_ONESHOT);
+}
+
+int manager_events_setup(Manager *m) {
+        int r;
+
+        if (!m || !m->event || !m->signal || !m->timer)
+                return -EINVAL;
+
+        r = sd_event_add_io(m->event, &m->signal_source, pico_signal_fd(m->signal), EPOLLIN,
+                             manager_dispatch_signal_io, m);
+        if (r < 0)
+                return r;
+        sd_event_source_set_priority(m->signal_source, EVENT_PRIORITY_SIGNALS);
+
+        r = sd_event_add_io(m->event, &m->timer_source, pico_timer_fd(m->timer), EPOLLIN,
+                             manager_dispatch_timer_io, m);
+        if (r < 0)
+                return r;
+        sd_event_source_set_priority(m->timer_source, EVENT_PRIORITY_PICO_TIMER);
+
+        /* Both defer sources start OFF: run_queue_source is armed ONESHOT by
+         * manager_trigger_run_queue(), cgroup_empty_source by
+         * manager_enqueue_cgroup_empty() -- see manager.c. */
+        r = sd_event_add_defer(m->event, &m->run_queue_source, manager_on_run_queue, m);
+        if (r < 0)
+                return r;
+        sd_event_source_set_priority(m->run_queue_source, EVENT_PRIORITY_RUN_QUEUE);
+        sd_event_source_set_enabled(m->run_queue_source, SD_EVENT_OFF);
+
+        r = sd_event_add_defer(m->event, &m->cgroup_empty_source, manager_on_cgroup_empty, m);
+        if (r < 0)
+                return r;
+        sd_event_source_set_priority(m->cgroup_empty_source, EVENT_PRIORITY_CGROUP_EMPTY);
+        sd_event_source_set_enabled(m->cgroup_empty_source, SD_EVENT_OFF);
+
+        r = sd_event_add_post(m->event, &m->shutdown_check_source, manager_on_shutdown_check, m);
+        if (r < 0)
+                return r;
+        sd_event_source_set_priority(m->shutdown_check_source, EVENT_PRIORITY_SHUTDOWN_CHECK);
 
         return 0;
 }
 
 int manager_loop(Manager *m) {
-        struct epoll_event events[MANAGER_MAX_EVENTS];
+        int r;
 
         if (!m)
                 return -EINVAL;
 
+        /*
+         * One pre-loop check for the enter-the-loop-with-a-pending-empty-
+         * shutdown case: a post source only becomes pending after some other
+         * dispatch, so a shutdown requested with an already-empty run queue
+         * (the direct API/test path, rather than one arriving through a
+         * signal or ctrl request already inside the loop) would otherwise
+         * never get adopted.
+         */
+        if (manager_shutdown_finished(m))
+                m->objective = m->pending_objective;
+
         while (m->objective == MANAGER_RUNNING) {
-                bool timer_ready = false;
-                int timeout;
-                int n, i;
-
-                /*
-                 * Dispatch BEFORE waiting, not only after.
-                 *
-                 * Queued work is not an event: nothing wakes epoll to announce
-                 * that a job has become runnable. Waiting first means the boot
-                 * transaction sits in the run queue while PID 1 blocks
-                 * indefinitely for an event that could only be produced by
-                 * starting it -- a hang on real hardware. This is why the
-                 * dispatch is at the top of the loop as well as the bottom.
-                 */
-                manager_dispatch_run_queue(m);
-
-                if (manager_shutdown_finished(m)) {
-                        m->objective = m->pending_objective;
-                        break;
-                }
-
-                /*
-                 * Never block while runnable work remains. Poll while a
-                 * shutdown is pending, because its drain deadline is
-                 * wall-clock and a wedged unit produces no events to wake us.
-                 * Otherwise block until something actually happens.
-                 */
-                if (m->run_queue)
-                        timeout = 0;
-                else if (m->pending_objective != MANAGER_RUNNING)
-                        timeout = 250;
-                else
-                        timeout = -1;
-
-                n = epoll_wait(m->epoll_fd, events, MANAGER_MAX_EVENTS, timeout);
-                if (n < 0) {
-                        if (errno == EINTR)
-                                continue;
-                        return -errno;
-                }
-
-                /* pass 1: cgroup wakeups, verified and queued only */
-                for (i = 0; i < n; i++) {
-                        struct pico_epoll_tag *tag = events[i].data.ptr;
-
-                        if (tag->source == PICO_EPOLL_TIMER)
-                                timer_ready = true;
-
-                        manager_dispatch_epoll_event(m, tag, true);
-                }
-
-                /* pass 2: signals, so every waitid() result is consumed before
-                 * any cgroup-empty event is acted on */
-                for (i = 0; i < n; i++) {
-                        struct pico_epoll_tag *tag = events[i].data.ptr;
-                        int r = manager_dispatch_epoll_event(m, tag, false);
-
-                        if (r < 0)
-                                pico_log(PICO_LOG_WARNING, "event on fd %d: %s", tag->fd, strerror(-r));
-                }
-
-                /* 3: now it is safe to act on emptiness */
-                manager_dispatch_cgroup_empty_queue(m);
-
-                /* 4: timers */
-                if (timer_ready) {
-                        int r = pico_timer_dispatch(m->timer);
-
-                        if (r < 0)
-                                pico_log(PICO_LOG_WARNING, "timer dispatch: %s", strerror(-r));
-                }
-
-                /* 5: and only then start whatever became runnable */
-                manager_dispatch_run_queue(m);
-
-                /*
-                 * 6: reclaim. events[] is done with, so anything retired
-                 * while it was being walked -- steps 2 through 5 can all
-                 * finish a job and so retire a picoctl connection -- can
-                 * finally be freed. Doing it at the point of retirement
-                 * instead is the use-after-free this defers away from.
-                 */
-                manager_ctrl_release_dead(m);
-
-                /*
-                 * A shutdown only takes effect once its stop jobs have
-                 * actually run. Checking here, after the run queue has been
-                 * dispatched, is what makes it orderly rather than immediate.
-                 */
-                if (manager_shutdown_finished(m))
-                        m->objective = m->pending_objective;
+                r = sd_event_run(m->event, UINT64_MAX);
+                if (r < 0)
+                        return r;
         }
 
         return (int) m->objective;

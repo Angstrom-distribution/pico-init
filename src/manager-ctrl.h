@@ -7,7 +7,8 @@
  * PID 1 directly.
  *
  * Deliberately NOT a .socket unit -- PID 1 cannot socket-activate itself --
- * but it joins the same epoll set as one more PICO_EPOLL_CONTROL arm.
+ * but the listener and every accepted connection each get their own io
+ * source on the manager's own m->event, at EVENT_PRIORITY_CTRL (manager.h).
  *
  * It carries exactly what nothing else can: start/stop/restart (which need
  * manager_add_job()) and reset-failed. Every read verb stays on the state
@@ -40,23 +41,16 @@ int manager_ctrl_setup(Manager *m);
 /* Close the socket, unlink its path, drop every pending reply. */
 void manager_ctrl_done(Manager *m);
 
-/* EPOLLIN on the listening socket or on an accepted connection. `tag` is the
- * registration's data.ptr; the implementation casts it back to its own
- * containing struct. 0 or -errno. */
-int manager_ctrl_dispatch(Manager *m, struct pico_epoll_tag *tag);
-
 /* Resolve any deferred reply waiting on this job. Called from
  * job_finish_full(), which is the only place a job result becomes final.
  *
- * This can retire the client's connection from deep inside an epoll batch,
- * so the connection is unregistered and closed here but not freed --
- * epoll_wait() may still have a later event in the same batch naming it.
- * manager_loop() calls manager_ctrl_release_dead() once the batch is done. */
+ * This can retire the client's connection from deep inside a dispatch of
+ * some OTHER event source (a SIGCHLD, typically); safe to do immediately --
+ * the connection's own io source, if it holds no other reference right now,
+ * is unlinked from the event's live source list on the spot, so a later
+ * dispatch in the same batch that might still name it (its own EPOLLHUP)
+ * simply never finds it (see manager-ctrl.c's ctrl_conn_free()). */
 void manager_ctrl_notify_job_finished(Job *j, JobResult result);
-
-/* Free every connection retired during the batch just dispatched. Must only
- * be called when no epoll event array is still being walked. */
-void manager_ctrl_release_dead(Manager *m);
 
 /*
  * Test-only introspection: the number of currently-tracked connections and

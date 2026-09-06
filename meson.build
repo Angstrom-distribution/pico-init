@@ -34,6 +34,30 @@ version_h = vcs_tag(
   output: 'version.h',
 )
 
+# sd-event.c/sd-event-source.c, hoisted into their own tiny static library
+# ahead of pico_init_core: PID 1's own manager (manager.c/manager-loop.c)
+# embeds an sd_event as its main loop and needs just these objects, not the
+# rest of libsystemd-compat (sd-bus, sd-device, ...), and vice versa
+# libsystemd-compat must not depend on pico-init-core. sd-daemon.c rides
+# along too, purely as a link dependency: sd_event_set_watchdog() calls its
+# real sd_watchdog_enabled() env parser, and pulling in the .o that defines
+# it means every consumer of this small library must resolve that symbol
+# too, whether or not it ever calls the watchdog path. The full
+# libsystemd_compat static library below link_wholes this back in rather
+# than listing these three files directly among its own sources, so its own
+# installed archive still carries every symbol it always did.
+libsystemd_compat_includes = include_directories('src/compat/libsystemd')
+
+sd_event_lib = static_library(
+  'sd-event',
+  files(
+    'src/compat/libsystemd/sd-event.c',
+    'src/compat/libsystemd/sd-event-source.c',
+    'src/compat/libsystemd/sd-daemon.c',
+  ),
+  include_directories: libsystemd_compat_includes,
+)
+
 # Everything except main() builds into a static library, so the test programs
 # can link the real manager, unit and job code instead of re-declaring it.
 # main.c stays out of it: a second main() would collide with every test's own.
@@ -97,6 +121,8 @@ pico_init_core = static_library(
   'pico-init-core',
   pico_init_core_sources,
   version_h,
+  include_directories: libsystemd_compat_includes,
+  link_with: sd_event_lib,
 )
 
 # link_whole, not link_with: a static library only contributes the object
@@ -108,6 +134,7 @@ pico_init_exe = executable(
   'pico-init',
   'src/main.c',
   version_h,
+  include_directories: libsystemd_compat_includes,
   link_whole: pico_init_core,
   install: true,
   install_dir: get_option('sbindir'),
@@ -160,12 +187,24 @@ pico_tests = [
   # The root check's two decision tables (plan §10, R1). The I/O half of it
   # remounts "/" and is proven by a boot instead.
   'test-root-check',
+  # Manager-level regression test for the SIGCHLD-before-cgroup-empty
+  # dispatch-order property (manager.h's EVENT_PRIORITY_* table): drives
+  # m->event directly, one dispatch at a time, since manager_loop() itself
+  # only exposes the final state once a whole batch has drained.
+  'test-loop-order',
 ]
 
+# manager.h now pulls in sd-event.h, so every test that reaches it
+# (transitively, through manager.h/socket.h/cgroups-v2.h) needs
+# libsystemd_compat_includes on its own compile line too -- a quoted
+# #include inside manager.h resolves against manager.h's own directory
+# first, then the including translation unit's search path, never
+# pico_init_core's.
 foreach t : pico_tests
   exe = executable(
     t,
     ['src/' + t + '.c'] + pico_test_sources + [version_h],
+    include_directories: libsystemd_compat_includes,
     link_with: pico_init_core,
   )
   test(t, exe)
@@ -500,7 +539,7 @@ endforeach
 picoctl_exe = executable(
   'picoctl',
   'src/picoctl.c',
-  include_directories: logd_includes,
+  include_directories: [logd_includes, libsystemd_compat_includes],
   link_with: [pico_init_core, logd_core],
   install: true,
   install_dir: get_option('sbindir'),
@@ -523,7 +562,9 @@ picoctl_exe = executable(
 # event object and its epoll-backed loop mechanics versus every
 # sd_event_source_*() property accessor. event-internal.h is the private
 # struct layout and helper set the two share; never installed, since a real
-# consumer only ever sees opaque sd_event/sd_event_source pointers.
+# consumer only ever sees opaque sd_event/sd_event_source pointers. Both live
+# in sd_event_lib (above, defined ahead of pico_init_core) and are pulled
+# back into this library via link_whole below, not listed as sources here.
 #
 # sd-journal's own sources are split by concern rather than upstream's
 # single sd-journal.c: -send/-sendv (printf-shaped write API funnelling
@@ -534,12 +575,7 @@ picoctl_exe = executable(
 # -util (helpers shared across the read side). sd-journal-internal.h is
 # their private struct sd_journal layout, never installed.
 # ---------------------------------------------------------------------------
-libsystemd_compat_includes = include_directories('src/compat/libsystemd')
-
 libsystemd_compat_sources = files(
-  'src/compat/libsystemd/sd-daemon.c',
-  'src/compat/libsystemd/sd-event.c',
-  'src/compat/libsystemd/sd-event-source.c',
   'src/compat/libsystemd/sd-id128.c',
   # sd_id128_get_app_specific()'s HMAC-SHA256: a small pico-original pair
   # (see sha256.h/hmac-sha256.h's own comments for why this is written from
@@ -608,6 +644,7 @@ libsystemd_compat = static_library(
   'systemd-compat',
   libsystemd_compat_sources,
   include_directories: libsystemd_compat_includes,
+  link_whole: sd_event_lib,
   install: true,
 )
 

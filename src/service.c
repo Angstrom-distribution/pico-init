@@ -79,12 +79,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/epoll.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 
 #include "job.h"
 #include "manager.h"
+#include "sd-event.h"
 #include "service.h"
 #include "socket.h"
 #include "timer.h"
@@ -271,7 +271,7 @@ static int service_ensure_cgroup(Service *s) {
 
         s->cgroup->userdata = s;
 
-        r = cgroup_v2_monitor(s->cgroup, m->epoll_fd);
+        r = cgroup_v2_monitor(s->cgroup, m->event);
         if (r < 0)
                 /* Not fatal: SIGCHLD alone still drives the state machine,
                  * cgroup-empty events just never arrive for this unit. */
@@ -994,11 +994,11 @@ static void service_done(Unit *u) {
                 pico_timer_cancel(u->manager->timer, s->timer_event);
         s->timer_event = NULL;
 
-        /* B13: EPOLL_CTL_DEL before cgroup_v2_free() closes the fd underneath
-         * it, or a queued epoll_wait() result can still carry data.ptr into
-         * memory that is about to be freed. */
-        if (s->cgroup && s->cgroup->events_efd >= 0 && u->manager && u->manager->epoll_fd >= 0)
-                epoll_ctl(u->manager->epoll_fd, EPOLL_CTL_DEL, s->cgroup->events_efd, NULL);
+        /* B13: disable/unref the events_source before cgroup_v2_free() closes
+         * the fd underneath it, or a pending dispatch could still run its
+         * callback against memory that is about to be freed. */
+        if (s->cgroup && s->cgroup->events_source)
+                s->cgroup->events_source = sd_event_source_disable_unref(s->cgroup->events_source);
 
         s->cgroup = cgroup_v2_free(s->cgroup);
 }

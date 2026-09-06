@@ -52,6 +52,7 @@ int manager_shutdown(Manager *m, ManagerObjective objective) {
 
         m->pending_objective = objective;
         m->shutdown_deadline = now_monotonic() + PICO_SHUTDOWN_TIMEOUT_USEC;
+        manager_arm_shutdown_deadline(m);
 
         /*
          * Queue a stop for everything still up. Ordering is the job engine's
