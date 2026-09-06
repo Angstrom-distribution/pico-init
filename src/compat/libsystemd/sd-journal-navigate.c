@@ -202,15 +202,15 @@ int sd_journal_seek_tail(sd_journal *j) {
  * realtime) key is >= (want_mono, want_real) -- realtime-only callers pass
  * want_mono=0 and skip_mono=true so a missing/unparsable clock on some
  * entry can't stop the scan; monotonic-only callers do the mirror. */
-static int seek_boundary_by_clock(sd_journal *j, bool skip_mono, uint64_t want_mono, bool skip_real,
-                                   uint64_t want_real) {
+static int seek_boundary_by_clock(
+                sd_journal *j, bool skip_mono, uint64_t want_mono, bool skip_real, uint64_t want_real) {
         size_t n = logd_ring_n_entries(j->ring);
         size_t found = n;
 
         for (size_t i = 0; i < n; i++) {
                 uint64_t mono = 0, real = 0;
-                int r = sd_journal_entry_clocks(logd_ring_entry(j->ring, i), skip_mono ? NULL : &mono,
-                                                 skip_real ? NULL : &real);
+                int r = sd_journal_entry_clocks(
+                                logd_ring_entry(j->ring, i), skip_mono ? NULL : &mono, skip_real ? NULL : &real);
 
                 if (r < 0)
                         continue; /* unparsable clock on one entry must not abort the whole seek */
@@ -235,7 +235,9 @@ int sd_journal_seek_realtime_usec(sd_journal *j, uint64_t usec) {
 }
 
 int sd_journal_seek_monotonic_usec(sd_journal *j, sd_id128_t boot_id, uint64_t usec) {
-        static const sd_id128_t null_id = { .qwords = { 0, 0 } };
+        static const sd_id128_t null_id = {
+                .qwords = { 0, 0 }
+        };
         sd_id128_t current;
         int r;
 
@@ -549,19 +551,20 @@ int sd_journal_process(sd_journal *j) {
                 }
         }
 
-        r = sd_journal_stat_ring(j->runtime_dir, &new_active_st, &have_new_active, &new_rotated_st,
-                                  &have_new_rotated);
+        r = sd_journal_stat_ring(
+                        j->runtime_dir, &new_active_st, &have_new_active, &new_rotated_st, &have_new_rotated);
         if (r < 0)
                 return r;
 
         changed = overflow || have_new_active != j->have_active_st || have_new_rotated != j->have_rotated_st;
         if (!changed && have_new_active)
-                changed = new_active_st.st_dev != j->active_st.st_dev || new_active_st.st_ino != j->active_st.st_ino ||
-                          new_active_st.st_size != j->active_st.st_size;
+                changed = new_active_st.st_dev != j->active_st.st_dev ||
+                                new_active_st.st_ino != j->active_st.st_ino ||
+                                new_active_st.st_size != j->active_st.st_size;
         if (!changed && have_new_rotated)
                 changed = new_rotated_st.st_dev != j->rotated_st.st_dev ||
-                          new_rotated_st.st_ino != j->rotated_st.st_ino ||
-                          new_rotated_st.st_size != j->rotated_st.st_size;
+                                new_rotated_st.st_ino != j->rotated_st.st_ino ||
+                                new_rotated_st.st_size != j->rotated_st.st_size;
 
         if (!changed)
                 return SD_JOURNAL_NOP;
@@ -573,8 +576,8 @@ int sd_journal_process(sd_journal *j) {
          * an inotify queue overflow forces INVALIDATE regardless. */
         int event = SD_JOURNAL_APPEND;
 
-        if (overflow || !have_new_active || !j->have_active_st || new_active_st.st_dev != j->active_st.st_dev ||
-            new_active_st.st_ino != j->active_st.st_ino)
+        if (overflow || !have_new_active || !j->have_active_st ||
+            new_active_st.st_dev != j->active_st.st_dev || new_active_st.st_ino != j->active_st.st_ino)
                 event = SD_JOURNAL_INVALIDATE;
 
         if (j->loc == SD_J_ON_ENTRY) {

@@ -34,10 +34,12 @@
  * pending. Patterned on real systemd's own table (src/core/manager.h).
  */
 enum {
-        EVENT_PRIORITY_WATCHDOG = SD_EVENT_PRIORITY_NORMAL - 20,      /* hardware watchdog feed: must outrank everything, see manager-loop.c */
+        EVENT_PRIORITY_WATCHDOG = SD_EVENT_PRIORITY_NORMAL -
+                        20, /* hardware watchdog feed: must outrank everything, see manager-loop.c */
         EVENT_PRIORITY_CGROUP_EVENTS = SD_EVENT_PRIORITY_NORMAL - 10, /* verify + queue only, never acts */
-        EVENT_PRIORITY_NOTIFY = SD_EVENT_PRIORITY_NORMAL - 5,         /* before SIGCHLD: attribution needs main_pid still set */
-        EVENT_PRIORITY_SIGNALS = SD_EVENT_PRIORITY_NORMAL - 4,        /* SIGCHLD reaped + attributed here */
+        EVENT_PRIORITY_NOTIFY = SD_EVENT_PRIORITY_NORMAL -
+                        5, /* before SIGCHLD: attribution needs main_pid still set */
+        EVENT_PRIORITY_SIGNALS = SD_EVENT_PRIORITY_NORMAL - 4, /* SIGCHLD reaped + attributed here */
         EVENT_PRIORITY_SOCKET = SD_EVENT_PRIORITY_NORMAL - 3,
         EVENT_PRIORITY_CTRL = SD_EVENT_PRIORITY_NORMAL - 3,
         EVENT_PRIORITY_CGROUP_EMPTY = SD_EVENT_PRIORITY_NORMAL - 2,
@@ -152,12 +154,12 @@ struct Manager {
         sd_event *event; /* the main loop; PID 1 is a real sd_event consumer, systemd-style */
         PicoSignal *signal;
         PicoTimer *timer;
-        sd_event_source *signal_source;            /* io on pico_signal_fd(), EVENT_PRIORITY_SIGNALS */
-        sd_event_source *timer_source;              /* io on pico_timer_fd(), EVENT_PRIORITY_PICO_TIMER */
-        sd_event_source *run_queue_source;          /* defer, ONESHOT-gated by manager_trigger_run_queue() */
-        sd_event_source *cgroup_empty_source;       /* defer, ONESHOT-gated by manager_enqueue_cgroup_empty() */
-        sd_event_source *shutdown_check_source;     /* post, always ON; adopts pending_objective */
-        sd_event_source *shutdown_deadline_source;  /* time; NULL unless a shutdown is pending */
+        sd_event_source *signal_source;         /* io on pico_signal_fd(), EVENT_PRIORITY_SIGNALS */
+        sd_event_source *timer_source;          /* io on pico_timer_fd(), EVENT_PRIORITY_PICO_TIMER */
+        sd_event_source *run_queue_source;      /* defer, ONESHOT-gated by manager_trigger_run_queue() */
+        sd_event_source *cgroup_empty_source;   /* defer, ONESHOT-gated by manager_enqueue_cgroup_empty() */
+        sd_event_source *shutdown_check_source; /* post, always ON; adopts pending_objective */
+        sd_event_source *shutdown_deadline_source; /* time; NULL unless a shutdown is pending */
 
         /* true when running as PID 1. Decides whether MANAGER_EXIT is even a
          * legal outcome: returning from main() as PID 1 is a kernel panic. */

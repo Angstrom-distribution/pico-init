@@ -56,8 +56,12 @@ int sd_journal_stream_fd(const char *identifier, int priority, int level_prefix)
         /* sun_path[0] left '\0' by the initializer above: an abstract-
          * namespace address, unforgeable by anything that isn't this
          * process (see sun_path's leading NUL, unix(7)). */
-        name_len = snprintf(local.sun_path + 1, sizeof(local.sun_path) - 1, "picoinit-jstream-%d-%u", (int) getpid(),
-                             n);
+        name_len = snprintf(
+                        local.sun_path + 1,
+                        sizeof(local.sun_path) - 1,
+                        "picoinit-jstream-%d-%u",
+                        (int) getpid(),
+                        n);
         if (name_len < 0 || (size_t) name_len >= sizeof(local.sun_path) - 1) {
                 close(fd);
                 return -EINVAL;
@@ -89,8 +93,8 @@ int sd_journal_stream_fd(const char *identifier, int priority, int level_prefix)
         return fd;
 }
 
-int sd_journal_stream_fd_with_namespace(const char *name_space, const char *identifier, int priority,
-                                         int level_prefix) {
+int sd_journal_stream_fd_with_namespace(
+                const char *name_space, const char *identifier, int priority, int level_prefix) {
         if (name_space)
                 return -EOPNOTSUPP; /* pico has no log namespaces to cross-wire a caller into */
 

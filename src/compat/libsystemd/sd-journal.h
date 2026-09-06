@@ -37,14 +37,16 @@ int sd_journal_sendv(const struct iovec *iov, int n);
 int sd_journal_perror(const char *message);
 
 /* Used by the macros below; not meant to be called directly. */
-int sd_journal_print_with_location(int priority, const char *file, const char *line, const char *func,
-                                    const char *format, ...) _sd_printf_(5, 6);
-int sd_journal_printv_with_location(int priority, const char *file, const char *line, const char *func,
-                                     const char *format, va_list ap) _sd_printf_(5, 0);
-int sd_journal_send_with_location(const char *file, const char *line, const char *func, const char *format,
-                                   ...) _sd_printf_(4, 0) _sd_sentinel_;
-int sd_journal_sendv_with_location(const char *file, const char *line, const char *func, const struct iovec *iov,
-                                    int n);
+int sd_journal_print_with_location(
+                int priority, const char *file, const char *line, const char *func, const char *format, ...)
+                _sd_printf_(5, 6);
+int sd_journal_printv_with_location(
+                int priority, const char *file, const char *line, const char *func, const char *format, va_list ap)
+                _sd_printf_(5, 0);
+int sd_journal_send_with_location(const char *file, const char *line, const char *func, const char *format, ...)
+                _sd_printf_(4, 0) _sd_sentinel_;
+int sd_journal_sendv_with_location(
+                const char *file, const char *line, const char *func, const struct iovec *iov, int n);
 int sd_journal_perror_with_location(const char *file, const char *line, const char *func, const char *message);
 
 /* Implicitly add the call site to every message sent, exactly as upstream
@@ -54,26 +56,38 @@ int sd_journal_perror_with_location(const char *file, const char *line, const ch
  * but a program built against the real header expects it to compile either
  * way. */
 #ifndef SD_JOURNAL_SUPPRESS_LOCATION
-#define sd_journal_print(priority, ...) \
-        sd_journal_print_with_location(priority, "CODE_FILE=" __FILE__, "CODE_LINE=" _SD_STRINGIFY(__LINE__), \
-                                        __func__, __VA_ARGS__)
-#define sd_journal_printv(priority, format, ap) \
-        sd_journal_printv_with_location(priority, "CODE_FILE=" __FILE__, "CODE_LINE=" _SD_STRINGIFY(__LINE__), \
-                                         __func__, format, ap)
-#define sd_journal_send(...) \
-        sd_journal_send_with_location("CODE_FILE=" __FILE__, "CODE_LINE=" _SD_STRINGIFY(__LINE__), __func__, \
-                                       __VA_ARGS__)
-#define sd_journal_sendv(iovec, n) \
-        sd_journal_sendv_with_location("CODE_FILE=" __FILE__, "CODE_LINE=" _SD_STRINGIFY(__LINE__), __func__, \
-                                        iovec, n)
-#define sd_journal_perror(message) \
-        sd_journal_perror_with_location("CODE_FILE=" __FILE__, "CODE_LINE=" _SD_STRINGIFY(__LINE__), __func__, \
-                                         message)
+#        define sd_journal_print(priority, ...)                       \
+                sd_journal_print_with_location(                       \
+                                priority,                             \
+                                "CODE_FILE=" __FILE__,                \
+                                "CODE_LINE=" _SD_STRINGIFY(__LINE__), \
+                                __func__,                             \
+                                __VA_ARGS__)
+#        define sd_journal_printv(priority, format, ap)               \
+                sd_journal_printv_with_location(                      \
+                                priority,                             \
+                                "CODE_FILE=" __FILE__,                \
+                                "CODE_LINE=" _SD_STRINGIFY(__LINE__), \
+                                __func__,                             \
+                                format,                               \
+                                ap)
+#        define sd_journal_send(...)                                  \
+                sd_journal_send_with_location(                        \
+                                "CODE_FILE=" __FILE__,                \
+                                "CODE_LINE=" _SD_STRINGIFY(__LINE__), \
+                                __func__,                             \
+                                __VA_ARGS__)
+#        define sd_journal_sendv(iovec, n)      \
+                sd_journal_sendv_with_location( \
+                                "CODE_FILE=" __FILE__, "CODE_LINE=" _SD_STRINGIFY(__LINE__), __func__, iovec, n)
+#        define sd_journal_perror(message)       \
+                sd_journal_perror_with_location( \
+                                "CODE_FILE=" __FILE__, "CODE_LINE=" _SD_STRINGIFY(__LINE__), __func__, message)
 #endif
 
 int sd_journal_stream_fd(const char *identifier, int priority, int level_prefix);
-int sd_journal_stream_fd_with_namespace(const char *name_space, const char *identifier, int priority,
-                                         int level_prefix);
+int sd_journal_stream_fd_with_namespace(
+                const char *name_space, const char *identifier, int priority, int level_prefix);
 
 /* --- Browse the log --- */
 
@@ -93,11 +107,7 @@ enum {
         SD_JOURNAL_SYSTEM_ONLY _sd_deprecated_ = SD_JOURNAL_SYSTEM
 };
 
-enum {
-        SD_JOURNAL_NOP,
-        SD_JOURNAL_APPEND,
-        SD_JOURNAL_INVALIDATE
-};
+enum { SD_JOURNAL_NOP, SD_JOURNAL_APPEND, SD_JOURNAL_INVALIDATE };
 
 int sd_journal_open(sd_journal **ret, int flags);
 int sd_journal_open_namespace(sd_journal **ret, const char *name_space, int flags);
@@ -167,14 +177,14 @@ int sd_journal_get_catalog_for_message_id(sd_id128_t id, char **ret);
 int sd_journal_has_runtime_files(sd_journal *j);
 int sd_journal_has_persistent_files(sd_journal *j);
 
-#define SD_JOURNAL_FOREACH(j) \
+#define SD_JOURNAL_FOREACH(j)              \
         if (sd_journal_seek_head(j) < 0) { \
-        } else \
+        } else                             \
                 while (sd_journal_next(j) > 0)
 
-#define SD_JOURNAL_FOREACH_BACKWARDS(j) \
+#define SD_JOURNAL_FOREACH_BACKWARDS(j)    \
         if (sd_journal_seek_tail(j) < 0) { \
-        } else \
+        } else                             \
                 while (sd_journal_previous(j) > 0)
 
 #define SD_JOURNAL_FOREACH_DATA(j, data, l) \

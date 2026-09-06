@@ -19,7 +19,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 
-#define ACCEPTED_OPEN_FLAGS \
+#define ACCEPTED_OPEN_FLAGS                                                                              \
         (SD_JOURNAL_LOCAL_ONLY | SD_JOURNAL_RUNTIME_ONLY | SD_JOURNAL_SYSTEM | SD_JOURNAL_CURRENT_USER | \
          SD_JOURNAL_ALL_NAMESPACES | SD_JOURNAL_INCLUDE_DEFAULT_NAMESPACE | SD_JOURNAL_ASSUME_IMMUTABLE)
 
@@ -53,8 +53,8 @@ int sd_journal_open(sd_journal **ret, int flags) {
                 return r;
         }
 
-        r = sd_journal_stat_ring(j->runtime_dir, &j->active_st, &j->have_active_st, &j->rotated_st,
-                                  &j->have_rotated_st);
+        r = sd_journal_stat_ring(
+                        j->runtime_dir, &j->active_st, &j->have_active_st, &j->rotated_st, &j->have_rotated_st);
         if (r < 0) {
                 logd_ring_free(j->ring);
                 free(j->runtime_dir);

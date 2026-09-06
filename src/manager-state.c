@@ -255,12 +255,18 @@ static void publish_unit_file(Unit *u) {
                         size_t off = (size_t) w;
 
                         if (s->status_text) {
-                                w = snprintf(notify_buf + off, sizeof(notify_buf) - off, "StatusText=%s\n", s->status_text);
+                                w = snprintf(notify_buf + off,
+                                             sizeof(notify_buf) - off,
+                                             "StatusText=%s\n",
+                                             s->status_text);
                                 if (w > 0 && (size_t) w < sizeof(notify_buf) - off)
                                         off += (size_t) w;
                         }
                         if (s->status_errno != 0)
-                                snprintf(notify_buf + off, sizeof(notify_buf) - off, "StatusErrno=%d\n", s->status_errno);
+                                snprintf(notify_buf + off,
+                                         sizeof(notify_buf) - off,
+                                         "StatusErrno=%d\n",
+                                         s->status_errno);
                 }
         }
 

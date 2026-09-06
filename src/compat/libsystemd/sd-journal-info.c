@@ -48,7 +48,8 @@ int sd_journal_get_monotonic_usec(sd_journal *j, uint64_t *ret_monotonic, sd_id1
                 return r;
 
         boot = logd_entry_field(e, "_BOOT_ID");
-        if (!boot || boot->binary || !sd_journal_parse_boot_id((const char *) boot->value, boot->value_len, &parsed))
+        if (!boot || boot->binary ||
+            !sd_journal_parse_boot_id((const char *) boot->value, boot->value_len, &parsed))
                 return -EBADMSG;
 
         if (ret_boot_id) {

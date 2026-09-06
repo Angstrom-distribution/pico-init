@@ -299,8 +299,12 @@ char *sd_journal_ring_path(const char *runtime_dir, const char *name) {
         return path;
 }
 
-int sd_journal_stat_ring(const char *runtime_dir, struct stat *active_st, bool *have_active, struct stat *rotated_st,
-                          bool *have_rotated) {
+int sd_journal_stat_ring(
+                const char *runtime_dir,
+                struct stat *active_st,
+                bool *have_active,
+                struct stat *rotated_st,
+                bool *have_rotated) {
         char *active_path, *rotated_path;
 
         *have_active = false;

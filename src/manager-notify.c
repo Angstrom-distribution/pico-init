@@ -271,7 +271,9 @@ static int notify_io_cb(sd_event_source *es, int fd, uint32_t revents, void *use
         }
 
         if (memchr(buf, '\0', (size_t) n)) {
-                pico_log(PICO_LOG_DEBUG, "notify: embedded NUL in datagram from pid %d, dropping", (int) ucred.pid);
+                pico_log(PICO_LOG_DEBUG,
+                         "notify: embedded NUL in datagram from pid %d, dropping",
+                         (int) ucred.pid);
                 return 0;
         }
 

@@ -36,8 +36,16 @@ int sd_journal_get_data_threshold(sd_journal *j, size_t *sz) {
 /* Assembles "NAME=value" into *scratch (growing it as needed), applying
  * `threshold` (0 = unlimited) the same way for get_data/enumerate_data and
  * enumerate_unique: never truncate into the "NAME=" prefix itself. */
-static int assemble_field(void **scratch, size_t *scratch_cap, size_t threshold, const void *name, size_t name_len,
-                           const void *value, size_t value_len, const void **ret_data, size_t *ret_size) {
+static int
+                assemble_field(void **scratch,
+                               size_t *scratch_cap,
+                               size_t threshold,
+                               const void *name,
+                               size_t name_len,
+                               const void *value,
+                               size_t value_len,
+                               const void **ret_data,
+                               size_t *ret_size) {
         size_t total = name_len + 1 + value_len;
         size_t out_len = total;
         int r;
@@ -84,8 +92,16 @@ int sd_journal_get_data(sd_journal *j, const char *field, const void **ret_data,
         if (!f)
                 return -ENOENT;
 
-        return assemble_field(&j->data_scratch, &j->data_scratch_cap, j->data_threshold, field, field_len, f->value,
-                               f->value_len, ret_data, ret_size);
+        return assemble_field(
+                        &j->data_scratch,
+                        &j->data_scratch_cap,
+                        j->data_threshold,
+                        field,
+                        field_len,
+                        f->value,
+                        f->value_len,
+                        ret_data,
+                        ret_size);
 }
 
 /* Writer-private address fields (logd-write.h): not returned by enumerate,
@@ -114,8 +130,16 @@ int sd_journal_enumerate_data(sd_journal *j, const void **ret_data, size_t *ret_
                 if (is_double_underscore(f->name, f->name_len))
                         continue;
 
-                r = assemble_field(&j->data_scratch, &j->data_scratch_cap, j->data_threshold, f->name, f->name_len,
-                                    f->value, f->value_len, ret_data, ret_size);
+                r = assemble_field(
+                                &j->data_scratch,
+                                &j->data_scratch_cap,
+                                j->data_threshold,
+                                f->name,
+                                f->name_len,
+                                f->value,
+                                f->value_len,
+                                ret_data,
+                                ret_size);
                 return r < 0 ? r : 1;
         }
 
@@ -249,8 +273,16 @@ int sd_journal_enumerate_unique(sd_journal *j, const void **ret_data, size_t *re
                 if (r < 0)
                         return r;
 
-                r = assemble_field(&j->unique_scratch, &j->unique_scratch_cap, j->data_threshold, j->unique_field,
-                                    field_len, f->value, f->value_len, ret_data, ret_size);
+                r = assemble_field(
+                                &j->unique_scratch,
+                                &j->unique_scratch_cap,
+                                j->data_threshold,
+                                j->unique_field,
+                                field_len,
+                                f->value,
+                                f->value_len,
+                                ret_data,
+                                ret_size);
                 return r < 0 ? r : 1;
         }
 
@@ -294,8 +326,8 @@ int sd_journal_enumerate_fields(sd_journal *j, const char **ret) {
                         if (r < 0)
                                 return r;
 
-                        r = sd_journal_scratch_grow((void **) &j->fields_scratch, &j->fields_scratch_cap,
-                                                     f->name_len + 1);
+                        r = sd_journal_scratch_grow(
+                                        (void **) &j->fields_scratch, &j->fields_scratch_cap, f->name_len + 1);
                         if (r < 0)
                                 return r;
                         memcpy(j->fields_scratch, f->name, f->name_len);

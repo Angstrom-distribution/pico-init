@@ -72,7 +72,8 @@ static bool drive_until(Manager *m, bool (*done)(void *), void *ctx, int max_tic
 
         m->objective = MANAGER_RUNNING;
 
-        ASSERT_EQ_INT(pico_timer_add(m->timer, now_monotonic() + 5 * USEC_PER_MSEC, drive_tick, NULL, NULL), 0);
+        ASSERT_EQ_INT(pico_timer_add(m->timer, now_monotonic() + 5 * USEC_PER_MSEC, drive_tick, NULL, NULL),
+                      0);
         manager_loop(m);
 
         return done(ctx);
@@ -423,7 +424,8 @@ static void test_notify_setup_failure_not_fatal(void) {
                 ASSERT_EQ_INT(manager_set_unit_path(m, up), 0);
         }
         ASSERT_EQ_INT(manager_set_runtime_dir(m, bogus_runtime), 0);
-        use_private_cgroup_root(m, cgroup_root, sizeof(cgroup_root)); /* service_start() below mkdirs a real cgroup */
+        use_private_cgroup_root(
+                        m, cgroup_root, sizeof(cgroup_root)); /* service_start() below mkdirs a real cgroup */
 
         ASSERT_TRUE(manager_notify_setup(m) < 0);
         ASSERT_TRUE(manager_notify_socket_path(m) == NULL);

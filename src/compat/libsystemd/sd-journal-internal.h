@@ -79,7 +79,7 @@ struct sd_journal {
         void *data_scratch;
         size_t data_scratch_cap;
 
-        char *unique_field; /* set by sd_journal_query_unique(); NULL means "no query yet" */
+        char *unique_field;     /* set by sd_journal_query_unique(); NULL means "no query yet" */
         size_t unique_scan_idx; /* next ring entry to inspect */
         SdJournalSeenSet unique_seen;
         void *unique_scratch;
@@ -95,7 +95,7 @@ struct sd_journal {
         int inotify_wd;
         struct stat active_st; /* ring file identity at last (re)load, for sd_journal_process() */
         struct stat rotated_st;
-        bool have_active_st; /* active.export may not exist yet on an empty ring */
+        bool have_active_st;  /* active.export may not exist yet on an empty ring */
         bool have_rotated_st; /* rotated.export may not exist at all */
 };
 
@@ -152,5 +152,9 @@ char *sd_journal_ring_path(const char *runtime_dir, const char *name);
 /* stat()s both ring files under `runtime_dir`. A missing file is not an
  * error -- it sets *have_active or *have_rotated false and leaves that stat
  * buffer untouched -- any other stat() failure is -errno and aborts both. */
-int sd_journal_stat_ring(const char *runtime_dir, struct stat *active_st, bool *have_active, struct stat *rotated_st,
-                          bool *have_rotated);
+int sd_journal_stat_ring(
+                const char *runtime_dir,
+                struct stat *active_st,
+                bool *have_active,
+                struct stat *rotated_st,
+                bool *have_rotated);

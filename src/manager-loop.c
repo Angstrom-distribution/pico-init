@@ -339,13 +339,14 @@ void manager_arm_shutdown_deadline(Manager *m) {
         if (!m || !m->event)
                 return;
 
-        r = sd_event_add_time(m->event,
-                               &m->shutdown_deadline_source,
-                               CLOCK_MONOTONIC,
-                               m->shutdown_deadline,
-                               0,
-                               manager_on_shutdown_deadline,
-                               m);
+        r = sd_event_add_time(
+                        m->event,
+                        &m->shutdown_deadline_source,
+                        CLOCK_MONOTONIC,
+                        m->shutdown_deadline,
+                        0,
+                        manager_on_shutdown_deadline,
+                        m);
         if (r < 0) {
                 /* No deadline wakeup at all beats an unbounded wait: adopt
                  * the objective directly rather than risk a shutdown that
@@ -370,14 +371,24 @@ int manager_events_setup(Manager *m) {
         if (!m || !m->event || !m->signal || !m->timer)
                 return -EINVAL;
 
-        r = sd_event_add_io(m->event, &m->signal_source, pico_signal_fd(m->signal), EPOLLIN,
-                             manager_dispatch_signal_io, m);
+        r = sd_event_add_io(
+                        m->event,
+                        &m->signal_source,
+                        pico_signal_fd(m->signal),
+                        EPOLLIN,
+                        manager_dispatch_signal_io,
+                        m);
         if (r < 0)
                 return r;
         sd_event_source_set_priority(m->signal_source, EVENT_PRIORITY_SIGNALS);
 
-        r = sd_event_add_io(m->event, &m->timer_source, pico_timer_fd(m->timer), EPOLLIN,
-                             manager_dispatch_timer_io, m);
+        r = sd_event_add_io(
+                        m->event,
+                        &m->timer_source,
+                        pico_timer_fd(m->timer),
+                        EPOLLIN,
+                        manager_dispatch_timer_io,
+                        m);
         if (r < 0)
                 return r;
         sd_event_source_set_priority(m->timer_source, EVENT_PRIORITY_PICO_TIMER);

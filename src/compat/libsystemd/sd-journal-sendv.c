@@ -191,8 +191,8 @@ static int get_client_fd(void) {
                 return -errno;
 
         expected = 0;
-        if (!__atomic_compare_exchange_n(&fd_plus_one, &expected, fd + 1, false, __ATOMIC_ACQ_REL,
-                                          __ATOMIC_ACQUIRE)) {
+        if (!__atomic_compare_exchange_n(
+                            &fd_plus_one, &expected, fd + 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
                 close(fd);
                 return expected - 1;
         }
@@ -302,8 +302,8 @@ int sd_journal_sendv(const struct iovec *iov, int n) {
         return 0;
 }
 
-int sd_journal_sendv_with_location(const char *file, const char *line, const char *func, const struct iovec *iov,
-                                    int n) {
+int sd_journal_sendv_with_location(
+                const char *file, const char *line, const char *func, const struct iovec *iov, int n) {
         struct iovec *niov;
         char funcbuf[256];
         int rc;

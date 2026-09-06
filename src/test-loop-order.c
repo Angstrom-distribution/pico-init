@@ -36,11 +36,12 @@
 #include "unit.h"
 #include "util.h"
 
-static const char *crash_service = "[Service]\n"
-                                    "Type=simple\n"
-                                    "Restart=on-failure\n"
-                                    "RestartSec=50ms\n"
-                                    "ExecStart=/bin/sh -c \"exit 7\"\n";
+static const char *crash_service =
+                "[Service]\n"
+                "Type=simple\n"
+                "Restart=on-failure\n"
+                "RestartSec=50ms\n"
+                "ExecStart=/bin/sh -c \"exit 7\"\n";
 
 static Manager *manager_for(const char *dir) {
         const char * const path[] = { dir, NULL };

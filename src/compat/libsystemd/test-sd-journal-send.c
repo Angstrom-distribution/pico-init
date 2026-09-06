@@ -103,7 +103,8 @@ static void test_enoent_is_silent_success(void) {
                 if (S_ISSOCK(st.st_mode))
                         unlink("/dev/log");
                 else {
-                        fprintf(stderr, "test-sd-journal-send: /dev/log already exists, skipping ENOENT case\n");
+                        fprintf(stderr,
+                                "test-sd-journal-send: /dev/log already exists, skipping ENOENT case\n");
                         return;
                 }
         }
@@ -194,7 +195,12 @@ static void test_sendv_field_syntax_validation(void) {
         struct iovec bad;
 
         ASSERT_EQ_INT(sd_journal_sendv(NULL, 1), -EINVAL);
-        ASSERT_EQ_INT(sd_journal_sendv(((const struct iovec[]) { { "x", 1 } }), 0), -EINVAL);
+        ASSERT_EQ_INT(sd_journal_sendv(
+                                      ((const struct iovec[]){
+                                                      { "x", 1 }
+        }),
+                                      0),
+                      -EINVAL);
 
         bad.iov_base = (void *) "noequalssign";
         bad.iov_len = strlen("noequalssign");
@@ -219,15 +225,16 @@ static void test_syslog_identifier_rules(void) {
         struct iovec iov[2];
 
         /* Valid identifier: used verbatim. */
-        iov[0] = (struct iovec) { (void *) "MESSAGE=hi", strlen("MESSAGE=hi") };
-        iov[1] = (struct iovec) { (void *) "SYSLOG_IDENTIFIER=myapp", strlen("SYSLOG_IDENTIFIER=myapp") };
+        iov[0] = (struct iovec){ (void *) "MESSAGE=hi", strlen("MESSAGE=hi") };
+        iov[1] = (struct iovec){ (void *) "SYSLOG_IDENTIFIER=myapp", strlen("SYSLOG_IDENTIFIER=myapp") };
         ASSERT_EQ_INT(sd_journal_sendv(iov, 2), 0);
         ASSERT_TRUE(recv_one(g_devlog_fd, buf, sizeof(buf), NULL, NULL) > 0);
         ASSERT_STREQ(buf, "myapp: hi");
 
         /* Invalid identifier (embedded space): dropped, no fallback --
          * message is sent bare, not under program_invocation_short_name. */
-        iov[1] = (struct iovec) { (void *) "SYSLOG_IDENTIFIER=has space", strlen("SYSLOG_IDENTIFIER=has space") };
+        iov[1] = (struct iovec){ (void *) "SYSLOG_IDENTIFIER=has space",
+                                 strlen("SYSLOG_IDENTIFIER=has space") };
         ASSERT_EQ_INT(sd_journal_sendv(iov, 2), 0);
         ASSERT_TRUE(recv_one(g_devlog_fd, buf, sizeof(buf), NULL, NULL) > 0);
         ASSERT_STREQ(buf, "hi");
@@ -241,7 +248,8 @@ static void test_syslog_identifier_rules(void) {
 
 static void test_message_embedded_nul_becomes_space(void) {
         char msgbuf[] = "MESSAGE=one\0two";
-        struct iovec iov = { msgbuf, sizeof(msgbuf) - 1 }; /* include the embedded NUL, exclude the final one */
+        struct iovec iov = { msgbuf,
+                             sizeof(msgbuf) - 1 }; /* include the embedded NUL, exclude the final one */
         char buf[512];
         char expect[600];
 
@@ -261,7 +269,10 @@ static void test_perror(void) {
         ASSERT_TRUE(recv_one(g_devlog_fd, buf, sizeof(buf), NULL, NULL) > 0);
 
         /* <PRI> = facility(1, default LOG_USER) << 3 | severity(3, LOG_ERR) = 11. */
-        snprintf(expect, sizeof(expect), "<11>%s: opening config: %s", program_invocation_short_name,
+        snprintf(expect,
+                 sizeof(expect),
+                 "<11>%s: opening config: %s",
+                 program_invocation_short_name,
                  strerror(ENOENT));
         ASSERT_STREQ(buf, expect);
 }
@@ -277,15 +288,15 @@ static void test_with_location_variants(void) {
         char buf[512];
         struct iovec iov = { (void *) "MESSAGE=direct sendv", strlen("MESSAGE=direct sendv") };
 
-        ASSERT_EQ_INT(sd_journal_print_with_location(LOG_INFO, "CODE_FILE=x.c", "CODE_LINE=1", "func", "hi"), 0);
+        ASSERT_EQ_INT(sd_journal_print_with_location(LOG_INFO, "CODE_FILE=x.c", "CODE_LINE=1", "func", "hi"),
+                      0);
         ASSERT_TRUE(recv_one(g_devlog_fd, buf, sizeof(buf), NULL, NULL) > 0);
         ASSERT_TRUE(strstr(buf, "hi") != NULL);
         ASSERT_TRUE(strstr(buf, "CODE_FILE") == NULL);
 
-        ASSERT_EQ_INT(
-                sd_journal_send_with_location("CODE_FILE=x.c", "CODE_LINE=1", "func", "MESSAGE=%s", "loc-send",
-                                               NULL),
-                0);
+        ASSERT_EQ_INT(sd_journal_send_with_location(
+                                      "CODE_FILE=x.c", "CODE_LINE=1", "func", "MESSAGE=%s", "loc-send", NULL),
+                      0);
         ASSERT_TRUE(recv_one(g_devlog_fd, buf, sizeof(buf), NULL, NULL) > 0);
         ASSERT_TRUE(strstr(buf, "loc-send") != NULL);
 
@@ -299,7 +310,8 @@ static void test_with_location_variants(void) {
         }
 
         errno = ENOENT;
-        ASSERT_EQ_INT(sd_journal_perror_with_location("CODE_FILE=x.c", "CODE_LINE=1", "func", "loc-perror"), 0);
+        ASSERT_EQ_INT(sd_journal_perror_with_location("CODE_FILE=x.c", "CODE_LINE=1", "func", "loc-perror"),
+                      0);
         ASSERT_TRUE(recv_one(g_devlog_fd, buf, sizeof(buf), NULL, NULL) > 0);
         ASSERT_TRUE(strstr(buf, "loc-perror") != NULL);
         ASSERT_TRUE(strstr(buf, "CODE_FUNC") == NULL);

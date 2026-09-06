@@ -52,28 +52,28 @@ static void build_fixture(void) {
 
         {
                 LogdField f[] = {
-                        {           "MESSAGE",        "netd started", strlen("netd started") },
-                        {          "PRIORITY",                   "6",                       1 },
-                        { "SYSLOG_IDENTIFIER",                "netd",              strlen("netd") },
-                        {     "_SYSTEMD_UNIT",        "netd.service",      strlen("netd.service") },
+                        {           "MESSAGE", "netd started", strlen("netd started") },
+                        {          "PRIORITY",            "6",                      1 },
+                        { "SYSLOG_IDENTIFIER",         "netd",         strlen("netd") },
+                        {     "_SYSTEMD_UNIT", "netd.service", strlen("netd.service") },
                 };
                 ASSERT_EQ_INT(logd_writer_append(w, f, sizeof(f) / sizeof(f[0])), 0);
         }
         {
                 LogdField f[] = {
-                        {           "MESSAGE",     "link down eth0", strlen("link down eth0") },
-                        {          "PRIORITY",                   "4",                       1 },
-                        { "SYSLOG_IDENTIFIER",                "netd",              strlen("netd") },
-                        {     "_SYSTEMD_UNIT",        "netd.service",      strlen("netd.service") },
+                        {           "MESSAGE", "link down eth0", strlen("link down eth0") },
+                        {          "PRIORITY",              "4",                        1 },
+                        { "SYSLOG_IDENTIFIER",           "netd",           strlen("netd") },
+                        {     "_SYSTEMD_UNIT",   "netd.service",   strlen("netd.service") },
                 };
                 ASSERT_EQ_INT(logd_writer_append(w, f, sizeof(f) / sizeof(f[0])), 0);
         }
         {
                 LogdField f[] = {
-                        {           "MESSAGE",     "device add failed", strlen("device add failed") },
-                        {          "PRIORITY",                     "3",                           1 },
-                        { "SYSLOG_IDENTIFIER",                 "eudev",               strlen("eudev") },
-                        {     "_SYSTEMD_UNIT",         "eudev.service",       strlen("eudev.service") },
+                        {           "MESSAGE", "device add failed", strlen("device add failed") },
+                        {          "PRIORITY",                 "3",                           1 },
+                        { "SYSLOG_IDENTIFIER",             "eudev",             strlen("eudev") },
+                        {     "_SYSTEMD_UNIT",     "eudev.service",     strlen("eudev.service") },
                 };
                 ASSERT_EQ_INT(logd_writer_append(w, f, sizeof(f) / sizeof(f[0])), 0);
         }
@@ -191,7 +191,8 @@ static void test_add_match_filters(void) {
         set_env();
         ASSERT_EQ_INT(sd_journal_open(&j, 0), 0);
 
-        ASSERT_EQ_INT(sd_journal_add_match(j, "SYSLOG_IDENTIFIER=eudev", strlen("SYSLOG_IDENTIFIER=eudev")), 0);
+        ASSERT_EQ_INT(sd_journal_add_match(j, "SYSLOG_IDENTIFIER=eudev", strlen("SYSLOG_IDENTIFIER=eudev")),
+                      0);
         sd_journal_seek_head(j);
         ASSERT_EQ_INT(sd_journal_next(j), 1);
         get_message(j, msg, sizeof(msg));
