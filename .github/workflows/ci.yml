@@ -24,18 +24,25 @@ jobs:
         run: meson setup build
       - name: Build
         run: ninja -C build
+      # Root, deliberately: the PID1 core tests write real cgroups and the
+      # netd ones create veth pairs and bind :123. Unprivileged they do not
+      # skip, they fail -- and skipping them to get a green tick would leave
+      # CI exercising almost none of the core. -E keeps the build dir's env.
       - name: Test
-        run: meson test -C build --print-errorlogs
+        run: sudo -E meson test -C build --print-errorlogs
 
   format:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - name: Install clang-format
-        run: sudo apt-get update && sudo apt-get install -y clang-format
+        # Pinned: an unpinned clang-format silently changes formatting rules
+        # when the runner image bumps its default, turning CI red with no
+        # code change.
+        run: sudo apt-get update && sudo apt-get install -y clang-format-18
       - name: Check formatting
         run: |
-          find src -name '*.c' -o -name '*.h' | xargs -r clang-format --dry-run --Werror
+          find src -name '*.c' -o -name '*.h' | xargs -r clang-format-18 --dry-run --Werror
 
   reuse:
     runs-on: ubuntu-latest
