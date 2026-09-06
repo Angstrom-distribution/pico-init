@@ -278,6 +278,10 @@ int sd_event_new(sd_event **ret) {
         e->epoll_fd = fd;
         e->state = SD_EVENT_INITIAL;
         e->original_pid = getpid();
+        /* Real systemd only records tid in sd_event_default(), not here in
+         * sd_event_new() -- recording it unconditionally is a harmless
+         * superset (sd_event_get_tid() reads the same field either way, and
+         * every real event in this shim is thread-confined already). */
         e->tid = gettid();
 
         *ret = e;
@@ -1423,6 +1427,10 @@ int sd_event_now(sd_event *e, clockid_t clock, uint64_t *ret) {
 
 /* ---- misc accessors ---------------------------------------------------- */
 
+/* This is the function that makes the shim loop embeddable in a foreign
+ * loop -- but even this must never be used to graft an sd_event onto
+ * PID 1's own manager loop; the -EPERM constructor guard in sd_event_new()
+ * already prevents creating one there in the first place. */
 int sd_event_get_fd(sd_event *e) {
         if (!e)
                 return -EINVAL;

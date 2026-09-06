@@ -19,6 +19,13 @@
  * sd_event_add_cpu_pressure(), sd_event_add_io_pressure(), and
  * sd_event_source_set_ratelimit() (plus its expire-callback companion) are
  * declared here for ABI completeness but always fail -- see sd-event.c.
+ *
+ * PID1-unsafe: sd_event_new() returns -EPERM when called from pico-init's
+ * own PID 1 (manager-loop.c already owns the sole epoll loop for that
+ * process; a second sd_event loop there would be two owning loops fighting
+ * over the same process, not a nested or embeddable one). This shim is
+ * meant for standalone helper processes linking libsystemd-compat, never
+ * for code running inside pico-init's own manager.
  */
 
 #pragma once
