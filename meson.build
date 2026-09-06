@@ -99,11 +99,13 @@ pico_init_core_sources = files(
   # not a separate daemon.
   'src/socket.c',
   'src/job.c',
-  # PID 1's own runtime state publisher and control socket (plan §1.7).
-  # Both are wired into unit.c/job.c/manager-loop.c already; see their
-  # headers for why the hooks live at those choke points.
+  # PID 1's own runtime state publisher, control socket, and sd_notify()
+  # listener (plan §1.7). All three are wired into unit.c/job.c/
+  # manager-loop.c/service-exec.c already; see their headers for why the
+  # hooks live at those choke points.
   'src/manager-state.c',
   'src/manager-ctrl.c',
+  'src/manager-notify.c',
   'src/cgroups-v2.c',
   'src/timer.c',
   'src/signal.c',

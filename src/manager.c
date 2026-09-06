@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include "manager-ctrl.h"
+#include "manager-notify.h"
 #include "manager-state.h"
 #include "manager.h"
 #include "sd-event.h"
@@ -188,6 +189,7 @@ Manager *manager_free(Manager *m) {
          * use-after-free. The state files go with it.
          */
         manager_ctrl_done(m);
+        manager_notify_done(m);
         manager_state_done(m);
 
         /* Jobs first: each one points at a unit and unlinks itself from the

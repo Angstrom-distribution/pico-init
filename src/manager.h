@@ -35,6 +35,7 @@
  */
 enum {
         EVENT_PRIORITY_CGROUP_EVENTS = SD_EVENT_PRIORITY_NORMAL - 10, /* verify + queue only, never acts */
+        EVENT_PRIORITY_NOTIFY = SD_EVENT_PRIORITY_NORMAL - 5,         /* before SIGCHLD: attribution needs main_pid still set */
         EVENT_PRIORITY_SIGNALS = SD_EVENT_PRIORITY_NORMAL - 4,        /* SIGCHLD reaped + attributed here */
         EVENT_PRIORITY_SOCKET = SD_EVENT_PRIORITY_NORMAL - 3,
         EVENT_PRIORITY_CTRL = SD_EVENT_PRIORITY_NORMAL - 3,
@@ -111,13 +112,15 @@ struct Manager {
          * PICO_DEFAULT_TARGET once startup ran without an override. */
         char *default_target;
 
-        /* State publisher and control socket (plan §1.7). Both are opaque
-         * here: manager-state.c and manager-ctrl.c own their shapes, so
-         * landing either does not mean editing this header. NULL until the
-         * corresponding setup() has run, and NULL is a supported state --
-         * an unwritable /run costs picoctl its verbs, never the boot. */
+        /* State publisher, control socket, and the sd_notify() listener
+         * (plan §1.7, manager-notify.h). All three are opaque here: their
+         * own .c files own their shapes, so landing one does not mean
+         * editing this header. NULL until the corresponding setup() has
+         * run, and NULL is a supported state -- an unwritable /run costs
+         * picoctl its verbs and sd_notify() its listener, never the boot. */
         struct pico_manager_state *state;
         struct pico_manager_ctrl *ctrl;
+        struct pico_manager_notify *notify;
 
         /* units waiting for unit_load(), linked via unit->load_queue_next */
         Unit *load_queue;

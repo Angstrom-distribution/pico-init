@@ -741,10 +741,10 @@ int sd_is_mq(int fd, const char *path) {
  * sd_notify() family.
  *
  * Simplified from current systemd on purpose (real systemd also handles
- * AF_VSOCK and SOCK_STREAM/SOCK_SEQPACKET NOTIFY_SOCKET values): pico's
- * planned listener (not yet built -- see manager-notify.c reference below)
- * is AF_UNIX SOCK_DGRAM only, so an address this code can't reach is an
- * honest -EINVAL, not a guess at a protocol nothing here implements.
+ * AF_VSOCK and SOCK_STREAM/SOCK_SEQPACKET NOTIFY_SOCKET values): pico's own
+ * listener (manager-notify.c) is AF_UNIX SOCK_DGRAM only, so an address
+ * this code can't reach is an honest -EINVAL, not a guess at a protocol
+ * nothing here implements.
  * --------------------------------------------------------------------- */
 
 static void unsetenv_notify(bool unset_environment) {
@@ -812,10 +812,10 @@ static int notify_internal(pid_t pid, const char *state, const int *fds, unsigne
         msghdr.msg_iov = &iovec;
         msghdr.msg_iovlen = 1;
 
-        /* pico's planned listener attributes senders via SO_PASSCRED +
-         * SCM_CREDENTIALS + manager_get_unit_by_pid() -- this is the
-         * supported attribution channel for a non-zero pid, not decoration.
-         * The kernel itself enforces who may claim which pid. */
+        /* pico's own listener (manager-notify.c) attributes senders via
+         * SO_PASSCRED + SCM_CREDENTIALS + manager_get_unit_by_pid() -- this
+         * is the supported attribution channel for a non-zero pid, not
+         * decoration. The kernel itself enforces who may claim which pid. */
         send_ucred = pid != 0 && pid != getpid();
 
         if (n_fds > 0 || send_ucred) {
@@ -954,8 +954,9 @@ int sd_pid_notifyf(pid_t pid, int unset_environment, const char *format, ...) {
  * honest_failure: the only documented purpose of fds/n_fds is FDSTORE=1 --
  * the manager storing fds and handing them back on the service's next
  * invocation. pico-init has no fd store and none is planned (nothing under
- * src/ implements one), and the planned notify listener ignores unknown
- * keys, so it would never honor FDSTORE=1 either. Returning 1 while the
+ * src/ implements one), and manager-notify.c's own listener treats
+ * FDSTORE=1 as deferred scope, closing any fd it receives rather than
+ * storing it. Returning 1 while the
  * fds silently die would make a caller close its own copies expecting them
  * back after a restart -- real data loss from a fake success. -EOPNOTSUPP
  * says plainly "this manager cannot store fds"; a well-written daemon falls
@@ -1013,8 +1014,8 @@ int sd_pid_notifyf_with_fds(
  * the undelivered fd at consumption time -- so the write end dies exactly
  * when the listener has consumed every earlier datagram, which is the
  * barrier's documented meaning ("synchronize against consumption, not
- * processing"). Works against pico's planned listener with zero extra
- * listener code, for exactly that reason. Quarry reference for shape only:
+ * processing"). Works against pico's own listener (manager-notify.c) with
+ * zero extra listener code, for exactly that reason. Quarry reference for shape only:
  * upstream added this as 4f07ddfa9b/0de3431871; reimplemented, not copied.
  */
 int sd_pid_notify_barrier(pid_t pid, int unset_environment, uint64_t timeout) {

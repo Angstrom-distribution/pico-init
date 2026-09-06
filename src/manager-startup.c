@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include "manager-ctrl.h"
+#include "manager-notify.h"
 #include "manager-state.h"
 #include "manager.h"
 #include "unit-enable.h"
@@ -136,14 +137,16 @@ int manager_startup(Manager *m, const char *default_target) {
          * NULL default_target correctly. */
 
         /*
-         * 0. Bring up the runtime state directory and the control socket
-         * before anything can transition, so the very first unit_notify() of
-         * the boot is already published rather than silently dropped.
+         * 0. Bring up the runtime state directory, the control socket and
+         * the sd_notify() listener before anything can transition, so the
+         * very first unit_notify() of the boot is already published rather
+         * than silently dropped.
          *
-         * Neither is fatal: a read-only or absent /run costs picoctl its
-         * verbs, and an image with no control socket is a supported
-         * configuration. A boot that fails because its status reporting
-         * failed would be strictly worse than one that boots quietly.
+         * None of the three is fatal: a read-only or absent /run costs
+         * picoctl its verbs and sd_notify() its listener, and an image
+         * without either is a supported configuration. A boot that fails
+         * because its status reporting failed would be strictly worse than
+         * one that boots quietly.
          */
         r = manager_state_setup(m);
         if (r < 0)
@@ -155,6 +158,12 @@ int manager_startup(Manager *m, const char *default_target) {
         if (r < 0)
                 pico_log(PICO_LOG_WARNING,
                          "control socket unavailable, picoctl start/stop will not work: %s",
+                         strerror(-r));
+
+        r = manager_notify_setup(m);
+        if (r < 0)
+                pico_log(PICO_LOG_WARNING,
+                         "notify socket unavailable, sd_notify() will be a no-op: %s",
                          strerror(-r));
 
         /* 1. Every fragment in the search path becomes a graph node. */

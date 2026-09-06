@@ -1,0 +1,48 @@
+/* SPDX-FileCopyrightText: 2026 Koen Kooi */
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+
+/*
+ * The sd_notify() listener: one AF_UNIX SOCK_DGRAM socket at
+ * <runtime_dir>/notify, bound by PID 1, closing the loop on
+ * sd-daemon.c's already-real notify_internal() SENDER.
+ *
+ * Mode 0666, unlike the control socket's 0600: any service must be able to
+ * sendto() here, and with SO_PASSCRED set the kernel -- not this socket's
+ * permissions -- is what stops an unprivileged sender from claiming a
+ * foreign pid's credentials (sd-daemon.c's own comment on notify_internal()
+ * says the same).
+ *
+ * DEFERRED SCOPE: this lands attribution and recognized-key handling only.
+ * READY=1 sets a real flag/timestamp but does NOT gate a service's active
+ * transition -- that needs SERVICE_TYPE_NOTIFY, a second arc through
+ * service.c's state machine (EXEC_START-until-READY gating, start-timeout
+ * interaction, STOPPING=1 stop path, NotifyAccess=), deliberately not built
+ * here. See manager-notify.c's READY=1 handler and this milestone's commit
+ * message for the same statement.
+ */
+
+#pragma once
+
+#include <stddef.h>
+
+typedef struct Manager Manager;
+
+/* Opaque; defined in manager-notify.c so manager.h need not know its shape. */
+struct pico_manager_notify;
+
+/* Bind <runtime_dir>/notify, join the epoll set. 0 or -errno. Failure is not
+ * fatal to boot -- sd_notify() degrades to notify_internal()'s own
+ * documented no-op, exactly as on an image without this listener. */
+int manager_notify_setup(Manager *m);
+
+/* Close the socket and unlink its path. */
+void manager_notify_done(Manager *m);
+
+/* NULL when the listener is not up -- service-exec.c's gate for whether to
+ * inject NOTIFY_SOCKET= into a child's environment at all. */
+const char *manager_notify_socket_path(Manager *m);
+
+/* Test-only: how many validated-but-unattributed datagrams have been
+ * dropped (no unit's main/control pid matched the sender). 0 when the
+ * listener is not up. */
+size_t manager_notify_debug_n_unattributed(Manager *m);
