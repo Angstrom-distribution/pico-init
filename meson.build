@@ -173,6 +173,9 @@ pico_tests = [
   'test-manager-state',
   'test-picoctl',
   'test-manager-ctrl',
+  # The sd_notify() listener (plan §1.7 follow-on): attribution, key
+  # handling, env injection/scrub, teardown, and the not-fatal-to-boot policy.
+  'test-manager-notify',
   # D0's five /dev symlinks (plan §1.8), and the fixture-driven unit-file
   # parser test the §7 unit-test item asks for.
   'test-dev-setup',
