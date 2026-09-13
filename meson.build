@@ -1078,6 +1078,25 @@ libudev_pc = configure_file(
   install_dir: pkgconfig_dir,
 )
 
+# udev.pc, a SEPARATE package name from libudev.pc: real consumers doing
+# `pkg-config --variable=udevdir udev` (alsa-utils' PACKAGECONFIG[udev] is
+# the real one that surfaced this, 2026-09-13 -- no udev.pc meant no
+# udevdir, so its configure script fell back to a hardcoded non-usrmerge
+# /lib/udev/rules.d) look up the package literally named "udev", which
+# carries udevdir; "libudev" is the library and carries no such variable
+# upstream either. Real path matches devd's own rules install location.
+udev_pc = configure_file(
+  input: 'src/compat/libudev/udev.pc.in',
+  output: 'udev.pc',
+  configuration: pc_conf,
+  install: true,
+  install_dir: pkgconfig_dir,
+)
+
+if python3.found()
+  test('test-udev-pc', python3, args: [check_pc, '--upstream', files('src/compat/libudev/udev-v259.pc.in'), '--generated', udev_pc])
+endif
+
 if python3.found() and nm.found()
   libudev_sym_args = [
     libsystemd_sym_gen,

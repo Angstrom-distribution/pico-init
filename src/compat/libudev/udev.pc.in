@@ -1,0 +1,19 @@
+#  SPDX-FileCopyrightText: 2026 Koen Kooi
+#  SPDX-License-Identifier: GPL-2.0-or-later
+#
+#  Same shape as real systemd's udev.pc.in (udev-v259.pc.in) -- vendored
+#  verbatim, not libudev.pc's own package. Real consumers (alsa-utils'
+#  PACKAGECONFIG[udev] is the one that found this the hard way, 2026-09-13:
+#  its configure script does `pkg-config --variable=udevdir udev`, gets
+#  nothing when only libudev.pc exists, and falls back to a hardcoded
+#  non-usrmerge /lib/udev/rules.d) look up udevdir on the package named
+#  "udev", not "libudev" -- the two names carry genuinely different
+#  variables upstream, and this project's own devd already installs its
+#  rules at exactly this path (${nonarch_libdir}/udev/rules.d in OE terms).
+
+Name: udev
+Description: udev
+Version: @PROJECT_VERSION@
+
+udev_dir=@PREFIX@/lib/udev
+udevdir=${udev_dir}

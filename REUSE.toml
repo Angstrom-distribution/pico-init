@@ -27,6 +27,7 @@ path = [
   "src/compat/libsystemd/systemd-v259.pc.in",
   "src/compat/libudev/libudev-v259.sym",
   "src/compat/libudev/libudev-v259.pc.in",
+  "src/compat/libudev/udev-v259.pc.in",
 ]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "systemd contributors"
