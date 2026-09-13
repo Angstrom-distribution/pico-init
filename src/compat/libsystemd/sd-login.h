@@ -88,7 +88,6 @@ int sd_uid_get_seats(uid_t uid, int require_active, char ***ret_seats);
 
 int sd_session_is_active(const char *session);
 int sd_session_is_remote(const char *session);
-int sd_session_get_extra_device_access(const char *session, char ***ret_ids);
 /* Possible states: online, active, closing. */
 int sd_session_get_state(const char *session, char **ret_state);
 int sd_session_get_uid(const char *session, uid_t *ret_uid);

@@ -972,26 +972,12 @@ int sd_event_add_exit(sd_event *e, sd_event_source **ret, sd_event_handler_t cal
         return 0;
 }
 
-/* PSI pressure sources need the $MEMORY_PRESSURE_WATCH/cgroup PSI protocol.
- * Upstream itself documents and returns -EOPNOTSUPP when PSI is
+/* The PSI pressure source needs the $MEMORY_PRESSURE_WATCH/cgroup PSI
+ * protocol. Upstream itself documents and returns -EOPNOTSUPP when PSI is
  * unavailable, so every portable caller already handles exactly this
  * errno -- a fake success would promise pressure wakeups that never come,
  * for zero known pico-side callers. */
 int sd_event_add_memory_pressure(sd_event *e, sd_event_source **ret, sd_event_handler_t callback, void *userdata) {
-        (void) e;
-        (void) ret;
-        (void) callback;
-        (void) userdata;
-        return -EOPNOTSUPP;
-}
-int sd_event_add_cpu_pressure(sd_event *e, sd_event_source **ret, sd_event_handler_t callback, void *userdata) {
-        (void) e;
-        (void) ret;
-        (void) callback;
-        (void) userdata;
-        return -EOPNOTSUPP;
-}
-int sd_event_add_io_pressure(sd_event *e, sd_event_source **ret, sd_event_handler_t callback, void *userdata) {
         (void) e;
         (void) ret;
         (void) callback;

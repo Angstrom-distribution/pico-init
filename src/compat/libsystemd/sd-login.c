@@ -226,10 +226,6 @@ int sd_session_is_active(const char *session) {
 int sd_session_is_remote(const char *session) {
         return session_or_seat_errno(session);
 }
-int sd_session_get_extra_device_access(const char *session, char ***ret_ids) {
-        (void) ret_ids;
-        return session_or_seat_errno(session);
-}
 int sd_session_get_state(const char *session, char **ret_state) {
         (void) ret_state;
         return session_or_seat_errno(session);

@@ -421,7 +421,7 @@ int sd_event_source_get_inotify_path(sd_event_source *s, const char **ret) {
         return 0;
 }
 
-/* ---- pressure: never real, see sd-event.c's add_*_pressure() ------------------ */
+/* ---- pressure: never real, see sd-event.c's add_memory_pressure() ------------- */
 
 int sd_event_source_set_memory_pressure_type(sd_event_source *s, const char *ty) {
         (void) ty;
@@ -435,32 +435,6 @@ int sd_event_source_set_memory_pressure_type(sd_event_source *s, const char *ty)
         return -EDOM;
 }
 int sd_event_source_set_memory_pressure_period(sd_event_source *s, uint64_t threshold_usec, uint64_t window_usec) {
-        (void) threshold_usec;
-        (void) window_usec;
-        if (!s)
-                return -EINVAL;
-        return -EDOM;
-}
-int sd_event_source_set_cpu_pressure_type(sd_event_source *s, const char *ty) {
-        (void) ty;
-        if (!s)
-                return -EINVAL;
-        return -EDOM;
-}
-int sd_event_source_set_cpu_pressure_period(sd_event_source *s, uint64_t threshold_usec, uint64_t window_usec) {
-        (void) threshold_usec;
-        (void) window_usec;
-        if (!s)
-                return -EINVAL;
-        return -EDOM;
-}
-int sd_event_source_set_io_pressure_type(sd_event_source *s, const char *ty) {
-        (void) ty;
-        if (!s)
-                return -EINVAL;
-        return -EDOM;
-}
-int sd_event_source_set_io_pressure_period(sd_event_source *s, uint64_t threshold_usec, uint64_t window_usec) {
         (void) threshold_usec;
         (void) window_usec;
         if (!s)
