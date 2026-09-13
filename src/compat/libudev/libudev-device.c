@@ -42,9 +42,9 @@ struct udev_device {
 };
 
 static const char * const action_names[_SD_DEVICE_ACTION_MAX] = {
-        [SD_DEVICE_ADD] = "add",       [SD_DEVICE_REMOVE] = "remove", [SD_DEVICE_CHANGE] = "change",
-        [SD_DEVICE_MOVE] = "move",     [SD_DEVICE_ONLINE] = "online", [SD_DEVICE_OFFLINE] = "offline",
-        [SD_DEVICE_BIND] = "bind",     [SD_DEVICE_UNBIND] = "unbind",
+        [SD_DEVICE_ADD] = "add",   [SD_DEVICE_REMOVE] = "remove", [SD_DEVICE_CHANGE] = "change",
+        [SD_DEVICE_MOVE] = "move", [SD_DEVICE_ONLINE] = "online", [SD_DEVICE_OFFLINE] = "offline",
+        [SD_DEVICE_BIND] = "bind", [SD_DEVICE_UNBIND] = "unbind",
 };
 
 static void *fail_errno(int r) {
@@ -114,7 +114,8 @@ struct udev_device *udev_device_new_from_devnum(struct udev *udev, char type, de
         return wrap_new(udev, device, r);
 }
 
-struct udev_device *udev_device_new_from_subsystem_sysname(struct udev *udev, const char *subsystem, const char *sysname) {
+struct udev_device *udev_device_new_from_subsystem_sysname(
+                struct udev *udev, const char *subsystem, const char *sysname) {
         sd_device *device = NULL;
         int r;
 
@@ -271,66 +272,82 @@ static const char *string_getter(int r, const char *value, bool enoent_is_null) 
 
 const char *udev_device_get_devpath(struct udev_device *udev_device) {
         const char *v = NULL;
+        int r;
 
         if (!udev_device)
                 return fail_errno(-EINVAL);
-        return string_getter(sd_device_get_devpath(udev_device->device, &v), v, false);
+        r = sd_device_get_devpath(udev_device->device, &v);
+        return string_getter(r, v, false);
 }
 
 const char *udev_device_get_syspath(struct udev_device *udev_device) {
         const char *v = NULL;
+        int r;
 
         if (!udev_device)
                 return fail_errno(-EINVAL);
-        return string_getter(sd_device_get_syspath(udev_device->device, &v), v, false);
+        r = sd_device_get_syspath(udev_device->device, &v);
+        return string_getter(r, v, false);
 }
 
 const char *udev_device_get_sysname(struct udev_device *udev_device) {
         const char *v = NULL;
+        int r;
 
         if (!udev_device)
                 return fail_errno(-EINVAL);
-        return string_getter(sd_device_get_sysname(udev_device->device, &v), v, false);
+        r = sd_device_get_sysname(udev_device->device, &v);
+        return string_getter(r, v, false);
 }
 
 const char *udev_device_get_sysnum(struct udev_device *udev_device) {
         const char *v = NULL;
+        int r;
 
         if (!udev_device)
                 return fail_errno(-EINVAL);
-        return string_getter(sd_device_get_sysnum(udev_device->device, &v), v, true);
+        r = sd_device_get_sysnum(udev_device->device, &v);
+        return string_getter(r, v, true);
 }
 
 const char *udev_device_get_subsystem(struct udev_device *udev_device) {
         const char *v = NULL;
+        int r;
 
         if (!udev_device)
                 return fail_errno(-EINVAL);
-        return string_getter(sd_device_get_subsystem(udev_device->device, &v), v, false);
+        r = sd_device_get_subsystem(udev_device->device, &v);
+        return string_getter(r, v, false);
 }
 
 const char *udev_device_get_devtype(struct udev_device *udev_device) {
         const char *v = NULL;
+        int r;
 
         if (!udev_device)
                 return fail_errno(-EINVAL);
-        return string_getter(sd_device_get_devtype(udev_device->device, &v), v, true);
+        r = sd_device_get_devtype(udev_device->device, &v);
+        return string_getter(r, v, true);
 }
 
 const char *udev_device_get_driver(struct udev_device *udev_device) {
         const char *v = NULL;
+        int r;
 
         if (!udev_device)
                 return fail_errno(-EINVAL);
-        return string_getter(sd_device_get_driver(udev_device->device, &v), v, false);
+        r = sd_device_get_driver(udev_device->device, &v);
+        return string_getter(r, v, false);
 }
 
 const char *udev_device_get_devnode(struct udev_device *udev_device) {
         const char *v = NULL;
+        int r;
 
         if (!udev_device)
                 return fail_errno(-EINVAL);
-        return string_getter(sd_device_get_devname(udev_device->device, &v), v, false);
+        r = sd_device_get_devname(udev_device->device, &v);
+        return string_getter(r, v, false);
 }
 
 dev_t udev_device_get_devnum(struct udev_device *udev_device) {
@@ -425,6 +442,7 @@ unsigned long long int udev_device_get_usec_since_initialized(struct udev_device
 
 const char *udev_device_get_property_value(struct udev_device *udev_device, const char *key) {
         const char *v = NULL;
+        int r;
 
         if (!udev_device || !key)
                 return fail_errno(-EINVAL);
@@ -435,7 +453,8 @@ const char *udev_device_get_property_value(struct udev_device *udev_device, cons
                         return v;
         }
 
-        return string_getter(sd_device_get_property_value(udev_device->device, key, &v), v, false);
+        r = sd_device_get_property_value(udev_device->device, key, &v);
+        return string_getter(r, v, false);
 }
 
 struct udev_list_entry *udev_device_get_properties_list_entry(struct udev_device *udev_device) {
@@ -458,9 +477,10 @@ struct udev_list_entry *udev_device_get_properties_list_entry(struct udev_device
                         struct udev_list_entry *e;
 
                         for (e = libudev_list_first(udev_device->env); e; e = udev_list_entry_get_next(e))
-                                if (!libudev_list_add(udev_device->properties,
-                                                      udev_list_entry_get_name(e),
-                                                      udev_list_entry_get_value(e)))
+                                if (!libudev_list_add(
+                                                    udev_device->properties,
+                                                    udev_list_entry_get_name(e),
+                                                    udev_list_entry_get_value(e)))
                                         return fail_errno(-ENOMEM);
                 }
 
@@ -560,10 +580,12 @@ struct udev_list_entry *udev_device_get_sysattr_list_entry(struct udev_device *u
 
 const char *udev_device_get_sysattr_value(struct udev_device *udev_device, const char *sysattr) {
         const char *v = NULL;
+        int r;
 
         if (!udev_device || !sysattr)
                 return fail_errno(-EINVAL);
-        return string_getter(sd_device_get_sysattr_value(udev_device->device, sysattr, &v), v, false);
+        r = sd_device_get_sysattr_value(udev_device->device, sysattr, &v);
+        return string_getter(r, v, false);
 }
 
 int udev_device_set_sysattr_value(struct udev_device *udev_device, const char *sysattr, const char *value) {
