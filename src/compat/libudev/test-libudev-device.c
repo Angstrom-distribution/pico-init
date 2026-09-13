@@ -34,7 +34,13 @@ static void mkpath(const char *base, const char *rel) {
         for (seg = strtok_r(rel_copy, "/", &saveptr); seg; seg = strtok_r(NULL, "/", &saveptr)) {
                 char next[512];
 
+                /* GCC's format-truncation checker cannot see that these are short,
+                 * controlled test fixture path segments -- it only sees three
+                 * unbounded %s into a 512-byte buffer. Real risk is zero here. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
                 snprintf(next, sizeof(next), "%s%s%s", partial, partial[0] ? "/" : "", seg);
+#pragma GCC diagnostic pop
                 ASSERT_EQ_INT(test_mkdir(base, next), 0);
                 snprintf(partial, sizeof(partial), "%s", next);
         }
