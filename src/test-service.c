@@ -1027,11 +1027,12 @@ static void test_exec_completes_only_after_execve(void) {
         m = manager_for(dir);
 
         a = load_service(m, dir, "exec-a.service", "[Unit]\n[Service]\nType=exec\nExecStart=/bin/sleep 100\n");
-        b = load_service(m,
-                         dir,
-                         "exec-b.service",
-                         "[Unit]\nRequires=exec-a.service\nAfter=exec-a.service\n"
-                         "[Service]\nType=simple\nExecStart=/bin/sleep 100\n");
+        b = load_service(
+                        m,
+                        dir,
+                        "exec-b.service",
+                        "[Unit]\nRequires=exec-a.service\nAfter=exec-a.service\n"
+                        "[Service]\nType=simple\nExecStart=/bin/sleep 100\n");
 
         ASSERT_EQ_INT(manager_add_job(m, JOB_START, UNIT(b), NULL), 0);
         ASSERT_EQ_INT(manager_dispatch_run_queue(m), 1); /* only a ran */
@@ -1080,15 +1081,17 @@ static void test_exec_failed_execve_never_active(void) {
         ASSERT_TRUE(dir != NULL);
         m = manager_for(dir);
 
-        a = load_service(m,
-                         dir,
-                         "exec-fail-a.service",
-                         "[Unit]\n[Service]\nType=exec\nExecStart=/nonexistent/pico-init-no-such-binary\n");
-        b = load_service(m,
-                         dir,
-                         "exec-fail-b.service",
-                         "[Unit]\nRequires=exec-fail-a.service\nAfter=exec-fail-a.service\n"
-                         "[Service]\nType=simple\nExecStart=/bin/sleep 100\n");
+        a = load_service(
+                        m,
+                        dir,
+                        "exec-fail-a.service",
+                        "[Unit]\n[Service]\nType=exec\nExecStart=/nonexistent/pico-init-no-such-binary\n");
+        b = load_service(
+                        m,
+                        dir,
+                        "exec-fail-b.service",
+                        "[Unit]\nRequires=exec-fail-a.service\nAfter=exec-fail-a.service\n"
+                        "[Service]\nType=simple\nExecStart=/bin/sleep 100\n");
 
         ASSERT_EQ_INT(manager_add_job(m, JOB_START, UNIT(b), NULL), 0);
         ASSERT_EQ_INT(manager_dispatch_run_queue(m), 1);
@@ -1144,11 +1147,12 @@ static void test_notify_ready_gates_activation(void) {
 
         snprintf(unit, sizeof(unit), "[Unit]\n[Service]\nType=notify\nExecStart=%s 300\n", helper);
         a = load_service(m, dir, "notify-a.service", unit);
-        b = load_service(m,
-                         dir,
-                         "notify-b.service",
-                         "[Unit]\nRequires=notify-a.service\nAfter=notify-a.service\n"
-                         "[Service]\nType=simple\nExecStart=/bin/sleep 100\n");
+        b = load_service(
+                        m,
+                        dir,
+                        "notify-b.service",
+                        "[Unit]\nRequires=notify-a.service\nAfter=notify-a.service\n"
+                        "[Service]\nType=simple\nExecStart=/bin/sleep 100\n");
 
         t0 = now_monotonic();
         ASSERT_EQ_INT(manager_add_job(m, JOB_START, UNIT(b), NULL), 0);
@@ -1196,10 +1200,11 @@ static void test_notify_timeout_without_ready(void) {
         ASSERT_TRUE(dir != NULL);
         m = notify_manager_for(dir, &rtdir);
 
-        s = load_service(m,
-                         dir,
-                         "notify-mute.service",
-                         "[Unit]\n[Service]\nType=notify\nExecStart=/bin/sleep 100\nTimeoutStartSec=200ms\n");
+        s = load_service(
+                        m,
+                        dir,
+                        "notify-mute.service",
+                        "[Unit]\n[Service]\nType=notify\nExecStart=/bin/sleep 100\nTimeoutStartSec=200ms\n");
 
         ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
         ASSERT_EQ_INT(s->state, SERVICE_EXEC_START);
@@ -1230,10 +1235,11 @@ static void test_notify_exit_before_ready_is_protocol_failure(void) {
         ASSERT_TRUE(dir != NULL);
         m = notify_manager_for(dir, &rtdir);
 
-        s = load_service(m,
-                         dir,
-                         "notify-quit.service",
-                         "[Unit]\n[Service]\nType=notify\nRemainAfterExit=yes\nExecStart=/bin/true\n");
+        s = load_service(
+                        m,
+                        dir,
+                        "notify-quit.service",
+                        "[Unit]\n[Service]\nType=notify\nRemainAfterExit=yes\nExecStart=/bin/true\n");
 
         ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
         ASSERT_TRUE(drive_until(m, service_settled_done, s, 400));
@@ -1301,14 +1307,19 @@ static void test_forking_pidfile_gates_activation(void) {
 
         write_forkd(dir, "forkd.sh", "#!/bin/sh\nsetsid sleep 100 &\necho $! > \"$1\"\nexit 0\n");
         snprintf(pidfile, sizeof(pidfile), "%s/a.pid", dir);
-        snprintf(unit, sizeof(unit), "[Unit]\n[Service]\nType=forking\nPIDFile=%s\nExecStart=%s/forkd.sh %s\n",
-                 pidfile, dir, pidfile);
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Unit]\n[Service]\nType=forking\nPIDFile=%s\nExecStart=%s/forkd.sh %s\n",
+                 pidfile,
+                 dir,
+                 pidfile);
         a = load_service(m, dir, "fork-a.service", unit);
-        b = load_service(m,
-                         dir,
-                         "fork-b.service",
-                         "[Unit]\nRequires=fork-a.service\nAfter=fork-a.service\n"
-                         "[Service]\nType=simple\nExecStart=/bin/sleep 100\n");
+        b = load_service(
+                        m,
+                        dir,
+                        "fork-b.service",
+                        "[Unit]\nRequires=fork-a.service\nAfter=fork-a.service\n"
+                        "[Service]\nType=simple\nExecStart=/bin/sleep 100\n");
 
         ASSERT_EQ_INT(manager_add_job(m, JOB_START, UNIT(b), NULL), 0);
         ASSERT_EQ_INT(manager_dispatch_run_queue(m), 1);
@@ -1372,10 +1383,25 @@ static void test_forking_guess_main_pid_from_cgroup(void) {
         ASSERT_TRUE(s->main_pid > 0);
         ASSERT_EQ_INT(s->main_pid_alien, true);
         snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", (int) s->main_pid);
-        f = fopen(comm_path, "r");
-        ASSERT_TRUE(f != NULL);
-        ASSERT_TRUE(fgets(comm, sizeof(comm), f) != NULL);
-        fclose(f);
+        /*
+         * setsid(1) itself forks and execs into the command given to it, so
+         * there is a real, if usually brief, window right after the cgroup
+         * gains this pid where /proc/<pid>/comm still reads "setsid" rather
+         * than "sleep" -- a fixture race, not a GuessMainPID= bug (it
+         * correctly named the one live process in the cgroup at that
+         * instant). Poll rather than reading once: this only ever needs
+         * more than one iteration under CI-runner-level scheduling
+         * pressure, never locally.
+         */
+        for (int i = 0; i < 20; i++) {
+                f = fopen(comm_path, "r");
+                ASSERT_TRUE(f != NULL);
+                ASSERT_TRUE(fgets(comm, sizeof(comm), f) != NULL);
+                fclose(f);
+                if (strcmp(comm, "sleep\n") == 0)
+                        break;
+                test_sleep_ms(25);
+        }
         ASSERT_STREQ(comm, "sleep\n");
 
         ASSERT_EQ_INT(unit_stop(UNIT(s)), 0);
@@ -1404,11 +1430,12 @@ static void test_forking_parent_failure_fails_start(void) {
         write_forkd(dir, "failfork.sh", "#!/bin/sh\nexit 3\n");
         snprintf(unit, sizeof(unit), "[Unit]\n[Service]\nType=forking\nExecStart=%s/failfork.sh\n", dir);
         a = load_service(m, dir, "fork-fail.service", unit);
-        b = load_service(m,
-                         dir,
-                         "fork-dep.service",
-                         "[Unit]\nRequires=fork-fail.service\nAfter=fork-fail.service\n"
-                         "[Service]\nType=simple\nExecStart=/bin/sleep 100\n");
+        b = load_service(
+                        m,
+                        dir,
+                        "fork-dep.service",
+                        "[Unit]\nRequires=fork-fail.service\nAfter=fork-fail.service\n"
+                        "[Service]\nType=simple\nExecStart=/bin/sleep 100\n");
 
         ASSERT_EQ_INT(manager_add_job(m, JOB_START, UNIT(b), NULL), 0);
         ASSERT_EQ_INT(manager_dispatch_run_queue(m), 1);
@@ -1493,8 +1520,12 @@ static void test_forking_pidfile_of_parent_refused(void) {
 
         write_forkd(dir, "early.sh", "#!/bin/sh\necho $$ > \"$1\"\nsetsid sleep 100 &\nexit 0\n");
         snprintf(pidfile, sizeof(pidfile), "%s/early.pid", dir);
-        snprintf(unit, sizeof(unit), "[Unit]\n[Service]\nType=forking\nPIDFile=%s\nExecStart=%s/early.sh %s\n",
-                 pidfile, dir, pidfile);
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Unit]\n[Service]\nType=forking\nPIDFile=%s\nExecStart=%s/early.sh %s\n",
+                 pidfile,
+                 dir,
+                 pidfile);
         s = load_service(m, dir, "fork-early.service", unit);
 
         ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
