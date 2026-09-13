@@ -612,13 +612,13 @@ static void test_read_verbs_against_real_boot(void) {
         ASSERT_TRUE(unitdir != NULL && root != NULL);
 
         ASSERT_EQ_INT(test_write_file(unitdir, "default.target", "[Unit]\nDescription=Default\n"), 0);
-        /* PIDFile=/DynamicUser= are dropped at parse time and must show up
+        /* PrivateTmp=/DynamicUser= are dropped at parse time and must show up
          * in `show`, which is the only place a board's operator can read the
          * degradation record from. User= is honoured and must not. */
         ASSERT_EQ_INT(test_write_file(unitdir,
                                       "console.service",
                                       "[Unit]\nDescription=Console\n[Service]\nType=simple\n"
-                                      "PIDFile=/run/console.pid\nUser=nobody\nDynamicUser=no\n"
+                                      "PrivateTmp=yes\nUser=nobody\nDynamicUser=no\n"
                                       "ExecStart=/bin/sleep 300\n[Install]\nWantedBy=default.target\n"),
                       0);
 
@@ -664,7 +664,7 @@ static void test_read_verbs_against_real_boot(void) {
         ASSERT_TRUE(strstr(res.out, "ActiveState=active\n") != NULL);
         ASSERT_TRUE(strstr(res.out, "SubState=running\n") != NULL);
         ASSERT_TRUE(strstr(res.out, "Description=Console\n") != NULL);
-        ASSERT_TRUE(strstr(res.out, "Degraded-Directives=PIDFile DynamicUser\n") != NULL);
+        ASSERT_TRUE(strstr(res.out, "Degraded-Directives=PrivateTmp DynamicUser\n") != NULL);
         {
                 char expect[64];
 

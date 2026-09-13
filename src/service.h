@@ -5,14 +5,17 @@
  * Service units. service.c implements the state machine, service-exec.c the
  * fork/exec + fd/cgroup setup.
  *
- * Type=simple, oneshot, exec and notify are supported (notify-reload loads
- * as notify with a recorded degradation). oneshot is not a luxury: nearly
- * every real boot-plumbing unit is one, and an init that cannot express "run
- * once, then stay exited" cannot boot an unmodified image. The four differ
- * only in when the start job completes -- simple counts as started the
- * moment the process is forked, exec once execve() has actually succeeded,
- * notify once the process sends READY=1, oneshot not until it has exited
- * successfully.
+ * Type=simple, oneshot, exec, notify and forking are supported
+ * (notify-reload loads as notify with a recorded degradation). oneshot is
+ * not a luxury: nearly every real boot-plumbing unit is one, and an init
+ * that cannot express "run once, then stay exited" cannot boot an
+ * unmodified image. The five differ only in when the start job completes --
+ * simple counts as started the moment the process is forked, exec once
+ * execve() has actually succeeded, notify once the process sends READY=1,
+ * oneshot not until it has exited successfully, forking once the ExecStart=
+ * process has exited successfully (it is a control process, never the main
+ * one) and the daemon it left behind has been found through PIDFile= or, by
+ * GuessMainPID=, as the sole survivor in the unit's cgroup.
  */
 
 #pragma once
@@ -61,6 +64,7 @@ typedef enum ServiceType {
         SERVICE_TYPE_ONESHOT, /* started once it has exited successfully */
         SERVICE_TYPE_EXEC,    /* started once execve() succeeded (exec_fd below) */
         SERVICE_TYPE_NOTIFY,  /* started once the main process sent READY=1 */
+        SERVICE_TYPE_FORKING, /* started once ExecStart= exited 0 and the main pid was located */
         _SERVICE_TYPE_MAX,
         _SERVICE_TYPE_INVALID = -1,
 } ServiceType;
@@ -69,7 +73,8 @@ typedef enum ServiceState {
         SERVICE_DEAD,
         SERVICE_START_PRE,    /* ExecStartPre= running */
         SERVICE_EXEC_START,   /* ExecStart= forked; oneshot: still running, exec: execve()
-                               * not yet confirmed, notify: READY=1 not yet received */
+                               * not yet confirmed, notify: READY=1 not yet received,
+                               * forking: the parent (control_pid) has not exited yet */
         SERVICE_RUNNING,      /* simple: main process up */
         SERVICE_EXITED,       /* main process gone, cgroup empty, clean exit */
         SERVICE_STOP,         /* SIGTERM sent, waiting for exit or TimeoutStopSec */
@@ -117,8 +122,25 @@ typedef struct Service {
         char *user;
         char *group;
 
-        pid_t main_pid;    /* ExecStart= process, 0 when none */
-        pid_t control_pid; /* ExecStartPre= process, 0 when none */
+        pid_t main_pid;    /* ExecStart= process, 0 when none; forking: the daemon left behind */
+        pid_t control_pid; /* ExecStartPre= process, or forking's ExecStart= parent; 0 when none */
+
+        /*
+         * Type=forking's main-pid discovery. pid_file is PIDFile= as
+         * written, absolute (a relative value was prefixed with /run/ at
+         * parse), owned, NULL when unset. guess_main_pid is GuessMainPID=,
+         * default yes: with no PIDFile=, the sole pid left in the cgroup once
+         * the parent has exited is taken as the main process. main_pid_alien
+         * marks a main_pid found either way rather than forked by this
+         * process: its SIGCHLD still arrives (PID 1 inherits every orphan,
+         * and a non-PID-1 manager makes itself a subreaper), but its exit
+         * status is unknowable to anyone else, so a cgroup-empty event with
+         * an alien main pid still set means "gone, status unknown" rather
+         * than "SIGCHLD not yet processed" -- see service_cgroup_empty_event().
+         */
+        char *pid_file;
+        bool guess_main_pid;
+        bool main_pid_alien;
 
         /*
          * The last main-process exit, split rather than a packed waitpid()

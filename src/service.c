@@ -7,7 +7,7 @@
  * cgroup child-side setup. Quarried from systemd's ~2011-era src/service.c
  * (tag v30, commit 501c92c, copyright 2010 Lennart Poettering,
  * GPL-2.0-or-later), reduced to the two-state-machine shape pico-init needs
- * (Type=simple/oneshot, no ExecStop=/ExecStopPost=/watchdog/D-Bus),
+ * (Type=simple/oneshot at first, no ExecStop=/ExecStopPost=/watchdog/D-Bus),
  * with a full history review (v30 -> 2026, ~2299 commits enumerated, ~300
  * read in full) applied on top so the reduction does not re-ship bugs
  * upstream has since fixed. No CVE has ever been assigned against
@@ -64,8 +64,19 @@
  *    arguments that needed them. Restored, not diverged from: see
  *    sigchld_code_to_string() and format_exit_status().
  *
+ *  - v30's Type=forking, quarried later than the rest: ExecStart= runs as
+ *    the control process, its clean exit is the start signal, and the main
+ *    pid is then read from PIDFile= (service_load_pid_file()) or, under
+ *    GuessMainPID=, found as the sole survivor of the cgroup
+ *    (service_search_main_pid()). Two later upstream rules ride along:
+ *    db256aab13 / e1b02726ec -- a PIDFile= pid that is not a member of the
+ *    unit's own cgroup is refused, so a compromised or confused daemon
+ *    cannot point PID 1 at an arbitrary process to SIGTERM on stop; and a
+ *    PIDFile= naming the control process itself (a daemon writing its pid
+ *    *before* forking) is refused rather than adopting a zombie.
+ *
  * Not backported: ExecStop=/ExecStopPost=/ExecReload=, ExecCondition=,
- * Type=forking/dbus/idle, the watchdog, cgroup accounting/resource-control
+ * Type=dbus/idle, the watchdog, cgroup accounting/resource-control
  * directives, D-Bus property change signals -- none of it has a field in
  * service.h, and pico-init's stop path (SIGTERM, then cgroup_v2_kill() on
  * timeout) makes an ExecStop= directive redundant for this MVP's scope.
@@ -79,6 +90,7 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -118,15 +130,16 @@
 
 /*
  * 0 = known dead (we hold no pid for it), >0 = alive/tracked, <0 (-EAGAIN)
- * reserved for a future "pid known but not yet confirmed" case pico-init
- * does not have today (no Type=forking/notify main-pid race exists here --
- * s->main_pid/control_pid are only ever 0 or a pid this process itself
- * forked and has not yet reaped). Kept int rather than bool anyway, per B5:
- * a bool caller cannot later distinguish "positively dead" from "unknown",
- * and that collapse is a real upstream bug class. Deliberately does NOT
- * probe with kill(pid, 0) or /proc/<pid> -- an unreaped zombie is "alive" by
- * either cheap test, which is exactly wrong when called from inside this
- * service's own SIGCHLD handling.
+ * reserved for a "pid known but not yet confirmed" case pico-init does not
+ * have today: s->control_pid is only ever 0 or a pid this process forked
+ * and has not yet reaped, and s->main_pid is that or an alien pid (Type=
+ * forking, MAINPID=) whose SIGCHLD still reaches us as PID 1 or subreaper
+ * (manager.c). Kept int rather than bool anyway, per B5: a bool caller
+ * cannot later distinguish "positively dead" from "unknown", and that
+ * collapse is a real upstream bug class. Deliberately does NOT probe with
+ * kill(pid, 0) or /proc/<pid> -- an unreaped zombie is "alive" by either
+ * cheap test, which is exactly wrong when called from inside this service's
+ * own SIGCHLD handling.
  */
 static int main_pid_good(Service *s) {
         return s->main_pid > 0 ? 1 : 0;
@@ -291,6 +304,177 @@ static int service_ensure_cgroup(Service *s) {
                          strerror(-r));
 
         return 0;
+}
+
+/* 0 if the cgroup is known empty or absent, 1 if it still has members. */
+static int service_cgroup_populated(Service *s) {
+        if (!s->cgroup)
+                return 0;
+
+        return cgroup_v2_is_empty(s->cgroup) == 0 ? 1 : 0;
+}
+
+/* --- Type=forking: locating the main pid once the parent has exited --- */
+
+/* True when pid is listed in the unit's own cgroup.procs. A cgroup that
+ * could not be created (service_ensure_cgroup() failed, logged there) has
+ * no membership to check against, and then the answer is "unknown", which
+ * this reports as false so the caller's refusal message is honest. */
+static bool service_pid_in_cgroup(Service *s, pid_t pid) {
+        pid_t pids[64];
+        size_t n = 0, i;
+
+        if (!s->cgroup)
+                return false;
+
+        if (cgroup_v2_get_pids(s->cgroup, pids, sizeof(pids) / sizeof(pids[0]), &n) < 0)
+                return false;
+
+        for (i = 0; i < n && i < sizeof(pids) / sizeof(pids[0]); i++)
+                if (pids[i] == pid)
+                        return true;
+
+        return false;
+}
+
+/*
+ * Read PIDFile=. 0 with s->main_pid set, -ENOENT/-errno when the file is not
+ * there or unreadable (a forking daemon may legitimately not have written
+ * it yet), -EINVAL for content that is not a pid, -ESRCH for a pid that is
+ * not a live member of this unit's cgroup. Only the first line is read,
+ * and only up to the first non-digit after it, matching parse_pid() on the
+ * output of read_one_line_file() in v30.
+ *
+ * The cgroup membership check is upstream's db256aab13/e1b02726ec: with
+ * User= real, a service running as an unprivileged user could otherwise
+ * write any pid into its own PIDFile= and have PID 1 SIGTERM it on stop.
+ * Membership also rules out the two classic self-inflicted mistakes at once:
+ * the pid of a process that was never ours, and a stale pid from a previous
+ * boot that now belongs to someone else.
+ */
+static int service_load_pid_file(Service *s) {
+        char buf[64];
+        char *end;
+        ssize_t n;
+        long long v;
+        int fd;
+
+        if (!s->pid_file)
+                return -ENOENT;
+
+        fd = open(s->pid_file, O_RDONLY | O_CLOEXEC | O_NOCTTY);
+        if (fd < 0)
+                return -errno;
+
+        n = read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+        if (n < 0)
+                return -errno;
+        if (n == 0)
+                return -EINVAL;
+        buf[n] = '\0';
+
+        errno = 0;
+        v = strtoll(buf, &end, 10);
+        if (errno != 0 || end == buf || v <= 0 || v > INT_MAX)
+                return -EINVAL;
+        if (*end != '\0' && *end != '\n' && *end != ' ' && *end != '\t' && *end != '\r')
+                return -EINVAL;
+
+        if ((pid_t) v == getpid() || (pid_t) v == s->control_pid) {
+                /* The daemon wrote its pid before forking: the control
+                 * process is exactly what has just exited. Adopting it would
+                 * track a zombie as the main process. */
+                pico_log(PICO_LOG_WARNING,
+                         "%s: PIDFile= %s names the process that just exited (pid %d), ignoring",
+                         UNIT(s)->id,
+                         s->pid_file,
+                         (int) v);
+                return -ESRCH;
+        }
+
+        if (!service_pid_in_cgroup(s, (pid_t) v)) {
+                pico_log(PICO_LOG_WARNING,
+                         "%s: PIDFile= %s names pid %d, which is not running in this unit's cgroup, ignoring",
+                         UNIT(s)->id,
+                         s->pid_file,
+                         (int) v);
+                return -ESRCH;
+        }
+
+        s->main_pid = (pid_t) v;
+        s->main_pid_alien = true;
+        pico_log(PICO_LOG_DEBUG, "%s: main pid %d read from %s", UNIT(s)->id, (int) v, s->pid_file);
+        return 0;
+}
+
+/*
+ * GuessMainPID= (v30's cgroup_bonding_search_main_pid()): with exactly one
+ * process left in the cgroup besides the control process that just exited,
+ * that one is the daemon. More than one and there is no way to tell, so
+ * nothing is guessed; the unit then runs with no main pid and its lifetime
+ * is the cgroup's. The control pid is still listed -- it is an unreaped
+ * zombie until manager-loop.c's second waitid() -- which is why it is
+ * excluded by number rather than assumed gone. 0 with s->main_pid set, or
+ * -ENOENT.
+ */
+static int service_search_main_pid(Service *s) {
+        pid_t pids[64];
+        pid_t found = 0;
+        size_t n = 0, i;
+
+        if (!s->guess_main_pid || !s->cgroup)
+                return -ENOENT;
+
+        if (cgroup_v2_get_pids(s->cgroup, pids, sizeof(pids) / sizeof(pids[0]), &n) < 0)
+                return -ENOENT;
+
+        if (n > sizeof(pids) / sizeof(pids[0]))
+                return -ENOENT; /* far more than one candidate: not guessable */
+
+        for (i = 0; i < n; i++) {
+                if (pids[i] == s->control_pid)
+                        continue;
+                if (found != 0)
+                        return -ENOENT; /* two candidates: no guess */
+                found = pids[i];
+        }
+
+        if (found == 0)
+                return -ENOENT;
+
+        s->main_pid = found;
+        s->main_pid_alien = true;
+        pico_log(PICO_LOG_DEBUG, "%s: main pid %d guessed from the cgroup", UNIT(s)->id, (int) found);
+        return 0;
+}
+
+/* The forking parent has exited 0: PIDFile= first, the cgroup guess second,
+ * neither is fatal. Without a main pid the unit is still up as long as its
+ * cgroup is populated (service_enter_running()). */
+static void service_forking_locate_main_pid(Service *s) {
+        int r;
+
+        if (s->pid_file) {
+                r = service_load_pid_file(s);
+                if (r == 0)
+                        return;
+                if (r == -ENOENT)
+                        pico_log(PICO_LOG_INFO, "%s: PIDFile= %s not present after start", UNIT(s)->id, s->pid_file);
+                else if (r == -EINVAL)
+                        pico_log(PICO_LOG_WARNING, "%s: PIDFile= %s does not contain a pid", UNIT(s)->id, s->pid_file);
+                else if (r != -ESRCH)
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s: PIDFile= %s: %s",
+                                 UNIT(s)->id,
+                                 s->pid_file,
+                                 strerror(-r));
+        }
+
+        if (service_search_main_pid(s) == 0)
+                return;
+
+        pico_log(PICO_LOG_INFO, "%s: no main pid known, supervising by cgroup only", UNIT(s)->id);
 }
 
 /* --- start-rate limiting (B7) --- */
@@ -459,10 +643,20 @@ static void service_enter_stop(Service *s) {
         service_exec_fd_close(s); /* a stop while still waiting on execve() */
 
         if (mp <= 0 && cp <= 0) {
-                /* Nothing left to wait for -- skip SERVICE_STOP entirely
+                /* No pid to wait for, but a Type=forking unit whose main pid
+                 * was never found is alive as long as its cgroup is: SIGTERM
+                 * the members and let cgroup-empty (or the stop timeout's
+                 * SIGKILL) finish it. Otherwise skip SERVICE_STOP entirely
                  * rather than arm a timeout for a death that already
                  * happened (or never started at all: a failed fork). */
-                service_enter_dead(s);
+                if (service_cgroup_populated(s) == 0) {
+                        service_enter_dead(s);
+                        return;
+                }
+
+                service_set_state(s, SERVICE_STOP);
+                cgroup_v2_signal(s->cgroup, SIGTERM);
+                service_arm_timeout(s, s->timeout_stop_usec, service_timer_stop_timeout);
                 return;
         }
 
@@ -507,6 +701,15 @@ static void service_enter_running(Service *s) {
                 return;
         }
 
+        /* v30's cgroup_good(): a Type=forking daemon whose main pid could
+         * not be determined is still running for as long as its cgroup has
+         * members; service_cgroup_empty_event() ends it. Only forking --
+         * for every other type a live main pid was never in doubt. */
+        if (s->type == SERVICE_TYPE_FORKING && service_cgroup_populated(s) == 1) {
+                service_set_state(s, SERVICE_RUNNING);
+                return;
+        }
+
         if (s->remain_after_exit) {
                 service_set_state(s, SERVICE_EXITED);
                 return;
@@ -524,7 +727,11 @@ static void service_enter_start(Service *s) {
         service_set_state(s, SERVICE_EXEC_START);
         service_arm_timeout(s, s->timeout_start_usec, service_timer_start_timeout);
 
-        r = service_spawn(s, s->exec_start, &s->main_pid);
+        /* Type=forking: ExecStart= is the control process, exactly as v30
+         * had it. It exits to signal readiness, and the daemon it leaves
+         * behind becomes main_pid only once located
+         * (service_forking_locate_main_pid(), from the SIGCHLD path). */
+        r = service_spawn(s, s->exec_start, s->type == SERVICE_TYPE_FORKING ? &s->control_pid : &s->main_pid);
         if (r < 0) {
                 pico_log(PICO_LOG_ERR, "%s: failed to spawn ExecStart=: %s", UNIT(s)->id, strerror(-r));
                 if (s->result == SERVICE_SUCCESS)
@@ -561,7 +768,8 @@ static void service_enter_start(Service *s) {
         /* "simple counts as started the moment the process is forked" (see
          * this file's own top-of-header comment). oneshot stays here until
          * the process exits, exec until service_exec_fd_cb() sees the
-         * execve() go through, notify until service_notify_ready(). */
+         * execve() go through, notify until service_notify_ready(), forking
+         * until the control process exits cleanly. */
         if (s->type == SERVICE_TYPE_SIMPLE)
                 service_enter_running(s);
 }
@@ -625,6 +833,7 @@ static void service_do_start(Service *s) {
         s->notify_ready = false;
         s->status_text = pico_mfree(s->status_text);
         s->status_errno = 0;
+        s->main_pid_alien = false;
 
         r = service_ensure_cgroup(s);
         if (r < 0)
@@ -820,16 +1029,31 @@ void service_sigchld_event(Service *s, pid_t pid, int code, int status) {
                  service_result_to_string(s->result));
 
         if (is_control) {
-                s->control_pid = 0;
-
                 if (s->state == SERVICE_START_PRE) {
+                        s->control_pid = 0;
                         if (f == SERVICE_SUCCESS)
                                 service_enter_start(s);
                         else
                                 service_enter_stop(s);
+                } else if (s->state == SERVICE_EXEC_START && s->type == SERVICE_TYPE_FORKING) {
+                        /*
+                         * The whole point of forking: the parent exiting IS
+                         * the start completing, never a failure by itself.
+                         * Its exit status still decides whether the start
+                         * worked (a daemon that could not bind its port
+                         * exits non-zero before ever forking). control_pid
+                         * stays set through the search so the pid-file and
+                         * cgroup checks can exclude the zombie by number.
+                         */
+                        if (f == SERVICE_SUCCESS)
+                                service_forking_locate_main_pid(s);
+                        s->control_pid = 0;
+                        service_enter_running(s); /* s->result routes the failure case */
                 } else if (s->state == SERVICE_STOP && main_pid_good(s) == 0) {
+                        s->control_pid = 0;
                         service_enter_dead(s);
-                }
+                } else
+                        s->control_pid = 0;
                 return;
         }
 
@@ -889,8 +1113,36 @@ void service_cgroup_empty_event(Service *s) {
          * sign the service is done), and doing anything here would be
          * racing our own other event source (abaf5edd08).
          */
-        if (main_pid_good(s) != 0 || control_pid_good(s) != 0)
+        if (control_pid_good(s) != 0)
                 return;
+
+        if (main_pid_good(s) != 0) {
+                /*
+                 * An alien main pid (Type=forking, MAINPID=) is not one this
+                 * process forked; its SIGCHLD still arrives as PID 1 or as
+                 * the subreaper manager.c makes a non-PID-1 manager, and
+                 * that SIGCHLD carries the exit status this event cannot
+                 * (abaf5edd08 above) -- so as long as the pid still exists,
+                 * as a zombie awaiting our own reap, wait for it exactly as
+                 * for a child of ours. Only a pid that no longer exists at
+                 * all was reaped by a foreign init and will never be
+                 * reported here: then it is gone with an unknowable status,
+                 * and s->result is left untouched. A liveness probe is safe
+                 * in this path precisely because it is not SIGCHLD handling
+                 * (manager-loop.c): the zombie answer is the wanted one.
+                 */
+                if (!s->main_pid_alien)
+                        return;
+                if (kill(s->main_pid, 0) == 0 || errno == EPERM)
+                        return;
+
+                pico_log(PICO_LOG_DEBUG,
+                         "%s: cgroup empty and main pid %d (not our child) already reaped elsewhere, exit status unknown",
+                         UNIT(s)->id,
+                         (int) s->main_pid);
+                s->main_pid = 0;
+                s->main_pid_alien = false;
+        }
 
         switch (s->state) {
         case SERVICE_START_PRE:
@@ -1032,6 +1284,7 @@ static const char * const service_type_table[_SERVICE_TYPE_MAX] = {
         [SERVICE_TYPE_ONESHOT] = "oneshot",
         [SERVICE_TYPE_EXEC] = "exec",
         [SERVICE_TYPE_NOTIFY] = "notify",
+        [SERVICE_TYPE_FORKING] = "forking",
 };
 
 const char *service_type_to_string(ServiceType t) {
@@ -1104,6 +1357,7 @@ static void service_init(Unit *u) {
         s->start_limit_interval = PICO_START_LIMIT_INTERVAL_USEC;
         s->start_limit_burst = PICO_START_LIMIT_BURST;
         s->exec_fd = -1;
+        s->guess_main_pid = true; /* GuessMainPID= defaults to yes */
 }
 
 /*
@@ -1119,6 +1373,7 @@ static void service_done(Unit *u) {
         s->exec_start_pre = pico_strv_free(s->exec_start_pre);
         s->user = pico_mfree(s->user);
         s->group = pico_mfree(s->group);
+        s->pid_file = pico_mfree(s->pid_file);
         s->status_text = pico_mfree(s->status_text);
 
         /*

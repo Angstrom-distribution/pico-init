@@ -88,12 +88,22 @@ UNIT
 
 cat > "$tree/system/forking.service" <<'UNIT'
 [Unit]
-Description=Refused type
+Description=Implemented type, honoured in full
 
 [Service]
 Type=forking
 PIDFile=/run/forking.pid
+GuessMainPID=no
 ExecStart=/usr/sbin/forkingd
+UNIT
+
+cat > "$tree/system/refused.service" <<'UNIT'
+[Unit]
+Description=Refused type
+
+[Service]
+Type=daemon
+ExecStart=/usr/sbin/refusedd
 UNIT
 
 out=$("$lint" "$tree/system" 2>/dev/null) && rc=0 || rc=$?
@@ -110,8 +120,8 @@ expect() {
 expect "iiotool.service: 14 dropped: DynamicUser NoNewPrivileges PrivateTmp PrivateDevices ProtectSystem ProtectHome ProtectKernelTunables ProtectControlGroups RestrictAddressFamilies RestrictNamespaces SystemCallFilter MemoryHigh MemoryMax TasksMax"
 expect "volatile-binds@.service: 5 dropped: DefaultDependencies RequiresMountsFor ConditionPathIsReadWrite Environment ExecStop"
 expect "cond.service: 1 dropped: ConditionPathExists=!"
-expect "forking.service: FAILED TO LOAD"
-expect "pico-unit-lint: 5 units in tree, 3 degraded (20 directives dropped), 1 failed to load"
+expect "refused.service: FAILED TO LOAD"
+expect "pico-unit-lint: 6 units in tree, 3 degraded (20 directives dropped), 1 failed to load"
 
 # network.target and multi-user.target were referenced, never in the tree,
 # and must not be reported as anything.
@@ -120,8 +130,8 @@ if printf '%s\n' "$out" | grep -q "network.target\|multi-user.target\|local-fs.t
         exit 1
 fi
 
-# the clean unit appears only under --verbose
-if printf '%s\n' "$out" | grep -q "^clean.service"; then
+# the clean units appear only under --verbose
+if printf '%s\n' "$out" | grep -q "^clean.service\|^forking.service"; then
         echo "clean unit reported without --verbose" >&2
         exit 1
 fi
@@ -132,6 +142,10 @@ fi
 
 "$lint" --verbose "$tree/system" 2>/dev/null | grep -qxF "clean.service: ok" || {
         echo "--verbose did not list the clean unit" >&2
+        exit 1
+}
+"$lint" --verbose "$tree/system" 2>/dev/null | grep -qxF "forking.service: ok" || {
+        echo "--verbose did not list the forking unit as clean" >&2
         exit 1
 }
 

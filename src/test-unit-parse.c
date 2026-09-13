@@ -276,7 +276,10 @@ static void test_degradation_record(void) {
         ASSERT_STREQ(((Service *) u)->user, "rich");
         ASSERT_STREQ(((Service *) u)->group, "rich");
 
-        ASSERT_EQ_INT(u->n_degraded_directives, 9);
+        /* PIDFile= likewise: stored for Type=forking, never a drop. */
+        ASSERT_STREQ(((Service *) u)->pid_file, "/run/richd.pid");
+
+        ASSERT_EQ_INT(u->n_degraded_directives, 8);
         ASSERT_STREQ(u->degraded_directives[0], "ConditionPathExists=!");
         ASSERT_STREQ(u->degraded_directives[1], "EnvironmentFile");
         ASSERT_STREQ(u->degraded_directives[2], "Environment");
@@ -284,19 +287,18 @@ static void test_degradation_record(void) {
         ASSERT_STREQ(u->degraded_directives[4], "ExecStart=@");
         ASSERT_STREQ(u->degraded_directives[5], "ExecStop");
         ASSERT_STREQ(u->degraded_directives[6], "ExecReload");
-        ASSERT_STREQ(u->degraded_directives[7], "PIDFile");
-        ASSERT_STREQ(u->degraded_directives[8], "Alias");
-        ASSERT_TRUE(u->degraded_directives[9] == NULL);
+        ASSERT_STREQ(u->degraded_directives[7], "Alias");
+        ASSERT_TRUE(u->degraded_directives[8] == NULL);
 
         joined = unit_degraded_directives_string(u);
         ASSERT_STREQ(joined,
                      "ConditionPathExists=! EnvironmentFile Environment ExecStartPre=multiple "
-                     "ExecStart=@ ExecStop ExecReload PIDFile Alias");
+                     "ExecStart=@ ExecStop ExecReload Alias");
         free(joined);
 
         /* a second identical drop is not a second entry */
-        ASSERT_EQ_INT(unit_add_degradation(u, "PIDFile"), 0);
-        ASSERT_EQ_INT(u->n_degraded_directives, 9);
+        ASSERT_EQ_INT(unit_add_degradation(u, "Alias"), 0);
+        ASSERT_EQ_INT(u->n_degraded_directives, 8);
 
         ASSERT_EQ_INT(clean->load_state, UNIT_LOADED);
         ASSERT_EQ_INT(clean->n_degraded_directives, 0);
@@ -1119,10 +1121,67 @@ static void test_type_values(void) {
         free(degraded);
 
         u = load_one(m, "forking.service");
-        ASSERT_EQ_INT(u->load_state, UNIT_ERROR);
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        ASSERT_EQ_INT(((Service *) u)->type, SERVICE_TYPE_FORKING);
+        ASSERT_EQ_INT(u->n_degraded_directives, 0);
 
         u = load_one(m, "bogus.service");
         ASSERT_EQ_INT(u->load_state, UNIT_ERROR);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * Type=forking's own directives: PIDFile= takes the full specifier table
+ * and a relative path lands under /run/ (systemd since v237); an empty
+ * value resets it. GuessMainPID= defaults to yes.
+ */
+static void test_forking_directives(void) {
+        Manager *m;
+        char *dir;
+        Unit *u;
+        Service *s;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "pf-abs.service",
+                                      "[Service]\nType=forking\nPIDFile=/run/%n.pid\nExecStart=/bin/true\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "pf-rel.service",
+                                      "[Service]\nType=forking\nPIDFile=pf/%p.pid\nGuessMainPID=no\n"
+                                      "ExecStart=/bin/true\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "pf-reset.service",
+                                      "[Service]\nType=forking\nPIDFile=/run/x.pid\nPIDFile=\n"
+                                      "GuessMainPID=bogus\nExecStart=/bin/true\n"),
+                      0);
+
+        m = manager_for(dir);
+
+        u = load_one(m, "pf-abs.service");
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        s = (Service *) u;
+        ASSERT_STREQ(s->pid_file, "/run/pf-abs.service.pid");
+        ASSERT_EQ_INT(s->guess_main_pid, true);
+
+        u = load_one(m, "pf-rel.service");
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        s = (Service *) u;
+        ASSERT_STREQ(s->pid_file, "/run/pf/pf-rel.pid");
+        ASSERT_EQ_INT(s->guess_main_pid, false);
+
+        u = load_one(m, "pf-reset.service");
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        s = (Service *) u;
+        ASSERT_TRUE(s->pid_file == NULL);
+        ASSERT_EQ_INT(s->guess_main_pid, true); /* an invalid value is ignored, not applied */
+        ASSERT_EQ_INT(u->n_degraded_directives, 0);
 
         manager_free(m);
         test_rm_rf(dir);
@@ -1152,6 +1211,7 @@ int main(void) {
         test_shipped_ttygs0_unit_is_unchanged();
         test_shipped_ttygs0_unit_wins_over_template();
         test_type_values();
+        test_forking_directives();
 
         printf("test-unit-parse: all checks passed\n");
         return 0;

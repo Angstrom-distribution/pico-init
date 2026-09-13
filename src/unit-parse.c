@@ -577,6 +577,8 @@ static int config_parse_type(Unit *u, const char *path, unsigned line, const cha
                 s->type = SERVICE_TYPE_EXEC;
         else if (strcmp(rvalue, "notify") == 0)
                 s->type = SERVICE_TYPE_NOTIFY;
+        else if (strcmp(rvalue, "forking") == 0)
+                s->type = SERVICE_TYPE_FORKING;
         else if (strcmp(rvalue, "notify-reload") == 0) {
                 /* Everything notify-reload adds over notify is a reload
                  * protocol, and neither ExecReload= nor a reload verb exists
@@ -591,13 +593,13 @@ static int config_parse_type(Unit *u, const char *path, unsigned line, const cha
         } else {
                 /*
                  * Still a hard failure rather than a dropped directive:
-                 * forking/dbus/idle each change *when* a service counts as
-                 * started, so silently running one as simple would report
-                 * the unit up before it actually is, and everything ordered
-                 * After= it would then start too early. Refusing is safer.
+                 * dbus/idle each change *when* a service counts as started,
+                 * so silently running one as simple would report the unit
+                 * up before it actually is, and everything ordered After=
+                 * it would then start too early. Refusing is safer.
                  */
                 pico_log(PICO_LOG_ERR,
-                         "%s:%u: Type=%s is not supported (simple, oneshot, exec, notify, notify-reload are), failing unit",
+                         "%s:%u: Type=%s is not supported (simple, oneshot, exec, notify, notify-reload, forking are), failing unit",
                          path,
                          line,
                          rvalue);
@@ -648,6 +650,69 @@ static int config_parse_remain_after_exit(
         }
 
         s->remain_after_exit = b;
+        return 0;
+}
+
+/*
+ * PIDFile=: the full specifier table (a path, so %I's unescaped '/' is
+ * wanted), and a relative value is taken under /run/ as systemd has done
+ * since v237. Only the shape is checked here; the file is read after the
+ * forking parent exits (service.c), never at load. An empty value resets.
+ */
+static int config_parse_pid_file(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        Service *s = unit_to_service(u, path, line);
+        char *expanded = NULL;
+        char *full;
+        int r;
+        (void) lvalue;
+
+        if (!s)
+                return 0;
+
+        if (!*rvalue) {
+                s->pid_file = pico_mfree(s->pid_file);
+                return 0;
+        }
+
+        r = unit_full_printf(u, rvalue, &expanded);
+        if (r < 0)
+                return r;
+
+        if (expanded[0] == '/')
+                full = expanded;
+        else {
+                size_t len = strlen(expanded) + sizeof("/run/");
+
+                full = malloc(len);
+                if (!full) {
+                        pico_mfree(expanded);
+                        return -ENOMEM;
+                }
+                snprintf(full, len, "/run/%s", expanded);
+                pico_mfree(expanded);
+        }
+
+        pico_mfree(s->pid_file);
+        s->pid_file = full;
+        return 0;
+}
+
+static int config_parse_guess_main_pid(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        Service *s = unit_to_service(u, path, line);
+        bool b;
+        (void) lvalue;
+
+        if (!s)
+                return 0;
+
+        if (parse_boolean_value(rvalue, &b) < 0) {
+                pico_log(PICO_LOG_WARNING, "%s:%u: invalid GuessMainPID= value '%s', ignoring", path, line, rvalue);
+                return 0;
+        }
+
+        s->guess_main_pid = b;
         return 0;
 }
 
@@ -1160,6 +1225,8 @@ static const ConfigItem config_items[] = {
         { SECTION_SERVICE,           "TimeoutStopSec",            config_parse_timeout_stop_sec },
         { SECTION_SERVICE,                     "User",                  config_parse_user_group },
         { SECTION_SERVICE,                    "Group",                  config_parse_user_group },
+        { SECTION_SERVICE,                  "PIDFile",                    config_parse_pid_file },
+        { SECTION_SERVICE,             "GuessMainPID",              config_parse_guess_main_pid },
         {  SECTION_SOCKET,             "ListenStream",               config_parse_listen_stream },
         {  SECTION_SOCKET,           "ListenDatagram",             config_parse_listen_datagram },
         {  SECTION_SOCKET,                  "Service",              config_parse_socket_service },

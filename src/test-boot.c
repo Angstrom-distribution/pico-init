@@ -45,8 +45,8 @@ static const char *sysinit_service =
                 "RemainAfterExit=yes\n"
                 "ExecStart=/bin/true\n";
 
-/* A long-running unit, ordered after the plumbing. PIDFile= is dropped by
- * the parser, so this is also the one degraded unit the boot summary counts. */
+/* A long-running unit, ordered after the plumbing. PrivateTmp= is dropped
+ * by the parser, so this is also the one degraded unit the boot summary counts. */
 static const char *console_service =
                 "[Unit]\n"
                 "Description=Console\n"
@@ -54,7 +54,7 @@ static const char *console_service =
                 "\n"
                 "[Service]\n"
                 "Type=simple\n"
-                "PIDFile=/run/console.pid\n"
+                "PrivateTmp=yes\n"
                 "ExecStart=/bin/sleep 300\n"
                 "\n"
                 "[Install]\n"
@@ -229,11 +229,11 @@ int main(void) {
         ASSERT_TRUE(console->job == NULL);
 
         /* the boot settled, so the one-line degradation summary went out,
-         * counting console.service's dropped PIDFile= and nothing else */
+         * counting console.service's dropped PrivateTmp= and nothing else */
         ASSERT_TRUE(m->degradation_summary_logged);
         ASSERT_EQ_INT(manager_count_degraded_units(m), 1);
         ASSERT_EQ_INT(console->n_degraded_directives, 1);
-        ASSERT_STREQ(console->degraded_directives[0], "PIDFile");
+        ASSERT_STREQ(console->degraded_directives[0], "PrivateTmp");
         ASSERT_EQ_INT(sysinit->n_degraded_directives, 0);
 
         /* --- shut it down again --- */

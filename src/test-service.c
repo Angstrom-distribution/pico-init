@@ -32,6 +32,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -1248,6 +1249,270 @@ static void test_notify_exit_before_ready_is_protocol_failure(void) {
         free(rtdir);
 }
 
+/* --- Type=forking --- */
+
+/*
+ * A stand-in for a daemonizing service: forks a long-lived child and exits,
+ * optionally writing a pid to $1 first. A script rather than an inline
+ * sh -c so the unit file stays a plain ExecStart= with no quoting in play.
+ *
+ * The child is started under setsid, as daemon(3) and start-stop-daemon
+ * --background do: pico-init hands every service the console as its
+ * controlling tty (service-exec.c, step 9), so a forking parent is a
+ * session leader and its exit SIGHUPs whatever it left in its own session.
+ * A daemon that does not detach from the session it was started in is
+ * broken under a real getty too; this is not the case being tested.
+ */
+static void write_forkd(const char *dir, const char *name, const char *body) {
+        char path[PATH_MAX];
+
+        ASSERT_EQ_INT(test_write_file(dir, name, body), 0);
+        snprintf(path, sizeof(path), "%s/%s", dir, name);
+        ASSERT_EQ_INT(chmod(path, 0755), 0);
+}
+
+static pid_t read_pid_file(const char *path) {
+        FILE *f = fopen(path, "r");
+        long v = 0;
+
+        ASSERT_TRUE(f != NULL);
+        ASSERT_EQ_INT(fscanf(f, "%ld", &v), 1);
+        fclose(f);
+        return (pid_t) v;
+}
+
+/*
+ * The forking contract, PIDFile= flavour: the start job (and everything
+ * After= it) stays open until the ExecStart= parent exits, and its exit is
+ * the start completing rather than the service dying. The daemon it left
+ * behind is then the main pid, read from the file, and is what a stop
+ * signals.
+ */
+static void test_forking_pidfile_gates_activation(void) {
+        Manager *m;
+        Service *a, *b;
+        char *dir;
+        char unit[PATH_MAX * 3 + 128]; /* three paths go in */
+        char pidfile[PATH_MAX];
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        write_forkd(dir, "forkd.sh", "#!/bin/sh\nsetsid sleep 100 &\necho $! > \"$1\"\nexit 0\n");
+        snprintf(pidfile, sizeof(pidfile), "%s/a.pid", dir);
+        snprintf(unit, sizeof(unit), "[Unit]\n[Service]\nType=forking\nPIDFile=%s\nExecStart=%s/forkd.sh %s\n",
+                 pidfile, dir, pidfile);
+        a = load_service(m, dir, "fork-a.service", unit);
+        b = load_service(m,
+                         dir,
+                         "fork-b.service",
+                         "[Unit]\nRequires=fork-a.service\nAfter=fork-a.service\n"
+                         "[Service]\nType=simple\nExecStart=/bin/sleep 100\n");
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, UNIT(b), NULL), 0);
+        ASSERT_EQ_INT(manager_dispatch_run_queue(m), 1);
+
+        /* The parent is a control process, not the main one, and nothing
+         * is started yet. */
+        ASSERT_EQ_INT(a->state, SERVICE_EXEC_START);
+        ASSERT_EQ_INT(unit_active_state(UNIT(a)), UNIT_ACTIVATING);
+        ASSERT_TRUE(a->control_pid > 0);
+        ASSERT_EQ_INT(a->main_pid, 0);
+        ASSERT_TRUE(UNIT(a)->job != NULL);
+        ASSERT_EQ_INT(b->state, SERVICE_DEAD);
+
+        ASSERT_TRUE(drive_until(m, service_running_done, b, 400));
+
+        ASSERT_EQ_INT(a->state, SERVICE_RUNNING);
+        ASSERT_EQ_INT(unit_active_state(UNIT(a)), UNIT_ACTIVE);
+        ASSERT_EQ_INT(a->control_pid, 0);
+        ASSERT_TRUE(a->main_pid > 0);
+        ASSERT_EQ_INT(a->main_pid, read_pid_file(pidfile));
+        ASSERT_EQ_INT(a->main_pid_alien, true);
+        ASSERT_TRUE(UNIT(a)->job == NULL);
+        ASSERT_TRUE(b->main_pid > 0);
+
+        ASSERT_EQ_INT(unit_stop(UNIT(b)), 0);
+        ASSERT_EQ_INT(unit_stop(UNIT(a)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, a, 400));
+        ASSERT_TRUE(drive_until(m, service_settled_done, b, 400));
+        ASSERT_EQ_INT(a->state, SERVICE_DEAD);
+        ASSERT_EQ_INT(a->result, SERVICE_SUCCESS); /* SIGTERM on the daemon: clean, alien or not */
+        ASSERT_EQ_INT(a->main_pid, 0);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* No PIDFile=: GuessMainPID= (default yes) takes the one process left in
+ * the cgroup once the parent is gone. */
+static void test_forking_guess_main_pid_from_cgroup(void) {
+        Manager *m;
+        Service *s;
+        char *dir;
+        char unit[PATH_MAX * 2];
+        char comm_path[64];
+        char comm[32] = "";
+        FILE *f;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        write_forkd(dir, "forkd.sh", "#!/bin/sh\nsetsid sleep 100 &\nexit 0\n");
+        snprintf(unit, sizeof(unit), "[Unit]\n[Service]\nType=forking\nExecStart=%s/forkd.sh\n", dir);
+        s = load_service(m, dir, "fork-guess.service", unit);
+
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        ASSERT_EQ_INT(s->state, SERVICE_EXEC_START);
+        ASSERT_TRUE(drive_until(m, service_running_done, s, 400));
+
+        ASSERT_TRUE(s->main_pid > 0);
+        ASSERT_EQ_INT(s->main_pid_alien, true);
+        snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", (int) s->main_pid);
+        f = fopen(comm_path, "r");
+        ASSERT_TRUE(f != NULL);
+        ASSERT_TRUE(fgets(comm, sizeof(comm), f) != NULL);
+        fclose(f);
+        ASSERT_STREQ(comm, "sleep\n");
+
+        ASSERT_EQ_INT(unit_stop(UNIT(s)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, s, 400));
+        ASSERT_EQ_INT(s->state, SERVICE_DEAD);
+        ASSERT_EQ_INT(s->result, SERVICE_SUCCESS);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* The parent exiting non-zero is the one way a forking start fails: the
+ * unit goes FAILED, the dependent's job is cancelled, nothing After= it
+ * ever forks. */
+static void test_forking_parent_failure_fails_start(void) {
+        Manager *m;
+        Service *a, *b;
+        char *dir;
+        char unit[PATH_MAX * 2];
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        write_forkd(dir, "failfork.sh", "#!/bin/sh\nexit 3\n");
+        snprintf(unit, sizeof(unit), "[Unit]\n[Service]\nType=forking\nExecStart=%s/failfork.sh\n", dir);
+        a = load_service(m, dir, "fork-fail.service", unit);
+        b = load_service(m,
+                         dir,
+                         "fork-dep.service",
+                         "[Unit]\nRequires=fork-fail.service\nAfter=fork-fail.service\n"
+                         "[Service]\nType=simple\nExecStart=/bin/sleep 100\n");
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, UNIT(b), NULL), 0);
+        ASSERT_EQ_INT(manager_dispatch_run_queue(m), 1);
+        ASSERT_TRUE(drive_until(m, service_settled_done, a, 400));
+
+        ASSERT_EQ_INT(a->state, SERVICE_FAILED);
+        ASSERT_EQ_INT(a->result, SERVICE_FAILURE_EXIT_CODE);
+        ASSERT_EQ_INT(a->main_pid, 0);
+        ASSERT_EQ_INT(a->control_pid, 0);
+        ASSERT_EQ_INT(b->state, SERVICE_DEAD);
+        ASSERT_EQ_INT(b->main_pid, 0);
+        ASSERT_TRUE(UNIT(b)->job == NULL);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * A PIDFile= naming a pid outside the unit's cgroup is refused (pid 1 here:
+ * alive, root-owned, and exactly what a confused or hostile daemon would
+ * love PID 1 to SIGTERM on stop). With GuessMainPID=no there is then no main
+ * pid at all -- and the unit is still running, because its cgroup is, and a
+ * stop still reaches the daemon through the cgroup rather than declaring
+ * the unit dead with the daemon alive.
+ */
+static void test_forking_pidfile_outside_cgroup_refused(void) {
+        Manager *m;
+        Service *s;
+        char *dir;
+        char unit[PATH_MAX * 3 + 128]; /* three paths go in */
+        char pidfile[PATH_MAX];
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        write_forkd(dir, "liar.sh", "#!/bin/sh\nsetsid sleep 100 &\necho 1 > \"$1\"\nexit 0\n");
+        snprintf(pidfile, sizeof(pidfile), "%s/liar.pid", dir);
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Unit]\n[Service]\nType=forking\nGuessMainPID=no\nPIDFile=%s\nExecStart=%s/liar.sh %s\n",
+                 pidfile,
+                 dir,
+                 pidfile);
+        s = load_service(m, dir, "fork-liar.service", unit);
+
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        ASSERT_TRUE(drive_until(m, service_running_done, s, 400));
+
+        ASSERT_EQ_INT(s->state, SERVICE_RUNNING);
+        ASSERT_EQ_INT(s->main_pid, 0);
+        ASSERT_EQ_INT(s->main_pid_alien, false);
+        ASSERT_TRUE(s->cgroup != NULL);
+        ASSERT_EQ_INT(cgroup_v2_is_empty(s->cgroup), 0);
+
+        ASSERT_EQ_INT(unit_stop(UNIT(s)), 0);
+        ASSERT_EQ_INT(s->state, SERVICE_STOP); /* not DEAD: the daemon is still there to stop */
+        ASSERT_TRUE(drive_until(m, service_settled_done, s, 400));
+        ASSERT_EQ_INT(s->state, SERVICE_DEAD);
+        ASSERT_EQ_INT(s->result, SERVICE_SUCCESS);
+        ASSERT_EQ_INT(cgroup_v2_is_empty(s->cgroup), 1);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* A daemon that writes its pid *before* forking names the very process
+ * that has just exited. That is refused rather than adopting a zombie, and
+ * the guess then finds the real daemon. */
+static void test_forking_pidfile_of_parent_refused(void) {
+        Manager *m;
+        Service *s;
+        char *dir;
+        char unit[PATH_MAX * 3 + 128]; /* three paths go in */
+        char pidfile[PATH_MAX];
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        write_forkd(dir, "early.sh", "#!/bin/sh\necho $$ > \"$1\"\nsetsid sleep 100 &\nexit 0\n");
+        snprintf(pidfile, sizeof(pidfile), "%s/early.pid", dir);
+        snprintf(unit, sizeof(unit), "[Unit]\n[Service]\nType=forking\nPIDFile=%s\nExecStart=%s/early.sh %s\n",
+                 pidfile, dir, pidfile);
+        s = load_service(m, dir, "fork-early.service", unit);
+
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        ASSERT_TRUE(drive_until(m, service_running_done, s, 400));
+
+        ASSERT_TRUE(s->main_pid > 0);
+        ASSERT_TRUE(s->main_pid != read_pid_file(pidfile));
+
+        ASSERT_EQ_INT(unit_stop(UNIT(s)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, s, 400));
+        ASSERT_EQ_INT(s->state, SERVICE_DEAD);
+        ASSERT_EQ_INT(s->result, SERVICE_SUCCESS);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
         test_lifecycle_simple();
         test_oneshot_completes_only_on_exit();
@@ -1267,6 +1532,11 @@ int main(void) {
         test_notify_ready_gates_activation();
         test_notify_timeout_without_ready();
         test_notify_exit_before_ready_is_protocol_failure();
+        test_forking_pidfile_gates_activation();
+        test_forking_guess_main_pid_from_cgroup();
+        test_forking_parent_failure_fails_start();
+        test_forking_pidfile_outside_cgroup_refused();
+        test_forking_pidfile_of_parent_refused();
 
         printf("test-service: all checks passed\n");
         return 0;
