@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <unistd.h>
 
 #include "manager-ctrl.h"
@@ -150,6 +151,17 @@ int manager_new(Manager **ret) {
          * re-checked all over the place; it also decides whether leaving the
          * loop is even a legal outcome (see main.c). */
         m->is_system = getpid() == 1;
+
+        /*
+         * PID 1 inherits every orphan, and the state machine relies on that:
+         * a Type=forking daemon's grandchild (or a MAINPID= from sd_notify)
+         * is a pid this process never forked, and its death is still learnt
+         * by SIGCHLD. Anywhere else (tests, a container as non-PID-1) the
+         * orphan would go to the real init instead, so become the subreaper
+         * for the subtree. Best-effort, as for user managers upstream.
+         */
+        if (!m->is_system)
+                (void) prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
 
         r = manager_set_unit_path(m, default_unit_path);
         if (r < 0)
