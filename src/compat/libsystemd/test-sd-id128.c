@@ -87,14 +87,14 @@ static void test_to_string(void) {
         sd_id128_t id = ID_EXPECT;
         char buf[SD_ID128_STRING_MAX];
         char ubuf[SD_ID128_UUID_STRING_MAX];
-        char *volatile null_buf = NULL; /* volatile, not just a variable: the real
-                                * armv5te cross-compiler's constant propagation still
-                                * proves a plain local is NULL at -Os and raises the
-                                * same -Wnonnull anyway. volatile blocks that proof
-                                * regardless of optimization level, even though the
-                                * whole point here is exercising this
-                                * shim's own defensive runtime check for the case a
-                                * real, non-constant caller bug would produce. */
+        char * volatile null_buf = NULL; /* volatile, not just a variable: the real
+                                          * armv5te cross-compiler's constant propagation still
+                                          * proves a plain local is NULL at -Os and raises the
+                                          * same -Wnonnull anyway. volatile blocks that proof
+                                          * regardless of optimization level, even though the
+                                          * whole point here is exercising this
+                                          * shim's own defensive runtime check for the case a
+                                          * real, non-constant caller bug would produce. */
 
         ASSERT_TRUE(sd_id128_to_string(id, buf) == buf);
         ASSERT_STREQ(buf, ID_EXPECT_PLAIN_STR);

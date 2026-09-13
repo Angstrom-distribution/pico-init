@@ -123,7 +123,8 @@ struct udev_list_entry *libudev_list_add(struct udev_list *list, const char *nam
 }
 
 static int cmp_entry(const void *a, const void *b) {
-        return strcmp((*(struct udev_list_entry * const *) a)->name, (*(struct udev_list_entry * const *) b)->name);
+        return strcmp((*(struct udev_list_entry * const *) a)->name,
+                      (*(struct udev_list_entry * const *) b)->name);
 }
 
 struct udev_list_entry *libudev_list_first(struct udev_list *list) {

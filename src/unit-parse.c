@@ -708,7 +708,11 @@ static int config_parse_guess_main_pid(
                 return 0;
 
         if (parse_boolean_value(rvalue, &b) < 0) {
-                pico_log(PICO_LOG_WARNING, "%s:%u: invalid GuessMainPID= value '%s', ignoring", path, line, rvalue);
+                pico_log(PICO_LOG_WARNING,
+                         "%s:%u: invalid GuessMainPID= value '%s', ignoring",
+                         path,
+                         line,
+                         rvalue);
                 return 0;
         }
 

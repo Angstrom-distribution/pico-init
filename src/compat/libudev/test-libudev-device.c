@@ -59,7 +59,8 @@ static void setup(void) {
         /* platform/foo (driver foodrv, no node) -> foo/bar1 (block disk, node /dev/bar1) */
         mkpath(g_sys, "sys/devices/platform/foo/bar1");
         ASSERT_EQ_INT(test_write_file(g_sys, "sys/devices/platform/foo/uevent", "DRIVER=foodrv\n"), 0);
-        ASSERT_EQ_INT(test_write_file(g_sys, "sys/devices/platform/foo/bar1/uevent",
+        ASSERT_EQ_INT(test_write_file(g_sys,
+                                      "sys/devices/platform/foo/bar1/uevent",
                                       "MAJOR=8\nMINOR=1\nDEVNAME=bar1\nDEVTYPE=disk\nID_TEST=fixture\n"),
                       0);
         ASSERT_EQ_INT(test_write_file(g_sys, "sys/devices/platform/foo/bar1/size", "2048\n"), 0);
@@ -68,8 +69,12 @@ static void setup(void) {
         mkpath(g_sys, "sys/class/block");
         mkpath(g_sys, "sys/dev/block");
         ASSERT_EQ_INT(test_symlink(g_sys, "sys/devices/platform/foo/subsystem", "../../../bus/platform"), 0);
-        ASSERT_EQ_INT(test_symlink(g_sys, "sys/devices/platform/foo/driver", "../../../bus/platform/drivers/foodrv"), 0);
-        ASSERT_EQ_INT(test_symlink(g_sys, "sys/devices/platform/foo/bar1/subsystem", "../../../../class/block"), 0);
+        ASSERT_EQ_INT(test_symlink(g_sys,
+                                   "sys/devices/platform/foo/driver",
+                                   "../../../bus/platform/drivers/foodrv"),
+                      0);
+        ASSERT_EQ_INT(test_symlink(g_sys, "sys/devices/platform/foo/bar1/subsystem", "../../../../class/block"),
+                      0);
         ASSERT_EQ_INT(test_symlink(g_sys, "sys/class/block/bar1", "../../devices/platform/foo/bar1"), 0);
         ASSERT_EQ_INT(test_symlink(g_sys, "sys/dev/block/8:1", "../../devices/platform/foo/bar1"), 0);
 

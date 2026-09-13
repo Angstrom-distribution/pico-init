@@ -111,8 +111,9 @@ int udev_enumerate_add_match_subsystem(struct udev_enumerate *udev_enumerate, co
                 return -EINVAL;
         if (!subsystem)
                 return 0;
-        return match_done(udev_enumerate,
-                          sd_device_enumerator_add_match_subsystem(udev_enumerate->enumerator, subsystem, 1));
+        return match_done(
+                        udev_enumerate,
+                        sd_device_enumerator_add_match_subsystem(udev_enumerate->enumerator, subsystem, 1));
 }
 
 int udev_enumerate_add_nomatch_subsystem(struct udev_enumerate *udev_enumerate, const char *subsystem) {
@@ -120,35 +121,42 @@ int udev_enumerate_add_nomatch_subsystem(struct udev_enumerate *udev_enumerate, 
                 return -EINVAL;
         if (!subsystem)
                 return 0;
-        return match_done(udev_enumerate,
-                          sd_device_enumerator_add_match_subsystem(udev_enumerate->enumerator, subsystem, 0));
+        return match_done(
+                        udev_enumerate,
+                        sd_device_enumerator_add_match_subsystem(udev_enumerate->enumerator, subsystem, 0));
 }
 
-int udev_enumerate_add_match_sysattr(struct udev_enumerate *udev_enumerate, const char *sysattr, const char *value) {
+int udev_enumerate_add_match_sysattr(
+                struct udev_enumerate *udev_enumerate, const char *sysattr, const char *value) {
         if (!udev_enumerate)
                 return -EINVAL;
         if (!sysattr)
                 return 0;
-        return match_done(udev_enumerate,
-                          sd_device_enumerator_add_match_sysattr(udev_enumerate->enumerator, sysattr, value, 1));
+        return match_done(
+                        udev_enumerate,
+                        sd_device_enumerator_add_match_sysattr(udev_enumerate->enumerator, sysattr, value, 1));
 }
 
-int udev_enumerate_add_nomatch_sysattr(struct udev_enumerate *udev_enumerate, const char *sysattr, const char *value) {
+int udev_enumerate_add_nomatch_sysattr(
+                struct udev_enumerate *udev_enumerate, const char *sysattr, const char *value) {
         if (!udev_enumerate)
                 return -EINVAL;
         if (!sysattr)
                 return 0;
-        return match_done(udev_enumerate,
-                          sd_device_enumerator_add_match_sysattr(udev_enumerate->enumerator, sysattr, value, 0));
+        return match_done(
+                        udev_enumerate,
+                        sd_device_enumerator_add_match_sysattr(udev_enumerate->enumerator, sysattr, value, 0));
 }
 
-int udev_enumerate_add_match_property(struct udev_enumerate *udev_enumerate, const char *property, const char *value) {
+int udev_enumerate_add_match_property(
+                struct udev_enumerate *udev_enumerate, const char *property, const char *value) {
         if (!udev_enumerate)
                 return -EINVAL;
         if (!property)
                 return 0;
-        return match_done(udev_enumerate,
-                          sd_device_enumerator_add_match_property(udev_enumerate->enumerator, property, value));
+        return match_done(
+                        udev_enumerate,
+                        sd_device_enumerator_add_match_property(udev_enumerate->enumerator, property, value));
 }
 
 int udev_enumerate_add_match_sysname(struct udev_enumerate *udev_enumerate, const char *sysname) {
@@ -156,7 +164,9 @@ int udev_enumerate_add_match_sysname(struct udev_enumerate *udev_enumerate, cons
                 return -EINVAL;
         if (!sysname)
                 return 0;
-        return match_done(udev_enumerate, sd_device_enumerator_add_match_sysname(udev_enumerate->enumerator, sysname));
+        return match_done(
+                        udev_enumerate,
+                        sd_device_enumerator_add_match_sysname(udev_enumerate->enumerator, sysname));
 }
 
 int udev_enumerate_add_match_tag(struct udev_enumerate *udev_enumerate, const char *tag) {
@@ -172,9 +182,10 @@ int udev_enumerate_add_match_parent(struct udev_enumerate *udev_enumerate, struc
                 return -EINVAL;
         if (!parent)
                 return 0;
-        return match_done(udev_enumerate,
-                          sd_device_enumerator_add_match_parent(udev_enumerate->enumerator,
-                                                                libudev_device_get_sd_device(parent)));
+        return match_done(
+                        udev_enumerate,
+                        sd_device_enumerator_add_match_parent(
+                                        udev_enumerate->enumerator, libudev_device_get_sd_device(parent)));
 }
 
 int udev_enumerate_add_match_is_initialized(struct udev_enumerate *udev_enumerate) {
@@ -228,11 +239,11 @@ static int scan(struct udev_enumerate *e, enum scan_kind kind) {
 
         libudev_list_clear(e->devices);
 
-        for (d = kind == SCAN_DEVICES ? sd_device_enumerator_get_device_first(e->enumerator)
-                                      : sd_device_enumerator_get_subsystem_first(e->enumerator);
+        for (d = kind == SCAN_DEVICES ? sd_device_enumerator_get_device_first(e->enumerator) :
+                                        sd_device_enumerator_get_subsystem_first(e->enumerator);
              d;
-             d = kind == SCAN_DEVICES ? sd_device_enumerator_get_device_next(e->enumerator)
-                                      : sd_device_enumerator_get_subsystem_next(e->enumerator)) {
+             d = kind == SCAN_DEVICES ? sd_device_enumerator_get_device_next(e->enumerator) :
+                                        sd_device_enumerator_get_subsystem_next(e->enumerator)) {
                 const char *syspath;
                 int r;
 

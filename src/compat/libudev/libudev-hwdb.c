@@ -72,7 +72,8 @@ struct udev_hwdb *udev_hwdb_unref(struct udev_hwdb *hwdb) {
         return NULL;
 }
 
-struct udev_list_entry *udev_hwdb_get_properties_list_entry(struct udev_hwdb *hwdb, const char *modalias, unsigned flags) {
+struct udev_list_entry *udev_hwdb_get_properties_list_entry(
+                struct udev_hwdb *hwdb, const char *modalias, unsigned flags) {
         const char *key, *value;
         struct udev_list_entry *e;
 
@@ -85,10 +86,10 @@ struct udev_list_entry *udev_hwdb_get_properties_list_entry(struct udev_hwdb *hw
 
         libudev_list_clear(hwdb->properties);
         SD_HWDB_FOREACH_PROPERTY(hwdb->hwdb, modalias, key, value)
-                if (!libudev_list_add(hwdb->properties, key, value)) {
-                        errno = ENOMEM;
-                        return NULL;
-                }
+        if (!libudev_list_add(hwdb->properties, key, value)) {
+                errno = ENOMEM;
+                return NULL;
+        }
 
         e = libudev_list_first(hwdb->properties);
         if (!e)

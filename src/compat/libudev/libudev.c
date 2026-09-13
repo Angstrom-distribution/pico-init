@@ -49,8 +49,13 @@ struct udev *udev_unref(struct udev *udev) {
 
 void udev_set_log_fn(
                 struct udev *udev,
-                void (*log_fn)(struct udev *udev, int priority, const char *file, int line, const char *fn,
-                               const char *format, va_list args)) {
+                void (*log_fn)(struct udev *udev,
+                               int priority,
+                               const char *file,
+                               int line,
+                               const char *fn,
+                               const char *format,
+                               va_list args)) {
         (void) udev;
         (void) log_fn;
 }

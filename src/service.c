@@ -460,15 +460,17 @@ static void service_forking_locate_main_pid(Service *s) {
                 if (r == 0)
                         return;
                 if (r == -ENOENT)
-                        pico_log(PICO_LOG_INFO, "%s: PIDFile= %s not present after start", UNIT(s)->id, s->pid_file);
-                else if (r == -EINVAL)
-                        pico_log(PICO_LOG_WARNING, "%s: PIDFile= %s does not contain a pid", UNIT(s)->id, s->pid_file);
-                else if (r != -ESRCH)
-                        pico_log(PICO_LOG_WARNING,
-                                 "%s: PIDFile= %s: %s",
+                        pico_log(PICO_LOG_INFO,
+                                 "%s: PIDFile= %s not present after start",
                                  UNIT(s)->id,
-                                 s->pid_file,
-                                 strerror(-r));
+                                 s->pid_file);
+                else if (r == -EINVAL)
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s: PIDFile= %s does not contain a pid",
+                                 UNIT(s)->id,
+                                 s->pid_file);
+                else if (r != -ESRCH)
+                        pico_log(PICO_LOG_WARNING, "%s: PIDFile= %s: %s", UNIT(s)->id, s->pid_file, strerror(-r));
         }
 
         if (service_search_main_pid(s) == 0)
@@ -746,12 +748,13 @@ static void service_enter_start(Service *s) {
          * running, refusing it now would be worse than an optimistic
          * "started" -- and says so. */
         if (s->exec_fd >= 0) {
-                r = sd_event_add_io(UNIT(s)->manager->event,
-                                    &s->exec_fd_source,
-                                    s->exec_fd,
-                                    EPOLLIN,
-                                    service_exec_fd_cb,
-                                    s);
+                r = sd_event_add_io(
+                                UNIT(s)->manager->event,
+                                &s->exec_fd_source,
+                                s->exec_fd,
+                                EPOLLIN,
+                                service_exec_fd_cb,
+                                s);
                 if (r < 0) {
                         pico_log(PICO_LOG_WARNING,
                                  "%s: cannot watch the exec fd (%s), counting the start as complete now",
@@ -1280,11 +1283,8 @@ int service_verify(Service *s) {
 /* --- string tables --- */
 
 static const char * const service_type_table[_SERVICE_TYPE_MAX] = {
-        [SERVICE_TYPE_SIMPLE] = "simple",
-        [SERVICE_TYPE_ONESHOT] = "oneshot",
-        [SERVICE_TYPE_EXEC] = "exec",
-        [SERVICE_TYPE_NOTIFY] = "notify",
-        [SERVICE_TYPE_FORKING] = "forking",
+        [SERVICE_TYPE_SIMPLE] = "simple", [SERVICE_TYPE_ONESHOT] = "oneshot", [SERVICE_TYPE_EXEC] = "exec",
+        [SERVICE_TYPE_NOTIFY] = "notify", [SERVICE_TYPE_FORKING] = "forking",
 };
 
 const char *service_type_to_string(ServiceType t) {

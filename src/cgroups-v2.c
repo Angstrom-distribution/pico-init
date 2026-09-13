@@ -216,8 +216,7 @@ static bool pid_seen(const pid_t *seen, size_t n_seen, pid_t pid) {
  * A cgroup that went away underneath us reads as empty, not as an error:
  * every caller here is asking "who is left", and the answer is nobody.
  */
-static int cgroup_v2_foreach_pid(
-                struct pico_cgroup *cg, int (*cb)(pid_t pid, void *userdata), void *userdata) {
+static int cgroup_v2_foreach_pid(struct pico_cgroup *cg, int (*cb)(pid_t pid, void *userdata), void *userdata) {
         char buf[4096];
         ssize_t n;
         int total = 0;

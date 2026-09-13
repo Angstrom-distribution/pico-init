@@ -36,8 +36,13 @@ struct udev *udev_unref(struct udev *udev);
 struct udev *udev_new(void);
 void udev_set_log_fn(
                 struct udev *udev,
-                void (*log_fn)(struct udev *udev, int priority, const char *file, int line, const char *fn,
-                               const char *format, va_list args)) __attribute__((__deprecated__));
+                void (*log_fn)(struct udev *udev,
+                               int priority,
+                               const char *file,
+                               int line,
+                               const char *fn,
+                               const char *format,
+                               va_list args)) __attribute__((__deprecated__));
 int udev_get_log_priority(struct udev *udev) __attribute__((__deprecated__));
 void udev_set_log_priority(struct udev *udev, int priority) __attribute__((__deprecated__));
 void *udev_get_userdata(struct udev *udev);
@@ -62,7 +67,8 @@ struct udev_device *udev_device_unref(struct udev_device *udev_device);
 struct udev *udev_device_get_udev(struct udev_device *udev_device);
 struct udev_device *udev_device_new_from_syspath(struct udev *udev, const char *syspath);
 struct udev_device *udev_device_new_from_devnum(struct udev *udev, char type, dev_t devnum);
-struct udev_device *udev_device_new_from_subsystem_sysname(struct udev *udev, const char *subsystem, const char *sysname);
+struct udev_device *udev_device_new_from_subsystem_sysname(
+                struct udev *udev, const char *subsystem, const char *sysname);
 struct udev_device *udev_device_new_from_device_id(struct udev *udev, const char *id);
 struct udev_device *udev_device_new_from_environment(struct udev *udev);
 /* The parent chain is owned by the child: no reference is returned. */
@@ -119,9 +125,12 @@ struct udev *udev_enumerate_get_udev(struct udev_enumerate *udev_enumerate);
 struct udev_enumerate *udev_enumerate_new(struct udev *udev);
 int udev_enumerate_add_match_subsystem(struct udev_enumerate *udev_enumerate, const char *subsystem);
 int udev_enumerate_add_nomatch_subsystem(struct udev_enumerate *udev_enumerate, const char *subsystem);
-int udev_enumerate_add_match_sysattr(struct udev_enumerate *udev_enumerate, const char *sysattr, const char *value);
-int udev_enumerate_add_nomatch_sysattr(struct udev_enumerate *udev_enumerate, const char *sysattr, const char *value);
-int udev_enumerate_add_match_property(struct udev_enumerate *udev_enumerate, const char *property, const char *value);
+int udev_enumerate_add_match_sysattr(
+                struct udev_enumerate *udev_enumerate, const char *sysattr, const char *value);
+int udev_enumerate_add_nomatch_sysattr(
+                struct udev_enumerate *udev_enumerate, const char *sysattr, const char *value);
+int udev_enumerate_add_match_property(
+                struct udev_enumerate *udev_enumerate, const char *property, const char *value);
 int udev_enumerate_add_match_sysname(struct udev_enumerate *udev_enumerate, const char *sysname);
 int udev_enumerate_add_match_tag(struct udev_enumerate *udev_enumerate, const char *tag);
 int udev_enumerate_add_match_parent(struct udev_enumerate *udev_enumerate, struct udev_device *parent);
@@ -138,8 +147,10 @@ struct udev_queue *udev_queue_ref(struct udev_queue *udev_queue);
 struct udev_queue *udev_queue_unref(struct udev_queue *udev_queue);
 struct udev *udev_queue_get_udev(struct udev_queue *udev_queue);
 struct udev_queue *udev_queue_new(struct udev *udev);
-unsigned long long int udev_queue_get_kernel_seqnum(struct udev_queue *udev_queue) __attribute__((__deprecated__));
-unsigned long long int udev_queue_get_udev_seqnum(struct udev_queue *udev_queue) __attribute__((__deprecated__));
+unsigned long long int udev_queue_get_kernel_seqnum(struct udev_queue *udev_queue)
+                __attribute__((__deprecated__));
+unsigned long long int udev_queue_get_udev_seqnum(struct udev_queue *udev_queue)
+                __attribute__((__deprecated__));
 int udev_queue_get_udev_is_active(struct udev_queue *udev_queue);
 int udev_queue_get_queue_is_empty(struct udev_queue *udev_queue);
 int udev_queue_get_seqnum_is_finished(struct udev_queue *udev_queue, unsigned long long int seqnum)
@@ -158,7 +169,8 @@ struct udev_hwdb;
 struct udev_hwdb *udev_hwdb_new(struct udev *udev);
 struct udev_hwdb *udev_hwdb_ref(struct udev_hwdb *hwdb);
 struct udev_hwdb *udev_hwdb_unref(struct udev_hwdb *hwdb);
-struct udev_list_entry *udev_hwdb_get_properties_list_entry(struct udev_hwdb *hwdb, const char *modalias, unsigned flags);
+struct udev_list_entry *udev_hwdb_get_properties_list_entry(
+                struct udev_hwdb *hwdb, const char *modalias, unsigned flags);
 
 /* --- utilities --- */
 

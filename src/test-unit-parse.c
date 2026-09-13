@@ -1095,11 +1095,16 @@ static void test_type_values(void) {
         ASSERT_TRUE(dir != NULL);
 
         ASSERT_EQ_INT(test_write_file(dir, "exec.service", "[Service]\nType=exec\nExecStart=/bin/true\n"), 0);
-        ASSERT_EQ_INT(test_write_file(dir, "notify.service", "[Service]\nType=notify\nExecStart=/bin/true\n"), 0);
-        ASSERT_EQ_INT(test_write_file(dir, "reload.service", "[Service]\nType=notify-reload\nExecStart=/bin/true\n"),
+        ASSERT_EQ_INT(test_write_file(dir, "notify.service", "[Service]\nType=notify\nExecStart=/bin/true\n"),
                       0);
-        ASSERT_EQ_INT(test_write_file(dir, "forking.service", "[Service]\nType=forking\nExecStart=/bin/true\n"), 0);
-        ASSERT_EQ_INT(test_write_file(dir, "bogus.service", "[Service]\nType=frobnicate\nExecStart=/bin/true\n"), 0);
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "reload.service",
+                                      "[Service]\nType=notify-reload\nExecStart=/bin/true\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir, "forking.service", "[Service]\nType=forking\nExecStart=/bin/true\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir, "bogus.service", "[Service]\nType=frobnicate\nExecStart=/bin/true\n"),
+                      0);
 
         m = manager_for(dir);
 
