@@ -16,6 +16,10 @@
  * span is never surfaced as data, only ever completed later or (for a
  * genuinely corrupt span, not expected in practice but not assumed
  * impossible either) skipped to the next entry boundary.
+ *
+ * libc only, deliberately: libsystemd-compat link_wholes this file for
+ * sd-journal's read side, and a shared libsystemd.so must not carry
+ * pico-init-core's util.c/log symbols -- so no "../util.h" here.
  */
 
 #include "logd-read.h"
@@ -30,7 +34,6 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#include "../util.h"
 #include "logd.h"
 
 #define MAX_FIELDS_PER_ENTRY 64
@@ -63,7 +66,7 @@ static int ring_path(const char *runtime_dir, const char *name, char **ret) {
         if (len < 0 || (size_t) len >= sizeof(buf))
                 return -ENAMETOOLONG;
 
-        copy = pico_strdup(buf);
+        copy = strdup(buf);
         if (!copy)
                 return -ENOMEM;
 

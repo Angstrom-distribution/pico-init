@@ -471,19 +471,30 @@ endforeach
 # ---------------------------------------------------------------------------
 logd_includes = include_directories('src/logd')
 
+# The ring reader (logd-read.c) is its own tiny static library, same shape
+# as sd_event_lib above: libsystemd-compat's sd-journal read side is built
+# on it and must not drag logd_core (whose writer/receiver need
+# pico_init_core's util.c) into every libsystemd consumer -- logd-read.c is
+# libc-only for exactly this reason. logd_core link_wholes it back in, so
+# picolog, picoctl and the logd tests keep seeing one archive with every
+# symbol it always had.
+logd_read = static_library(
+  'logd-read',
+  files('src/logd/logd-read.c'),
+  include_directories: logd_includes,
+)
+
 logd_core_sources = files(
   'src/logd/logd-write.c',
   'src/logd/logd-recv.c',
   'src/logd/logd-kmsg.c',
-  # The ring reader lives in the library, not inside picolog.c, because
-  # picoctl's per-unit log tail (plan §1.7, C1) reuses exactly this reader.
-  'src/logd/logd-read.c',
 )
 
 logd_core = static_library(
   'logd-core',
   logd_core_sources,
   include_directories: logd_includes,
+  link_whole: logd_read,
 )
 
 logd_exe = executable(
