@@ -636,6 +636,50 @@ static int config_parse_remain_after_exit(
         return 0;
 }
 
+/*
+ * User=/Group=: kept as written (a name or a numeric id) and resolved at
+ * every spawn, in the parent (service-exec.c). Only the shape is checked
+ * here: whether the account exists is a start-time question, and answering
+ * it at load would make the unit tree's load order depend on the user
+ * database. An empty value resets to unset, as in systemd.
+ */
+static int config_parse_user_group(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        Service *s = unit_to_service(u, path, line);
+        char **field;
+        const char *p;
+        char *copy;
+
+        if (!s)
+                return 0;
+
+        field = strcmp(lvalue, "User") == 0 ? &s->user : &s->group;
+
+        if (!*rvalue) {
+                *field = pico_mfree(*field);
+                return 0;
+        }
+
+        for (p = rvalue; *p; p++)
+                if ((unsigned char) *p <= ' ' || *p == 0x7f || *p == ':' || *p == '/') {
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s:%u: invalid %s= value '%s', ignoring",
+                                 path,
+                                 line,
+                                 lvalue,
+                                 rvalue);
+                        return 0;
+                }
+
+        copy = pico_strdup(rvalue);
+        if (!copy)
+                return -ENOMEM;
+
+        pico_mfree(*field);
+        *field = copy;
+        return 0;
+}
+
 static int config_parse_exec_start(
                 Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
         Service *s = unit_to_service(u, path, line);
@@ -1099,6 +1143,8 @@ static const ConfigItem config_items[] = {
         { SECTION_SERVICE,          "RemainAfterExit",           config_parse_remain_after_exit },
         { SECTION_SERVICE,          "TimeoutStartSec",           config_parse_timeout_start_sec },
         { SECTION_SERVICE,           "TimeoutStopSec",            config_parse_timeout_stop_sec },
+        { SECTION_SERVICE,                     "User",                  config_parse_user_group },
+        { SECTION_SERVICE,                    "Group",                  config_parse_user_group },
         {  SECTION_SOCKET,             "ListenStream",               config_parse_listen_stream },
         {  SECTION_SOCKET,           "ListenDatagram",             config_parse_listen_datagram },
         {  SECTION_SOCKET,                  "Service",              config_parse_socket_service },

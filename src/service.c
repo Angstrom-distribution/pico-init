@@ -163,6 +163,8 @@ static bool pico_exit_status_is_internal(int status) {
         case PICO_EXIT_SIGNAL_MASK:
         case PICO_EXIT_STDIN:
         case PICO_EXIT_STDOUT:
+        case PICO_EXIT_GROUP:
+        case PICO_EXIT_USER:
         case PICO_EXIT_CGROUP:
         case PICO_EXIT_SETSID:
         case PICO_EXIT_STDERR:
@@ -454,7 +456,7 @@ static void service_enter_start(Service *s) {
 
         r = service_spawn(s, s->exec_start, &s->main_pid);
         if (r < 0) {
-                pico_log(PICO_LOG_ERR, "%s: failed to fork ExecStart=: %s", UNIT(s)->id, strerror(-r));
+                pico_log(PICO_LOG_ERR, "%s: failed to spawn ExecStart=: %s", UNIT(s)->id, strerror(-r));
                 if (s->result == SERVICE_SUCCESS)
                         s->result = SERVICE_FAILURE_RESOURCES;
                 service_enter_stop(s);
@@ -480,7 +482,7 @@ static void service_enter_start_pre(Service *s) {
 
         r = service_spawn(s, s->exec_start_pre, &s->control_pid);
         if (r < 0) {
-                pico_log(PICO_LOG_ERR, "%s: failed to fork ExecStartPre=: %s", UNIT(s)->id, strerror(-r));
+                pico_log(PICO_LOG_ERR, "%s: failed to spawn ExecStartPre=: %s", UNIT(s)->id, strerror(-r));
                 if (s->result == SERVICE_SUCCESS)
                         s->result = SERVICE_FAILURE_RESOURCES;
                 service_enter_stop(s);
@@ -990,6 +992,8 @@ static void service_done(Unit *u) {
 
         s->exec_start = pico_strv_free(s->exec_start);
         s->exec_start_pre = pico_strv_free(s->exec_start_pre);
+        s->user = pico_mfree(s->user);
+        s->group = pico_mfree(s->group);
         s->status_text = pico_mfree(s->status_text);
 
         /*

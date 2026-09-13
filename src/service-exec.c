@@ -129,7 +129,9 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
 #include <limits.h>
+#include <pwd.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -522,6 +524,166 @@ static int create_stdout_socket(const char *unit_id) {
 }
 
 /*
+ * User=/Group= (plans/30 R6): the integers that cross fork(). Resolved by
+ * exec_creds_resolve() in the PARENT -- getpwnam()/getgrnam()/getgrouplist()
+ * go through NSS, allocate, and are nowhere near async-signal-safe -- and
+ * applied by child_exec() at step 10, which reads nothing but these.
+ * `groups` is malloc'd here and freed by the parent after fork(); the child
+ * sees it through its copy-on-write mapping, same as argv and cg->path.
+ * `set` is false when the unit names neither directive, in which case the
+ * child never touches its ids at all.
+ */
+typedef struct ExecCreds {
+        bool set;
+        uid_t uid;
+        gid_t gid;
+        gid_t *groups;
+        int n_groups;
+} ExecCreds;
+
+/* An all-digits User=/Group= is an id, not a name to look up (systemd
+ * accepts both spellings). (uid_t) -1 is the sentinel the setuid() family
+ * treats as "unchanged", never a real id. */
+static bool parse_id(const char *v, unsigned long *ret) {
+        const char *p;
+        unsigned long n;
+        char *end;
+
+        if (!v || !*v)
+                return false;
+        for (p = v; *p; p++)
+                if (*p < '0' || *p > '9')
+                        return false;
+
+        errno = 0;
+        n = strtoul(v, &end, 10);
+        if (errno != 0 || *end != '\0' || n >= (unsigned long) UINT_MAX)
+                return false;
+
+        *ret = n;
+        return true;
+}
+
+/*
+ * Group= alone keeps the caller's uid and changes only the gid; User= alone
+ * takes the account's primary group; both set, Group= wins. The
+ * supplementary list is the account's full membership from the group
+ * database, initgroups(3)-style, computed against the FINAL gid exactly as
+ * systemd's own exec path does -- so a Group= override is in the list and
+ * the passwd primary group is not, unless the database says so. A numeric
+ * User= with no passwd entry still resolves (its own number as gid, no
+ * membership to look up), matching systemd. 0 on success, -ESRCH when a
+ * named account does not exist (logged here, with the name), -ENOMEM.
+ */
+static int exec_creds_resolve(Service *s, ExecCreds *c) {
+        const char *pw_name = NULL;
+        struct passwd *pw = NULL;
+        unsigned long id;
+        gid_t group_gid = 0;
+
+        memset(c, 0, sizeof(*c));
+
+        if (!s->user && !s->group)
+                return 0;
+        c->set = true;
+
+        if (s->group) {
+                if (parse_id(s->group, &id))
+                        group_gid = (gid_t) id;
+                else {
+                        struct group *gr;
+
+                        errno = 0;
+                        gr = getgrnam(s->group);
+                        if (!gr) {
+                                pico_log(PICO_LOG_ERR,
+                                         "%s: Group=%s: no such group%s%s",
+                                         UNIT(s)->id,
+                                         s->group,
+                                         errno ? ": " : "",
+                                         errno ? strerror(errno) : "");
+                                return -ESRCH;
+                        }
+                        group_gid = gr->gr_gid;
+                }
+        }
+
+        if (s->user) {
+                if (parse_id(s->user, &id)) {
+                        c->uid = (uid_t) id;
+                        pw = getpwuid(c->uid);
+                        c->gid = pw ? pw->pw_gid : (gid_t) id;
+                } else {
+                        errno = 0;
+                        pw = getpwnam(s->user);
+                        if (!pw) {
+                                pico_log(PICO_LOG_ERR,
+                                         "%s: User=%s: no such user%s%s",
+                                         UNIT(s)->id,
+                                         s->user,
+                                         errno ? ": " : "",
+                                         errno ? strerror(errno) : "");
+                                return -ESRCH;
+                        }
+                        c->uid = pw->pw_uid;
+                        c->gid = pw->pw_gid;
+                }
+                if (pw)
+                        pw_name = pw->pw_name;
+        } else
+                c->uid = geteuid();
+
+        if (s->group)
+                c->gid = group_gid;
+
+        if (pw_name) {
+                int tries, n = 0;
+
+                /* getgrouplist() reports the size it needed through `n`
+                 * when the buffer is too small; the retry loop covers the
+                 * database growing between the sizing call and the real
+                 * one, which is not worth failing a start over. */
+                (void) getgrouplist(pw_name, c->gid, NULL, &n);
+                for (tries = 0; tries < 4; tries++) {
+                        gid_t *g;
+
+                        if (n < 1)
+                                n = 1;
+                        g = realloc(c->groups, (size_t) n * sizeof(gid_t));
+                        if (!g)
+                                return -ENOMEM;
+                        c->groups = g;
+
+                        if (getgrouplist(pw_name, c->gid, c->groups, &n) >= 0) {
+                                c->n_groups = n;
+                                break;
+                        }
+                }
+                if (c->n_groups < 1) {
+                        pico_log(PICO_LOG_ERR,
+                                 "%s: User=%s: cannot determine group membership",
+                                 UNIT(s)->id,
+                                 s->user);
+                        return -ESRCH;
+                }
+        } else {
+                c->groups = malloc(sizeof(gid_t));
+                if (!c->groups)
+                        return -ENOMEM;
+                c->groups[0] = c->gid;
+                c->n_groups = 1;
+        }
+
+        return 0;
+}
+
+static void exec_creds_free(ExecCreds *c) {
+        free(c->groups);
+        c->groups = NULL;
+        c->n_groups = 0;
+}
+
+/*
  * Reopens the unit's cgroup.procs by path rather than reusing any fd the
  * parent had open for it: everything this process inherited is closed in
  * the fd sweep before this runs (see child_exec() step 5), so there is
@@ -571,7 +733,9 @@ static void child_attach_cgroup(const struct pico_cgroup *cg) {
  * n_sock_fds > 0 (see build_socket_envp()'s own layout-invariant comment).
  * `stdout_fd` (create_stdout_socket(), also parent-built) is likewise
  * excluded from the sweep, then dup2()'d over stdout/stderr at step 8;
- * -1 means "logd unavailable", the console fallback (plan §3.6).
+ * -1 means "logd unavailable", the console fallback (plan §3.6). `creds`
+ * (exec_creds_resolve(), parent-built too) is the User=/Group= result the
+ * child applies at step 10 -- integers only, nothing left to look up.
  */
 static _Noreturn void
                 child_exec(Service *s,
@@ -580,7 +744,8 @@ static _Noreturn void
                            int *sock_fds,
                            unsigned n_sock_fds,
                            size_t pid_slot,
-                           int stdout_fd) {
+                           int stdout_fd,
+                           const ExecCreds *creds) {
         char pidbuf[32];
         sigset_t empty;
         int sig, fd;
@@ -747,7 +912,25 @@ static _Noreturn void
         if (isatty(STDIN_FILENO) == 1)
                 ioctl(STDIN_FILENO, TIOCSCTTY, 0);
 
-        /* 10. Does not return on success. Its failure is reported purely by
+        /*
+         * 10. User=/Group=: setgroups() -> setgid() -> setuid(), in exactly
+         * that order -- once the uid is unprivileged the first two are no
+         * longer permitted, so the reverse order silently keeps root's
+         * groups (the classic privilege-retention bug). Placed after the
+         * cgroup attach (7) and the console open (8), both of which may
+         * need the privilege being given up here. Fatal: a unit that asked
+         * to drop privilege must never run with more than it asked for.
+         */
+        if (creds->set) {
+                if (setgroups((size_t) creds->n_groups, creds->groups) < 0)
+                        _exit(PICO_EXIT_GROUP);
+                if (setgid(creds->gid) < 0)
+                        _exit(PICO_EXIT_GROUP);
+                if (setuid(creds->uid) < 0)
+                        _exit(PICO_EXIT_USER);
+        }
+
+        /* 11. Does not return on success. Its failure is reported purely by
          * exit code -- there is no other channel back to the parent. envp is
          * NULL exactly when this start passes neither socket-activation fds
          * nor NOTIFY_SOCKET= (no Environment= directive exists in this MVP
@@ -763,6 +946,7 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
         char **envp = NULL;
         size_t pid_slot = 0;
         const char *notify_socket;
+        ExecCreds creds;
         int stdout_fd;
         pid_t pid;
         int r;
@@ -776,6 +960,15 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
          * caller mistake never even forks. */
         if (!argv || !argv[0] || argv[0][0] == '\0')
                 return -ENOEXEC;
+
+        /* User=/Group= resolution: NSS, so parent-only, and before any
+         * side effect (socket_notify_service_starting() below) so an
+         * unknown account is a plain start failure with nothing to undo. */
+        r = exec_creds_resolve(s, &creds);
+        if (r < 0) {
+                exec_creds_free(&creds);
+                return r;
+        }
 
         /*
          * Only the main command inherits socket-activation fds, matching
@@ -831,19 +1024,22 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
         if (pid < 0) {
                 r = -errno; /* 74129a1276: never a stale success value */
                 free_socket_envp(envp);
+                exec_creds_free(&creds);
                 if (stdout_fd >= 0)
                         close(stdout_fd);
                 return r;
         }
 
         if (pid == 0)
-                child_exec(s, argv, envp, sock_fds, (unsigned) n_sock_fds, pid_slot, stdout_fd); /* never returns */
+                child_exec(
+                                s, argv, envp, sock_fds, (unsigned) n_sock_fds, pid_slot, stdout_fd, &creds); /* never returns */
 
         /* COW: the child already has its own copy of everything envp/
-         * stdout_fd point to, made at fork() -- freeing/closing the
+         * creds/stdout_fd point to, made at fork() -- freeing/closing the
          * parent's copies here cannot affect it. See build_socket_envp()'s
-         * and free_socket_envp()'s own notes; same reasoning for stdout_fd. */
+         * and free_socket_envp()'s own notes; same reasoning for the rest. */
         free_socket_envp(envp);
+        exec_creds_free(&creds);
         if (stdout_fd >= 0)
                 close(stdout_fd);
 

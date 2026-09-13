@@ -271,7 +271,12 @@ static void test_degradation_record(void) {
         ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
         ASSERT_STREQ(((Service *) u)->exec_start[0], "/usr/bin/richd");
 
-        ASSERT_EQ_INT(u->n_degraded_directives, 11);
+        /* User=/Group= are honoured, not dropped: parsed verbatim here,
+         * resolved to ids at spawn (test-service.c proves the drop). */
+        ASSERT_STREQ(((Service *) u)->user, "rich");
+        ASSERT_STREQ(((Service *) u)->group, "rich");
+
+        ASSERT_EQ_INT(u->n_degraded_directives, 9);
         ASSERT_STREQ(u->degraded_directives[0], "ConditionPathExists=!");
         ASSERT_STREQ(u->degraded_directives[1], "EnvironmentFile");
         ASSERT_STREQ(u->degraded_directives[2], "Environment");
@@ -280,20 +285,18 @@ static void test_degradation_record(void) {
         ASSERT_STREQ(u->degraded_directives[5], "ExecStop");
         ASSERT_STREQ(u->degraded_directives[6], "ExecReload");
         ASSERT_STREQ(u->degraded_directives[7], "PIDFile");
-        ASSERT_STREQ(u->degraded_directives[8], "User");
-        ASSERT_STREQ(u->degraded_directives[9], "Group");
-        ASSERT_STREQ(u->degraded_directives[10], "Alias");
-        ASSERT_TRUE(u->degraded_directives[11] == NULL);
+        ASSERT_STREQ(u->degraded_directives[8], "Alias");
+        ASSERT_TRUE(u->degraded_directives[9] == NULL);
 
         joined = unit_degraded_directives_string(u);
         ASSERT_STREQ(joined,
                      "ConditionPathExists=! EnvironmentFile Environment ExecStartPre=multiple "
-                     "ExecStart=@ ExecStop ExecReload PIDFile User Group Alias");
+                     "ExecStart=@ ExecStop ExecReload PIDFile Alias");
         free(joined);
 
         /* a second identical drop is not a second entry */
-        ASSERT_EQ_INT(unit_add_degradation(u, "User"), 0);
-        ASSERT_EQ_INT(u->n_degraded_directives, 11);
+        ASSERT_EQ_INT(unit_add_degradation(u, "PIDFile"), 0);
+        ASSERT_EQ_INT(u->n_degraded_directives, 9);
 
         ASSERT_EQ_INT(clean->load_state, UNIT_LOADED);
         ASSERT_EQ_INT(clean->n_degraded_directives, 0);

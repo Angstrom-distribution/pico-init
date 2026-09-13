@@ -36,7 +36,7 @@
  * every one of them to SERVICE_FAILURE_RESOURCES rather than treating them
  * as an ordinary nonzero ExecStart= exit, because they mean pico-init's own
  * setup failed, not the workload. Not every code here is currently
- * reachable (EXIT_CHDIR, EXIT_FDS, EXIT_MEMORY: pico-init does none of
+ * reachable (EXIT_CHDIR, EXIT_MEMORY: pico-init does none of
  * WorkingDirectory=/rlimits/MemoryLimit= yet) -- defined now so the mapping
  * table does not need revisiting when they become reachable.
  */
@@ -47,6 +47,8 @@
 #define PICO_EXIT_SIGNAL_MASK 207
 #define PICO_EXIT_STDIN 208
 #define PICO_EXIT_STDOUT 209
+#define PICO_EXIT_GROUP 216 /* setgroups()/setgid() for Group= (or User='s primary group) failed */
+#define PICO_EXIT_USER 217  /* setuid() for User= failed */
 #define PICO_EXIT_CGROUP 219
 #define PICO_EXIT_SETSID 220
 #define PICO_EXIT_STDERR 222
@@ -97,6 +99,16 @@ typedef struct Service {
         /* argv-style NULL-terminated vectors, owned */
         char **exec_start_pre; /* may be NULL */
         char **exec_start;
+
+        /*
+         * User=/Group= as written (a name or a numeric id), owned, NULL when
+         * unset. Resolved to ids in the PARENT at every spawn -- getpwnam()
+         * and friends go through NSS and are not async-signal-safe, so only
+         * the resulting integers ever cross fork() (service-exec.c). Group=
+         * alone keeps uid 0; User= alone takes the account's primary group.
+         */
+        char *user;
+        char *group;
 
         pid_t main_pid;    /* ExecStart= process, 0 when none */
         pid_t control_pid; /* ExecStartPre= process, 0 when none */

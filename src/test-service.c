@@ -24,13 +24,16 @@
  */
 
 #include <errno.h>
+#include <grp.h>
 #include <limits.h>
 #include <poll.h>
+#include <pwd.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "manager.h"
 #include "service.h"
@@ -684,6 +687,251 @@ static void test_condition_skips_start_without_failing(void) {
         free(dir);
 }
 
+/*
+ * The kernel's own view of a process's ids -- /proc/<pid>/status Uid:/Gid:
+ * (real ids, the first field) and the Groups: line verbatim -- rather than
+ * anything pico-init believes it set. false when the process is gone.
+ */
+static bool read_proc_ids(pid_t pid, uid_t *uid, gid_t *gid, char *groups, size_t groups_len) {
+        char path[64], line[512];
+        bool have_uid = false, have_gid = false, have_groups = false;
+        FILE *f;
+
+        snprintf(path, sizeof(path), "/proc/%d/status", (int) pid);
+        f = fopen(path, "re");
+        if (!f)
+                return false;
+
+        while (fgets(line, sizeof(line), f)) {
+                unsigned long v;
+
+                if (sscanf(line, "Uid:\t%lu", &v) == 1) {
+                        *uid = (uid_t) v;
+                        have_uid = true;
+                } else if (sscanf(line, "Gid:\t%lu", &v) == 1) {
+                        *gid = (gid_t) v;
+                        have_gid = true;
+                } else if (strncmp(line, "Groups:", 7) == 0) {
+                        size_t n = strlen(line + 7);
+
+                        if (n >= groups_len)
+                                n = groups_len - 1;
+                        memcpy(groups, line + 7, n);
+                        groups[n] = '\0';
+                        have_groups = true;
+                }
+        }
+        fclose(f);
+
+        return have_uid && have_gid && have_groups;
+}
+
+/* Whether the Groups: line (space-separated, leading tab, trailing space)
+ * names `g` as a whole token. */
+static bool groups_line_has(const char *groups, gid_t g) {
+        char want[32];
+        const char *p = groups;
+        size_t n;
+
+        snprintf(want, sizeof(want), "%lu", (unsigned long) g);
+        n = strlen(want);
+
+        while (*p) {
+                while (*p == ' ' || *p == '\t' || *p == '\n')
+                        p++;
+                if (strncmp(p, want, n) == 0 && (p[n] == ' ' || p[n] == '\n' || p[n] == '\0'))
+                        return true;
+                while (*p && *p != ' ' && *p != '\t' && *p != '\n')
+                        p++;
+        }
+        return false;
+}
+
+/*
+ * The drop happens in the child right before execve(), after
+ * service_spawn() has already returned to the parent -- so the very first
+ * read can still see root. Polls until the real uid AND gid are the expected
+ * ones or the deadline passes; returns whether they were.
+ */
+static bool wait_for_ids(pid_t pid, uid_t want_uid, gid_t want_gid, char *groups, size_t groups_len) {
+        int tries;
+
+        for (tries = 0; tries < 2000; tries++) {
+                uid_t uid;
+                gid_t gid;
+
+                if (!read_proc_ids(pid, &uid, &gid, groups, groups_len))
+                        return false;
+                if (uid == want_uid && gid == want_gid)
+                        return true;
+                test_sleep_ms(1);
+        }
+        return false;
+}
+
+/*
+ * §9.2's acceptance test: a unit with User=/Group= naming real unprivileged
+ * accounts actually runs as those ids, proven by the kernel's own
+ * /proc/<pid>/status for the exec'd /bin/sleep, and root's supplementary
+ * group is gone from the exec'd process. Group= alone keeps uid 0 and
+ * changes only the gid; a numeric User= resolves through the passwd
+ * database for its primary group.
+ *
+ * Only root can drop to another account. Unprivileged, the same unit must
+ * still never run as the caller: the child's setgroups() fails, it
+ * _exit()s PICO_EXIT_GROUP, and the parent reports a resources failure --
+ * that branch is what gets proven instead.
+ */
+static void test_user_group_drops_privilege(void) {
+        Manager *m;
+        Service *s;
+        char *dir;
+        char groups[256];
+        struct passwd *pw;
+        struct group *gr;
+        uid_t nobody_uid;
+        gid_t nobody_gid, daemon_gid;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        s = load_service(
+                        m,
+                        dir,
+                        "drop.service",
+                        "[Unit]\n[Service]\nType=simple\nUser=nobody\nGroup=daemon\n"
+                        "ExecStart=/bin/sleep 100\n");
+        ASSERT_STREQ(s->user, "nobody");
+        ASSERT_STREQ(s->group, "daemon");
+
+        if (getuid() != 0) {
+                printf("test-service: not root, checking the fatal-drop path instead\n");
+
+                ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+                ASSERT_EQ_INT(s->state, SERVICE_RUNNING); /* forked; the child fails on its own */
+                ASSERT_TRUE(reap_for(s, 3000));
+
+                ASSERT_EQ_INT(s->state, SERVICE_FAILED);
+                ASSERT_EQ_INT(s->result, SERVICE_FAILURE_RESOURCES); /* PICO_EXIT_GROUP, ours */
+                ASSERT_EQ_INT(s->main_exit_code, CLD_EXITED);
+                ASSERT_EQ_INT(s->main_exit_status, PICO_EXIT_GROUP);
+
+                manager_free(m);
+                test_rm_rf(dir);
+                free(dir);
+                return;
+        }
+
+        pw = getpwnam("nobody");
+        ASSERT_TRUE(pw != NULL);
+        nobody_uid = pw->pw_uid;
+        nobody_gid = pw->pw_gid;
+        gr = getgrnam("daemon");
+        ASSERT_TRUE(gr != NULL);
+        daemon_gid = gr->gr_gid;
+        ASSERT_TRUE(nobody_uid != 0);
+        ASSERT_TRUE(daemon_gid != 0);
+
+        /* User= + Group=: both real, Group= overrides the primary group,
+         * root's own group 0 is not left behind in the supplementary set. */
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        ASSERT_EQ_INT(s->state, SERVICE_RUNNING);
+        ASSERT_TRUE(s->main_pid > 0);
+        ASSERT_TRUE(wait_for_ids(s->main_pid, nobody_uid, daemon_gid, groups, sizeof(groups)));
+        ASSERT_TRUE(groups_line_has(groups, daemon_gid));
+        ASSERT_TRUE(!groups_line_has(groups, 0));
+
+        ASSERT_EQ_INT(unit_stop(UNIT(s)), 0);
+        ASSERT_TRUE(reap_for(s, 3000));
+        ASSERT_EQ_INT(s->state, SERVICE_DEAD);
+        ASSERT_EQ_INT(s->result, SERVICE_SUCCESS);
+
+        /* Group= alone: uid stays 0, gid changes. */
+        s = load_service(
+                        m,
+                        dir,
+                        "group-only.service",
+                        "[Unit]\n[Service]\nType=simple\nGroup=daemon\nExecStart=/bin/sleep 100\n");
+        ASSERT_TRUE(s->user == NULL);
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        ASSERT_TRUE(wait_for_ids(s->main_pid, 0, daemon_gid, groups, sizeof(groups)));
+        ASSERT_TRUE(groups_line_has(groups, daemon_gid));
+        ASSERT_TRUE(!groups_line_has(groups, 0));
+        ASSERT_EQ_INT(unit_stop(UNIT(s)), 0);
+        ASSERT_TRUE(reap_for(s, 3000));
+        ASSERT_EQ_INT(s->state, SERVICE_DEAD);
+
+        /* Numeric User=: the id as written, primary group from passwd. */
+        {
+                char unit[256];
+
+                snprintf(unit,
+                         sizeof(unit),
+                         "[Unit]\n[Service]\nType=simple\nUser=%lu\nExecStart=/bin/sleep 100\n",
+                         (unsigned long) nobody_uid);
+                s = load_service(m, dir, "numeric.service", unit);
+        }
+        ASSERT_TRUE(s->group == NULL);
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        ASSERT_TRUE(wait_for_ids(s->main_pid, nobody_uid, nobody_gid, groups, sizeof(groups)));
+        ASSERT_TRUE(!groups_line_has(groups, 0));
+        ASSERT_EQ_INT(unit_stop(UNIT(s)), 0);
+        ASSERT_TRUE(reap_for(s, 3000));
+        ASSERT_EQ_INT(s->state, SERVICE_DEAD);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * A User= or Group= that does not exist fails the start attempt cleanly in
+ * the parent: nothing is forked, the unit is FAILED with a resources result,
+ * and -- the actual requirement -- nothing ever ran as root instead.
+ * ExecStartPre= is covered too: resolution is per spawn, not per main
+ * command, so a control command never runs with more privilege than
+ * ExecStart= would have.
+ */
+static void test_user_unknown_fails_start_cleanly(void) {
+        Manager *m;
+        Service *s;
+        char *dir;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        s = load_service(
+                        m,
+                        dir,
+                        "nouser.service",
+                        "[Unit]\n[Service]\nType=simple\nUser=pico-no-such-user-5f\n"
+                        "ExecStart=/bin/sleep 100\n");
+        ASSERT_EQ_INT(UNIT(s)->load_state, UNIT_LOADED); /* an unknown account is not a load error */
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        ASSERT_EQ_INT(s->state, SERVICE_FAILED);
+        ASSERT_EQ_INT(s->result, SERVICE_FAILURE_RESOURCES);
+        ASSERT_EQ_INT(s->main_pid, 0);
+        ASSERT_TRUE(s->timer_event == NULL);
+
+        s = load_service(
+                        m,
+                        dir,
+                        "nogroup.service",
+                        "[Unit]\n[Service]\nType=oneshot\nGroup=pico-no-such-group-5f\n"
+                        "ExecStartPre=/bin/true\nExecStart=/bin/true\n");
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        ASSERT_EQ_INT(s->state, SERVICE_FAILED);
+        ASSERT_EQ_INT(s->result, SERVICE_FAILURE_RESOURCES);
+        ASSERT_EQ_INT(s->main_pid, 0);
+        ASSERT_EQ_INT(s->control_pid, 0);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
         test_lifecycle_simple();
         test_oneshot_completes_only_on_exit();
@@ -696,6 +944,8 @@ int main(void) {
         test_b9_service_verify_refuses_no_execstart();
         test_b1_zero_timeout_means_infinity();
         test_condition_skips_start_without_failing();
+        test_user_group_drops_privilege();
+        test_user_unknown_fails_start_cleanly();
 
         printf("test-service: all checks passed\n");
         return 0;
