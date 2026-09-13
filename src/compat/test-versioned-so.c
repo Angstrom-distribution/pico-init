@@ -2,19 +2,21 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The drop-in contract of the built libsystemd.so, checked on the real
- * file a consumer gets rather than on the build recipe that made it:
- * DT_SONAME is libsystemd.so.0; the ELF version-definition table is
- * exactly the node set of libsystemd.sym; every symbol the version script
- * lists resolves at its node through dlvsym(), which is the lookup a
- * binary linked against real libsystemd performs
- * (sd_bus_message_append@LIBSYSTEMD_209); and the helpers behind
- * `local: *` stay hidden. dlopen() with RTLD_NOW is the undefined-symbol
- * check -- every relocation resolves up front or the load fails, the same
- * way it would on the target.
+ * The drop-in contract of a built compat shared object (libsystemd.so.0,
+ * libudev.so.1), checked on the real file a consumer gets rather than on
+ * the build recipe that made it: DT_SONAME is the expected name; the ELF
+ * version-definition table is exactly the node set of the version
+ * script; every symbol the script lists resolves at its node through
+ * dlvsym(), which is the lookup a binary linked against the real library
+ * performs (sd_bus_message_append@LIBSYSTEMD_209, udev_new@LIBUDEV_183);
+ * and the helpers behind `local: *` stay hidden. dlopen() with RTLD_NOW
+ * is the undefined-symbol check -- every relocation resolves up front or
+ * the load fails, the same way it would on the target.
  *
  * argv[1]: the built shared object; argv[2]: the version script it was
- * linked with.
+ * linked with; argv[3]: the expected DT_SONAME; argv[4..]: private
+ * symbols that must not be exported, one per link_whole'd or internal
+ * family.
  */
 
 #define _GNU_SOURCE
@@ -25,7 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "../../test-util.h"
+#include "../test-util.h"
 
 #define MAX_NODES 64
 #define MAX_SYMBOLS 4096
@@ -221,16 +223,9 @@ static void check_elf(const char *path, const char *expect_soname) {
         fclose(f);
 }
 
-static void check_dlopen(const char *path) {
+static void check_dlopen(const char *path, char **hidden, size_t n_hidden) {
         void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
         size_t missing = 0;
-        static const char * const hidden[] = {
-                /* one per link_whole'd or private family: logd's ring
-                 * reader, the HMAC helper, sd-event/sd-device/sd-journal
-                 * internals */
-                "logd_ring_read",  "hmac_sha256",           "event_source_new",
-                "device_new_bare", "journal_current_entry",
-        };
 
         if (!h) {
                 fprintf(stderr, "dlopen(%s) failed: %s\n", path, dlerror());
@@ -245,12 +240,12 @@ static void check_dlopen(const char *path) {
         ASSERT_EQ_INT(missing, 0);
 
         /* An unversioned lookup, the shape dlsym()-driven consumers use,
-         * lands on the default version. */
-        ASSERT_TRUE(dlsym(h, "sd_bus_message_append"));
-        ASSERT_TRUE(dlsym(h, "sd_journal_open"));
-        ASSERT_TRUE(dlsym(h, "sd_network_monitor_new"));
+         * lands on the default version: checked on the first-node and
+         * last-node symbols, which brackets every node in between. */
+        ASSERT_TRUE(dlsym(h, symbols[0]));
+        ASSERT_TRUE(dlsym(h, symbols[n_symbols - 1]));
 
-        for (size_t i = 0; i < sizeof hidden / sizeof hidden[0]; i++)
+        for (size_t i = 0; i < n_hidden; i++)
                 if (dlsym(h, hidden[i])) {
                         fprintf(stderr, "%s leaks out of the shared object\n", hidden[i]);
                         exit(1);
@@ -260,17 +255,18 @@ static void check_dlopen(const char *path) {
 }
 
 int main(int argc, char **argv) {
-        ASSERT_EQ_INT(argc, 3);
+        ASSERT_TRUE(argc >= 4);
 
         parse_version_script(argv[2]);
         ASSERT_TRUE(n_nodes > 0);
         ASSERT_TRUE(n_symbols > 0);
 
-        check_elf(argv[1], "libsystemd.so.0");
-        check_dlopen(argv[1]);
+        check_elf(argv[1], argv[3]);
+        check_dlopen(argv[1], argv + 4, (size_t) (argc - 4));
 
-        printf("test-libsystemd-so: %s: SONAME ok, %zu version nodes, %zu versioned symbols resolve\n",
+        printf("test-versioned-so: %s: SONAME %s ok, %zu version nodes, %zu versioned symbols resolve\n",
                argv[1],
+               argv[3],
                n_nodes,
                n_symbols);
         return 0;

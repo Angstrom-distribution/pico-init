@@ -799,16 +799,22 @@ if python3.found()
   test('test-systemd-pc', python3, args: [check_pc, '--upstream', files('src/compat/libsystemd/systemd-v259.pc.in'), '--generated', systemd_pc])
 endif
 
-# The built .so checked as the file a consumer gets: SONAME, the
-# version-definition table against libsystemd.sym's nodes, every listed
-# symbol resolving at its node through dlvsym(), private helpers hidden,
-# and an RTLD_NOW load that fails on any undefined symbol.
-test_libsystemd_so_exe = executable(
-  'test-libsystemd-so',
-  ['src/compat/libsystemd/test-libsystemd-so.c'] + pico_test_sources,
+# A built .so checked as the file a consumer gets: SONAME, the
+# version-definition table against its version script's nodes, every
+# listed symbol resolving at its node through dlvsym(), private helpers
+# (one named per link_whole'd or internal family) hidden, and an RTLD_NOW
+# load that fails on any undefined symbol. Shared with libudev.so below.
+test_versioned_so_exe = executable(
+  'test-versioned-so',
+  ['src/compat/test-versioned-so.c'] + pico_test_sources,
   dependencies: dependency('dl'),
 )
-test('test-libsystemd-so', test_libsystemd_so_exe, args: [libsystemd, libsystemd_sym])
+test(
+  'test-libsystemd-so',
+  test_versioned_so_exe,
+  args: [libsystemd, libsystemd_sym, 'libsystemd.so.0',
+         'logd_ring_read', 'hmac_sha256', 'event_source_new', 'device_new_bare', 'journal_current_entry'],
+)
 
 # Tests that only use the installed headers link the shared library, so
 # the versioned export list is what they exercise; the ones below that
@@ -965,3 +971,4 @@ foreach t : libsystemd_compat_device_tests
   )
   test(t, exe)
 endforeach
+
