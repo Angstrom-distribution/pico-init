@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: 2026 Koen Kooi
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# systemd-tmpfiles-setup.service's own shape and ordering: a oneshot that
+# runs Before=sysinit.target, with --boot so `!` lines apply. No After= for
+# a writable /var is needed here: pico-init remounts the root filesystem
+# read-write and mounts /run before it starts a single unit (root-check.h,
+# mount-setup.c), and there are no separate .mount units to wait for.
+#
+# --remove is absent because it is not implemented (tmpfiles.h); every line
+# type with a consumer in these images is a --create one. Enablement follows
+# the preset flow like every other unit: this ships WantedBy=sysinit.target,
+# upstream's own hook, and the preset alone decides.
+
+[Unit]
+Description=Create System Files and Directories
+Before=sysinit.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/pico-tmpfiles --create --boot
+
+[Install]
+WantedBy=sysinit.target

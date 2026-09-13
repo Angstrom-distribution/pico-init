@@ -475,6 +475,62 @@ foreach t : devd_tests
   test(t, exe)
 endforeach
 
+# ---------------------------------------------------------------------------
+# pico-tmpfiles -- the creation half of systemd-tmpfiles over tmpfiles.d
+# (plans/38 §9.4). A fifth binary out of the same tree, a oneshot rather than
+# a daemon, and the thing that makes the tmpfiles.d snippets oe-core packages
+# already ship do something under pico-init. tmpfiles.h lists exactly which
+# line types are real and which are an explicit, logged skip.
+#
+# It links pico-init-core for util.c's logging and os-release.c's reader
+# (behind the %o/%w/%A specifiers) and nothing else of PID 1. bindir, like
+# systemd-tmpfiles itself.
+# ---------------------------------------------------------------------------
+tmpfiles_includes = include_directories('src/tmpfiles')
+
+tmpfiles_core = static_library(
+  'tmpfiles-core',
+  files(
+    'src/tmpfiles/tmpfiles-conf.c',
+    'src/tmpfiles/tmpfiles-create.c',
+  ),
+  include_directories: tmpfiles_includes,
+)
+
+pico_tmpfiles_exe = executable(
+  'pico-tmpfiles',
+  'src/tmpfiles/pico-tmpfiles.c',
+  include_directories: tmpfiles_includes,
+  link_whole: tmpfiles_core,
+  link_with: pico_init_core,
+  install: true,
+  install_dir: get_option('bindir'),
+)
+
+install_data(
+  'src/tmpfiles/pico-tmpfiles.service',
+  install_dir: get_option('prefix') / 'lib' / 'systemd' / 'system',
+)
+
+# test-tmpfiles-conf covers the grammar and the file-precedence rule against
+# fixture trees under a --root; test-tmpfiles-create applies real fixtures
+# and reads the inodes back, then runs the installed binary end to end (found
+# next to the test via /proc/self/exe, test-picoctl.c's idiom).
+tmpfiles_tests = [
+  'test-tmpfiles-conf',
+  'test-tmpfiles-create',
+]
+
+foreach t : tmpfiles_tests
+  exe = executable(
+    t,
+    ['src/tmpfiles/' + t + '.c'] + pico_test_sources,
+    include_directories: tmpfiles_includes,
+    link_with: [tmpfiles_core, pico_init_core],
+  )
+  test(t, exe, depends: pico_tmpfiles_exe)
+endforeach
+
 # picoctl is defined after logd below, because it links logd's ring reader.
 
 # ---------------------------------------------------------------------------
