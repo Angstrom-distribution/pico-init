@@ -271,7 +271,7 @@ int sd_listen_fds(int unset_environment) {
          * init reusing the same pid across a wrapped exec. */
         e = getenv("LISTEN_PIDFDID");
         if (e) {
-                uint64_t want, have;
+                uint64_t want, have = 0;
 
                 r = parse_strict_u64(e, &want);
                 if (r < 0)
