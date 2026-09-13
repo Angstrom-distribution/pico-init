@@ -972,3 +972,110 @@ foreach t : libsystemd_compat_device_tests
   test(t, exe)
 endforeach
 
+# ---------------------------------------------------------------------------
+# libudev shim -- ${libdir}/libudev.so.1 with real libudev's SONAME, symbol
+# versions (libudev-v259.sym, all 92 exports on their upstream nodes) and
+# libudev.pc, for the DEPENDS = "udev" population that wants the library
+# rather than the daemon. Built the way upstream builds its own: every
+# udev_* entry point is a thin wrapper over sd_device_*, so the shared
+# object links libsystemd.so.0 and carries no device code of its own.
+#
+# Scope is the read-only half: udev_device_*/udev_enumerate_*/
+# udev_list_entry_* are real. udev_monitor_* is the silent-but-successful
+# interim of libudev-monitor.c, kept until live uevent subscription lands;
+# udev_queue_*/udev_hwdb_* report the true no-udevd/no-hwdb state.
+# ---------------------------------------------------------------------------
+libudev_includes = include_directories('src/compat/libudev')
+libudev_sources = files(
+  'src/compat/libudev/libudev.c',
+  'src/compat/libudev/libudev-list.c',
+  'src/compat/libudev/libudev-device.c',
+  'src/compat/libudev/libudev-enumerate.c',
+  'src/compat/libudev/libudev-monitor.c',
+  'src/compat/libudev/libudev-queue.c',
+  'src/compat/libudev/libudev-hwdb.c',
+  'src/compat/libudev/libudev-util.c',
+)
+
+# Build-internal archive, never installed: the fixture-driven tests link
+# it together with libsystemd_compat to reach the /sys test hooks, and the
+# sym generator reads its symbol table through nm.
+libudev_compat = static_library(
+  'udev-compat',
+  libudev_sources,
+  include_directories: libsystemd_compat_includes,
+)
+
+# Upstream's own libudev_version at v259, bumped together with the
+# vendored files on a systemd bump.
+libudev_version = '1.7.12'
+libudev_sym = files('src/compat/libudev/libudev.sym')
+libudev = shared_library(
+  'udev',
+  version: libudev_version,
+  link_whole: libudev_compat,
+  link_with: libsystemd,
+  link_args: ['-Wl,--version-script=' + meson.current_source_dir() / 'src/compat/libudev/libudev.sym'],
+  link_depends: libudev_sym,
+  install: true,
+)
+
+install_headers('src/compat/libudev/libudev.h')
+
+libudev_pc = configure_file(
+  input: 'src/compat/libudev/libudev.pc.in',
+  output: 'libudev.pc',
+  configuration: pc_conf,
+  install: true,
+  install_dir: pkgconfig_dir,
+)
+
+if python3.found() and nm.found()
+  libudev_sym_args = [
+    libsystemd_sym_gen,
+    '--upstream', files('src/compat/libudev/libudev-v259.sym'),
+    '--nm', nm.full_path(),
+    '--archive', libudev_compat,
+    '--header', files('src/compat/libudev/libudev.h'),
+    '--prefix', 'udev_',
+    '--pico-node', 'PICO_LIBUDEV_0',
+    '--regen-target', 'regen-libudev-sym',
+  ]
+  test('test-libudev-sym', python3, args: libudev_sym_args + ['--check', libudev_sym])
+  run_target(
+    'regen-libudev-sym',
+    command: [python3] + libudev_sym_args + ['--summary', '-o', meson.current_source_dir() / 'src/compat/libudev/libudev.sym'],
+  )
+endif
+
+if python3.found()
+  test('test-libudev-pc', python3, args: [check_pc, '--upstream', files('src/compat/libudev/libudev-v259.pc.in'), '--generated', libudev_pc])
+endif
+
+test(
+  'test-libudev-so',
+  test_versioned_so_exe,
+  args: [libudev, libudev_sym, 'libudev.so.1', 'libudev_list_new', 'libudev_device_new'],
+)
+
+# test-libudev-device/-enumerate drive the wrappers against a fixture /sys
+# through the compat archives; test-libudev-monitor links the installed
+# shape (the .so) and pins the never-delivers monitor contract that
+# libusb_init() depends on.
+foreach t : ['test-libudev-device', 'test-libudev-enumerate']
+  exe = executable(
+    t,
+    ['src/compat/libudev/' + t + '.c'] + pico_test_sources,
+    include_directories: [libudev_includes, libsystemd_compat_includes],
+    link_with: [libudev_compat, libsystemd_compat],
+  )
+  test(t, exe)
+endforeach
+
+test_libudev_monitor_exe = executable(
+  'test-libudev-monitor',
+  ['src/compat/libudev/test-libudev-monitor.c'] + pico_test_sources,
+  include_directories: libudev_includes,
+  link_with: libudev,
+)
+test('test-libudev-monitor', test_libudev_monitor_exe)
