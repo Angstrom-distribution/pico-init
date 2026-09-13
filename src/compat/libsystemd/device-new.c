@@ -200,9 +200,10 @@ static bool location_is_valid(const char *resolved, size_t rootlen) {
 }
 
 int device_new_from_syspath_internal(sd_device **ret, const char *syspath, bool relaxed) {
-        char resolved[PATH_MAX], uevent_path[PATH_MAX];
+        char resolved[PATH_MAX], uevent_path[PATH_MAX], root_resolved[PATH_MAX];
         const char *root = device_sys_root();
-        size_t rootlen = strlen(root);
+        const char *canon_root;
+        size_t rootlen;
         struct stat st;
         sd_device *d;
 
@@ -212,7 +213,21 @@ int device_new_from_syspath_internal(sd_device **ret, const char *syspath, bool 
         if (!realpath(syspath, resolved))
                 return errno == ENOENT ? -ENODEV : -errno;
 
-        if (strncmp(resolved, root, rootlen) != 0 || resolved[rootlen] != '/')
+        /* device_sys_root() can itself sit behind a symlink -- never true
+         * for the real "/sys", but routine for a test fixture's tmpdir on
+         * a host where /tmp (or some ancestor) is one. realpath(syspath,
+         * ...) above already resolved through any such symlink, so
+         * comparing it against the raw, un-resolved root mismatches for no
+         * reason other than the two spellings of the same directory
+         * differing -- confirmed by reproducing the exact failure with a
+         * symlinked /tmp locally. Canonicalize root the same way; fall
+         * back to the raw string only if it does not exist yet (only
+         * possible mid-setup of a test fixture, and moot there since no
+         * syspath under it could resolve to a real file either). */
+        canon_root = realpath(root, root_resolved) ? root_resolved : root;
+        rootlen = strlen(canon_root);
+
+        if (strncmp(resolved, canon_root, rootlen) != 0 || resolved[rootlen] != '/')
                 return -ENODEV;
 
         if (!location_is_valid(resolved, rootlen))

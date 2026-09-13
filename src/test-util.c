@@ -19,13 +19,30 @@
 
 char *test_tmpdir_new(void) {
         char template[] = "/tmp/pico-init-test-XXXXXX";
+        char resolved[PATH_MAX];
         char *dir;
 
         dir = mkdtemp(template);
         if (!dir)
                 return NULL;
 
-        return strdup(dir);
+        /*
+         * realpath(), not a plain strdup(): whenever /tmp (or any ancestor)
+         * is itself a symlink -- never true locally, routine on at least
+         * one real CI runner, confirmed by reproducing device-new.c's own
+         * syspath mismatch this way -- every device/sd_device test that
+         * builds an expected path by hand from this string and every
+         * production code path that canonicalizes the syspath it is fed
+         * (device_new_from_syspath_internal()) must agree on the same
+         * spelling. Canonicalizing once here, at the one place every such
+         * test's fixture root is minted, is cheaper than teaching each of
+         * them to do it themselves. The directory this mkdtemp() just
+         * created always exists, so realpath() cannot fail on it.
+         */
+        if (!realpath(dir, resolved))
+                return strdup(dir);
+
+        return strdup(resolved);
 }
 
 static int join(char *buf, size_t size, const char *dir, const char *name) {
