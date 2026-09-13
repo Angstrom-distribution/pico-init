@@ -44,8 +44,8 @@ version_h = vcs_tag(
 # it means every consumer of this small library must resolve that symbol
 # too, whether or not it ever calls the watchdog path. The full
 # libsystemd_compat static library below link_wholes this back in rather
-# than listing these three files directly among its own sources, so its own
-# installed archive still carries every symbol it always did.
+# than listing these three files directly among its own sources, so the
+# libsystemd.so built from it still carries every symbol it always did.
 libsystemd_compat_includes = include_directories('src/compat/libsystemd')
 
 sd_event_lib = static_library(
@@ -665,11 +665,37 @@ libsystemd_compat_sources = files(
   'src/compat/libsystemd/network-monitor.c',
 )
 
+# The archive is the build-internal form, never installed: the tests that
+# reach private hooks (device_set_sys_root_for_tests() and friends, hidden
+# behind the version script's `local: *`) link it, and
+# gen-libsystemd-sym.py reads its full symbol table through nm. Real
+# systemd ships no static libsystemd either; a consumer lands on the .so.
 libsystemd_compat = static_library(
   'systemd-compat',
   libsystemd_compat_sources,
   include_directories: libsystemd_compat_includes,
   link_whole: [sd_event_lib, logd_read],
+)
+
+# The installed artifact: ${libdir}/libsystemd.so.0.<minor>.<micro> with
+# DT_SONAME libsystemd.so.0 -- the name, path and SONAME real systemd's
+# libsystemd occupies, so package.bbclass's shlib pass and every
+# consumer's -lsystemd resolve to it with nothing downstream needing to
+# know. Two version numbers travel with the vendored libsystemd-v259.sym
+# and change together on a systemd bump: the library version is
+# upstream's own libsystemd_version at that tag, and the systemd release
+# number is what the .pc files report, since consumers gate on
+# `systemd >= N`. meson's default b_lundef makes an undefined symbol a
+# link error here rather than a load failure on the target.
+libsystemd_version = '0.42.0'
+libsystemd_compat_systemd_version = '259'
+libsystemd_sym = files('src/compat/libsystemd/libsystemd.sym')
+libsystemd = shared_library(
+  'systemd',
+  version: libsystemd_version,
+  link_whole: libsystemd_compat,
+  link_args: ['-Wl,--version-script=' + meson.current_source_dir() / 'src/compat/libsystemd/libsystemd.sym'],
+  link_depends: libsystemd_sym,
   install: true,
 )
 
@@ -709,7 +735,6 @@ install_headers(libsystemd_public_headers, subdir: 'systemd')
 # function, and on an sd_*-named internal helper leaking out of the archive.
 libsystemd_sym_gen = files('tools/gen-libsystemd-sym.py')
 libsystemd_sym_upstream = files('src/compat/libsystemd/libsystemd-v259.sym')
-libsystemd_sym = files('src/compat/libsystemd/libsystemd.sym')
 python3 = find_program('python3', required: false)
 nm = find_program('nm', required: false)
 if python3.found() and nm.found()
@@ -724,11 +749,25 @@ if python3.found() and nm.found()
   )
 endif
 
+# The built .so checked as the file a consumer gets: SONAME, the
+# version-definition table against libsystemd.sym's nodes, every listed
+# symbol resolving at its node through dlvsym(), private helpers hidden,
+# and an RTLD_NOW load that fails on any undefined symbol.
+test_libsystemd_so_exe = executable(
+  'test-libsystemd-so',
+  ['src/compat/libsystemd/test-libsystemd-so.c'] + pico_test_sources,
+  dependencies: dependency('dl'),
+)
+test('test-libsystemd-so', test_libsystemd_so_exe, args: [libsystemd, libsystemd_sym])
+
+# Tests that only use the installed headers link the shared library, so
+# the versioned export list is what they exercise; the ones below that
+# reach private test hooks (*-internal.h) link the archive instead.
 test_sd_daemon_exe = executable(
   'test-sd-daemon',
   ['src/compat/libsystemd/test-sd-daemon.c'] + pico_test_sources,
   include_directories: libsystemd_compat_includes,
-  link_with: libsystemd_compat,
+  link_with: libsystemd,
 )
 test('test-sd-daemon', test_sd_daemon_exe)
 
@@ -736,7 +775,7 @@ test_sd_event_exe = executable(
   'test-sd-event',
   ['src/compat/libsystemd/test-sd-event.c'] + pico_test_sources,
   include_directories: libsystemd_compat_includes,
-  link_with: libsystemd_compat,
+  link_with: libsystemd,
 )
 test('test-sd-event', test_sd_event_exe)
 
@@ -757,7 +796,7 @@ test_sd_journal_read_exe = executable(
   'test-sd-journal-read',
   ['src/compat/libsystemd/test-sd-journal-read.c'] + pico_test_sources,
   include_directories: libsystemd_compat_includes,
-  link_with: libsystemd_compat,
+  link_with: libsystemd,
 )
 test('test-sd-journal-read', test_sd_journal_read_exe)
 
@@ -765,7 +804,7 @@ test_sd_journal_send_exe = executable(
   'test-sd-journal-send',
   ['src/compat/libsystemd/test-sd-journal-send.c'] + pico_test_sources,
   include_directories: libsystemd_compat_includes,
-  link_with: libsystemd_compat,
+  link_with: libsystemd,
 )
 test('test-sd-journal-send', test_sd_journal_send_exe)
 
@@ -779,7 +818,7 @@ test_sd_bus_validate_exe = executable(
   'test-sd-bus-validate',
   ['src/compat/libsystemd/test-sd-bus-validate.c'] + pico_test_sources,
   include_directories: libsystemd_compat_includes,
-  link_with: libsystemd_compat,
+  link_with: libsystemd,
 )
 test('test-sd-bus-validate', test_sd_bus_validate_exe)
 
@@ -787,7 +826,7 @@ test_sd_bus_path_exe = executable(
   'test-sd-bus-path',
   ['src/compat/libsystemd/test-sd-bus-path.c'] + pico_test_sources,
   include_directories: libsystemd_compat_includes,
-  link_with: libsystemd_compat,
+  link_with: libsystemd,
 )
 test('test-sd-bus-path', test_sd_bus_path_exe)
 
@@ -795,7 +834,7 @@ test_sd_bus_error_exe = executable(
   'test-sd-bus-error',
   ['src/compat/libsystemd/test-sd-bus-error.c'] + pico_test_sources,
   include_directories: libsystemd_compat_includes,
-  link_with: libsystemd_compat,
+  link_with: libsystemd,
 )
 test('test-sd-bus-error', test_sd_bus_error_exe)
 
@@ -803,7 +842,7 @@ test_sd_bus_open_exe = executable(
   'test-sd-bus-open',
   ['src/compat/libsystemd/test-sd-bus-open.c'] + pico_test_sources,
   include_directories: libsystemd_compat_includes,
-  link_with: libsystemd_compat,
+  link_with: libsystemd,
 )
 test('test-sd-bus-open', test_sd_bus_open_exe)
 
@@ -811,7 +850,7 @@ test_sd_bus_stubs_exe = executable(
   'test-sd-bus-stubs',
   ['src/compat/libsystemd/test-sd-bus-stubs.c'] + pico_test_sources,
   include_directories: libsystemd_compat_includes,
-  link_with: libsystemd_compat,
+  link_with: libsystemd,
 )
 test('test-sd-bus-stubs', test_sd_bus_stubs_exe)
 
@@ -819,7 +858,7 @@ test_sd_bus_noop_exe = executable(
   'test-sd-bus-noop',
   ['src/compat/libsystemd/test-sd-bus-noop.c'] + pico_test_sources,
   include_directories: libsystemd_compat_includes,
-  link_with: libsystemd_compat,
+  link_with: libsystemd,
 )
 test('test-sd-bus-noop', test_sd_bus_noop_exe)
 
@@ -830,7 +869,7 @@ test_sd_login_cgroup_exe = executable(
   'test-sd-login-cgroup',
   ['src/compat/libsystemd/test-sd-login-cgroup.c'] + pico_test_sources,
   include_directories: libsystemd_compat_includes,
-  link_with: libsystemd_compat,
+  link_with: libsystemd,
 )
 test('test-sd-login-cgroup', test_sd_login_cgroup_exe)
 
@@ -838,7 +877,7 @@ test_sd_login_exe = executable(
   'test-sd-login',
   ['src/compat/libsystemd/test-sd-login.c'] + pico_test_sources,
   include_directories: libsystemd_compat_includes,
-  link_with: libsystemd_compat,
+  link_with: libsystemd,
 )
 test('test-sd-login', test_sd_login_exe)
 
@@ -846,7 +885,7 @@ test_sd_hwdb_exe = executable(
   'test-sd-hwdb',
   ['src/compat/libsystemd/test-sd-hwdb.c'] + pico_test_sources,
   include_directories: libsystemd_compat_includes,
-  link_with: libsystemd_compat,
+  link_with: libsystemd,
 )
 test('test-sd-hwdb', test_sd_hwdb_exe)
 
