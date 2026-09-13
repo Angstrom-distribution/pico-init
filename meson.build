@@ -699,6 +699,50 @@ libsystemd = shared_library(
   install: true,
 )
 
+# libsystemd.pc for the -lsystemd consumers and systemd.pc for the larger
+# population that never links anything and only asks pkg-config where
+# units go (systemdsystemunitdir and its siblings). Both templates mirror
+# the vendored upstream ones name for name; test-systemd-pc fails on any
+# drift. Path values follow upstream's own derivation (an absolute
+# libdir/sysconfdir passes through the join unchanged); the uid-range
+# values are upstream's option defaults.
+pc_prefix = get_option('prefix')
+pc_conf = configuration_data({
+  'PREFIX': pc_prefix,
+  'PREFIX_NOSLASH': '/' + pc_prefix.strip('/'),
+  'LIBDIR': pc_prefix / get_option('libdir'),
+  'INCLUDE_DIR': pc_prefix / get_option('includedir'),
+  'SYSCONF_DIR': pc_prefix / get_option('sysconfdir'),
+  'PROJECT_URL': 'https://github.com/koenkooi/pico-init',
+  'PROJECT_VERSION': libsystemd_compat_systemd_version,
+  'SYSTEM_ALLOC_UID_MIN': 1,
+  'SYSTEM_UID_MAX': 999,
+  'SYSTEM_ALLOC_GID_MIN': 1,
+  'SYSTEM_GID_MAX': 999,
+  'GREETER_UID_MIN': 60578,
+  'GREETER_UID_MAX': 60705,
+  'DYNAMIC_UID_MIN': 61184,
+  'DYNAMIC_UID_MAX': 65519,
+  'CONTAINER_UID_BASE_MIN': 524288,
+  'CONTAINER_UID_BASE_MAX': 1878982656,
+  'FOREIGN_UID_BASE': 2147352576,
+})
+pkgconfig_dir = get_option('libdir') / 'pkgconfig'
+libsystemd_pc = configure_file(
+  input: 'src/compat/libsystemd/libsystemd.pc.in',
+  output: 'libsystemd.pc',
+  configuration: pc_conf,
+  install: true,
+  install_dir: pkgconfig_dir,
+)
+systemd_pc = configure_file(
+  input: 'src/compat/libsystemd/systemd.pc.in',
+  output: 'systemd.pc',
+  configuration: pc_conf,
+  install: true,
+  install_dir: pkgconfig_dir,
+)
+
 # Real consumers expect "systemd/sd-daemon.h" (etc.) on their include path,
 # the same layout a real systemd-devel package ships. _sd-common.h rides
 # along unconditionally, same as real systemd's own src/systemd/meson.build
@@ -747,6 +791,12 @@ if python3.found() and nm.found()
     'regen-libsystemd-sym',
     command: [python3] + libsystemd_sym_args + ['--summary', '-o', meson.current_source_dir() / 'src/compat/libsystemd/libsystemd.sym'],
   )
+endif
+
+if python3.found()
+  check_pc = files('tools/check-pc.py')
+  test('test-libsystemd-pc', python3, args: [check_pc, '--upstream', files('src/compat/libsystemd/libsystemd-v259.pc.in'), '--generated', libsystemd_pc])
+  test('test-systemd-pc', python3, args: [check_pc, '--upstream', files('src/compat/libsystemd/systemd-v259.pc.in'), '--generated', systemd_pc])
 endif
 
 # The built .so checked as the file a consumer gets: SONAME, the

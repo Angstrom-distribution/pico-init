@@ -1,0 +1,17 @@
+#  SPDX-FileCopyrightText: 2026 Koen Kooi
+#  SPDX-License-Identifier: GPL-2.0-or-later
+#
+#  Same shape as real systemd's libsystemd.pc (libsystemd-v259.pc.in);
+#  test-systemd-pc keeps it that way.
+
+prefix=@PREFIX@
+exec_prefix=@PREFIX@
+libdir=@LIBDIR@
+includedir=@INCLUDE_DIR@
+
+Name: systemd
+Description: systemd Library (pico-init's libsystemd-compat)
+URL: @PROJECT_URL@
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -lsystemd
+Cflags: -I${includedir}
