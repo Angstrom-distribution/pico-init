@@ -680,7 +680,7 @@ libsystemd_compat = static_library(
 # -- any public sd-*.h that #includes "_sd-common.h" needs it installed
 # beside itself, since that's a quoted include and resolves against the
 # installed file's own directory, not the source tree's.
-install_headers(
+libsystemd_public_headers = files(
   'src/compat/libsystemd/sd-daemon.h',
   'src/compat/libsystemd/sd-event.h',
   'src/compat/libsystemd/sd-id128.h',
@@ -693,8 +693,36 @@ install_headers(
   'src/compat/libsystemd/sd-hwdb.h',
   'src/compat/libsystemd/sd-device.h',
   'src/compat/libsystemd/sd-network.h',
-  subdir: 'systemd',
 )
+install_headers(libsystemd_public_headers, subdir: 'systemd')
+
+# Symbol versions are real systemd's own, so a binary linked against real
+# libsystemd (sd_bus_message_append@LIBSYSTEMD_209) resolves against this
+# library too. libsystemd.sym is generated, not maintained: the pinned
+# upstream libsystemd.sym (libsystemd-v259.sym, verbatim from systemd's
+# v259 tag) intersected with what the archive defines, every symbol on its
+# upstream node, the sd_network_* family (never exported by upstream's
+# libsystemd, it lives in libsystemd-shared) on a trailing
+# PICO_LIBSYSTEMD_0. A systemd version bump is: replace the upstream file,
+# `ninja regen-libsystemd-sym`, review the diff. test-libsystemd-sym fails
+# on a stale committed file, on a public header declaring an undefined
+# function, and on an sd_*-named internal helper leaking out of the archive.
+libsystemd_sym_gen = files('tools/gen-libsystemd-sym.py')
+libsystemd_sym_upstream = files('src/compat/libsystemd/libsystemd-v259.sym')
+libsystemd_sym = files('src/compat/libsystemd/libsystemd.sym')
+python3 = find_program('python3', required: false)
+nm = find_program('nm', required: false)
+if python3.found() and nm.found()
+  libsystemd_sym_args = [libsystemd_sym_gen, '--upstream', libsystemd_sym_upstream, '--nm', nm.full_path(), '--archive', libsystemd_compat]
+  foreach h : libsystemd_public_headers
+    libsystemd_sym_args += ['--header', h]
+  endforeach
+  test('test-libsystemd-sym', python3, args: libsystemd_sym_args + ['--check', libsystemd_sym])
+  run_target(
+    'regen-libsystemd-sym',
+    command: [python3] + libsystemd_sym_args + ['--summary', '-o', meson.current_source_dir() / 'src/compat/libsystemd/libsystemd.sym'],
+  )
+endif
 
 test_sd_daemon_exe = executable(
   'test-sd-daemon',
