@@ -883,9 +883,11 @@ int main(void) {
         test_enable_disable_is_enabled();
         test_preset();
         test_preset_default_enable();
-        test_oracle_symlinks_byte_identical();
         test_read_verbs_against_real_boot();
         test_status_log_tail();
+        /* Last: it exit(77)s on a host without systemctl, and a SKIP must not
+         * hide the in-process checks above. */
+        test_oracle_symlinks_byte_identical();
 
         printf("test-picoctl: all checks passed\n");
         return 0;
