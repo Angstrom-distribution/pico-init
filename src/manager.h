@@ -180,6 +180,9 @@ struct Manager {
         /* When to stop waiting for the drain and go anyway. A service that
          * will not die must not be able to keep the machine up forever. */
         usec_t shutdown_deadline;
+
+        /* set once manager_log_degradation_summary() has logged its one line */
+        bool degradation_summary_logged;
 };
 
 /* --- manager.c --- */
@@ -204,6 +207,14 @@ Unit *manager_get_unit(Manager *m, const char *id);
 
 /* The service whose main pid is `pid`, or NULL. Used to route SIGCHLD. */
 Unit *manager_get_unit_by_pid(Manager *m, pid_t pid);
+
+/* Units carrying a degradation record (unit.h). */
+size_t manager_count_degraded_units(Manager *m);
+
+/* The one boot-time summary line naming how many loaded units carry a
+ * degradation record. job.c calls it when the default target's start job
+ * finishes; a second call is a no-op. */
+void manager_log_degradation_summary(Manager *m);
 
 /*
  * Look up, or create and load, a unit by id. 0 or -errno.

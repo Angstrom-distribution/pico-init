@@ -612,9 +612,13 @@ static void test_read_verbs_against_real_boot(void) {
         ASSERT_TRUE(unitdir != NULL && root != NULL);
 
         ASSERT_EQ_INT(test_write_file(unitdir, "default.target", "[Unit]\nDescription=Default\n"), 0);
+        /* PIDFile=/User= are dropped at parse time and must show up in
+         * `show`, which is the only place a board's operator can read the
+         * degradation record from. */
         ASSERT_EQ_INT(test_write_file(unitdir,
                                       "console.service",
                                       "[Unit]\nDescription=Console\n[Service]\nType=simple\n"
+                                      "PIDFile=/run/console.pid\nUser=nobody\n"
                                       "ExecStart=/bin/sleep 300\n[Install]\nWantedBy=default.target\n"),
                       0);
 
@@ -660,6 +664,7 @@ static void test_read_verbs_against_real_boot(void) {
         ASSERT_TRUE(strstr(res.out, "ActiveState=active\n") != NULL);
         ASSERT_TRUE(strstr(res.out, "SubState=running\n") != NULL);
         ASSERT_TRUE(strstr(res.out, "Description=Console\n") != NULL);
+        ASSERT_TRUE(strstr(res.out, "Degraded-Directives=PIDFile User\n") != NULL);
         {
                 char expect[64];
 
@@ -669,6 +674,11 @@ static void test_read_verbs_against_real_boot(void) {
                          (int) SERVICE(manager_get_unit(m, "console.service"))->main_pid);
                 ASSERT_TRUE(strstr(res.out, expect) != NULL);
         }
+        ASSERT_EQ_INT(res.exit_code, 0);
+
+        /* show: a unit honoured in full publishes the field empty */
+        RUN_PICOCTL(&res, "--root", root, "show", "default.target");
+        ASSERT_TRUE(strstr(res.out, "Degraded-Directives=\n") != NULL);
         ASSERT_EQ_INT(res.exit_code, 0);
 
         /* show: never-published unit reads as not-found, not an error */

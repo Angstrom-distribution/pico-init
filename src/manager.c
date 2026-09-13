@@ -419,6 +419,41 @@ int manager_dispatch_cgroup_empty_queue(Manager *m) {
         return n;
 }
 
+size_t manager_count_degraded_units(Manager *m) {
+        size_t i, n = 0;
+
+        for (i = 0; m && i < m->n_units; i++)
+                if (m->units[i]->n_degraded_directives > 0)
+                        n++;
+
+        return n;
+}
+
+void manager_log_degradation_summary(Manager *m) {
+        size_t n, i, directives = 0;
+
+        if (!m || m->degradation_summary_logged)
+                return;
+        m->degradation_summary_logged = true;
+
+        n = manager_count_degraded_units(m);
+        for (i = 0; i < m->n_units; i++)
+                directives += m->units[i]->n_degraded_directives;
+
+        /* WARNING when anything degraded so it survives a quiet log level;
+         * the clean case is worth one INFO line so its absence means something. */
+        if (n > 0)
+                pico_log(PICO_LOG_WARNING,
+                         "boot settled: %zu of %zu units degraded, %zu directive%s dropped "
+                         "(see 'picoctl show <unit>' Degraded-Directives=)",
+                         n,
+                         m->n_units,
+                         directives,
+                         directives == 1 ? "" : "s");
+        else
+                pico_log(PICO_LOG_INFO, "boot settled: %zu units loaded, none degraded", m->n_units);
+}
+
 Unit *manager_get_unit(Manager *m, const char *id) {
         size_t i;
 

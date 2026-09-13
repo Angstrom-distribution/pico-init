@@ -151,6 +151,16 @@ struct Unit {
 
         /* DFS generation marker for cycle detection, owned by unit-dependency.c */
         unsigned dep_generation;
+
+        /*
+         * Degradation record: every directive the parser dropped and every
+         * Type= fallback taken, deduplicated. Populated by unit-parse.c,
+         * reported as Degraded-Directives= in the state file, as one WARNING
+         * at load and in the boot summary -- a compatibility gap is never only
+         * a DEBUG line. NULL/0 for a unit pico-init honours in full.
+         */
+        char **degraded_directives;
+        size_t n_degraded_directives;
 };
 
 /* --- unit.c --- */
@@ -202,6 +212,18 @@ int unit_name_printf(Unit *u, const char *format, char **ret);
 /* unit_name_printf()'s table plus %I; for ExecStart=/ExecStartPre=/Description=,
  * never for a value that becomes part of a unit name. 0 or -ENOMEM. */
 int unit_full_printf(Unit *u, const char *format, char **ret);
+
+/*
+ * Record one degradation on u. `what` is the directive name as written
+ * ("PrivateTmp"), or name=qualifier where only a value shape is dropped
+ * ("ConditionPathExists=!", "ExecStart=@") or a fallback was taken
+ * ("Type=forking"). Duplicates are not recorded twice. 0 or -ENOMEM.
+ */
+int unit_add_degradation(Unit *u, const char *what);
+
+/* The record joined with single spaces, owned; "" (still owned) when clean;
+ * NULL on -ENOMEM. */
+char *unit_degraded_directives_string(Unit *u);
 
 /* --- unit-load.c --- */
 /* Find u->id's fragment in the manager's unit search path, parse it, resolve to

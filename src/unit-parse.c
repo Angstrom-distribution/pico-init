@@ -81,6 +81,7 @@
 
 #include <errno.h>
 #include <stdbool.h>
+#include <stdio.h> /* snprintf, for the degradation record's name=qualifier form */
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h> /* strcasecmp, for the boolean spellings */
@@ -218,7 +219,8 @@ static int expand_word(Unit *u, char **word) {
         return r;
 }
 
-static int parse_exec_line(Unit *u, const char *path, unsigned line, const char *rvalue, char ***ret_argv) {
+static int parse_exec_line(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue, char ***ret_argv) {
         const char *p = rvalue;
         char **argv = NULL;
         char *word;
@@ -236,11 +238,16 @@ static int parse_exec_line(Unit *u, const char *path, unsigned line, const char 
                          line);
                 return -EINVAL;
         } else if (*p == '@' || *p == '+' || *p == '!' || *p == ':') {
+                char what[64];
+
                 pico_log(PICO_LOG_DEBUG,
-                         "%s:%u: unsupported ExecStart= modifier '%c', ignoring line",
+                         "%s:%u: unsupported %s= modifier '%c', ignoring line",
                          path,
                          line,
+                         lvalue,
                          *p);
+                snprintf(what, sizeof(what), "%s=%c", lvalue, *p);
+                (void) unit_add_degradation(u, what);
                 return -EINVAL;
         }
 
@@ -498,21 +505,22 @@ static int config_parse_after(Unit *u, const char *path, unsigned line, const ch
  */
 static int config_parse_condition_path(
                 Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue, char ***target) {
-        (void) u;
-
         if (rvalue[0] == '\0') {
                 *target = pico_strv_free(*target);
                 return 0;
         }
 
         if (rvalue[0] == '!' || rvalue[0] == '|') {
+                char what[64];
+
                 pico_log(PICO_LOG_WARNING,
                          "%s:%u: %s=%s: negated and triggering conditions are not supported, ignoring",
                          path,
                          line,
                          lvalue,
                          rvalue);
-                return 0;
+                snprintf(what, sizeof(what), "%s=%c", lvalue, rvalue[0]);
+                return unit_add_degradation(u, what);
         }
 
         if (rvalue[0] != '/') {
@@ -633,7 +641,6 @@ static int config_parse_exec_start(
         Service *s = unit_to_service(u, path, line);
         char **argv = NULL;
         int r;
-        (void) lvalue;
 
         if (!s)
                 return 0;
@@ -645,7 +652,7 @@ static int config_parse_exec_start(
          * ExecStart= at all is a validation problem, not a parse error --
          * not yet enforced (no post-load validation pass exists), tracked in
          * plans/29-pico-init.md. */
-        r = parse_exec_line(u, path, line, rvalue, &argv);
+        r = parse_exec_line(u, path, line, lvalue, rvalue, &argv);
         if (r < 0)
                 return 0;
 
@@ -659,21 +666,22 @@ static int config_parse_exec_start_pre(
         Service *s = unit_to_service(u, path, line);
         char **argv = NULL;
         int r;
-        (void) lvalue;
 
         if (!s)
                 return 0;
 
-        r = parse_exec_line(u, path, line, rvalue, &argv);
+        r = parse_exec_line(u, path, line, lvalue, rvalue, &argv);
         if (r < 0)
                 return 0;
 
-        if (s->exec_start_pre)
+        if (s->exec_start_pre) {
                 pico_log(PICO_LOG_DEBUG,
                          "%s:%u: multiple ExecStartPre= not supported, replacing "
                          "previous value",
                          path,
                          line);
+                (void) unit_add_degradation(u, "ExecStartPre=multiple");
+        }
 
         s->exec_start_pre = pico_strv_free(s->exec_start_pre);
         s->exec_start_pre = argv;
@@ -1145,8 +1153,12 @@ static int unit_conf_handler(
                 if (config_items[i].section == sec && strcmp(config_items[i].lvalue, lvalue) == 0)
                         return config_items[i].parse(u, path, line, lvalue, rvalue);
 
+        /* Still DEBUG per line -- the per-unit WARNING in unit_parse_file()
+         * is what makes the drop visible; this line only keeps the file:line.
+         * An empty name ("=value") is a malformed line, not a dropped
+         * directive, so it is skipped rather than recorded. */
         pico_log(PICO_LOG_DEBUG, "%s:%u: unknown directive %s= in [%s], ignoring", path, line, lvalue, section);
-        return 0;
+        return *lvalue ? unit_add_degradation(u, lvalue) : 0;
 }
 
 int unit_parse_file(Unit *u, const char *path) {
@@ -1156,6 +1168,20 @@ int unit_parse_file(Unit *u, const char *path) {
                 return -EINVAL;
 
         r = pico_conf_scan(path, unit_conf_handler, u);
+
+        /* One WARNING per unit, not one per directive: the record itself
+         * carries the names, and a unit like iiotool's drops twenty. */
+        if (r == 0 && u->n_degraded_directives > 0) {
+                char *list = unit_degraded_directives_string(u);
+
+                pico_log(PICO_LOG_WARNING,
+                         "%s: %zu directive%s not implemented by pico-init dropped: %s",
+                         u->id,
+                         u->n_degraded_directives,
+                         u->n_degraded_directives == 1 ? "" : "s",
+                         list ? list : "(out of memory)");
+                pico_mfree(list);
+        }
 
         /*
          * B9/69339ae9f7/29500cf8c4/8688a389ca: load-time validation. Placed

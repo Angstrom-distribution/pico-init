@@ -177,9 +177,56 @@ Unit *unit_free(Unit *u) {
         u->condition_path_exists = pico_strv_free(u->condition_path_exists);
         u->condition_path_is_directory = pico_strv_free(u->condition_path_is_directory);
 
+        u->degraded_directives = pico_strv_free(u->degraded_directives);
+        u->n_degraded_directives = 0;
+
         free(u);
 
         return NULL;
+}
+
+int unit_add_degradation(Unit *u, const char *what) {
+        char **p;
+        int r;
+
+        if (!u || !what || !*what)
+                return -EINVAL;
+
+        for (p = u->degraded_directives; p && *p; p++)
+                if (strcmp(*p, what) == 0)
+                        return 0;
+
+        r = pico_strv_extend(&u->degraded_directives, what);
+        if (r < 0)
+                return r;
+
+        u->n_degraded_directives++;
+        return 0;
+}
+
+char *unit_degraded_directives_string(Unit *u) {
+        size_t len = 0, off = 0;
+        char **p;
+        char *s;
+
+        for (p = u ? u->degraded_directives : NULL; p && *p; p++)
+                len += strlen(*p) + 1;
+
+        s = malloc(len + 1);
+        if (!s)
+                return NULL;
+
+        for (p = u ? u->degraded_directives : NULL; p && *p; p++) {
+                size_t n = strlen(*p);
+
+                if (off > 0)
+                        s[off++] = ' ';
+                memcpy(s + off, *p, n);
+                off += n;
+        }
+        s[off] = '\0';
+
+        return s;
 }
 
 UnitActiveState unit_active_state(Unit *u) {

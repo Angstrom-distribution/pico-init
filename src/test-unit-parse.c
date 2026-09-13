@@ -188,6 +188,127 @@ static void test_unknown_directives_are_tolerated(void) {
         ASSERT_STREQ(u->description, "B");
         ASSERT_STREQ(s->exec_start[0], "/bin/true");
 
+        /* Tolerated is not the same as silent: every drop is on the record,
+         * in file order, the unknown [Slice] section's directive included. */
+        ASSERT_EQ_INT(u->n_degraded_directives, 8);
+        ASSERT_STREQ(u->degraded_directives[0], "AssertPathIsDirectory");
+        ASSERT_STREQ(u->degraded_directives[1], "OnFailure");
+        ASSERT_STREQ(u->degraded_directives[2], "PrivateTmp");
+        ASSERT_STREQ(u->degraded_directives[3], "ProtectSystem");
+        ASSERT_STREQ(u->degraded_directives[4], "NoNewPrivileges");
+        ASSERT_STREQ(u->degraded_directives[5], "CPUQuota");
+        ASSERT_STREQ(u->degraded_directives[6], "BusName");
+        ASSERT_STREQ(u->degraded_directives[7], "MemoryMax");
+        ASSERT_TRUE(u->degraded_directives[8] == NULL);
+        ASSERT_EQ_INT(manager_count_degraded_units(m), 1);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * The degradation record on a directive-rich real-world shape: the value-
+ * level drops (a negated condition, an ExecStart= modifier, a second
+ * ExecStartPre=) are recorded under name=qualifier, repeats collapse, and a
+ * unit pico-init honours in full carries no record at all.
+ */
+static void test_degradation_record(void) {
+        Manager *m;
+        char *dir;
+        char *joined;
+        Unit *u, *clean;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "rich.service",
+                                      "[Unit]\n"
+                                      "Description=Rich\n"
+                                      "ConditionPathExists=!/etc/skip\n"
+                                      "After=clean.service\n"
+                                      "\n"
+                                      "[Service]\n"
+                                      "Type=simple\n"
+                                      "EnvironmentFile=-/etc/default/rich\n"
+                                      "Environment=A=1\n"
+                                      "Environment=B=2\n"
+                                      "ExecStartPre=/bin/true one\n"
+                                      "ExecStartPre=/bin/true two\n"
+                                      "ExecStart=@/usr/bin/richd richd\n"
+                                      "ExecStart=/usr/bin/richd\n"
+                                      "ExecStop=/usr/bin/richd --stop\n"
+                                      "ExecReload=/bin/kill -HUP $MAINPID\n"
+                                      "PIDFile=/run/richd.pid\n"
+                                      "User=rich\n"
+                                      "Group=rich\n"
+                                      "\n"
+                                      "[Install]\n"
+                                      "WantedBy=multi-user.target\n"
+                                      "Alias=r.service\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "clean.service",
+                                      "[Unit]\n"
+                                      "Description=Clean\n"
+                                      "ConditionPathExists=/etc\n"
+                                      "\n"
+                                      "[Service]\n"
+                                      "Type=oneshot\n"
+                                      "ExecStartPre=/bin/true\n"
+                                      "ExecStart=/bin/true\n"
+                                      "\n"
+                                      "[Install]\n"
+                                      "WantedBy=multi-user.target\n"),
+                      0);
+
+        m = manager_for(dir);
+        u = load_one(m, "rich.service");
+        clean = manager_get_unit(m, "clean.service");
+        ASSERT_TRUE(clean != NULL);
+
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        ASSERT_STREQ(((Service *) u)->exec_start[0], "/usr/bin/richd");
+
+        ASSERT_EQ_INT(u->n_degraded_directives, 11);
+        ASSERT_STREQ(u->degraded_directives[0], "ConditionPathExists=!");
+        ASSERT_STREQ(u->degraded_directives[1], "EnvironmentFile");
+        ASSERT_STREQ(u->degraded_directives[2], "Environment");
+        ASSERT_STREQ(u->degraded_directives[3], "ExecStartPre=multiple");
+        ASSERT_STREQ(u->degraded_directives[4], "ExecStart=@");
+        ASSERT_STREQ(u->degraded_directives[5], "ExecStop");
+        ASSERT_STREQ(u->degraded_directives[6], "ExecReload");
+        ASSERT_STREQ(u->degraded_directives[7], "PIDFile");
+        ASSERT_STREQ(u->degraded_directives[8], "User");
+        ASSERT_STREQ(u->degraded_directives[9], "Group");
+        ASSERT_STREQ(u->degraded_directives[10], "Alias");
+        ASSERT_TRUE(u->degraded_directives[11] == NULL);
+
+        joined = unit_degraded_directives_string(u);
+        ASSERT_STREQ(joined,
+                     "ConditionPathExists=! EnvironmentFile Environment ExecStartPre=multiple "
+                     "ExecStart=@ ExecStop ExecReload PIDFile User Group Alias");
+        free(joined);
+
+        /* a second identical drop is not a second entry */
+        ASSERT_EQ_INT(unit_add_degradation(u, "User"), 0);
+        ASSERT_EQ_INT(u->n_degraded_directives, 11);
+
+        ASSERT_EQ_INT(clean->load_state, UNIT_LOADED);
+        ASSERT_EQ_INT(clean->n_degraded_directives, 0);
+        ASSERT_TRUE(clean->degraded_directives == NULL);
+        joined = unit_degraded_directives_string(clean);
+        ASSERT_STREQ(joined, "");
+        free(joined);
+
+        /* the boot summary counts units, not directives, and logs once */
+        ASSERT_EQ_INT(manager_count_degraded_units(m), 1);
+        ASSERT_TRUE(!m->degradation_summary_logged);
+        manager_log_degradation_summary(m);
+        ASSERT_TRUE(m->degradation_summary_logged);
+        manager_log_degradation_summary(m);
+
         manager_free(m);
         test_rm_rf(dir);
         free(dir);
@@ -956,6 +1077,7 @@ static void test_shipped_ttygs0_unit_wins_over_template(void) {
 int main(void) {
         test_service_fields();
         test_unknown_directives_are_tolerated();
+        test_degradation_record();
         test_malformed_line_skips_only_that_line();
         test_bom_comments_and_continuations();
         test_quoting_and_trailing_garbage();

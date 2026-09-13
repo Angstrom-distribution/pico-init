@@ -573,6 +573,12 @@ int job_finish_full(Job *j, JobResult result, bool recursive) {
                               u->description ? u->description : u->id);
         }
 
+        /* The default target's start job ending, either way, is when the boot
+         * has settled: everything it pulled in has been loaded and tried, so
+         * the degradation count is final. */
+        if (j->type == JOB_START && m->default_target && strcmp(u->id, m->default_target) == 0)
+                manager_log_degradation_summary(m);
+
         /*
          * Resolve any deferred picoctl reply BEFORE the job is freed -- this
          * is the only point at which a job result becomes final, and it is

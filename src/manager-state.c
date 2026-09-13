@@ -210,6 +210,7 @@ static void publish_unit_file(Unit *u) {
         char final[PATH_MAX];
         char job_buf[80] = "";
         char notify_buf[192] = "";
+        char *degraded;
         Service *s = NULL;
         FILE *f;
         int n;
@@ -270,6 +271,10 @@ static void publish_unit_file(Unit *u) {
                 }
         }
 
+        /* Degraded-Directives=: the unit's degradation record (unit.h),
+         * space-separated, empty when pico-init honoured every directive. */
+        degraded = unit_degraded_directives_string(u);
+
         fprintf(f,
                 "ActiveState=%s\n"
                 "SubState=%s\n"
@@ -283,6 +288,7 @@ static void publish_unit_file(Unit *u) {
                 "ExecMainStatus=%d\n"
                 "NRestarts=%u\n"
                 "Job=%s\n"
+                "Degraded-Directives=%s\n"
                 "%s",
                 unit_active_state_to_string(unit_active_state(u)),
                 unit_substate(u),
@@ -296,7 +302,9 @@ static void publish_unit_file(Unit *u) {
                 s ? s->main_exit_status : 0,
                 s ? s->n_restarts : 0u,
                 job_buf,
+                degraded ? degraded : "",
                 notify_buf);
+        pico_mfree(degraded);
 
         if (fclose(f) != 0) {
                 pico_log(PICO_LOG_DEBUG, "%s: could not finish writing state file: %s", u->id, strerror(errno));
