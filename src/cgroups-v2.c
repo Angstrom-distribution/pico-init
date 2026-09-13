@@ -209,21 +209,22 @@ static bool pid_seen(const pid_t *seen, size_t n_seen, pid_t pid) {
 }
 
 /*
- * Read every pid out of cgroup.procs and SIGKILL any not signalled before.
- * Returns the number of *newly* signalled pids, or -errno.
+ * Walk cgroup.procs, calling cb for every pid in it. The callback's return
+ * value is accumulated (a negative one stops the walk and is returned as
+ * is). Returns the sum, or -errno from the read itself.
  *
- * Counting only new pids is what lets the caller terminate. A SIGKILLed
- * process remains a member of the cgroup as a zombie until its parent reaps
- * it, so cgroup.procs keeps listing it and "loop until empty" would never
- * finish -- the reap happens in the manager's SIGCHLD handler, which cannot
- * run while this loop is spinning. Once a pass finds nothing new, every member
- * has been signalled and there is nothing further this function can do.
+ * A cgroup that went away underneath us reads as empty, not as an error:
+ * every caller here is asking "who is left", and the answer is nobody.
  */
-static int cgroup_v2_kill_one_pass(struct pico_cgroup *cg, pid_t *seen, size_t *n_seen, size_t max_seen) {
+static int cgroup_v2_foreach_pid(
+                struct pico_cgroup *cg, int (*cb)(pid_t pid, void *userdata), void *userdata) {
         char buf[4096];
         ssize_t n;
-        int killed = 0;
+        int total = 0;
         off_t off = 0;
+
+        if (cg->procs_fd < 0)
+                return 0;
 
         for (;;) {
                 char *line;
@@ -234,13 +235,12 @@ static int cgroup_v2_kill_one_pass(struct pico_cgroup *cg, pid_t *seen, size_t *
                 if (n < 0) {
                         if (errno == EINTR)
                                 continue;
-                        /* the cgroup went away underneath us: nothing left to kill */
                         if (errno == ENOENT || errno == ENODEV)
-                                return killed;
+                                return total;
                         return -errno;
                 }
                 if (n == 0)
-                        return killed;
+                        return total;
 
                 buf[n] = '\0';
 
@@ -252,7 +252,7 @@ static int cgroup_v2_kill_one_pass(struct pico_cgroup *cg, pid_t *seen, size_t *
                  */
                 nl = strrchr(buf, '\n');
                 if (!nl)
-                        return killed; /* partial line with no newline: give up this pass */
+                        return total; /* partial line with no newline: give up this pass */
 
                 nl[1] = '\0';
                 off += (off_t) (nl - buf) + 1;
@@ -260,30 +260,119 @@ static int cgroup_v2_kill_one_pass(struct pico_cgroup *cg, pid_t *seen, size_t *
                 for (line = strtok_r(buf, "\n", &saveptr); line; line = strtok_r(NULL, "\n", &saveptr)) {
                         long long pid;
                         char *end;
+                        int r;
 
                         errno = 0;
                         pid = strtoll(line, &end, 10);
                         if (errno != 0 || end == line || *end != '\0')
                                 continue;
 
-                        /* never signal ourselves, init, or the whole process group */
+                        /* never report ourselves, init, or the whole process group */
                         if (pid <= 1 || (pid_t) pid == getpid())
                                 continue;
 
-                        /* already signalled on an earlier pass; it is a zombie
-                         * awaiting reaping, not something still to kill */
-                        if (pid_seen(seen, *n_seen, (pid_t) pid))
-                                continue;
-
-                        if (*n_seen < max_seen)
-                                seen[(*n_seen)++] = (pid_t) pid;
-
-                        if (kill((pid_t) pid, SIGKILL) == 0)
-                                killed++;
-                        else if (errno != ESRCH)
-                                pico_log(PICO_LOG_WARNING, "%s: kill(%lld): %s", cg->path, pid, strerror(errno));
+                        r = cb((pid_t) pid, userdata);
+                        if (r < 0)
+                                return r;
+                        total += r;
                 }
         }
+}
+
+struct kill_pass_ctx {
+        pid_t *seen;
+        size_t *n_seen;
+        size_t max_seen;
+        const char *path;
+};
+
+static int cgroup_v2_kill_pass_cb(pid_t pid, void *userdata) {
+        struct kill_pass_ctx *c = userdata;
+
+        /* already signalled on an earlier pass; it is a zombie awaiting
+         * reaping, not something still to kill */
+        if (pid_seen(c->seen, *c->n_seen, pid))
+                return 0;
+
+        if (*c->n_seen < c->max_seen)
+                c->seen[(*c->n_seen)++] = pid;
+
+        if (kill(pid, SIGKILL) == 0)
+                return 1;
+        if (errno != ESRCH)
+                pico_log(PICO_LOG_WARNING, "%s: kill(%d): %s", c->path, (int) pid, strerror(errno));
+        return 0;
+}
+
+/*
+ * SIGKILL every pid in cgroup.procs not signalled before. Returns the number
+ * of *newly* signalled pids, or -errno.
+ *
+ * Counting only new pids is what lets the caller terminate. A SIGKILLed
+ * process remains a member of the cgroup as a zombie until its parent reaps
+ * it, so cgroup.procs keeps listing it and "loop until empty" would never
+ * finish -- the reap happens in the manager's SIGCHLD handler, which cannot
+ * run while this loop is spinning. Once a pass finds nothing new, every member
+ * has been signalled and there is nothing further this function can do.
+ */
+static int cgroup_v2_kill_one_pass(struct pico_cgroup *cg, pid_t *seen, size_t *n_seen, size_t max_seen) {
+        struct kill_pass_ctx c = { .seen = seen, .n_seen = n_seen, .max_seen = max_seen, .path = cg->path };
+
+        return cgroup_v2_foreach_pid(cg, cgroup_v2_kill_pass_cb, &c);
+}
+
+struct get_pids_ctx {
+        pid_t *pids;
+        size_t max;
+        size_t n;
+};
+
+static int cgroup_v2_get_pids_cb(pid_t pid, void *userdata) {
+        struct get_pids_ctx *c = userdata;
+
+        if (c->n < c->max)
+                c->pids[c->n] = pid;
+        c->n++;
+        return 0;
+}
+
+int cgroup_v2_get_pids(struct pico_cgroup *cg, pid_t *pids, size_t max, size_t *ret_n) {
+        struct get_pids_ctx c = { .pids = pids, .max = max, .n = 0 };
+        int r;
+
+        if (!cg || !ret_n || (max > 0 && !pids))
+                return -EINVAL;
+
+        r = cgroup_v2_foreach_pid(cg, cgroup_v2_get_pids_cb, &c);
+        if (r < 0)
+                return r;
+
+        *ret_n = c.n;
+        return 0;
+}
+
+struct signal_ctx {
+        int sig;
+        const char *path;
+};
+
+static int cgroup_v2_signal_cb(pid_t pid, void *userdata) {
+        struct signal_ctx *c = userdata;
+
+        if (kill(pid, c->sig) == 0)
+                return 1;
+        if (errno != ESRCH)
+                pico_log(PICO_LOG_WARNING, "%s: kill(%d, %d): %s", c->path, (int) pid, c->sig, strerror(errno));
+        return 0;
+}
+
+int cgroup_v2_signal(struct pico_cgroup *cg, int sig) {
+        struct signal_ctx c = { .sig = sig, .path = cg ? cg->path : NULL };
+
+        if (!cg)
+                return -EINVAL;
+
+        return cgroup_v2_foreach_pid(cg, cgroup_v2_signal_cb, &c);
 }
 
 int cgroup_v2_kill(struct pico_cgroup *cg) {

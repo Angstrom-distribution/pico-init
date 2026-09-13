@@ -98,5 +98,22 @@ int cgroup_v2_kill(struct pico_cgroup *cg);
 /* 1 if populated=0, 0 if still populated, -errno on error. */
 int cgroup_v2_is_empty(struct pico_cgroup *cg);
 
+/*
+ * Every pid listed in cgroup.procs (this cgroup only, not descendants),
+ * minus pid 1 and the caller itself. Up to `max` are stored; *ret_n is the
+ * full count, so *ret_n > max means the array was too small. Zombies are
+ * still members until reaped, so a pid returned here may be one the
+ * manager's SIGCHLD path is about to reap. 0 or -errno.
+ */
+int cgroup_v2_get_pids(struct pico_cgroup *cg, pid_t *pids, size_t max, size_t *ret_n);
+
+/*
+ * One pass of kill(sig) over every pid in cgroup.procs. Returns how many
+ * were signalled, or -errno. Not atomic and not repeated: a process forking
+ * as the pass runs can escape it, which is why this is the *first* step of a
+ * stop and cgroup_v2_kill() above the escalation, never the other way round.
+ */
+int cgroup_v2_signal(struct pico_cgroup *cg, int sig);
+
 /* Close fds, remove the cgroup directory, free. Returns NULL. */
 struct pico_cgroup *cgroup_v2_free(struct pico_cgroup *cg);
