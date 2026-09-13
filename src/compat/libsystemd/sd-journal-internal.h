@@ -106,53 +106,53 @@ struct sd_journal {
  * static to its own TU, and this project's own logd is a reference here,
  * not a dependency this shim links): 1-64 bytes, first byte not a digit,
  * every byte in [A-Z0-9_]. */
-bool sd_journal_field_name_valid(const char *name, size_t len);
+bool journal_field_name_valid(const char *name, size_t len);
 
 /* Reads /proc/sys/kernel/random/boot_id once per process and caches it:
  * every read-side function that needs "this boot's ID" (get_monotonic_usec,
  * seek_monotonic_usec, get_cutoff_monotonic_usec) asks here rather than
  * re-opening /proc on every call. 0 or -errno. */
-int sd_journal_current_boot_id(sd_id128_t *ret);
+int journal_current_boot_id(sd_id128_t *ret);
 
 /* 32 lowercase hex chars -> 16 bytes, the canonical _BOOT_ID= form
  * (logd-write.h's own rule). false on anything else. */
-bool sd_journal_parse_boot_id(const char *hex, size_t len, sd_id128_t *ret);
+bool journal_parse_boot_id(const char *hex, size_t len, sd_id128_t *ret);
 
 /* Grows *buf to at least `need` bytes via realloc(); *cap is updated in
  * place. 0 or -ENOMEM, in which case *buf and *cap are left as they were. */
-int sd_journal_scratch_grow(void **buf, size_t *cap, size_t need);
+int journal_scratch_grow(void **buf, size_t *cap, size_t need);
 
 /* True if `e` survives every stored match (grouped OR-within-name,
  * AND-across-name; no matches at all always passes). */
-bool sd_journal_entry_matches(const struct sd_journal *j, const LogdEntry *e);
+bool journal_entry_matches(const struct sd_journal *j, const LogdEntry *e);
 
 /* *ret_monotonic and *ret_realtime are the parsed __MONOTONIC_TIMESTAMP and
  * __REALTIME_TIMESTAMP of entry `e` (writer-guaranteed present, per
  * logd-write.h); -EBADMSG if either is missing or unparsable. */
-int sd_journal_entry_clocks(const LogdEntry *e, uint64_t *ret_monotonic, uint64_t *ret_realtime);
+int journal_entry_clocks(const LogdEntry *e, uint64_t *ret_monotonic, uint64_t *ret_realtime);
 
 /* Add (data,len) to the dedup set if not already present. Returns 1 if it
  * was added (new), 0 if the set already had an equal entry, -ENOMEM on
  * allocation failure. */
-int sd_journal_seen_add(SdJournalSeenSet *set, const void *data, size_t len);
-bool sd_journal_seen_contains(const SdJournalSeenSet *set, const void *data, size_t len);
-void sd_journal_seen_clear(SdJournalSeenSet *set);
+int journal_seen_add(SdJournalSeenSet *set, const void *data, size_t len);
+bool journal_seen_contains(const SdJournalSeenSet *set, const void *data, size_t len);
+void journal_seen_clear(SdJournalSeenSet *set);
 
 /* The current entry, or NULL if loc != SD_J_ON_ENTRY. */
-const LogdEntry *sd_journal_current_entry(const struct sd_journal *j);
+const LogdEntry *journal_current_entry(const struct sd_journal *j);
 
 /* Runtime dir lookup shared by sd_journal_open(): LOGD_RUNTIME_DIR the env
  * var, then the logd.h macro of the same name -- same order picolog.c uses.
  * Returns a freshly strdup'd string, or NULL on ENOMEM. */
-char *sd_journal_default_runtime_dir(void);
+char *journal_default_runtime_dir(void);
 
 /* "<runtime_dir>/<name>" freshly allocated, or NULL on ENOMEM. */
-char *sd_journal_ring_path(const char *runtime_dir, const char *name);
+char *journal_ring_path(const char *runtime_dir, const char *name);
 
 /* stat()s both ring files under `runtime_dir`. A missing file is not an
  * error -- it sets *have_active or *have_rotated false and leaves that stat
  * buffer untouched -- any other stat() failure is -errno and aborts both. */
-int sd_journal_stat_ring(
+int journal_stat_ring(
                 const char *runtime_dir,
                 struct stat *active_st,
                 bool *have_active,

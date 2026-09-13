@@ -59,7 +59,7 @@ int sd_journal_next(sd_journal *j) {
                 start = 0; /* SD_J_BEFORE_HEAD */
 
         for (size_t i = start; i < n; i++)
-                if (sd_journal_entry_matches(j, logd_ring_entry(j->ring, i))) {
+                if (journal_entry_matches(j, logd_ring_entry(j->ring, i))) {
                         land_on(j, i);
                         return 1;
                 }
@@ -88,7 +88,7 @@ int sd_journal_previous(sd_journal *j) {
                 start = (ssize_t) n - 1; /* SD_J_AFTER_TAIL */
 
         for (ssize_t i = start; i >= 0; i--)
-                if (sd_journal_entry_matches(j, logd_ring_entry(j->ring, (size_t) i))) {
+                if (journal_entry_matches(j, logd_ring_entry(j->ring, (size_t) i))) {
                         land_on(j, (size_t) i);
                         return 1;
                 }
@@ -209,7 +209,7 @@ static int seek_boundary_by_clock(
 
         for (size_t i = 0; i < n; i++) {
                 uint64_t mono = 0, real = 0;
-                int r = sd_journal_entry_clocks(
+                int r = journal_entry_clocks(
                                 logd_ring_entry(j->ring, i), skip_mono ? NULL : &mono, skip_real ? NULL : &real);
 
                 if (r < 0)
@@ -245,7 +245,7 @@ int sd_journal_seek_monotonic_usec(sd_journal *j, sd_id128_t boot_id, uint64_t u
                 return -EINVAL;
 
         if (memcmp(&boot_id, &null_id, sizeof(boot_id)) != 0) {
-                r = sd_journal_current_boot_id(&current);
+                r = journal_current_boot_id(&current);
                 if (r < 0)
                         return r;
 
@@ -272,11 +272,11 @@ int sd_journal_get_cursor(sd_journal *j, char **ret) {
         if (!j || !ret)
                 return -EINVAL;
 
-        e = sd_journal_current_entry(j);
+        e = journal_current_entry(j);
         if (!e)
                 return -EADDRNOTAVAIL;
 
-        r = sd_journal_entry_clocks(e, &mono, &real);
+        r = journal_entry_clocks(e, &mono, &real);
         if (r < 0)
                 return r;
 
@@ -382,10 +382,10 @@ int sd_journal_seek_cursor(sd_journal *j, const char *cursor) {
         if (pc.have_boot) {
                 sd_id128_t want, current;
 
-                if (!sd_journal_parse_boot_id(pc.boot, 32, &want))
+                if (!journal_parse_boot_id(pc.boot, 32, &want))
                         return -EINVAL;
 
-                r = sd_journal_current_boot_id(&current);
+                r = journal_current_boot_id(&current);
                 if (r < 0)
                         return r;
 
@@ -407,7 +407,7 @@ int sd_journal_test_cursor(sd_journal *j, const char *cursor) {
         if (!j)
                 return -EINVAL;
 
-        e = sd_journal_current_entry(j);
+        e = journal_current_entry(j);
         if (!e)
                 return -EADDRNOTAVAIL;
 
@@ -425,7 +425,7 @@ int sd_journal_test_cursor(sd_journal *j, const char *cursor) {
         if (pc.have_mono || pc.have_real) {
                 uint64_t mono = 0, real = 0;
 
-                r = sd_journal_entry_clocks(e, pc.have_mono ? &mono : NULL, pc.have_real ? &real : NULL);
+                r = journal_entry_clocks(e, pc.have_mono ? &mono : NULL, pc.have_real ? &real : NULL);
                 if (r < 0)
                         return 0;
 
@@ -500,7 +500,7 @@ static bool relocate(LogdRing *new_ring, uint64_t old_mono, uint64_t old_real, s
         for (size_t i = 0; i < n; i++) {
                 uint64_t mono, real;
 
-                if (sd_journal_entry_clocks(logd_ring_entry(new_ring, i), &mono, &real) < 0)
+                if (journal_entry_clocks(logd_ring_entry(new_ring, i), &mono, &real) < 0)
                         continue;
                 if (mono == old_mono && real == old_real) {
                         *ret_idx = i;
@@ -551,7 +551,7 @@ int sd_journal_process(sd_journal *j) {
                 }
         }
 
-        r = sd_journal_stat_ring(
+        r = journal_stat_ring(
                         j->runtime_dir, &new_active_st, &have_new_active, &new_rotated_st, &have_new_rotated);
         if (r < 0)
                 return r;
@@ -581,9 +581,9 @@ int sd_journal_process(sd_journal *j) {
                 event = SD_JOURNAL_INVALIDATE;
 
         if (j->loc == SD_J_ON_ENTRY) {
-                const LogdEntry *e = sd_journal_current_entry(j);
+                const LogdEntry *e = journal_current_entry(j);
 
-                if (e && sd_journal_entry_clocks(e, &old_mono, &old_real) == 0)
+                if (e && journal_entry_clocks(e, &old_mono, &old_real) == 0)
                         was_on_entry = true;
         }
 

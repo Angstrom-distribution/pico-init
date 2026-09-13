@@ -20,7 +20,7 @@
 
 #include "../../logd/logd.h"
 
-bool sd_journal_field_name_valid(const char *name, size_t len) {
+bool journal_field_name_valid(const char *name, size_t len) {
         if (!name || len == 0 || len > 64)
                 return false;
 
@@ -37,7 +37,7 @@ bool sd_journal_field_name_valid(const char *name, size_t len) {
         return true;
 }
 
-bool sd_journal_parse_boot_id(const char *hex, size_t len, sd_id128_t *ret) {
+bool journal_parse_boot_id(const char *hex, size_t len, sd_id128_t *ret) {
         sd_id128_t id;
 
         if (len != 32)
@@ -71,7 +71,7 @@ bool sd_journal_parse_boot_id(const char *hex, size_t len, sd_id128_t *ret) {
 static bool boot_id_cached = false;
 static sd_id128_t boot_id_cache;
 
-int sd_journal_current_boot_id(sd_id128_t *ret) {
+int journal_current_boot_id(sd_id128_t *ret) {
         FILE *f;
         char buf[64];
         size_t n_hex = 0;
@@ -95,13 +95,13 @@ int sd_journal_current_boot_id(sd_id128_t *ret) {
         fclose(f);
 
         /* /proc's form is dashed ("xxxxxxxx-xxxx-..."); strip the dashes down
-         * to the canonical 32-hex form sd_journal_parse_boot_id() expects. */
+         * to the canonical 32-hex form journal_parse_boot_id() expects. */
         for (size_t i = 0; buf[i] != '\0' && n_hex < sizeof(hex) - 1; i++)
                 if (buf[i] != '-')
                         hex[n_hex++] = buf[i];
         hex[n_hex] = '\0';
 
-        if (!sd_journal_parse_boot_id(hex, n_hex, &boot_id_cache))
+        if (!journal_parse_boot_id(hex, n_hex, &boot_id_cache))
                 return -EINVAL;
 
         boot_id_cached = true;
@@ -109,7 +109,7 @@ int sd_journal_current_boot_id(sd_id128_t *ret) {
         return 0;
 }
 
-int sd_journal_scratch_grow(void **buf, size_t *cap, size_t need) {
+int journal_scratch_grow(void **buf, size_t *cap, size_t need) {
         void *n;
 
         if (*cap >= need)
@@ -124,10 +124,10 @@ int sd_journal_scratch_grow(void **buf, size_t *cap, size_t need) {
         return 0;
 }
 
-int sd_journal_seen_add(SdJournalSeenSet *set, const void *data, size_t len) {
+int journal_seen_add(SdJournalSeenSet *set, const void *data, size_t len) {
         void *copy;
 
-        if (sd_journal_seen_contains(set, data, len))
+        if (journal_seen_contains(set, data, len))
                 return 0;
 
         if (set->n == set->cap) {
@@ -160,7 +160,7 @@ int sd_journal_seen_add(SdJournalSeenSet *set, const void *data, size_t len) {
         return 1;
 }
 
-bool sd_journal_seen_contains(const SdJournalSeenSet *set, const void *data, size_t len) {
+bool journal_seen_contains(const SdJournalSeenSet *set, const void *data, size_t len) {
         for (size_t i = 0; i < set->n; i++)
                 if (set->lens[i] == len && memcmp(set->items[i], data, len) == 0)
                         return true;
@@ -168,7 +168,7 @@ bool sd_journal_seen_contains(const SdJournalSeenSet *set, const void *data, siz
         return false;
 }
 
-void sd_journal_seen_clear(SdJournalSeenSet *set) {
+void journal_seen_clear(SdJournalSeenSet *set) {
         for (size_t i = 0; i < set->n; i++)
                 free(set->items[i]);
 
@@ -180,14 +180,14 @@ void sd_journal_seen_clear(SdJournalSeenSet *set) {
         set->cap = 0;
 }
 
-const LogdEntry *sd_journal_current_entry(const struct sd_journal *j) {
+const LogdEntry *journal_current_entry(const struct sd_journal *j) {
         if (!j || j->loc != SD_J_ON_ENTRY)
                 return NULL;
 
         return logd_ring_entry(j->ring, j->pos);
 }
 
-int sd_journal_entry_clocks(const LogdEntry *e, uint64_t *ret_monotonic, uint64_t *ret_realtime) {
+int journal_entry_clocks(const LogdEntry *e, uint64_t *ret_monotonic, uint64_t *ret_realtime) {
         const LogdReadField *mt = logd_entry_field(e, "__MONOTONIC_TIMESTAMP");
         const LogdReadField *rt = logd_entry_field(e, "__REALTIME_TIMESTAMP");
         char numbuf[24];
@@ -240,7 +240,7 @@ static bool field_equals_match(const LogdEntry *e, const char *name, size_t name
         return true;
 }
 
-bool sd_journal_entry_matches(const struct sd_journal *j, const LogdEntry *e) {
+bool journal_entry_matches(const struct sd_journal *j, const LogdEntry *e) {
         if (j->n_matches == 0)
                 return true;
 
@@ -281,7 +281,7 @@ bool sd_journal_entry_matches(const struct sd_journal *j, const LogdEntry *e) {
         return true;
 }
 
-char *sd_journal_default_runtime_dir(void) {
+char *journal_default_runtime_dir(void) {
         const char *dir = getenv("LOGD_RUNTIME_DIR");
 
         if (!dir || dir[0] == '\0')
@@ -290,7 +290,7 @@ char *sd_journal_default_runtime_dir(void) {
         return strdup(dir);
 }
 
-char *sd_journal_ring_path(const char *runtime_dir, const char *name) {
+char *journal_ring_path(const char *runtime_dir, const char *name) {
         char *path;
 
         if (asprintf(&path, "%s/%s", runtime_dir, name) < 0)
@@ -299,7 +299,7 @@ char *sd_journal_ring_path(const char *runtime_dir, const char *name) {
         return path;
 }
 
-int sd_journal_stat_ring(
+int journal_stat_ring(
                 const char *runtime_dir,
                 struct stat *active_st,
                 bool *have_active,
@@ -310,10 +310,10 @@ int sd_journal_stat_ring(
         *have_active = false;
         *have_rotated = false;
 
-        active_path = sd_journal_ring_path(runtime_dir, LOGD_RING_ACTIVE_NAME);
+        active_path = journal_ring_path(runtime_dir, LOGD_RING_ACTIVE_NAME);
         if (!active_path)
                 return -ENOMEM;
-        rotated_path = sd_journal_ring_path(runtime_dir, LOGD_RING_ROTATED_NAME);
+        rotated_path = journal_ring_path(runtime_dir, LOGD_RING_ROTATED_NAME);
         if (!rotated_path) {
                 free(active_path);
                 return -ENOMEM;

@@ -58,7 +58,7 @@ static int
                         out_len = cap;
         }
 
-        r = sd_journal_scratch_grow(scratch, scratch_cap, total > 0 ? total : 1);
+        r = journal_scratch_grow(scratch, scratch_cap, total > 0 ? total : 1);
         if (r < 0)
                 return r;
 
@@ -80,12 +80,12 @@ int sd_journal_get_data(sd_journal *j, const char *field, const void **ret_data,
         if (!j || !field || !ret_data || !ret_size)
                 return -EINVAL;
 
-        e = sd_journal_current_entry(j);
+        e = journal_current_entry(j);
         if (!e)
                 return -EADDRNOTAVAIL;
 
         field_len = strlen(field);
-        if (!sd_journal_field_name_valid(field, field_len))
+        if (!journal_field_name_valid(field, field_len))
                 return -EINVAL;
 
         f = logd_entry_field(e, field);
@@ -117,7 +117,7 @@ int sd_journal_enumerate_data(sd_journal *j, const void **ret_data, size_t *ret_
         if (!j || !ret_data || !ret_size)
                 return -EINVAL;
 
-        e = sd_journal_current_entry(j);
+        e = journal_current_entry(j);
         if (!e)
                 return -EADDRNOTAVAIL;
 
@@ -171,7 +171,7 @@ int sd_journal_add_match(sd_journal *j, const void *data, size_t size) {
         if (!eq || eq == data)
                 return -EINVAL;
 
-        if (!sd_journal_field_name_valid((const char *) data, (size_t) (eq - (const char *) data)))
+        if (!journal_field_name_valid((const char *) data, (size_t) (eq - (const char *) data)))
                 return -EINVAL;
 
         copy = malloc(size);
@@ -219,7 +219,7 @@ void sd_journal_flush_matches(sd_journal *j) {
 
 static void reset_unique_iterator(sd_journal *j) {
         j->unique_scan_idx = 0;
-        sd_journal_seen_clear(&j->unique_seen);
+        journal_seen_clear(&j->unique_seen);
 }
 
 int sd_journal_query_unique(sd_journal *j, const char *field) {
@@ -230,7 +230,7 @@ int sd_journal_query_unique(sd_journal *j, const char *field) {
                 return -EINVAL;
 
         field_len = strlen(field);
-        if (!sd_journal_field_name_valid(field, field_len))
+        if (!journal_field_name_valid(field, field_len))
                 return -EINVAL;
 
         dup = strdup(field);
@@ -266,10 +266,10 @@ int sd_journal_enumerate_unique(sd_journal *j, const void **ret_data, size_t *re
                 if (!f)
                         continue;
 
-                if (sd_journal_seen_contains(&j->unique_seen, f->value, f->value_len))
+                if (journal_seen_contains(&j->unique_seen, f->value, f->value_len))
                         continue;
 
-                r = sd_journal_seen_add(&j->unique_seen, f->value, f->value_len);
+                r = journal_seen_add(&j->unique_seen, f->value, f->value_len);
                 if (r < 0)
                         return r;
 
@@ -319,14 +319,14 @@ int sd_journal_enumerate_fields(sd_journal *j, const char **ret) {
 
                         j->fields_scan_field_idx++;
 
-                        if (sd_journal_seen_contains(&j->fields_seen, f->name, f->name_len))
+                        if (journal_seen_contains(&j->fields_seen, f->name, f->name_len))
                                 continue;
 
-                        r = sd_journal_seen_add(&j->fields_seen, f->name, f->name_len);
+                        r = journal_seen_add(&j->fields_seen, f->name, f->name_len);
                         if (r < 0)
                                 return r;
 
-                        r = sd_journal_scratch_grow(
+                        r = journal_scratch_grow(
                                         (void **) &j->fields_scratch, &j->fields_scratch_cap, f->name_len + 1);
                         if (r < 0)
                                 return r;
@@ -350,5 +350,5 @@ void sd_journal_restart_fields(sd_journal *j) {
 
         j->fields_scan_entry_idx = 0;
         j->fields_scan_field_idx = 0;
-        sd_journal_seen_clear(&j->fields_seen);
+        journal_seen_clear(&j->fields_seen);
 }

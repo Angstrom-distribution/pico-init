@@ -40,7 +40,7 @@ int sd_journal_open(sd_journal **ret, int flags) {
         j->inotify_fd = -1;
         j->inotify_wd = -1;
 
-        j->runtime_dir = sd_journal_default_runtime_dir();
+        j->runtime_dir = journal_default_runtime_dir();
         if (!j->runtime_dir) {
                 free(j);
                 return -ENOMEM;
@@ -53,7 +53,7 @@ int sd_journal_open(sd_journal **ret, int flags) {
                 return r;
         }
 
-        r = sd_journal_stat_ring(
+        r = journal_stat_ring(
                         j->runtime_dir, &j->active_st, &j->have_active_st, &j->rotated_st, &j->have_rotated_st);
         if (r < 0) {
                 logd_ring_free(j->ring);
@@ -126,10 +126,10 @@ void sd_journal_close(sd_journal *j) {
         free(j->data_scratch);
 
         free(j->unique_field);
-        sd_journal_seen_clear(&j->unique_seen);
+        journal_seen_clear(&j->unique_seen);
         free(j->unique_scratch);
 
-        sd_journal_seen_clear(&j->fields_seen);
+        journal_seen_clear(&j->fields_seen);
         free(j->fields_scratch);
 
         free(j);

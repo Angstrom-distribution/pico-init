@@ -69,7 +69,7 @@ static uint64_t clock_usec(clockid_t id) {
  * Deliberately the REAL machine's boot ID, not a fixed one (unlike test-
  * logd-write.c's own fixture): sd_journal_seek_monotonic_usec()/
  * seek_cursor() cross-check a cursor's/caller's boot ID against
- * /proc/sys/kernel/random/boot_id (sd_journal_current_boot_id()), by
+ * /proc/sys/kernel/random/boot_id (journal_current_boot_id()), by
  * design -- that is what makes get_cutoff_monotonic_usec()'s bogus-boot-id
  * case in test_info_and_honest_failures() below meaningful. A fixture under
  * a fake, fixed boot ID would make every one of those checks see "a

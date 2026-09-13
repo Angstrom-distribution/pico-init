@@ -23,11 +23,11 @@ int sd_journal_get_realtime_usec(sd_journal *j, uint64_t *ret) {
         if (!j || !ret)
                 return -EINVAL;
 
-        e = sd_journal_current_entry(j);
+        e = journal_current_entry(j);
         if (!e)
                 return -EADDRNOTAVAIL;
 
-        return sd_journal_entry_clocks(e, NULL, ret);
+        return journal_entry_clocks(e, NULL, ret);
 }
 
 int sd_journal_get_monotonic_usec(sd_journal *j, uint64_t *ret_monotonic, sd_id128_t *ret_boot_id) {
@@ -39,17 +39,17 @@ int sd_journal_get_monotonic_usec(sd_journal *j, uint64_t *ret_monotonic, sd_id1
         if (!j || !ret_monotonic)
                 return -EINVAL;
 
-        e = sd_journal_current_entry(j);
+        e = journal_current_entry(j);
         if (!e)
                 return -EADDRNOTAVAIL;
 
-        r = sd_journal_entry_clocks(e, ret_monotonic, NULL);
+        r = journal_entry_clocks(e, ret_monotonic, NULL);
         if (r < 0)
                 return r;
 
         boot = logd_entry_field(e, "_BOOT_ID");
         if (!boot || boot->binary ||
-            !sd_journal_parse_boot_id((const char *) boot->value, boot->value_len, &parsed))
+            !journal_parse_boot_id((const char *) boot->value, boot->value_len, &parsed))
                 return -EBADMSG;
 
         if (ret_boot_id) {
@@ -60,7 +60,7 @@ int sd_journal_get_monotonic_usec(sd_journal *j, uint64_t *ret_monotonic, sd_id1
         {
                 sd_id128_t current;
 
-                r = sd_journal_current_boot_id(&current);
+                r = journal_current_boot_id(&current);
                 if (r < 0)
                         return r;
 
@@ -86,10 +86,10 @@ int sd_journal_get_cutoff_realtime_usec(sd_journal *j, uint64_t *from, uint64_t 
         if (n == 0)
                 return 0;
 
-        r = sd_journal_entry_clocks(logd_ring_entry(j->ring, 0), NULL, from);
+        r = journal_entry_clocks(logd_ring_entry(j->ring, 0), NULL, from);
         if (r < 0)
                 return r;
-        r = sd_journal_entry_clocks(logd_ring_entry(j->ring, n - 1), NULL, to);
+        r = journal_entry_clocks(logd_ring_entry(j->ring, n - 1), NULL, to);
         if (r < 0)
                 return r;
 
@@ -108,16 +108,16 @@ int sd_journal_get_cutoff_monotonic_usec(sd_journal *j, sd_id128_t boot_id, uint
         if (n == 0)
                 return 0;
 
-        r = sd_journal_current_boot_id(&current);
+        r = journal_current_boot_id(&current);
         if (r < 0)
                 return r;
         if (memcmp(&boot_id, &current, sizeof(boot_id)) != 0)
                 return 0; /* no data for a boot other than the one this /run ring holds */
 
-        r = sd_journal_entry_clocks(logd_ring_entry(j->ring, 0), from, NULL);
+        r = journal_entry_clocks(logd_ring_entry(j->ring, 0), from, NULL);
         if (r < 0)
                 return r;
-        r = sd_journal_entry_clocks(logd_ring_entry(j->ring, n - 1), to, NULL);
+        r = journal_entry_clocks(logd_ring_entry(j->ring, n - 1), to, NULL);
         if (r < 0)
                 return r;
 
@@ -132,7 +132,7 @@ int sd_journal_get_usage(sd_journal *j, uint64_t *ret_bytes) {
         if (!j || !ret_bytes)
                 return -EINVAL;
 
-        path = sd_journal_ring_path(j->runtime_dir, LOGD_RING_ACTIVE_NAME);
+        path = journal_ring_path(j->runtime_dir, LOGD_RING_ACTIVE_NAME);
         if (!path)
                 return -ENOMEM;
         if (stat(path, &st) == 0)
@@ -145,7 +145,7 @@ int sd_journal_get_usage(sd_journal *j, uint64_t *ret_bytes) {
         }
         free(path);
 
-        path = sd_journal_ring_path(j->runtime_dir, LOGD_RING_ROTATED_NAME);
+        path = journal_ring_path(j->runtime_dir, LOGD_RING_ROTATED_NAME);
         if (!path)
                 return -ENOMEM;
         if (stat(path, &st) == 0)
@@ -182,7 +182,7 @@ int sd_journal_has_runtime_files(sd_journal *j) {
         if (!j)
                 return -EINVAL;
 
-        r = sd_journal_stat_ring(j->runtime_dir, &active_st, &have_active, &rotated_st, &have_rotated);
+        r = journal_stat_ring(j->runtime_dir, &active_st, &have_active, &rotated_st, &have_rotated);
         if (r < 0)
                 return r;
 
