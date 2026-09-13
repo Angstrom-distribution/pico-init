@@ -670,10 +670,19 @@ libsystemd_compat_sources = files(
 # behind the version script's `local: *`) link it, and
 # gen-libsystemd-sym.py reads its full symbol table through nm. Real
 # systemd ships no static libsystemd either; a consumer lands on the .so.
+#
+# -Wno-error=nonnull-compare: sd-id128.c's char s[_SD_ARRAY_STATIC N]
+# parameters are real systemd's own upstream signature (_sd-common.h), and
+# the defensive `if (!s) return NULL;` alongside them is real systemd's
+# own style too -- GCC's nonnull-compare treats the [static N] bound as an
+# implicit nonnull contract and flags the very check that guards against a
+# caller violating it. Real behavior, not a bug; scoped to this one
+# warning rather than disabling -Werror for the whole target.
 libsystemd_compat = static_library(
   'systemd-compat',
   libsystemd_compat_sources,
   include_directories: libsystemd_compat_includes,
+  c_args: ['-Wno-error=nonnull-compare'],
   link_whole: [sd_event_lib, logd_read],
 )
 
