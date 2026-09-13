@@ -55,6 +55,13 @@ implementation experience as each subsystem landed. Summary:
   `sd-network`) — real wherever pico-init has a genuine equivalent
   mechanism, an honest error where it categorically doesn't, never a
   faked success.
+- **Unit-file degradation is on the record**: a real systemd unit loads
+  even when pico-init cannot honour every directive in it, and every drop
+  is recorded on the unit — `picoctl show` reports it as
+  `Degraded-Directives=`, PID 1 logs one warning per unit at load and one
+  summary line once the boot has settled, and `pico-unit-lint DIR...` runs
+  the same parser over an installed unit tree at build time so the gap is
+  visible in a build log before anything boots.
 - **Build system**: meson.
 
 ## License

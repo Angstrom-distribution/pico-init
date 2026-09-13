@@ -224,6 +224,26 @@ foreach t : pico_tests
   test(t, exe)
 endforeach
 
+# pico-unit-lint -- PID 1's own unit parser run over an installed unit tree
+# at build time, printing the degradation record each unit would carry in
+# `picoctl show`. It links pico-init-core so the verdict cannot drift from
+# the boot-time one. bindir, not sbindir: it is a check, not an init tool.
+pico_unit_lint_exe = executable(
+  'pico-unit-lint',
+  'src/pico-unit-lint.c',
+  version_h,
+  include_directories: libsystemd_compat_includes,
+  link_with: pico_init_core,
+  install: true,
+  install_dir: get_option('bindir'),
+)
+
+test(
+  'unit-lint',
+  find_program('src/test-unit-lint.sh'),
+  args: [pico_unit_lint_exe],
+)
+
 # ---------------------------------------------------------------------------
 # netd -- the network daemon (plan §2). A second executable in the same tree,
 # built exactly like PID 1: one static library the tests link, one installed
