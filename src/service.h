@@ -5,11 +5,14 @@
  * Service units. service.c implements the state machine, service-exec.c the
  * fork/exec + fd/cgroup setup.
  *
- * Type=simple and Type=oneshot are supported. oneshot is not a luxury: nearly
+ * Type=simple, oneshot, exec and notify are supported (notify-reload loads
+ * as notify with a recorded degradation). oneshot is not a luxury: nearly
  * every real boot-plumbing unit is one, and an init that cannot express "run
- * once, then stay exited" cannot boot an unmodified image. The two differ only
- * in when the start job completes -- simple counts as started the moment the
- * process is forked, oneshot not until it has exited successfully.
+ * once, then stay exited" cannot boot an unmodified image. The four differ
+ * only in when the start job completes -- simple counts as started the
+ * moment the process is forked, exec once execve() has actually succeeded,
+ * notify once the process sends READY=1, oneshot not until it has exited
+ * successfully.
  */
 
 #pragma once
@@ -56,6 +59,8 @@
 typedef enum ServiceType {
         SERVICE_TYPE_SIMPLE,  /* started once forked */
         SERVICE_TYPE_ONESHOT, /* started once it has exited successfully */
+        SERVICE_TYPE_EXEC,    /* started once execve() succeeded (exec_fd below) */
+        SERVICE_TYPE_NOTIFY,  /* started once the main process sent READY=1 */
         _SERVICE_TYPE_MAX,
         _SERVICE_TYPE_INVALID = -1,
 } ServiceType;
@@ -63,7 +68,8 @@ typedef enum ServiceType {
 typedef enum ServiceState {
         SERVICE_DEAD,
         SERVICE_START_PRE,    /* ExecStartPre= running */
-        SERVICE_EXEC_START,   /* ExecStart= forked; for oneshot, still running */
+        SERVICE_EXEC_START,   /* ExecStart= forked; oneshot: still running, exec: execve()
+                               * not yet confirmed, notify: READY=1 not yet received */
         SERVICE_RUNNING,      /* simple: main process up */
         SERVICE_EXITED,       /* main process gone, cgroup empty, clean exit */
         SERVICE_STOP,         /* SIGTERM sent, waiting for exit or TimeoutStopSec */
@@ -86,6 +92,7 @@ typedef enum ServiceResult {
         SERVICE_FAILURE_EXIT_CODE,   /* exited non-zero */
         SERVICE_FAILURE_SIGNAL,      /* killed by a signal */
         SERVICE_FAILURE_START_LIMIT, /* B7: restarted too many times too fast, refusing */
+        SERVICE_FAILURE_PROTOCOL,    /* Type=notify main process exited cleanly before READY=1 */
         _SERVICE_RESULT_MAX,
 } ServiceResult;
 
@@ -167,14 +174,27 @@ typedef struct Service {
         unsigned n_restarts; /* how many times Restart= has fired, for logging */
 
         /*
-         * sd_notify() state (manager-notify.c). notify_ready does NOT gate
-         * the active transition -- that needs SERVICE_TYPE_NOTIFY, deferred
-         * scope, see manager-notify.h. All three reset on every fresh
+         * sd_notify() state (manager-notify.c). For Type=notify, READY=1
+         * from the main pid is what moves EXEC_START to RUNNING
+         * (service_notify_ready()); for every other type notify_ready is
+         * informational only. All three reset on every fresh
          * service_do_start() so a restart never carries a stale value.
          */
         bool notify_ready;
         char *status_text; /* owned, STATUS= from sd_notify, bounded */
         int status_errno;
+
+        /*
+         * Type=exec's readiness channel: the read end of an O_CLOEXEC pipe
+         * whose write end the child holds across execve(). The child writes
+         * a 1 right before execve() and a 0 right after a failed one; a
+         * successful execve() closes the write end instead, so EOF after a
+         * 1 is the "execve() succeeded" signal and nothing else is. -1 and
+         * NULL when no start is waiting on one; the source owns the fd.
+         */
+        int exec_fd;
+        sd_event_source *exec_fd_source;
+        bool exec_fd_hot; /* the 1 has been read, EOF now means success */
 } Service;
 
 /* downcast/upcast helpers, valid because Unit is the first member */
@@ -208,6 +228,11 @@ void service_sigchld_event(Service *s, pid_t pid, int code, int status);
 
 /* cgroup.events reported populated=0 */
 void service_cgroup_empty_event(Service *s);
+
+/* READY=1 arrived from the main pid (manager-notify.c). Completes the start
+ * of a Type=notify service still in EXEC_START; a no-op for every other
+ * type and state. */
+void service_notify_ready(Service *s);
 
 const char *service_type_to_string(ServiceType t);
 const char *service_state_to_string(ServiceState s);

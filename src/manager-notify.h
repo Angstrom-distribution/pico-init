@@ -12,13 +12,11 @@
  * foreign pid's credentials (sd-daemon.c's own comment on notify_internal()
  * says the same).
  *
- * DEFERRED SCOPE: this lands attribution and recognized-key handling only.
- * READY=1 sets a real flag/timestamp but does NOT gate a service's active
- * transition -- that needs SERVICE_TYPE_NOTIFY, a second arc through
- * service.c's state machine (EXEC_START-until-READY gating, start-timeout
- * interaction, STOPPING=1 stop path, NotifyAccess=), deliberately not built
- * here. See manager-notify.c's READY=1 handler and this milestone's commit
- * message for the same statement.
+ * READY=1 from a Type=notify service's main pid completes its start
+ * (service_notify_ready(), service.c); for every other type it is a flag
+ * picoctl reports. Still deliberately unbuilt: NotifyAccess= (the sender
+ * check is fixed at upstream's =main default), STOPPING=1 as a stop path,
+ * RELOADING=1 (no reload machinery exists to drive), the watchdog keys.
  */
 
 #pragma once

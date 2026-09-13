@@ -29,12 +29,15 @@
 #include <poll.h>
 #include <pwd.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
+#include "job.h"
+#include "manager-notify.h"
 #include "manager.h"
 #include "service.h"
 #include "test-util.h"
@@ -46,6 +49,80 @@ static void test_sleep_ms(int ms) {
         struct timespec ts = { .tv_sec = ms / 1000, .tv_nsec = (long) (ms % 1000) * 1000000L };
 
         nanosleep(&ts, NULL);
+}
+
+/* --- manager_loop() driver, test-manager-notify.c's own --- */
+
+/*
+ * The Type=exec/notify tests below need the real loop: the exec fd and the
+ * notify socket are sd_event io sources, and reap_for()'s hand-driven
+ * signalfd would bypass exactly the dispatch order those tests are about.
+ */
+static Manager *g_drive_m;
+static bool (*g_drive_done)(void *userdata);
+static void *g_drive_ctx;
+static int g_drive_ticks;
+static int g_drive_max_ticks;
+
+static void drive_tick(void *userdata, usec_t now) {
+        (void) userdata;
+        (void) now;
+
+        g_drive_ticks++;
+
+        if (g_drive_done(g_drive_ctx) || g_drive_ticks >= g_drive_max_ticks)
+                g_drive_m->objective = MANAGER_EXIT;
+        else
+                ASSERT_EQ_INT(pico_timer_add(g_drive_m->timer,
+                                             now_monotonic() + 5 * USEC_PER_MSEC,
+                                             drive_tick,
+                                             NULL,
+                                             NULL),
+                              0);
+}
+
+static bool drive_until(Manager *m, bool (*done)(void *), void *ctx, int max_ticks) {
+        g_drive_m = m;
+        g_drive_done = done;
+        g_drive_ctx = ctx;
+        g_drive_ticks = 0;
+        g_drive_max_ticks = max_ticks;
+
+        m->objective = MANAGER_RUNNING;
+
+        ASSERT_EQ_INT(pico_timer_add(m->timer, now_monotonic() + 5 * USEC_PER_MSEC, drive_tick, NULL, NULL),
+                      0);
+        manager_loop(m);
+
+        return done(ctx);
+}
+
+static bool service_running_done(void *userdata) {
+        return ((Service *) userdata)->state == SERVICE_RUNNING;
+}
+
+static bool service_settled_done(void *userdata) {
+        Service *s = userdata;
+
+        return s->state == SERVICE_DEAD || s->state == SERVICE_FAILED;
+}
+
+/* test-notify-helper, built next to this binary (test-picoctl.c's idiom). */
+static void notify_helper_path(char *out, size_t out_size) {
+        char self[PATH_MAX];
+        ssize_t n;
+        char *slash;
+
+        n = readlink("/proc/self/exe", self, sizeof(self) - 1);
+        ASSERT_TRUE(n > 0);
+        self[n] = '\0';
+        slash = strrchr(self, '/');
+        ASSERT_TRUE(slash != NULL);
+        *slash = '\0';
+
+        n = snprintf(out, out_size, "%s/test-notify-helper", self);
+        ASSERT_TRUE(n > 0 && (size_t) n < out_size);
+        ASSERT_EQ_INT(access(out, X_OK), 0);
 }
 
 static Manager *manager_for(const char *dir) {
@@ -932,6 +1009,245 @@ static void test_user_unknown_fails_start_cleanly(void) {
         free(dir);
 }
 
+/*
+ * Type=exec versus Type=simple, observed through ordering rather than
+ * through the state field alone: b is After= (and Requires=) a, so b's
+ * start job is runnable exactly when a's has finished. For simple that is
+ * inside the same manager_dispatch_run_queue() call that forked a; for exec
+ * it is not until the loop has seen a's execve() go through.
+ */
+static void test_exec_completes_only_after_execve(void) {
+        Manager *m;
+        Service *a, *b;
+        char *dir;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        a = load_service(m, dir, "exec-a.service", "[Unit]\n[Service]\nType=exec\nExecStart=/bin/sleep 100\n");
+        b = load_service(m,
+                         dir,
+                         "exec-b.service",
+                         "[Unit]\nRequires=exec-a.service\nAfter=exec-a.service\n"
+                         "[Service]\nType=simple\nExecStart=/bin/sleep 100\n");
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, UNIT(b), NULL), 0);
+        ASSERT_EQ_INT(manager_dispatch_run_queue(m), 1); /* only a ran */
+
+        /* Forked, exec fd armed, and NOT started: a's job is still open,
+         * so b -- ordered after it -- has not been touched. */
+        ASSERT_EQ_INT(a->state, SERVICE_EXEC_START);
+        ASSERT_EQ_INT(unit_active_state(UNIT(a)), UNIT_ACTIVATING);
+        ASSERT_TRUE(a->main_pid > 0);
+        ASSERT_TRUE(a->exec_fd >= 0);
+        ASSERT_TRUE(UNIT(a)->job != NULL);
+        ASSERT_EQ_INT(b->state, SERVICE_DEAD);
+        ASSERT_EQ_INT(b->main_pid, 0);
+
+        ASSERT_TRUE(drive_until(m, service_running_done, b, 400));
+
+        ASSERT_EQ_INT(a->state, SERVICE_RUNNING);
+        ASSERT_EQ_INT(unit_active_state(UNIT(a)), UNIT_ACTIVE);
+        ASSERT_TRUE(a->exec_fd < 0); /* consumed: the EOF was the signal */
+        ASSERT_TRUE(a->exec_fd_source == NULL);
+        ASSERT_TRUE(UNIT(a)->job == NULL);
+        ASSERT_TRUE(b->main_pid > 0);
+
+        ASSERT_EQ_INT(unit_stop(UNIT(b)), 0);
+        ASSERT_EQ_INT(unit_stop(UNIT(a)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, a, 400));
+        ASSERT_TRUE(drive_until(m, service_settled_done, b, 400));
+        ASSERT_EQ_INT(a->state, SERVICE_DEAD);
+        ASSERT_EQ_INT(a->result, SERVICE_SUCCESS);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* The other half of the exec contract: an execve() that fails is a start
+ * that never completed. Under simple the same unit reports ACTIVE first
+ * and its dependent starts; under exec it goes straight to FAILED, the
+ * dependent's job is cancelled with it, and nothing After= it ever forks. */
+static void test_exec_failed_execve_never_active(void) {
+        Manager *m;
+        Service *a, *b;
+        char *dir;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        a = load_service(m,
+                         dir,
+                         "exec-fail-a.service",
+                         "[Unit]\n[Service]\nType=exec\nExecStart=/nonexistent/pico-init-no-such-binary\n");
+        b = load_service(m,
+                         dir,
+                         "exec-fail-b.service",
+                         "[Unit]\nRequires=exec-fail-a.service\nAfter=exec-fail-a.service\n"
+                         "[Service]\nType=simple\nExecStart=/bin/sleep 100\n");
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, UNIT(b), NULL), 0);
+        ASSERT_EQ_INT(manager_dispatch_run_queue(m), 1);
+        ASSERT_EQ_INT(a->state, SERVICE_EXEC_START);
+
+        ASSERT_TRUE(drive_until(m, service_settled_done, a, 400));
+
+        ASSERT_EQ_INT(a->state, SERVICE_FAILED);
+        ASSERT_EQ_INT(a->result, SERVICE_FAILURE_RESOURCES); /* PICO_EXIT_EXEC, our setup, not the workload */
+        ASSERT_TRUE(a->exec_fd < 0);
+        ASSERT_TRUE(UNIT(a)->job == NULL);
+        ASSERT_EQ_INT(b->state, SERVICE_DEAD);
+        ASSERT_EQ_INT(b->main_pid, 0);
+        ASSERT_TRUE(UNIT(b)->job == NULL); /* cancelled along with a's failure */
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* A manager with the notify listener up: Type=notify needs a real socket
+ * for the real sd_notify() in test-notify-helper to reach. */
+static Manager *notify_manager_for(const char *dir, char **ret_rtdir) {
+        Manager *m = manager_for(dir);
+        char *rtdir = test_tmpdir_new();
+
+        ASSERT_TRUE(rtdir != NULL);
+        ASSERT_EQ_INT(manager_set_runtime_dir(m, rtdir), 0);
+        ASSERT_EQ_INT(manager_notify_setup(m), 0);
+
+        *ret_rtdir = rtdir;
+        return m;
+}
+
+/*
+ * Type=notify: the start job stays open, and so does everything After= it,
+ * until the main process itself sends READY=1 -- here through the real
+ * sd_notify() over the $NOTIFY_SOCKET service-exec.c injected, after a
+ * deliberate delay the elapsed time proves was waited out.
+ */
+static void test_notify_ready_gates_activation(void) {
+        Manager *m;
+        Service *a, *b;
+        char *dir, *rtdir;
+        char helper[PATH_MAX];
+        char unit[PATH_MAX + 128];
+        usec_t t0;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = notify_manager_for(dir, &rtdir);
+        notify_helper_path(helper, sizeof(helper));
+
+        snprintf(unit, sizeof(unit), "[Unit]\n[Service]\nType=notify\nExecStart=%s 300\n", helper);
+        a = load_service(m, dir, "notify-a.service", unit);
+        b = load_service(m,
+                         dir,
+                         "notify-b.service",
+                         "[Unit]\nRequires=notify-a.service\nAfter=notify-a.service\n"
+                         "[Service]\nType=simple\nExecStart=/bin/sleep 100\n");
+
+        t0 = now_monotonic();
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, UNIT(b), NULL), 0);
+        ASSERT_EQ_INT(manager_dispatch_run_queue(m), 1);
+
+        ASSERT_EQ_INT(a->state, SERVICE_EXEC_START);
+        ASSERT_EQ_INT(unit_active_state(UNIT(a)), UNIT_ACTIVATING);
+        ASSERT_TRUE(a->main_pid > 0);
+        ASSERT_TRUE(a->exec_fd < 0); /* the exec fd is Type=exec's, not notify's */
+        ASSERT_EQ_INT(a->notify_ready, false);
+        ASSERT_EQ_INT(b->state, SERVICE_DEAD);
+
+        ASSERT_TRUE(drive_until(m, service_running_done, b, 800));
+
+        /* Not before the helper's own 300ms sleep, whatever the scheduler did. */
+        ASSERT_TRUE(now_monotonic() - t0 >= 300 * USEC_PER_MSEC);
+        ASSERT_EQ_INT(a->notify_ready, true);
+        ASSERT_EQ_INT(a->state, SERVICE_RUNNING);
+        ASSERT_EQ_INT(unit_active_state(UNIT(a)), UNIT_ACTIVE);
+        ASSERT_TRUE(UNIT(a)->job == NULL);
+        ASSERT_TRUE(b->main_pid > 0);
+
+        ASSERT_EQ_INT(unit_stop(UNIT(b)), 0);
+        ASSERT_EQ_INT(unit_stop(UNIT(a)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, a, 400));
+        ASSERT_TRUE(drive_until(m, service_settled_done, b, 400));
+        ASSERT_EQ_INT(a->state, SERVICE_DEAD);
+        ASSERT_EQ_INT(a->result, SERVICE_SUCCESS); /* SIGTERM on a daemon's main process: clean */
+
+        manager_free(m);
+        test_rm_rf(dir);
+        test_rm_rf(rtdir);
+        free(dir);
+        free(rtdir);
+}
+
+/* READY=1 never comes: TimeoutStartSec= ends the wait as a timeout
+ * failure, and the process that never spoke is gone with it. */
+static void test_notify_timeout_without_ready(void) {
+        Manager *m;
+        Service *s;
+        char *dir, *rtdir;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = notify_manager_for(dir, &rtdir);
+
+        s = load_service(m,
+                         dir,
+                         "notify-mute.service",
+                         "[Unit]\n[Service]\nType=notify\nExecStart=/bin/sleep 100\nTimeoutStartSec=200ms\n");
+
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        ASSERT_EQ_INT(s->state, SERVICE_EXEC_START);
+
+        ASSERT_TRUE(drive_until(m, service_settled_done, s, 800));
+
+        ASSERT_EQ_INT(s->state, SERVICE_FAILED);
+        ASSERT_EQ_INT(s->result, SERVICE_FAILURE_TIMEOUT);
+        ASSERT_EQ_INT(s->notify_ready, false);
+        ASSERT_EQ_INT(s->main_pid, 0);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        test_rm_rf(rtdir);
+        free(dir);
+        free(rtdir);
+}
+
+/* A Type=notify main process that exits 0 without ever sending READY=1
+ * was never active: a protocol failure, not a success -- and not a
+ * RemainAfterExit=yes EXITED either, since there is nothing to remain. */
+static void test_notify_exit_before_ready_is_protocol_failure(void) {
+        Manager *m;
+        Service *s;
+        char *dir, *rtdir;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = notify_manager_for(dir, &rtdir);
+
+        s = load_service(m,
+                         dir,
+                         "notify-quit.service",
+                         "[Unit]\n[Service]\nType=notify\nRemainAfterExit=yes\nExecStart=/bin/true\n");
+
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, s, 400));
+
+        ASSERT_EQ_INT(s->state, SERVICE_FAILED);
+        ASSERT_EQ_INT(s->result, SERVICE_FAILURE_PROTOCOL);
+        ASSERT_EQ_INT(unit_active_state(UNIT(s)), UNIT_FAILED);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        test_rm_rf(rtdir);
+        free(dir);
+        free(rtdir);
+}
+
 int main(void) {
         test_lifecycle_simple();
         test_oneshot_completes_only_on_exit();
@@ -946,6 +1262,11 @@ int main(void) {
         test_condition_skips_start_without_failing();
         test_user_group_drops_privilege();
         test_user_unknown_fails_start_cleanly();
+        test_exec_completes_only_after_execve();
+        test_exec_failed_execve_never_active();
+        test_notify_ready_gates_activation();
+        test_notify_timeout_without_ready();
+        test_notify_exit_before_ready_is_protocol_failure();
 
         printf("test-service: all checks passed\n");
         return 0;

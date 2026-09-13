@@ -168,7 +168,8 @@ pico_tests = [
   'test-unit-load',
   'test-job',
   'test-boot-root',
-  'test-service',
+  # test-service is registered further down, after the shared libsystemd
+  # its Type=notify helper links.
   'test-timer-cgroup',
   'test-boot',
   # Socket activation (plan §1.6) and picoctl (plan §1.7), registered up
@@ -727,6 +728,24 @@ libsystemd = shared_library(
   link_depends: libsystemd_sym,
   install: true,
 )
+
+# Not a test: the Type=notify service test-service.c execs (found next to
+# the test binary via /proc/self/exe, test-picoctl.c's own idiom). Links the
+# shared library above so its READY=1 goes through the installed ABI, which
+# is why test-service itself is registered here rather than in pico_tests.
+test_notify_helper_exe = executable(
+  'test-notify-helper',
+  'src/test-notify-helper.c',
+  include_directories: libsystemd_compat_includes,
+  link_with: libsystemd,
+)
+test_service_exe = executable(
+  'test-service',
+  ['src/test-service.c'] + pico_test_sources + [version_h],
+  include_directories: libsystemd_compat_includes,
+  link_with: pico_init_core,
+)
+test('test-service', test_service_exe, depends: test_notify_helper_exe)
 
 # libsystemd.pc for the -lsystemd consumers and systemd.pc for the larger
 # population that never links anything and only asks pkg-config where

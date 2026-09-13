@@ -135,6 +135,7 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -736,6 +737,9 @@ static void child_attach_cgroup(const struct pico_cgroup *cg) {
  * -1 means "logd unavailable", the console fallback (plan §3.6). `creds`
  * (exec_creds_resolve(), parent-built too) is the User=/Group= result the
  * child applies at step 10 -- integers only, nothing left to look up.
+ * `exec_fd` is the write end of a Type=exec service's O_CLOEXEC readiness
+ * pipe (see service.h), -1 for every other type: kept across the sweep,
+ * written at step 11, and closed by a successful execve() itself.
  */
 static _Noreturn void
                 child_exec(Service *s,
@@ -745,6 +749,7 @@ static _Noreturn void
                            unsigned n_sock_fds,
                            size_t pid_slot,
                            int stdout_fd,
+                           int exec_fd,
                            const ExecCreds *creds) {
         char pidbuf[32];
         sigset_t empty;
@@ -788,13 +793,15 @@ static _Noreturn void
          * needs to survive this. See close_all_except()'s own comment for
          * why this is not simply a close() per fd number any more. */
         {
-                int keep_fds[PICO_MAX_SOCKET_FDS + 1];
+                int keep_fds[PICO_MAX_SOCKET_FDS + 2];
                 unsigned n_keep = 0, i;
 
                 for (i = 0; i < n_sock_fds && n_keep < PICO_MAX_SOCKET_FDS; i++)
                         keep_fds[n_keep++] = sock_fds[i];
                 if (stdout_fd >= 0)
                         keep_fds[n_keep++] = stdout_fd;
+                if (exec_fd >= 0)
+                        keep_fds[n_keep++] = exec_fd;
 
                 max_fd = sysconf(_SC_OPEN_MAX);
                 if (max_fd < 0)
@@ -828,6 +835,18 @@ static _Noreturn void
 
                         close(stdout_fd);
                         stdout_fd = nfd; /* -1 on failure: console fallback */
+                }
+
+                /* Same collision, same fix, but F_DUPFD_CLOEXEC: plain
+                 * F_DUPFD drops the flag the whole protocol rests on. A
+                 * failure here leaves the parent seeing EOF without the 1,
+                 * which it treats as "not confirmed" and lets SIGCHLD
+                 * decide -- never a false success. */
+                if (exec_fd >= 0 && exec_fd < (int) n_sock_fds + 3) {
+                        int nfd = fcntl(exec_fd, F_DUPFD_CLOEXEC, (int) n_sock_fds + 3);
+
+                        close(exec_fd);
+                        exec_fd = nfd;
                 }
 
                 if (shift_fds(sock_fds, n_sock_fds) < 0)
@@ -935,8 +954,27 @@ static _Noreturn void
          * NULL exactly when this start passes neither socket-activation fds
          * nor NOTIFY_SOCKET= (no Environment= directive exists in this MVP
          * to need one otherwise), in which case the inherited `environ` is
-         * used unchanged, same as always. */
+         * used unchanged, same as always.
+         *
+         * Type=exec (upstream's exec_fd, exec-invoke.c): a 1 goes down the
+         * pipe right before execve(), a 0 right after a failed one. Success
+         * never writes the 0 -- O_CLOEXEC closes the pipe, and that EOF
+         * after the 1 is the parent's signal. A failed write is not fatal:
+         * the parent then sees EOF with nothing before it and lets SIGCHLD
+         * decide, which is the pre-exec verdict anyway. */
+        if (exec_fd >= 0) {
+                const uint8_t hot = 1;
+
+                (void) !write(exec_fd, &hot, sizeof(hot));
+        }
+
         execve(argv[0], argv, envp ? envp : environ);
+
+        if (exec_fd >= 0) {
+                const uint8_t cold = 0;
+
+                (void) !write(exec_fd, &cold, sizeof(cold));
+        }
         _exit(PICO_EXIT_EXEC);
 }
 
@@ -948,6 +986,7 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
         const char *notify_socket;
         ExecCreds creds;
         int stdout_fd;
+        int exec_pipe[2] = { -1, -1 };
         pid_t pid;
         int r;
 
@@ -1020,6 +1059,22 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
          * console" below, never a reason to fail the spawn itself. */
         stdout_fd = create_stdout_socket(UNIT(s)->id);
 
+        /* Type=exec's readiness pipe (service.h), for the main command
+         * only: ExecStartPre= completes by exiting, not by exec'ing. Both
+         * ends O_CLOEXEC -- the child's end closing on execve() IS the
+         * signal. A pipe failure is a real spawn failure, not a fallback to
+         * simple: the unit asked for exec semantics. */
+        if (argv == s->exec_start && s->type == SERVICE_TYPE_EXEC) {
+                if (pipe2(exec_pipe, O_CLOEXEC | O_NONBLOCK) < 0) {
+                        r = -errno;
+                        free_socket_envp(envp);
+                        exec_creds_free(&creds);
+                        if (stdout_fd >= 0)
+                                close(stdout_fd);
+                        return r;
+                }
+        }
+
         pid = fork();
         if (pid < 0) {
                 r = -errno; /* 74129a1276: never a stale success value */
@@ -1027,12 +1082,23 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
                 exec_creds_free(&creds);
                 if (stdout_fd >= 0)
                         close(stdout_fd);
+                if (exec_pipe[0] >= 0) {
+                        close(exec_pipe[0]);
+                        close(exec_pipe[1]);
+                }
                 return r;
         }
 
         if (pid == 0)
-                child_exec(
-                                s, argv, envp, sock_fds, (unsigned) n_sock_fds, pid_slot, stdout_fd, &creds); /* never returns */
+                child_exec(s,
+                           argv,
+                           envp,
+                           sock_fds,
+                           (unsigned) n_sock_fds,
+                           pid_slot,
+                           stdout_fd,
+                           exec_pipe[1],
+                           &creds); /* never returns */
 
         /* COW: the child already has its own copy of everything envp/
          * creds/stdout_fd point to, made at fork() -- freeing/closing the
@@ -1042,6 +1108,12 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
         exec_creds_free(&creds);
         if (stdout_fd >= 0)
                 close(stdout_fd);
+
+        /* The parent must hold no copy of the write end, or EOF never
+         * arrives. The read end is service.c's to watch and close. */
+        if (exec_pipe[1] >= 0)
+                close(exec_pipe[1]);
+        s->exec_fd = exec_pipe[0];
 
         *ret_pid = pid;
         return 0;

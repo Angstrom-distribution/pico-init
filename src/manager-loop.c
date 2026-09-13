@@ -38,6 +38,10 @@
  *                            final notify (sent moments before it exits)
  *                            would be unattributable if SIGCHLD ran first
  *                            in the same batch
+ *    -5  exec fd          -- a Type=exec service's execve() confirmation
+ *                            (service.c), before SIGCHLD for the same
+ *                            reason: an exec'd-then-exited process went
+ *                            RUNNING before it died
  *    -4  signals         -- SIGCHLD reaped and attributed here, in full,
  *                            before anything at a higher priority runs
  *    -3  sockets / ctrl   -- may enqueue jobs, carry no exit status

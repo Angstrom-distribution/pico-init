@@ -78,6 +78,7 @@ struct pico_manager_notify {
 static void notify_apply(Manager *m, Unit *u, const struct ucred *ucred, char *buf, size_t len) {
         Service *s;
         bool changed = false;
+        bool from_main;
         char *line, *save = NULL;
 
         (void) m;
@@ -87,13 +88,21 @@ static void notify_apply(Manager *m, Unit *u, const struct ucred *ucred, char *b
                 return;
         s = SERVICE(u);
 
+        /* Decided once, before any MAINPID= in this same datagram can move
+         * the goalposts -- upstream gates access on the sender the same
+         * way, up front. NotifyAccess= is not built; this is its =main
+         * default, upstream's own for Type=notify. */
+        from_main = s->main_pid > 0 && ucred->pid == s->main_pid;
+
         for (line = strtok_r(buf, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
                 if (strcmp(line, "READY=1") == 0) {
-                        /* Does NOT gate the active transition -- see this
-                         * file's header / manager-notify.h's DEFERRED SCOPE:
-                         * that needs SERVICE_TYPE_NOTIFY. */
                         s->notify_ready = true;
                         changed = true;
+                        /* The one key that drives the state machine: a
+                         * Type=notify start completes here, nowhere else.
+                         * A no-op for other types and states (service.c). */
+                        if (from_main)
+                                service_notify_ready(s);
                 } else if (strncmp(line, "STATUS=", 7) == 0) {
                         const char *val = line + 7;
                         size_t vlen = strlen(val);

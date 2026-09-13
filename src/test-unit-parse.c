@@ -1077,6 +1077,58 @@ static void test_shipped_ttygs0_unit_wins_over_template(void) {
         free(dir);
 }
 
+/*
+ * Type=: exec and notify load as themselves, notify-reload as notify with
+ * the fallback on the record, and a type pico-init has no answer for at all
+ * (forking, until it lands) is still a load failure rather than a silent
+ * simple -- the ordering argument in config_parse_type() unchanged.
+ */
+static void test_type_values(void) {
+        Manager *m;
+        char *dir;
+        Unit *u;
+        char *degraded;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir, "exec.service", "[Service]\nType=exec\nExecStart=/bin/true\n"), 0);
+        ASSERT_EQ_INT(test_write_file(dir, "notify.service", "[Service]\nType=notify\nExecStart=/bin/true\n"), 0);
+        ASSERT_EQ_INT(test_write_file(dir, "reload.service", "[Service]\nType=notify-reload\nExecStart=/bin/true\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir, "forking.service", "[Service]\nType=forking\nExecStart=/bin/true\n"), 0);
+        ASSERT_EQ_INT(test_write_file(dir, "bogus.service", "[Service]\nType=frobnicate\nExecStart=/bin/true\n"), 0);
+
+        m = manager_for(dir);
+
+        u = load_one(m, "exec.service");
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        ASSERT_EQ_INT(((Service *) u)->type, SERVICE_TYPE_EXEC);
+        ASSERT_EQ_INT(u->n_degraded_directives, 0);
+
+        u = load_one(m, "notify.service");
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        ASSERT_EQ_INT(((Service *) u)->type, SERVICE_TYPE_NOTIFY);
+        ASSERT_EQ_INT(u->n_degraded_directives, 0);
+
+        u = load_one(m, "reload.service");
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        ASSERT_EQ_INT(((Service *) u)->type, SERVICE_TYPE_NOTIFY);
+        degraded = unit_degraded_directives_string(u);
+        ASSERT_STREQ(degraded, "Type=notify-reload");
+        free(degraded);
+
+        u = load_one(m, "forking.service");
+        ASSERT_EQ_INT(u->load_state, UNIT_ERROR);
+
+        u = load_one(m, "bogus.service");
+        ASSERT_EQ_INT(u->load_state, UNIT_ERROR);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
         test_service_fields();
         test_unknown_directives_are_tolerated();
@@ -1099,6 +1151,7 @@ int main(void) {
         test_condition_values_are_not_expanded();
         test_shipped_ttygs0_unit_is_unchanged();
         test_shipped_ttygs0_unit_wins_over_template();
+        test_type_values();
 
         printf("test-unit-parse: all checks passed\n");
         return 0;

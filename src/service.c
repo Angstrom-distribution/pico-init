@@ -7,7 +7,7 @@
  * cgroup child-side setup. Quarried from systemd's ~2011-era src/service.c
  * (tag v30, commit 501c92c, copyright 2010 Lennart Poettering,
  * GPL-2.0-or-later), reduced to the two-state-machine shape pico-init needs
- * (Type=simple/oneshot, no ExecStop=/ExecStopPost=/notify/watchdog/D-Bus),
+ * (Type=simple/oneshot, no ExecStop=/ExecStopPost=/watchdog/D-Bus),
  * with a full history review (v30 -> 2026, ~2299 commits enumerated, ~300
  * read in full) applied on top so the reduction does not re-ship bugs
  * upstream has since fixed. No CVE has ever been assigned against
@@ -65,22 +65,30 @@
  *    sigchld_code_to_string() and format_exit_status().
  *
  * Not backported: ExecStop=/ExecStopPost=/ExecReload=, ExecCondition=,
- * Type=forking/dbus/notify/idle, socket activation, the watchdog, cgroup
- * accounting/resource-control directives, D-Bus property change signals --
- * none of it has a field in service.h, and pico-init's stop path (SIGTERM,
- * then cgroup_v2_kill() on timeout) makes an ExecStop= directive redundant
- * for this MVP's scope.
+ * Type=forking/dbus/idle, the watchdog, cgroup accounting/resource-control
+ * directives, D-Bus property change signals -- none of it has a field in
+ * service.h, and pico-init's stop path (SIGTERM, then cgroup_v2_kill() on
+ * timeout) makes an ExecStop= directive redundant for this MVP's scope.
+ *
+ * Type=exec and Type=notify are modern upstream, not v30: exec follows
+ * exec-invoke.c's exec_fd protocol (service_exec_fd_cb() below), notify
+ * follows service_notify_message()'s READY=1 gating with the
+ * exited-before-READY case mapped to SERVICE_FAILURE_PROTOCOL as upstream
+ * does; NotifyAccess= is not built, so only the main pid's READY=1 counts
+ * (upstream's own default for Type=notify).
  */
 
 #include <errno.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <unistd.h>
 
 #include "job.h"
 #include "manager.h"
@@ -331,6 +339,65 @@ static bool service_shall_restart(Service *s, const char **reason) {
         }
 }
 
+/* --- Type=exec's readiness pipe --- */
+
+/* Idempotent; the source owns the fd once registered, the raw fd before. */
+static void service_exec_fd_close(Service *s) {
+        if (s->exec_fd_source)
+                s->exec_fd_source = sd_event_source_disable_unref(s->exec_fd_source);
+        else if (s->exec_fd >= 0)
+                close(s->exec_fd);
+
+        s->exec_fd = -1;
+        s->exec_fd_hot = false;
+}
+
+static void service_enter_running(Service *s);
+
+/*
+ * The io callback (EVENT_PRIORITY_EXEC_FD). Protocol per service.h: bytes
+ * set/clear "hot", EOF while hot means execve() succeeded. EOF while not
+ * hot means the child never reached execve() or it failed (it wrote the
+ * 0): nothing to do here, its exit code reaches service_sigchld_event().
+ * CALLBACK CONTRACT (manager-loop.c): every path returns 0.
+ */
+static int service_exec_fd_cb(sd_event_source *es, int fd, uint32_t revents, void *userdata) {
+        Service *s = userdata;
+        (void) es;
+        (void) revents;
+
+        for (;;) {
+                uint8_t x;
+                ssize_t n = read(fd, &x, sizeof(x));
+
+                if (n < 0) {
+                        if (errno == EAGAIN || errno == EINTR)
+                                return 0;
+
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s: exec fd read failed (%s), start will be judged by exit status",
+                                 UNIT(s)->id,
+                                 strerror(errno));
+                        service_exec_fd_close(s);
+                        return 0;
+                }
+
+                if (n == 0) {
+                        bool hot = s->exec_fd_hot;
+
+                        service_exec_fd_close(s);
+
+                        if (hot && s->state == SERVICE_EXEC_START) {
+                                pico_log(PICO_LOG_DEBUG, "%s: execve() confirmed", UNIT(s)->id);
+                                service_enter_running(s);
+                        }
+                        return 0;
+                }
+
+                s->exec_fd_hot = x != 0;
+        }
+}
+
 /* --- state transitions --- */
 
 static UnitActiveState service_active_state_of(ServiceState state, bool remain_after_exit);
@@ -353,6 +420,7 @@ static void service_enter_dead(Service *s) {
         const char *reason = "";
 
         service_timer_reset(s);
+        service_exec_fd_close(s);
 
         /* B8/a509f0e631: always the real DEAD/FAILED state first, then --
          * and only then -- AUTO_RESTART is even considered. Skipping this
@@ -388,6 +456,7 @@ static void service_enter_stop(Service *s) {
         int cp = control_pid_good(s);
 
         service_timer_reset(s);
+        service_exec_fd_close(s); /* a stop while still waiting on execve() */
 
         if (mp <= 0 && cp <= 0) {
                 /* Nothing left to wait for -- skip SERVICE_STOP entirely
@@ -426,6 +495,7 @@ static void service_enter_running(Service *s) {
          * harmless on the RUNNING/EXITED paths, which never called it at all.
          */
         service_timer_reset(s);
+        service_exec_fd_close(s); /* whichever way EXEC_START ended, nothing waits on it now */
 
         if (s->result != SERVICE_SUCCESS) {
                 service_enter_stop(s);
@@ -463,10 +533,35 @@ static void service_enter_start(Service *s) {
                 return;
         }
 
+        /* Type=exec: service_spawn() handed back the pipe's read end; watch
+         * it. Priority per manager.h. A registration failure leaves the
+         * start to be judged the way Type=simple's is -- the process IS
+         * running, refusing it now would be worse than an optimistic
+         * "started" -- and says so. */
+        if (s->exec_fd >= 0) {
+                r = sd_event_add_io(UNIT(s)->manager->event,
+                                    &s->exec_fd_source,
+                                    s->exec_fd,
+                                    EPOLLIN,
+                                    service_exec_fd_cb,
+                                    s);
+                if (r < 0) {
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s: cannot watch the exec fd (%s), counting the start as complete now",
+                                 UNIT(s)->id,
+                                 strerror(-r));
+                        service_exec_fd_close(s);
+                        service_enter_running(s);
+                        return;
+                }
+                sd_event_source_set_priority(s->exec_fd_source, EVENT_PRIORITY_EXEC_FD);
+                sd_event_source_set_io_fd_own(s->exec_fd_source, 1);
+        }
+
         /* "simple counts as started the moment the process is forked" (see
-         * this file's own top-of-header comment): for Type=oneshot the
-         * process is still running and EXEC_START is correct; simple is
-         * done right here. */
+         * this file's own top-of-header comment). oneshot stays here until
+         * the process exits, exec until service_exec_fd_cb() sees the
+         * execve() go through, notify until service_notify_ready(). */
         if (s->type == SERVICE_TYPE_SIMPLE)
                 service_enter_running(s);
 }
@@ -745,6 +840,21 @@ void service_sigchld_event(Service *s, pid_t pid, int code, int status) {
 
         switch (s->state) {
         case SERVICE_EXEC_START:
+                /*
+                 * Type=notify: only READY=1 ever makes this service active,
+                 * so a main process that exits "cleanly" first never was,
+                 * and RemainAfterExit= has nothing to keep. Upstream's
+                 * SERVICE_FAILURE_PROTOCOL, minus its NotifyAccess=all
+                 * escape (some other cgroup member might still send READY),
+                 * which pico-init does not attribute anyway.
+                 */
+                if (s->type == SERVICE_TYPE_NOTIFY && s->result == SERVICE_SUCCESS) {
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s: main process exited before sending READY=1 (Type=notify)",
+                                 UNIT(s)->id);
+                        s->result = SERVICE_FAILURE_PROTOCOL;
+                }
+                /* fall through */
         case SERVICE_RUNNING:
                 /*
                  * SIGCHLD for the main pid while the cgroup may still be
@@ -809,6 +919,17 @@ void service_cgroup_empty_event(Service *s) {
         default:
                 break;
         }
+}
+
+void service_notify_ready(Service *s) {
+        if (!s)
+                return;
+
+        if (s->type != SERVICE_TYPE_NOTIFY || s->state != SERVICE_EXEC_START)
+                return;
+
+        pico_log(PICO_LOG_DEBUG, "%s: READY=1 received, start complete", UNIT(s)->id);
+        service_enter_running(s);
 }
 
 /* --- timer callbacks --- */
@@ -909,6 +1030,8 @@ int service_verify(Service *s) {
 static const char * const service_type_table[_SERVICE_TYPE_MAX] = {
         [SERVICE_TYPE_SIMPLE] = "simple",
         [SERVICE_TYPE_ONESHOT] = "oneshot",
+        [SERVICE_TYPE_EXEC] = "exec",
+        [SERVICE_TYPE_NOTIFY] = "notify",
 };
 
 const char *service_type_to_string(ServiceType t) {
@@ -953,9 +1076,10 @@ const char *service_restart_to_string(ServiceRestart r) {
 }
 
 static const char * const service_result_table[_SERVICE_RESULT_MAX] = {
-        [SERVICE_SUCCESS] = "success",         [SERVICE_FAILURE_RESOURCES] = "resources",
-        [SERVICE_FAILURE_TIMEOUT] = "timeout", [SERVICE_FAILURE_EXIT_CODE] = "exit-code",
-        [SERVICE_FAILURE_SIGNAL] = "signal",   [SERVICE_FAILURE_START_LIMIT] = "start-limit-hit",
+        [SERVICE_SUCCESS] = "success",           [SERVICE_FAILURE_RESOURCES] = "resources",
+        [SERVICE_FAILURE_TIMEOUT] = "timeout",   [SERVICE_FAILURE_EXIT_CODE] = "exit-code",
+        [SERVICE_FAILURE_SIGNAL] = "signal",     [SERVICE_FAILURE_START_LIMIT] = "start-limit-hit",
+        [SERVICE_FAILURE_PROTOCOL] = "protocol",
 };
 
 const char *service_result_to_string(ServiceResult r) {
@@ -979,6 +1103,7 @@ static void service_init(Unit *u) {
         s->timeout_stop_usec = PICO_DEFAULT_TIMEOUT_USEC;
         s->start_limit_interval = PICO_START_LIMIT_INTERVAL_USEC;
         s->start_limit_burst = PICO_START_LIMIT_BURST;
+        s->exec_fd = -1;
 }
 
 /*
@@ -1004,6 +1129,8 @@ static void service_done(Unit *u) {
         if (s->timer_event && u->manager && u->manager->timer)
                 pico_timer_cancel(u->manager->timer, s->timer_event);
         s->timer_event = NULL;
+
+        service_exec_fd_close(s); /* same hazard as the timer: a source outliving its Service */
 
         /* B13: disable/unref the events_source before cgroup_v2_free() closes
          * the fd underneath it, or a pending dispatch could still run its

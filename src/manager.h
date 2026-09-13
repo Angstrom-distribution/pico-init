@@ -39,6 +39,9 @@ enum {
         EVENT_PRIORITY_CGROUP_EVENTS = SD_EVENT_PRIORITY_NORMAL - 10, /* verify + queue only, never acts */
         EVENT_PRIORITY_NOTIFY = SD_EVENT_PRIORITY_NORMAL -
                         5, /* before SIGCHLD: attribution needs main_pid still set */
+        EVENT_PRIORITY_EXEC_FD = SD_EVENT_PRIORITY_NORMAL -
+                        5, /* before SIGCHLD: a Type=exec process that exec'd and died in one batch
+                            * went RUNNING first, so its exit is judged as a running daemon's */
         EVENT_PRIORITY_SIGNALS = SD_EVENT_PRIORITY_NORMAL - 4, /* SIGCHLD reaped + attributed here */
         EVENT_PRIORITY_SOCKET = SD_EVENT_PRIORITY_NORMAL - 3,
         EVENT_PRIORITY_CTRL = SD_EVENT_PRIORITY_NORMAL - 3,

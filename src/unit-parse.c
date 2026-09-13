@@ -573,16 +573,31 @@ static int config_parse_type(Unit *u, const char *path, unsigned line, const cha
                 s->type = SERVICE_TYPE_SIMPLE;
         else if (strcmp(rvalue, "oneshot") == 0)
                 s->type = SERVICE_TYPE_ONESHOT;
-        else {
+        else if (strcmp(rvalue, "exec") == 0)
+                s->type = SERVICE_TYPE_EXEC;
+        else if (strcmp(rvalue, "notify") == 0)
+                s->type = SERVICE_TYPE_NOTIFY;
+        else if (strcmp(rvalue, "notify-reload") == 0) {
+                /* Everything notify-reload adds over notify is a reload
+                 * protocol, and neither ExecReload= nor a reload verb exists
+                 * for it to differ on -- so the start semantics are exact,
+                 * and the record is what keeps that visible. */
+                s->type = SERVICE_TYPE_NOTIFY;
+                pico_log(PICO_LOG_WARNING,
+                         "%s:%u: Type=notify-reload: no reload machinery, running as Type=notify",
+                         path,
+                         line);
+                return unit_add_degradation(u, "Type=notify-reload");
+        } else {
                 /*
                  * Still a hard failure rather than a dropped directive:
-                 * forking/dbus/notify/idle each change *when* a service counts
-                 * as started, so silently running one as simple would report
+                 * forking/dbus/idle each change *when* a service counts as
+                 * started, so silently running one as simple would report
                  * the unit up before it actually is, and everything ordered
                  * After= it would then start too early. Refusing is safer.
                  */
                 pico_log(PICO_LOG_ERR,
-                         "%s:%u: Type=%s is not supported (only 'simple' and 'oneshot' are), failing unit",
+                         "%s:%u: Type=%s is not supported (simple, oneshot, exec, notify, notify-reload are), failing unit",
                          path,
                          line,
                          rvalue);
