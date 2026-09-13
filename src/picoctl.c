@@ -320,6 +320,83 @@ static int cmd_list_units(int argc, char *argv[]) {
         return 0;
 }
 
+/* --- is-system-running --- */
+
+/*
+ * Real systemctl's own state machine (src/systemctl/systemctl.c
+ * determine_ambiguous_result()) has more states than this -- initializing,
+ * stopping, offline -- that all need info PID 1 does not publish yet
+ * (a distinct pre-jobs-queued phase, a shutdown flag). What IS published is
+ * enough for the two states that matter for a health check: NJobs>0 means
+ * the boot's own start job (or any other job) has not settled yet, and a
+ * failed unit among the published ones means degraded -- matching upstream's
+ * own precedence (any job running trumps any failure, since a failure seen
+ * mid-boot may still resolve). "offline" covers PID 1 not running at all
+ * (no manager file), the same not-a-unit-problem case read_unit_state()'s
+ * own not-found default already models for a single unit.
+ */
+static int cmd_is_system_running(int argc, char *argv[]) {
+        char rt[PATH_MAX];
+        char manager_path[PATH_MAX + 16];
+        char unitsdir[PATH_MAX + 16];
+        FILE *f;
+        char line[256];
+        DIR *d;
+        struct dirent *de;
+        unsigned n_jobs = 0;
+        bool any_failed = false;
+
+        (void) argc;
+        (void) argv;
+
+        if (path_join(rt, sizeof(rt), PICO_RUNTIME_DIR) < 0) {
+                printf("offline\n");
+                return 1;
+        }
+
+        snprintf(manager_path, sizeof(manager_path), "%s/manager", rt);
+        f = fopen(manager_path, "re");
+        if (!f) {
+                printf("offline\n");
+                return 1;
+        }
+        while (fgets(line, sizeof(line), f)) {
+                unsigned v;
+
+                if (sscanf(line, "NJobs=%u", &v) == 1)
+                        n_jobs = v;
+        }
+        fclose(f);
+
+        if (n_jobs > 0) {
+                printf("starting\n");
+                return 1;
+        }
+
+        snprintf(unitsdir, sizeof(unitsdir), "%s/units", rt);
+        d = opendir(unitsdir);
+        if (d) {
+                while ((de = readdir(d))) {
+                        struct unit_state st;
+
+                        if (de->d_name[0] == '.')
+                                continue;
+                        read_unit_state(de->d_name, &st);
+                        if (strcmp(st.active_state, "failed") == 0)
+                                any_failed = true;
+                }
+                closedir(d);
+        }
+
+        if (any_failed) {
+                printf("degraded\n");
+                return 1;
+        }
+
+        printf("running\n");
+        return 0;
+}
+
 /* --- is-active / is-failed: LSB init-script exit codes --- */
 
 /*
@@ -1094,8 +1171,8 @@ static int cmd_reset_failed(int argc, char *argv[]) {
 static void usage(void) {
         fprintf(stderr,
                 "usage: picoctl [--root DIR] VERB [UNIT...] [--no-block]\n"
-                "verbs: status list-units is-active is-failed show enable disable is-enabled "
-                "preset start stop restart reset-failed\n");
+                "verbs: status list-units is-active is-failed is-system-running show enable "
+                "disable is-enabled preset start stop restart reset-failed\n");
 }
 
 int main(int argc, char *argv[]) {
@@ -1107,6 +1184,7 @@ int main(int argc, char *argv[]) {
                 {   "list-units",   cmd_list_units },
                 {    "is-active",    cmd_is_active },
                 {    "is-failed",    cmd_is_failed },
+                { "is-system-running", cmd_is_system_running },
                 {         "show",         cmd_show },
                 {       "enable",       cmd_enable },
                 {      "disable",      cmd_disable },

@@ -658,6 +658,11 @@ static void test_read_verbs_against_real_boot(void) {
         ASSERT_STREQ(res.out, "active\n");
         ASSERT_EQ_INT(res.exit_code, 1); /* LSB 1: dead/not-failed */
 
+        /* is-system-running: real boot, settled, nothing failed */
+        RUN_PICOCTL(&res, "--root", root, "is-system-running");
+        ASSERT_STREQ(res.out, "running\n");
+        ASSERT_EQ_INT(res.exit_code, 0);
+
         /* show: Id= plus the real published properties */
         RUN_PICOCTL(&res, "--root", root, "show", "console.service");
         ASSERT_TRUE(strstr(res.out, "Id=console.service\n") != NULL);
@@ -758,6 +763,11 @@ static void test_read_verbs_against_real_boot(void) {
         RUN_PICOCTL(&res, "--root", root, "is-failed", "console.service");
         ASSERT_STREQ(res.out, "failed\n");
         ASSERT_EQ_INT(res.exit_code, 0);
+
+        /* is-system-running: a real failed unit now on the books */
+        RUN_PICOCTL(&res, "--root", root, "is-system-running");
+        ASSERT_STREQ(res.out, "degraded\n");
+        ASSERT_EQ_INT(res.exit_code, 1);
 
         RUN_PICOCTL(&res, "--root", root, "status", "console.service");
         ASSERT_TRUE(strstr(res.out, "Active: failed (failed)") != NULL);
