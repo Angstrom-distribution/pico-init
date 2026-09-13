@@ -618,7 +618,7 @@ libsystemd_compat_sources = files(
   'src/compat/libsystemd/sd-journal-info.c',
   # src/logd/logd-read.h's LogdEntry/LogdReadField views and its ring
   # reader (logd_ring_read() et al) are what sd-journal-open.c/-navigate.c/
-  # -data.c build the whole read side on; logd_core is linked below for it.
+  # -data.c build the whole read side on; logd_read is link_whole'd below.
   #
   # sd-bus.h/sd-login.h/sd-hwdb.h family: split by behavioral bucket, not
   # upstream's file layout. sd-bus-validate.c/-path.c/-error.c are the
@@ -669,7 +669,7 @@ libsystemd_compat = static_library(
   'systemd-compat',
   libsystemd_compat_sources,
   include_directories: libsystemd_compat_includes,
-  link_whole: sd_event_lib,
+  link_whole: [sd_event_lib, logd_read],
   install: true,
 )
 
@@ -720,19 +720,16 @@ test_sd_id128_exe = executable(
 )
 test('test-sd-id128', test_sd_id128_exe)
 
-# sd-journal's read side calls into logd_core (logd_ring_read() et al,
-# src/logd/logd-read.h) directly -- the first family here to need it. A
-# static_library() itself builds fine without it (unresolved symbols in an
-# archive are normal), but the executables below need the real objects at
-# final link time, same as picoctl_exe's own [pico_init_core, logd_core]
-# pairing above. Packaging the installed systemd-compat.a for an external
-# consumer that isn't already linking logd_core is a question for whoever
-# owns that story; not resolved here.
+# sd-journal's read side resolves its logd_ring_*() calls from logd_read,
+# link_whole'd into libsystemd_compat above, so this links exactly what an
+# external consumer would: the compat library alone. The fixture writes
+# logd's export format itself rather than through logd-write.h, whose
+# writer needs pico_init_core.
 test_sd_journal_read_exe = executable(
   'test-sd-journal-read',
   ['src/compat/libsystemd/test-sd-journal-read.c'] + pico_test_sources,
-  include_directories: [libsystemd_compat_includes, logd_includes],
-  link_with: [libsystemd_compat, logd_core, pico_init_core],
+  include_directories: libsystemd_compat_includes,
+  link_with: libsystemd_compat,
 )
 test('test-sd-journal-read', test_sd_journal_read_exe)
 

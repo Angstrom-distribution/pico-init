@@ -2,22 +2,28 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The read side: sd_journal_open() over a real fixture ring built with
- * logd-write.h directly (same approach test-picolog.c uses), then
- * navigation, per-entry data, matches, unique/fields, cutoffs/usage and the
- * honest-failure group, all against real entries -- never a mocked LogdRing.
+ * The read side: sd_journal_open() over a real fixture ring written in
+ * logd's export format, then navigation, per-entry data, matches,
+ * unique/fields, cutoffs/usage and the honest-failure group, all against
+ * real entries -- never a mocked LogdRing.
+ *
+ * Links libsystemd_compat alone, nothing from logd_core or pico_init_core:
+ * that link line is the property under test as much as any assertion
+ * below, since it is what a shared libsystemd.so's consumers get.
  */
 
 #include "sd-journal.h"
 
 #include <errno.h>
+#include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
-#include "../../logd/logd-write.h"
+#include "../../logd/logd.h"
 #include "../../test-util.h"
 
 static char *g_dir;
@@ -26,59 +32,94 @@ static void set_env(void) {
         setenv("LOGD_RUNTIME_DIR", g_dir, 1);
 }
 
+/* The kernel's dashed boot ID, in the 32-hex form _BOOT_ID= carries. */
+static void read_boot_id(char out[33]) {
+        FILE *f;
+        char buf[64];
+        size_t n = 0;
+
+        f = fopen("/proc/sys/kernel/random/boot_id", "re");
+        ASSERT_TRUE(f != NULL);
+        ASSERT_TRUE(fgets(buf, sizeof(buf), f) != NULL);
+        fclose(f);
+
+        for (size_t i = 0; buf[i] != '\0' && n < 32; i++)
+                if (buf[i] != '-')
+                        out[n++] = buf[i];
+        out[n] = '\0';
+        ASSERT_EQ_INT((int) n, 32);
+}
+
+static uint64_t clock_usec(clockid_t id) {
+        struct timespec ts;
+
+        ASSERT_EQ_INT(clock_gettime(id, &ts), 0);
+        return (uint64_t) ts.tv_sec * 1000000ULL + (uint64_t) ts.tv_nsec / 1000ULL;
+}
+
 /*
  * Three entries: two from "netd" (one info, one warning) and one from
- * "eudev" at err. Real clocks (not fixed), since realtime/monotonic seek
- * tests need genuinely increasing values across appends.
+ * "eudev" at err, as the exact bytes logd_writer_append() emits -- the
+ * writer-generated clocks and _BOOT_ID first, the caller's fields in order,
+ * then the blank-line separator -- but written here directly rather than
+ * through logd-write.h, whose writer needs pico_init_core. Real clocks, one
+ * microsecond apart per entry, since realtime/monotonic seek tests need
+ * genuinely increasing values.
  *
- * Deliberately no logd_writer_set_boot_id() override here (unlike test-
+ * Deliberately the REAL machine's boot ID, not a fixed one (unlike test-
  * logd-write.c's own fixture): sd_journal_seek_monotonic_usec()/
- * seek_cursor() cross-check a cursor's/caller's boot ID against the REAL
- * machine's own /proc/sys/kernel/random/boot_id (sd_journal_current_boot_
- * id()), by design -- that is what makes get_cutoff_monotonic_usec()'s
- * bogus-boot-id case in test_info_and_honest_failures() below meaningful.
- * A fixture written under a fake, fixed boot ID would make every one of
- * those checks see "a different, unknown boot" and report no data, which
- * is correct behavior facing a fake ID but would make this whole fixture
- * untestable against it. Leaving it unset makes logd_writer_open() read
- * the real one itself, the same source sd_journal_current_boot_id() reads.
+ * seek_cursor() cross-check a cursor's/caller's boot ID against
+ * /proc/sys/kernel/random/boot_id (sd_journal_current_boot_id()), by
+ * design -- that is what makes get_cutoff_monotonic_usec()'s bogus-boot-id
+ * case in test_info_and_honest_failures() below meaningful. A fixture under
+ * a fake, fixed boot ID would make every one of those checks see "a
+ * different, unknown boot" and report no data, which is correct behavior
+ * facing a fake ID but would make this whole fixture untestable against it.
  */
 static void build_fixture(void) {
-        LogdWriter *w;
+        static const struct {
+                const char *message, *priority, *identifier, *unit;
+        } entries[] = {
+                {      "netd started", "6",  "netd",  "netd.service" },
+                {    "link down eth0", "4",  "netd",  "netd.service" },
+                { "device add failed", "3", "eudev", "eudev.service" },
+        };
+        char boot_id[33];
+        uint64_t realtime, monotonic;
+        char content[1024];
+        size_t off = 0;
 
-        ASSERT_EQ_INT(logd_writer_new(&w), 0);
-        ASSERT_EQ_INT(logd_writer_set_runtime_dir(w, g_dir), 0);
-        ASSERT_EQ_INT(logd_writer_open(w), 0);
+        read_boot_id(boot_id);
+        realtime = clock_usec(CLOCK_REALTIME);
+        monotonic = clock_usec(CLOCK_MONOTONIC);
 
-        {
-                LogdField f[] = {
-                        {           "MESSAGE", "netd started", strlen("netd started") },
-                        {          "PRIORITY",            "6",                      1 },
-                        { "SYSLOG_IDENTIFIER",         "netd",         strlen("netd") },
-                        {     "_SYSTEMD_UNIT", "netd.service", strlen("netd.service") },
-                };
-                ASSERT_EQ_INT(logd_writer_append(w, f, sizeof(f) / sizeof(f[0])), 0);
-        }
-        {
-                LogdField f[] = {
-                        {           "MESSAGE", "link down eth0", strlen("link down eth0") },
-                        {          "PRIORITY",              "4",                        1 },
-                        { "SYSLOG_IDENTIFIER",           "netd",           strlen("netd") },
-                        {     "_SYSTEMD_UNIT",   "netd.service",   strlen("netd.service") },
-                };
-                ASSERT_EQ_INT(logd_writer_append(w, f, sizeof(f) / sizeof(f[0])), 0);
-        }
-        {
-                LogdField f[] = {
-                        {           "MESSAGE", "device add failed", strlen("device add failed") },
-                        {          "PRIORITY",                 "3",                           1 },
-                        { "SYSLOG_IDENTIFIER",             "eudev",             strlen("eudev") },
-                        {     "_SYSTEMD_UNIT",     "eudev.service",     strlen("eudev.service") },
-                };
-                ASSERT_EQ_INT(logd_writer_append(w, f, sizeof(f) / sizeof(f[0])), 0);
+        for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); i++) {
+                int n = snprintf(
+                                content + off,
+                                sizeof(content) - off,
+                                "__REALTIME_TIMESTAMP=%" PRIu64
+                                "\n"
+                                "__MONOTONIC_TIMESTAMP=%" PRIu64
+                                "\n"
+                                "_BOOT_ID=%s\n"
+                                "MESSAGE=%s\n"
+                                "PRIORITY=%s\n"
+                                "SYSLOG_IDENTIFIER=%s\n"
+                                "_SYSTEMD_UNIT=%s\n"
+                                "\n",
+                                realtime + i,
+                                monotonic + i,
+                                boot_id,
+                                entries[i].message,
+                                entries[i].priority,
+                                entries[i].identifier,
+                                entries[i].unit);
+
+                ASSERT_TRUE(n > 0 && (size_t) n < sizeof(content) - off);
+                off += (size_t) n;
         }
 
-        logd_writer_free(w);
+        ASSERT_EQ_INT(test_write_file(g_dir, LOGD_RING_ACTIVE_NAME, content), 0);
 }
 
 static void get_message(sd_journal *j, char *out, size_t out_sz) {
