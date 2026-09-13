@@ -1180,20 +1180,20 @@ int main(int argc, char *argv[]) {
                 const char *name;
                 int (*fn)(int, char **);
         } verbs[] = {
-                {       "status",       cmd_status },
-                {   "list-units",   cmd_list_units },
-                {    "is-active",    cmd_is_active },
-                {    "is-failed",    cmd_is_failed },
+                {            "status",            cmd_status },
+                {        "list-units",        cmd_list_units },
+                {         "is-active",         cmd_is_active },
+                {         "is-failed",         cmd_is_failed },
                 { "is-system-running", cmd_is_system_running },
-                {         "show",         cmd_show },
-                {       "enable",       cmd_enable },
-                {      "disable",      cmd_disable },
-                {   "is-enabled",   cmd_is_enabled },
-                {       "preset",       cmd_preset },
-                {        "start",        cmd_start },
-                {         "stop",         cmd_stop },
-                {      "restart",      cmd_restart },
-                { "reset-failed", cmd_reset_failed },
+                {              "show",              cmd_show },
+                {            "enable",            cmd_enable },
+                {           "disable",           cmd_disable },
+                {        "is-enabled",        cmd_is_enabled },
+                {            "preset",            cmd_preset },
+                {             "start",             cmd_start },
+                {              "stop",              cmd_stop },
+                {           "restart",           cmd_restart },
+                {      "reset-failed",      cmd_reset_failed },
         };
         int argi = 1;
         size_t i;
