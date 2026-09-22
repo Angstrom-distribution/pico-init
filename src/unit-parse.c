@@ -816,6 +816,116 @@ static int config_parse_exec_start_pre(
         return 0;
 }
 
+/*
+ * Environment= (E1 -- parse only, service-exec.c does not read this field
+ * yet). Tokenized with the same extract_first_word() ExecStart= uses, so
+ * quoting is identical: Environment="FOO=a b" is one word. Each word is then
+ * %-expanded individually through expand_word(), matching parse_exec_line()'s
+ * per-word-not-per-line order for the reason recorded at that function's own
+ * comment. A word with no '=' or an empty name is warned and skipped, not
+ * stored -- v30 stored it unchecked; that is not worth copying. An empty
+ * rvalue resets the list, the same precedent as config_parse_condition_path().
+ */
+static int config_parse_environment(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        Service *s = unit_to_service(u, path, line);
+        const char *p = rvalue;
+        char *word;
+        int r;
+
+        (void) lvalue;
+
+        if (!s)
+                return 0;
+
+        if (rvalue[0] == '\0') {
+                s->environment = pico_strv_free(s->environment);
+                return 0;
+        }
+
+        for (;;) {
+                r = extract_first_word(&p, &word);
+                if (r < 0) {
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s:%u: malformed quoting in Environment=, ignoring",
+                                 path,
+                                 line);
+                        return 0;
+                }
+                if (r == 0)
+                        break;
+
+                r = expand_word(u, &word);
+                if (r < 0)
+                        return r;
+
+                if (!strchr(word, '=') || word[0] == '=') {
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s:%u: Environment=%s is not a valid assignment, ignoring",
+                                 path,
+                                 line,
+                                 word);
+                        free(word);
+                        continue;
+                }
+
+                r = pico_strv_extend(&s->environment, word);
+                free(word);
+                if (r < 0)
+                        return r;
+        }
+
+        return 0;
+}
+
+/*
+ * EnvironmentFile= (E1 -- parse only, same not-yet-consumed caveat as
+ * config_parse_environment() above). Unlike Environment=, the whole rvalue is
+ * one path: %-expanded as a single value (v30 does the same), not tokenized.
+ * An optional leading '-' (missing file is not an error) is kept in the
+ * stored string so E2's loader sees it; what follows it must be absolute.
+ * Accumulates like Environment=, and an empty rvalue resets the list.
+ */
+static int config_parse_environment_file(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        Service *s = unit_to_service(u, path, line);
+        char *expanded = NULL;
+        const char *check;
+        int r;
+
+        (void) lvalue;
+
+        if (!s)
+                return 0;
+
+        if (rvalue[0] == '\0') {
+                s->environment_files = pico_strv_free(s->environment_files);
+                return 0;
+        }
+
+        r = unit_full_printf(u, rvalue, &expanded);
+        if (r < 0)
+                return r;
+
+        check = expanded;
+        if (check[0] == '-')
+                check++;
+
+        if (check[0] != '/') {
+                pico_log(PICO_LOG_WARNING,
+                         "%s:%u: EnvironmentFile= path '%s' is not absolute, ignoring",
+                         path,
+                         line,
+                         expanded);
+                free(expanded);
+                return 0;
+        }
+
+        r = pico_strv_extend(&s->environment_files, expanded);
+        free(expanded);
+        return r;
+}
+
 static int config_parse_restart(Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
         Service *s = unit_to_service(u, path, line);
         (void) lvalue;
@@ -1222,6 +1332,8 @@ static const ConfigItem config_items[] = {
         { SECTION_SERVICE,                     "Type",                        config_parse_type },
         { SECTION_SERVICE,                "ExecStart",                  config_parse_exec_start },
         { SECTION_SERVICE,             "ExecStartPre",              config_parse_exec_start_pre },
+        { SECTION_SERVICE,              "Environment",                 config_parse_environment },
+        { SECTION_SERVICE,          "EnvironmentFile",            config_parse_environment_file },
         { SECTION_SERVICE,                  "Restart",                     config_parse_restart },
         { SECTION_SERVICE,               "RestartSec",                 config_parse_restart_sec },
         { SECTION_SERVICE,          "RemainAfterExit",           config_parse_remain_after_exit },

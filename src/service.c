@@ -1371,6 +1371,8 @@ static void service_done(Unit *u) {
 
         s->exec_start = pico_strv_free(s->exec_start);
         s->exec_start_pre = pico_strv_free(s->exec_start_pre);
+        s->environment = pico_strv_free(s->environment);
+        s->environment_files = pico_strv_free(s->environment_files);
         s->user = pico_mfree(s->user);
         s->group = pico_mfree(s->group);
         s->pid_file = pico_mfree(s->pid_file);

@@ -118,10 +118,10 @@ expect() {
 }
 
 expect "iiotool.service: 14 dropped: DynamicUser NoNewPrivileges PrivateTmp PrivateDevices ProtectSystem ProtectHome ProtectKernelTunables ProtectControlGroups RestrictAddressFamilies RestrictNamespaces SystemCallFilter MemoryHigh MemoryMax TasksMax"
-expect "volatile-binds@.service: 5 dropped: DefaultDependencies RequiresMountsFor ConditionPathIsReadWrite Environment ExecStop"
+expect "volatile-binds@.service: 4 dropped: DefaultDependencies RequiresMountsFor ConditionPathIsReadWrite ExecStop"
 expect "cond.service: 1 dropped: ConditionPathExists=!"
 expect "refused.service: FAILED TO LOAD"
-expect "pico-unit-lint: 6 units in tree, 3 degraded (20 directives dropped), 1 failed to load"
+expect "pico-unit-lint: 6 units in tree, 3 degraded (19 directives dropped), 1 failed to load"
 
 # network.target and multi-user.target were referenced, never in the tree,
 # and must not be reported as anything.

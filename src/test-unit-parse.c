@@ -279,26 +279,33 @@ static void test_degradation_record(void) {
         /* PIDFile= likewise: stored for Type=forking, never a drop. */
         ASSERT_STREQ(((Service *) u)->pid_file, "/run/richd.pid");
 
-        ASSERT_EQ_INT(u->n_degraded_directives, 8);
+        /* EnvironmentFile=/Environment= are parsed and stored now (E1), not
+         * degraded -- see test_environment_directives() for their own
+         * dedicated coverage. */
+        ASSERT_STREQ(((Service *) u)->environment_files[0], "-/etc/default/rich");
+        ASSERT_TRUE(((Service *) u)->environment_files[1] == NULL);
+        ASSERT_STREQ(((Service *) u)->environment[0], "A=1");
+        ASSERT_STREQ(((Service *) u)->environment[1], "B=2");
+        ASSERT_TRUE(((Service *) u)->environment[2] == NULL);
+
+        ASSERT_EQ_INT(u->n_degraded_directives, 6);
         ASSERT_STREQ(u->degraded_directives[0], "ConditionPathExists=!");
-        ASSERT_STREQ(u->degraded_directives[1], "EnvironmentFile");
-        ASSERT_STREQ(u->degraded_directives[2], "Environment");
-        ASSERT_STREQ(u->degraded_directives[3], "ExecStartPre=multiple");
-        ASSERT_STREQ(u->degraded_directives[4], "ExecStart=@");
-        ASSERT_STREQ(u->degraded_directives[5], "ExecStop");
-        ASSERT_STREQ(u->degraded_directives[6], "ExecReload");
-        ASSERT_STREQ(u->degraded_directives[7], "Alias");
-        ASSERT_TRUE(u->degraded_directives[8] == NULL);
+        ASSERT_STREQ(u->degraded_directives[1], "ExecStartPre=multiple");
+        ASSERT_STREQ(u->degraded_directives[2], "ExecStart=@");
+        ASSERT_STREQ(u->degraded_directives[3], "ExecStop");
+        ASSERT_STREQ(u->degraded_directives[4], "ExecReload");
+        ASSERT_STREQ(u->degraded_directives[5], "Alias");
+        ASSERT_TRUE(u->degraded_directives[6] == NULL);
 
         joined = unit_degraded_directives_string(u);
         ASSERT_STREQ(joined,
-                     "ConditionPathExists=! EnvironmentFile Environment ExecStartPre=multiple "
+                     "ConditionPathExists=! ExecStartPre=multiple "
                      "ExecStart=@ ExecStop ExecReload Alias");
         free(joined);
 
         /* a second identical drop is not a second entry */
         ASSERT_EQ_INT(unit_add_degradation(u, "Alias"), 0);
-        ASSERT_EQ_INT(u->n_degraded_directives, 8);
+        ASSERT_EQ_INT(u->n_degraded_directives, 6);
 
         ASSERT_EQ_INT(clean->load_state, UNIT_LOADED);
         ASSERT_EQ_INT(clean->n_degraded_directives, 0);
@@ -313,6 +320,90 @@ static void test_degradation_record(void) {
         manager_log_degradation_summary(m);
         ASSERT_TRUE(m->degradation_summary_logged);
         manager_log_degradation_summary(m);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * E1: Environment=/EnvironmentFile= are parsed and stored, not degraded.
+ * Quoting matches ExecStart= (extract_first_word()), each word is
+ * %-expanded individually, an empty rvalue resets the accumulated list, and
+ * EnvironmentFile='s optional leading '-' is kept verbatim.
+ */
+static void test_environment_directives(void) {
+        Manager *m;
+        char *dir;
+        Unit *u;
+        Service *s;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        /* quoting, a % specifier inside a value, and the '-' prefix */
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "env.service",
+                                      "[Service]\n"
+                                      "Environment=\"FOO=bar baz\" QUX=1\n"
+                                      "Environment=INST=%n\n"
+                                      "EnvironmentFile=/etc/default/a\n"
+                                      "EnvironmentFile=-/etc/default/b\n"
+                                      "ExecStart=/bin/true\n"),
+                      0);
+
+        /* reset-on-empty-rvalue: the accumulated list from the first two
+         * lines of each pair is dropped by the empty third line */
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "env-reset.service",
+                                      "[Service]\n"
+                                      "Environment=A=1\n"
+                                      "Environment=B=2\n"
+                                      "Environment=\n"
+                                      "EnvironmentFile=/etc/default/x\n"
+                                      "EnvironmentFile=\n"
+                                      "ExecStart=/bin/true\n"),
+                      0);
+
+        /* a word with no '=' or an empty name is warned and skipped, not
+         * stored, and never fails the unit; same for a non-absolute path
+         * with or without the '-' modifier */
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "env-bad.service",
+                                      "[Service]\n"
+                                      "Environment=NOEQUALS QUX=1 =EMPTYNAME\n"
+                                      "EnvironmentFile=relative/path\n"
+                                      "EnvironmentFile=-relative/path2\n"
+                                      "ExecStart=/bin/true\n"),
+                      0);
+
+        m = manager_for(dir);
+
+        u = load_one(m, "env.service");
+        s = (Service *) u;
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        ASSERT_STREQ(s->environment[0], "FOO=bar baz");
+        ASSERT_STREQ(s->environment[1], "QUX=1");
+        ASSERT_STREQ(s->environment[2], "INST=env.service");
+        ASSERT_TRUE(s->environment[3] == NULL);
+        ASSERT_STREQ(s->environment_files[0], "/etc/default/a");
+        ASSERT_STREQ(s->environment_files[1], "-/etc/default/b");
+        ASSERT_TRUE(s->environment_files[2] == NULL);
+        ASSERT_EQ_INT(u->n_degraded_directives, 0);
+
+        u = load_one(m, "env-reset.service");
+        s = (Service *) u;
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        ASSERT_TRUE(s->environment == NULL);
+        ASSERT_TRUE(s->environment_files == NULL);
+
+        u = load_one(m, "env-bad.service");
+        s = (Service *) u;
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        ASSERT_STREQ(s->environment[0], "QUX=1");
+        ASSERT_TRUE(s->environment[1] == NULL);
+        ASSERT_TRUE(s->environment_files == NULL);
+        ASSERT_EQ_INT(u->n_degraded_directives, 0);
 
         manager_free(m);
         test_rm_rf(dir);
@@ -1197,6 +1288,7 @@ int main(void) {
         test_service_fields();
         test_unknown_directives_are_tolerated();
         test_degradation_record();
+        test_environment_directives();
         test_malformed_line_skips_only_that_line();
         test_bom_comments_and_continuations();
         test_quoting_and_trailing_garbage();
