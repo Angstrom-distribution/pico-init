@@ -423,13 +423,14 @@ static int config_parse_after(Unit *u, const char *path, unsigned line, const ch
  * silently regressed if a future commit's search-and-replace ever reaches
  * this function.
  */
-static int config_parse_condition_path(Unit *u,
-                                        const char *path,
-                                        unsigned line,
-                                        const char *lvalue,
-                                        const char *rvalue,
-                                        char ***target,
-                                        bool **target_negated) {
+static int config_parse_condition_path(
+                Unit *u,
+                const char *path,
+                unsigned line,
+                const char *lvalue,
+                const char *rvalue,
+                char ***target,
+                bool **target_negated) {
         bool negated = false;
         size_t n;
         bool *new_negated;
@@ -493,13 +494,14 @@ static int config_parse_condition_path_exists(
 
 static int config_parse_condition_path_is_directory(
                 Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
-        return config_parse_condition_path(u,
-                                            path,
-                                            line,
-                                            lvalue,
-                                            rvalue,
-                                            &u->condition_path_is_directory,
-                                            &u->condition_path_is_directory_negated);
+        return config_parse_condition_path(
+                        u,
+                        path,
+                        line,
+                        lvalue,
+                        rvalue,
+                        &u->condition_path_is_directory,
+                        &u->condition_path_is_directory_negated);
 }
 
 /* --- [Service] handlers --- */
