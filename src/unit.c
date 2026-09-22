@@ -175,7 +175,9 @@ Unit *unit_free(Unit *u) {
         u->required_by = pico_strv_free(u->required_by);
 
         u->condition_path_exists = pico_strv_free(u->condition_path_exists);
+        u->condition_path_exists_negated = pico_mfree(u->condition_path_exists_negated);
         u->condition_path_is_directory = pico_strv_free(u->condition_path_is_directory);
+        u->condition_path_is_directory_negated = pico_mfree(u->condition_path_is_directory_negated);
 
         u->degraded_directives = pico_strv_free(u->degraded_directives);
         u->n_degraded_directives = 0;
@@ -242,23 +244,35 @@ UnitActiveState unit_active_state(Unit *u) {
  * created by other units during the boot (/dev/ttyGS0 exists only once
  * usb-multi-gadget.service has run), so a load-time answer would be the wrong
  * one for exactly the case this exists to serve.
+ *
+ * Each entry's raw stat-based result is inverted when its parallel *_negated
+ * flag is set, matching that one entry's leading '!' at parse time.
  */
 static bool unit_condition_test(Unit *u) {
         char **p;
+        size_t i;
 
-        for (p = u->condition_path_exists; p && *p; p++) {
+        for (p = u->condition_path_exists, i = 0; p && *p; p++, i++) {
                 struct stat st;
+                bool met = stat(*p, &st) == 0;
 
-                if (stat(*p, &st) < 0) {
+                if (u->condition_path_exists_negated && u->condition_path_exists_negated[i])
+                        met = !met;
+
+                if (!met) {
                         pico_log(PICO_LOG_INFO, "%s: ConditionPathExists=%s not met, skipping", u->id, *p);
                         return false;
                 }
         }
 
-        for (p = u->condition_path_is_directory; p && *p; p++) {
+        for (p = u->condition_path_is_directory, i = 0; p && *p; p++, i++) {
                 struct stat st;
+                bool met = stat(*p, &st) == 0 && S_ISDIR(st.st_mode);
 
-                if (stat(*p, &st) < 0 || !S_ISDIR(st.st_mode)) {
+                if (u->condition_path_is_directory_negated && u->condition_path_is_directory_negated[i])
+                        met = !met;
+
+                if (!met) {
                         pico_log(PICO_LOG_INFO, "%s: ConditionPathIsDirectory=%s not met, skipping", u->id, *p);
                         return false;
                 }

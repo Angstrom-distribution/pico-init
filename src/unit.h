@@ -109,13 +109,16 @@ struct Unit {
 
         /*
          * [Unit] Condition* checks, each an owned list of absolute paths that
-         * must all pass. Only the two spellings this project's own units carry
-         * are implemented; negation ('!') and triggering ('|') are not, and
-         * unit-parse.c drops a value using either rather than mistaking it for
-         * a literal path that can never exist.
+         * must all pass. A leading '!' negates that one entry's result; the
+         * negation flags are a parallel array, one bool per path, index-
+         * matched. Triggering ('|') is not implemented, and unit-parse.c
+         * drops a value using it rather than mistaking it for a literal path
+         * that can never exist.
          */
         char **condition_path_exists;       /* ConditionPathExists=, owned, may be NULL */
+        bool *condition_path_exists_negated;       /* parallel to condition_path_exists, owned, may be NULL */
         char **condition_path_is_directory; /* ConditionPathIsDirectory=, owned, may be NULL */
+        bool *condition_path_is_directory_negated; /* parallel to condition_path_is_directory, owned, may be NULL */
 
         /* Result of the last unit_start() condition check. False means the
          * unit was deliberately left inactive, which is what job.c reads to

@@ -4,9 +4,9 @@
 #
 # pico-unit-lint against a fixture tree: the two worked examples from the
 # design (an iiotool-shaped sandboxed service, a volatile-binds-shaped
-# template), a clean unit, a negated condition, and a Type= the parser
-# refuses. Every expected line is asserted verbatim, and so are the three
-# exit statuses.
+# template), a clean unit, a unit whose only condition is a now-honoured
+# negation (E2.5), and a Type= the parser refuses. Every expected line is
+# asserted verbatim, and so are the three exit statuses.
 set -eu
 
 lint="$1"
@@ -79,7 +79,7 @@ UNIT
 
 cat > "$tree/system/cond.service" <<'UNIT'
 [Unit]
-Description=Negated condition
+Description=Negated condition, honoured (E2.5), not degraded
 ConditionPathExists=!/etc/skip-cond
 
 [Service]
@@ -119,9 +119,8 @@ expect() {
 
 expect "iiotool.service: 14 dropped: DynamicUser NoNewPrivileges PrivateTmp PrivateDevices ProtectSystem ProtectHome ProtectKernelTunables ProtectControlGroups RestrictAddressFamilies RestrictNamespaces SystemCallFilter MemoryHigh MemoryMax TasksMax"
 expect "volatile-binds@.service: 4 dropped: DefaultDependencies RequiresMountsFor ConditionPathIsReadWrite ExecStop"
-expect "cond.service: 1 dropped: ConditionPathExists=!"
 expect "refused.service: FAILED TO LOAD"
-expect "pico-unit-lint: 6 units in tree, 3 degraded (19 directives dropped), 1 failed to load"
+expect "pico-unit-lint: 6 units in tree, 2 degraded (18 directives dropped), 1 failed to load"
 
 # network.target and multi-user.target were referenced, never in the tree,
 # and must not be reported as anything.
@@ -130,8 +129,10 @@ if printf '%s\n' "$out" | grep -q "network.target\|multi-user.target\|local-fs.t
         exit 1
 fi
 
-# the clean units appear only under --verbose
-if printf '%s\n' "$out" | grep -q "^clean.service\|^forking.service"; then
+# cond.service's negated ConditionPathExists= is honoured (E2.5), not
+# degraded, so it reports the same as any other clean unit: nothing without
+# --verbose.
+if printf '%s\n' "$out" | grep -q "^clean.service\|^forking.service\|^cond.service"; then
         echo "clean unit reported without --verbose" >&2
         exit 1
 fi

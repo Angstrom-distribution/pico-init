@@ -209,7 +209,7 @@ static void test_unknown_directives_are_tolerated(void) {
 
 /*
  * The degradation record on a directive-rich real-world shape: the value-
- * level drops (a negated condition, an ExecStart= modifier, a second
+ * level drops (a triggering condition, an ExecStart= modifier, a second
  * ExecStartPre=) are recorded under name=qualifier, repeats collapse, and a
  * unit pico-init honours in full carries no record at all.
  */
@@ -226,7 +226,7 @@ static void test_degradation_record(void) {
                                       "rich.service",
                                       "[Unit]\n"
                                       "Description=Rich\n"
-                                      "ConditionPathExists=!/etc/skip\n"
+                                      "ConditionPathExists=|/etc/skip\n"
                                       "After=clean.service\n"
                                       "\n"
                                       "[Service]\n"
@@ -289,7 +289,7 @@ static void test_degradation_record(void) {
         ASSERT_TRUE(((Service *) u)->environment[2] == NULL);
 
         ASSERT_EQ_INT(u->n_degraded_directives, 6);
-        ASSERT_STREQ(u->degraded_directives[0], "ConditionPathExists=!");
+        ASSERT_STREQ(u->degraded_directives[0], "ConditionPathExists=|");
         ASSERT_STREQ(u->degraded_directives[1], "ExecStartPre=multiple");
         ASSERT_STREQ(u->degraded_directives[2], "ExecStart=@");
         ASSERT_STREQ(u->degraded_directives[3], "ExecStop");
@@ -299,7 +299,7 @@ static void test_degradation_record(void) {
 
         joined = unit_degraded_directives_string(u);
         ASSERT_STREQ(joined,
-                     "ConditionPathExists=! ExecStartPre=multiple "
+                     "ConditionPathExists=| ExecStartPre=multiple "
                      "ExecStart=@ ExecStop ExecReload Alias");
         free(joined);
 
@@ -700,7 +700,9 @@ static void test_huge_requires_line_does_not_crash(void) {
 /*
  * ConditionPathExists=/ConditionPathIsDirectory= accumulate across repeated
  * assignments, and the two directives keep genuinely separate lists rather
- * than sharing one.
+ * than sharing one. A '!'-negated entry is stored with the '!' stripped from
+ * the path and a matching true recorded at the same index in the parallel
+ * *_negated array; a plain entry records false there.
  */
 static void test_conditions_are_parsed(void) {
         Manager *m;
@@ -716,7 +718,7 @@ static void test_conditions_are_parsed(void) {
                                       "Description=Cond\n"
                                       "ConditionPathExists=/a/one\n"
                                       "ConditionPathIsDirectory=/a/dir\n"
-                                      "ConditionPathExists=/a/two\n"
+                                      "ConditionPathExists=!/a/two\n"
                                       "\n"
                                       "[Service]\n"
                                       "ExecStart=/bin/true\n"),
@@ -729,10 +731,13 @@ static void test_conditions_are_parsed(void) {
 
         ASSERT_EQ_INT((int) pico_strv_length(u->condition_path_exists), 2);
         ASSERT_STREQ(u->condition_path_exists[0], "/a/one");
+        ASSERT_TRUE(!u->condition_path_exists_negated[0]);
         ASSERT_STREQ(u->condition_path_exists[1], "/a/two");
+        ASSERT_TRUE(u->condition_path_exists_negated[1]);
 
         ASSERT_EQ_INT((int) pico_strv_length(u->condition_path_is_directory), 1);
         ASSERT_STREQ(u->condition_path_is_directory[0], "/a/dir");
+        ASSERT_TRUE(!u->condition_path_is_directory_negated[0]);
 
         manager_free(m);
         test_rm_rf(dir);
@@ -740,9 +745,10 @@ static void test_conditions_are_parsed(void) {
 }
 
 /*
- * The three spellings this MVP does not implement -- negated, triggering,
- * relative -- are dropped with a warning rather than failing the unit, and an
- * empty value resets whatever the same directive had already accumulated.
+ * The two spellings this MVP does not implement -- triggering, relative --
+ * are dropped with a warning rather than failing the unit, and an empty
+ * value resets whatever the same directive had already accumulated,
+ * including its negation flags.
  */
 static void test_unsupported_condition_values_are_dropped(void) {
         Manager *m;
@@ -756,10 +762,9 @@ static void test_unsupported_condition_values_are_dropped(void) {
                                       "bad.service",
                                       "[Unit]\n"
                                       "Description=Bad\n"
-                                      "ConditionPathExists=!/a/neg\n"
                                       "ConditionPathExists=|/a/trigger\n"
                                       "ConditionPathExists=relative/path\n"
-                                      "ConditionPathIsDirectory=/a/dir\n"
+                                      "ConditionPathIsDirectory=!/a/dir\n"
                                       "ConditionPathIsDirectory=\n"
                                       "\n"
                                       "[Service]\n"
@@ -774,8 +779,11 @@ static void test_unsupported_condition_values_are_dropped(void) {
         ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
 
         ASSERT_TRUE(u->condition_path_exists == NULL);
-        /* the trailing empty value reset the list the line above had filled */
+        ASSERT_TRUE(u->condition_path_exists_negated == NULL);
+        /* the trailing empty value reset the list (and its negation flags)
+         * the negated line above had filled */
         ASSERT_TRUE(u->condition_path_is_directory == NULL);
+        ASSERT_TRUE(u->condition_path_is_directory_negated == NULL);
 
         ASSERT_STREQ(((Service *) u)->exec_start[0], "/bin/true");
 

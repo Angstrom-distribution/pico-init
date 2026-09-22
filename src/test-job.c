@@ -900,6 +900,86 @@ static void test_condition_skipped_job_completes_done(void) {
         free(dir);
 }
 
+/*
+ * E2.5: a '!'-negated ConditionPathExists= inverts the stat() result, proven
+ * both ways through the same job-dispatch path as the un-negated case above
+ * -- the direct analogue of oe-core's dropbearkey.service, whose
+ * "ConditionPathExists=!/etc/dropbear/dropbear_rsa_host_key" is meant to skip
+ * regeneration once a host key already exists.
+ */
+static void test_negated_condition_inverts_result(void) {
+        Manager *m;
+        char *dir;
+        char existing[PATH_MAX];
+        char missing[PATH_MAX];
+        char unit_text[PATH_MAX + 128];
+        Unit *b;
+        FILE *f;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        snprintf(existing, sizeof(existing), "%s/exists", dir);
+        f = fopen(existing, "w");
+        ASSERT_TRUE(f != NULL);
+        fclose(f);
+
+        snprintf(missing, sizeof(missing), "%s/does-not-exist", dir);
+
+        /* negated against an existing path: the raw test is true, negation
+         * flips it to false, so the unit is skipped */
+        snprintf(unit_text,
+                 sizeof(unit_text),
+                 "[Unit]\nDescription=B\nConditionPathExists=!%s\n",
+                 existing);
+        ASSERT_EQ_INT(test_write_file(dir, "b.target", unit_text), 0);
+        ASSERT_EQ_INT(test_write_file(dir, "a.target", "[Unit]\nRequires=b.target\nAfter=b.target\n"), 0);
+
+        m = manager_for(dir);
+        ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+
+        b = manager_get_unit(m, "b.target");
+        ASSERT_TRUE(b != NULL);
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, manager_get_unit(m, "a.target"), NULL), 0);
+        ASSERT_TRUE(manager_dispatch_run_queue(m) > 0);
+
+        ASSERT_EQ_INT(unit_active_state(b), UNIT_INACTIVE);
+        ASSERT_TRUE(!b->condition_result);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+
+        /* negated against a missing path: the raw test is false, negation
+         * flips it to true, so the unit runs */
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        snprintf(unit_text,
+                 sizeof(unit_text),
+                 "[Unit]\nDescription=B\nConditionPathExists=!%s\n",
+                 missing);
+        ASSERT_EQ_INT(test_write_file(dir, "b.target", unit_text), 0);
+        ASSERT_EQ_INT(test_write_file(dir, "a.target", "[Unit]\nRequires=b.target\nAfter=b.target\n"), 0);
+
+        m = manager_for(dir);
+        ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+
+        b = manager_get_unit(m, "b.target");
+        ASSERT_TRUE(b != NULL);
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, manager_get_unit(m, "a.target"), NULL), 0);
+        ASSERT_TRUE(manager_dispatch_run_queue(m) > 0);
+
+        ASSERT_EQ_INT(unit_active_state(b), UNIT_ACTIVE);
+        ASSERT_TRUE(b->condition_result);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
         test_ordering_c_b_a();
         test_unit_free_cancels_its_job();
@@ -916,6 +996,7 @@ int main(void) {
         test_target_start_completes();
         test_redundant_job_dropped();
         test_condition_skipped_job_completes_done();
+        test_negated_condition_inverts_result();
 
         printf("test-job: all checks passed\n");
         return 0;

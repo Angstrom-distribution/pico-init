@@ -480,16 +480,19 @@ static int config_parse_after(Unit *u, const char *path, unsigned line, const ch
 /*
  * One path per assignment, taken verbatim: Condition* values are single paths,
  * not whitespace-separated lists, and repeated assignments accumulate (all
- * must pass). An empty value resets the list, as upstream.
+ * must pass). An empty value resets the list, as upstream. A leading '!'
+ * negates that one entry's result and is stripped before the path is stored;
+ * the negation is recorded in the parallel *_negated array at the same
+ * index, which unit_condition_test() consults.
  *
- * Bad values are dropped with a warning rather than returned as an error: a
- * handler returning < 0 aborts the rest of the scan (conf-scan.c) and leaves
- * the unit UNIT_ERROR, so a real unit file carrying a '!'-negated condition
+ * Triggering ('|') is still dropped with a warning rather than returned as an
+ * error: a handler returning < 0 aborts the rest of the scan (conf-scan.c)
+ * and leaves the unit UNIT_ERROR, so a real unit file carrying a directive
  * this MVP does not implement would drop out of the boot entirely over a
- * directive it does not need. Dropping is also exactly what these spellings
+ * directive it does not need. Dropping is also exactly what this spelling
  * already did before this handler existed, so it is no regression -- but it
- * does mean a negated condition is ignored rather than honoured, which is the
- * named limitation of this minimal support.
+ * does mean a triggering condition is ignored rather than honoured, which is
+ * the named limitation of this minimal support.
  *
  * Deliberately not specifier-expanded (G2): verified at v30's own tag that
  * this directive (load-fragment.c:1584-1620) is not run through
@@ -503,24 +506,40 @@ static int config_parse_after(Unit *u, const char *path, unsigned line, const ch
  * silently regressed if a future commit's search-and-replace ever reaches
  * this function.
  */
-static int config_parse_condition_path(
-                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue, char ***target) {
+static int config_parse_condition_path(Unit *u,
+                                        const char *path,
+                                        unsigned line,
+                                        const char *lvalue,
+                                        const char *rvalue,
+                                        char ***target,
+                                        bool **target_negated) {
+        bool negated = false;
+        size_t n;
+        bool *new_negated;
+        int r;
+
         if (rvalue[0] == '\0') {
                 *target = pico_strv_free(*target);
+                *target_negated = pico_mfree(*target_negated);
                 return 0;
         }
 
-        if (rvalue[0] == '!' || rvalue[0] == '|') {
+        if (rvalue[0] == '|') {
                 char what[64];
 
                 pico_log(PICO_LOG_WARNING,
-                         "%s:%u: %s=%s: negated and triggering conditions are not supported, ignoring",
+                         "%s:%u: %s=%s: triggering conditions are not supported, ignoring",
                          path,
                          line,
                          lvalue,
                          rvalue);
                 snprintf(what, sizeof(what), "%s=%c", lvalue, rvalue[0]);
                 return unit_add_degradation(u, what);
+        }
+
+        if (rvalue[0] == '!') {
+                negated = true;
+                rvalue++;
         }
 
         if (rvalue[0] != '/') {
@@ -533,17 +552,37 @@ static int config_parse_condition_path(
                 return 0;
         }
 
-        return pico_strv_extend(target, rvalue);
+        n = pico_strv_length(*target);
+
+        r = pico_strv_extend(target, rvalue);
+        if (r < 0)
+                return r;
+
+        new_negated = realloc(*target_negated, (n + 1) * sizeof(bool));
+        if (!new_negated)
+                return -ENOMEM;
+
+        new_negated[n] = negated;
+        *target_negated = new_negated;
+
+        return 0;
 }
 
 static int config_parse_condition_path_exists(
                 Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
-        return config_parse_condition_path(u, path, line, lvalue, rvalue, &u->condition_path_exists);
+        return config_parse_condition_path(
+                        u, path, line, lvalue, rvalue, &u->condition_path_exists, &u->condition_path_exists_negated);
 }
 
 static int config_parse_condition_path_is_directory(
                 Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
-        return config_parse_condition_path(u, path, line, lvalue, rvalue, &u->condition_path_is_directory);
+        return config_parse_condition_path(u,
+                                            path,
+                                            line,
+                                            lvalue,
+                                            rvalue,
+                                            &u->condition_path_is_directory,
+                                            &u->condition_path_is_directory_negated);
 }
 
 /* --- [Service] handlers --- */
