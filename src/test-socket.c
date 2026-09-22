@@ -176,6 +176,61 @@ static int helper_recv_echo(void) {
         return 0;
 }
 
+/* How many environ entries start with `prefix` -- a duplicate would be
+ * invisible to getenv(), which only ever returns the first. */
+static int count_env(const char *prefix) {
+        char **e;
+        int n = 0;
+
+        for (e = environ; *e; e++)
+                if (strncmp(*e, prefix, strlen(prefix)) == 0)
+                        n++;
+
+        return n;
+}
+
+/* --recv-echo plus the unit's own Environment=/EnvironmentFile= values, from
+ * the same envp that carried LISTEN_FDS/LISTEN_PID. Written aside and renamed
+ * into place, FAIL included: the test polls for the result file's existence,
+ * not its contents. */
+static int helper_recv_echo_env(void) {
+        const char *result_path = getenv("TEST_RESULT_PATH");
+        const char *a = getenv("PICO_ENV_A"), *b = getenv("PICO_ENV_B");
+        char buf[64], tmp_path[PATH_MAX];
+        int ret = 1;
+        ssize_t n;
+        FILE *f;
+
+        if (!result_path)
+                return 90;
+        snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", result_path);
+        f = fopen(tmp_path, "we");
+        if (!f)
+                return 91;
+
+        if (!check_listen_env(f))
+                goto finish;
+
+        if (count_env("LISTEN_PID=") != 1 || count_env("LISTEN_FDS=") != 1 || count_env("PICO_ENV_B=") != 1) {
+                fprintf(f, "FAIL duplicate environment entries\n");
+                goto finish;
+        }
+
+        n = recv(3, buf, sizeof(buf) - 1, 0);
+        if (n <= 0) {
+                fprintf(f, "FAIL recv\n");
+                goto finish;
+        }
+        buf[n] = '\0';
+
+        fprintf(f, "OK %s A=%s B=%s\n", buf, a ? a : "(unset)", b ? b : "(unset)");
+        ret = 0;
+
+finish:
+        fclose(f);
+        return rename(tmp_path, result_path) < 0 ? 92 : ret;
+}
+
 /* Exits immediately without ever touching fd 3 -- the crash-without-
  * draining shape H4/the datagram-livelock test needs: a service that keeps
  * getting (re-)triggered but never consumes what triggered it. */
@@ -188,6 +243,8 @@ static int run_as_helper(const char *mode) {
                 return helper_accept_echo();
         if (strcmp(mode, "--recv-echo") == 0)
                 return helper_recv_echo();
+        if (strcmp(mode, "--recv-echo-env") == 0)
+                return helper_recv_echo_env();
         if (strcmp(mode, "--instant-exit") == 0)
                 return helper_instant_exit();
 
@@ -784,6 +841,79 @@ static void test_boot_ordered_collects_fds_without_trigger(void) {
         free(dir);
 }
 
+/*
+ * A socket-activated unit with Environment= and EnvironmentFile= gets both in
+ * one envp: LISTEN_FDS/LISTEN_PID intact (the reserved slot still last and
+ * still the child's own pid, even with a LISTEN_PID= in Environment=), the
+ * unit's own variables with the file overriding Environment=, and the
+ * inherited TEST_RESULT_PATH -- each name exactly once.
+ */
+static void test_socket_activation_with_unit_environment(void) {
+        Manager *m;
+        Unit *sock_u, *svc_u;
+        char *dir = test_tmpdir_new();
+        char sockpath[PATH_MAX], resultpath[PATH_MAX], envpath[PATH_MAX];
+        char extra[PATH_MAX + 256];
+        int cfd;
+        struct sockaddr_un addr;
+        FILE *f;
+        char line[128] = "";
+
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+        snprintf(sockpath, sizeof(sockpath), "%s/env.sock", dir);
+        snprintf(resultpath, sizeof(resultpath), "%s/result", dir);
+        snprintf(envpath, sizeof(envpath), "%s/env.conf", dir);
+        setenv("TEST_RESULT_PATH", resultpath, 1);
+
+        ASSERT_EQ_INT(test_write_file(dir, "env.conf", "# comment\nPICO_ENV_B=\"from file\"\n"), 0);
+        {
+                char content[PATH_MAX + 256];
+                snprintf(content, sizeof(content), "[Socket]\nListenDatagram=%s\n", sockpath);
+                ASSERT_EQ_INT(test_write_file(dir, "env.socket", content), 0);
+        }
+        snprintf(extra,
+                 sizeof(extra),
+                 "Environment=PICO_ENV_A=from-unit \"PICO_ENV_B=unit default\" LISTEN_PID=1\n"
+                 "EnvironmentFile=%s\n",
+                 envpath);
+        write_helper_service(dir, "env.service", "--recv-echo-env", extra);
+        ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+
+        sock_u = manager_get_unit(m, "env.socket");
+        svc_u = manager_get_unit(m, "env.service");
+        ASSERT_TRUE(sock_u != NULL && svc_u != NULL);
+
+        ASSERT_EQ_INT(unit_start(sock_u), 0);
+        ASSERT_EQ_INT(unit_start(svc_u), 0);
+        ASSERT_EQ_INT(unit_active_state(svc_u), UNIT_ACTIVE);
+
+        cfd = socket(AF_UNIX, SOCK_DGRAM, 0);
+        ASSERT_TRUE(cfd >= 0);
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        strncpy(addr.sun_path, sockpath, sizeof(addr.sun_path) - 1);
+        ASSERT_EQ_INT((int) sendto(cfd, "world", 5, 0, (struct sockaddr *) &addr, sizeof(addr)), 5);
+        close(cfd);
+
+        {
+                DriveWait wait = { .kind = DRIVE_WAIT_FILE, .path = resultpath };
+
+                ASSERT_TRUE(drive_until(m, svc_u, &wait, 4000));
+        }
+
+        f = fopen(resultpath, "re");
+        ASSERT_TRUE(f != NULL);
+        ASSERT_TRUE(fgets(line, sizeof(line), f) != NULL);
+        fclose(f);
+        ASSERT_STREQ(line, "OK world A=from-unit B=from file\n");
+
+        unsetenv("TEST_RESULT_PATH");
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 /* --- S2: lifecycle hardening --- */
 
 /* kill-the-service -> re-listen -> next-connect-retriggers, repeated. */
@@ -1096,6 +1226,7 @@ int main(int argc, char **argv) {
 
         test_stream_end_to_end();
         test_boot_ordered_collects_fds_without_trigger();
+        test_socket_activation_with_unit_environment();
 
         test_relisten_repeated_cycles();
         test_service_start_limit_yields_socket_failed();

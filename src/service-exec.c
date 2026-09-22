@@ -151,8 +151,7 @@
 
 /* Declared explicitly rather than relying on <unistd.h> to have pulled it
  * in under whatever feature-test macros happen to be active -- environ is
- * used exactly once below, to build a service's inherited-plus-LISTEN_FDS
- * envp. */
+ * read by build_exec_envp() and by child_exec()'s NULL-envp fallback. */
 extern char **environ;
 
 /* A generous, fixed bound on how many fds one paired socket unit (or several
@@ -311,17 +310,6 @@ static int flags_fds(const int *fds, unsigned n_fds) {
         return 0;
 }
 
-/*
- * Builds the child's envp: environ's own pointers (borrowed -- those strings
- * outlive both fork() and this process's own execve(), so copying the
- * pointer array is enough, minus any inherited LISTEN_* entry, see the scrub
- * below) plus "LISTEN_FDS=<n>", plus one reserved trailing
- * slot child_exec() fills in with LISTEN_PID after fork(). *ret_pid_slot is
- * that slot's index. Called only in the parent, before fork() -- malloc here
- * is fine, this is exactly the "everything that can be computed in the
- * parent is computed there instead" this file's header promises. NULL on
- * OOM.
- */
 static bool is_listen_var(const char *e) {
         static const char * const names[] = {
                 "LISTEN_FDS=",
@@ -346,108 +334,159 @@ static bool is_notify_var(const char *e) {
         return strncmp(e, "NOTIFY_SOCKET=", strlen("NOTIFY_SOCKET=")) == 0;
 }
 
-static void free_socket_envp(char **envp);
+/*
+ * v30's exec_context_load_environment(): every EnvironmentFile= is read
+ * afresh on each spawn, in the PARENT, so a file one ExecStartPre= writes is
+ * seen by the next command (8c7be95e5). A later file overrides an earlier
+ * one. A '-'-prefixed file is skipped on any load failure, as in v30; any
+ * other failure fails the spawn. *ret is NULL when there is nothing to load.
+ * 0 or -errno.
+ */
+static int load_environment_files(Service *s, char ***ret) {
+        char **i, **acc = NULL;
+
+        *ret = NULL;
+
+        for (i = s->environment_files; i && *i; i++) {
+                const char *fn = *i;
+                bool ignore = fn[0] == '-';
+                char **loaded = NULL, **merged;
+                int r;
+
+                if (ignore)
+                        fn++;
+
+                r = fn[0] == '/' ? pico_load_env_file(fn, &loaded) : -EINVAL;
+                if (r < 0) {
+                        if (ignore) {
+                                pico_log(PICO_LOG_DEBUG,
+                                         "%s: EnvironmentFile=-%s: %s, skipping",
+                                         UNIT(s)->id,
+                                         fn,
+                                         strerror(-r));
+                                continue;
+                        }
+                        pico_log(PICO_LOG_ERR,
+                                 "%s: failed to load EnvironmentFile=%s: %s",
+                                 UNIT(s)->id,
+                                 fn,
+                                 strerror(-r));
+                        pico_strv_free(acc);
+                        return r;
+                }
+
+                merged = pico_strv_env_merge(2, acc, loaded);
+                pico_strv_free(acc);
+                pico_strv_free(loaded);
+                if (!merged)
+                        return -ENOMEM;
+                acc = merged;
+        }
+
+        *ret = acc;
+        return 0;
+}
 
 /*
- * LAYOUT INVARIANT (load-bearing, see free_socket_envp() below):
- * [borrowed environ, minus LISTEN_* and NOTIFY_SOCKET=][NOTIFY_SOCKET=,
- * malloc'd, iff notify_socket][LISTEN_FDS=, malloc'd, iff n_fds>0][reserved LISTEN_PID
- * slot, NULL in parent, iff n_fds>0][NUL terminator]. Both malloc'd entries
- * MUST precede the reserved slot: the parent's free loop below walks while
- * (envp[i]), and a malloc'd entry placed after that NULL would leak on every
- * spawn. n_fds == 0 means no LISTEN_FDS entry and no reserved slot at all
- * (*ret_pid_slot left untouched -- child_exec() only reads it when n_fds>0).
+ * Builds the child's whole envp in the PARENT, before fork() -- malloc here
+ * is fine, this is exactly the "everything that can be computed in the
+ * parent is computed there instead" this file's header promises.
+ *
+ * Merge order is v30's own (execute.c:1365), a later NAME= replacing an
+ * earlier one: the inherited environ, then NOTIFY_SOCKET=/LISTEN_FDS=, then
+ * Environment=, then EnvironmentFile= contents. The order is load-bearing: a
+ * file beats Environment= (oe-core's read-only-rootfs hook overrides a
+ * unit's default that way).
+ *
+ * Any inherited LISTEN_* or NOTIFY_SOCKET= is dropped first (upstream scrubs
+ * the same names for the same reason). PID 1's own environment really can
+ * contain one: the kernel hands init every unrecognised name=value
+ * boot-cmdline parameter as an environment variable, and left in place it
+ * would reach a child that was never meant to see it.
+ *
+ * LAYOUT INVARIANT: [merged entries, every one malloc'd][reserved LISTEN_PID
+ * slot, NULL in the parent, iff n_fds>0][NUL terminator]. Every entry is
+ * owned, environ's included, so pico_strv_free() is the single free path; it
+ * stops at the first NULL, which is why the reserved slot stays last. A
+ * LISTEN_PID= from Environment=/EnvironmentFile= is dropped when the slot is
+ * reserved -- the child's own pid is the only value that protocol allows,
+ * and a second entry would be the one getenv() finds first. n_fds == 0 means
+ * no LISTEN_FDS entry and no reserved slot (*ret_pid_slot left untouched --
+ * child_exec() only reads it when n_fds>0). NULL on OOM.
  */
-static char **build_socket_envp(unsigned n_fds, const char *notify_socket, size_t *ret_pid_slot) {
-        size_t n = 0, i, idx;
-        char **envp;
-        char buf[32];
-        int r;
+static char **
+                build_exec_envp(char **unit_env,
+                                char **file_env,
+                                unsigned n_fds,
+                                const char *notify_socket,
+                                size_t *ret_pid_slot) {
+        char *ours[3] = { NULL, NULL, NULL };
+        char fds_buf[32];
+        char **inherited, **envp = NULL;
+        size_t n = 0, i, idx = 0;
 
         while (environ[n])
                 n++;
 
-        /* Worst case: +1 NOTIFY_SOCKET, +1 LISTEN_FDS, +1 reserved
-         * LISTEN_PID slot, +1 NUL terminator. */
-        envp = calloc(n + 4, sizeof(char *));
-        if (!envp)
+        /* Borrowed pointers only: the merge below copies every string. */
+        inherited = calloc(n + 1, sizeof(char *));
+        if (!inherited)
                 return NULL;
+        for (i = 0; i < n; i++)
+                if (!is_listen_var(environ[i]) && !is_notify_var(environ[i]))
+                        inherited[idx++] = environ[i];
 
-        /*
-         * Drop any INHERITED LISTEN_* or NOTIFY_SOCKET= entry while copying
-         * (upstream scrubs the same names for the same reason). PID 1's own
-         * environment really can contain one: the kernel hands init every
-         * unrecognised name=value boot-cmdline parameter as an environment
-         * variable. Left in place it would be the entry getenv() in the
-         * child returns (getenv() takes the FIRST match), and the entry
-         * free_socket_envp() later frees -- a pointer into the initial
-         * stack's env block, never malloc()'d. After this loop each name
-         * appears at most once: the one built below.
-         */
         idx = 0;
-        for (i = 0; i < n; i++) {
-                if (is_listen_var(environ[i]) || is_notify_var(environ[i]))
-                        continue;
-
-                envp[idx++] = environ[i];
-        }
-
         if (notify_socket) {
                 size_t len = strlen("NOTIFY_SOCKET=") + strlen(notify_socket) + 1;
-                char *entry = malloc(len);
 
-                if (!entry) {
-                        free(envp);
-                        return NULL;
-                }
-                snprintf(entry, len, "NOTIFY_SOCKET=%s", notify_socket);
-                envp[idx++] = entry;
+                ours[idx] = malloc(len);
+                if (!ours[idx])
+                        goto finish;
+                snprintf(ours[idx++], len, "NOTIFY_SOCKET=%s", notify_socket);
         }
-
         if (n_fds > 0) {
-                r = snprintf(buf, sizeof(buf), "LISTEN_FDS=%u", n_fds);
-                if (r < 0 || (size_t) r >= sizeof(buf)) {
-                        free_socket_envp(envp);
-                        return NULL;
-                }
+                int r = snprintf(fds_buf, sizeof(fds_buf), "LISTEN_FDS=%u", n_fds);
 
-                envp[idx] = pico_strdup(buf);
-                if (!envp[idx]) {
-                        free_socket_envp(envp);
-                        return NULL;
-                }
-                idx++;
-
-                *ret_pid_slot = idx;
-                envp[idx] = NULL; /* filled by the child, post-fork -- see child_exec() */
-                idx++;
+                if (r < 0 || (size_t) r >= sizeof(fds_buf))
+                        goto finish;
+                ours[idx++] = fds_buf;
         }
 
-        envp[idx] = NULL; /* terminator */
+        envp = pico_strv_env_merge(4, inherited, ours, unit_env, file_env);
+        if (!envp || n_fds == 0)
+                goto finish;
 
+        {
+                size_t j, w;
+                char **grown;
+
+                for (j = w = 0; envp[j]; j++) {
+                        if (strncmp(envp[j], "LISTEN_PID=", strlen("LISTEN_PID=")) == 0) {
+                                free(envp[j]);
+                                continue;
+                        }
+                        envp[w++] = envp[j];
+                }
+                envp[w] = NULL;
+
+                grown = realloc(envp, (w + 2) * sizeof(char *));
+                if (!grown) {
+                        envp = pico_strv_free(envp);
+                        goto finish;
+                }
+                envp = grown;
+
+                *ret_pid_slot = w;
+                envp[w] = NULL; /* filled by the child, post-fork -- see child_exec() */
+                envp[w + 1] = NULL;
+        }
+
+finish:
+        if (notify_socket)
+                free(ours[0]);
+        free(inherited);
         return envp;
-}
-
-/* Frees only what build_socket_envp() itself allocated: any NOTIFY_SOCKET=
- * and LISTEN_FDS= entry, and the array. Every other slot is either borrowed
- * from environ or (the reserved one) never written by the parent at all.
- * The scrub above guarantees each malloc'd prefix appears at most once and
- * only as our own copy, so a full-array scan (not break-on-first) can never
- * touch a borrowed pointer. Safe to call from the parent right after fork()
- * returns -- the child already has its own COW copy of this same memory, so
- * freeing the parent's does not touch it. */
-static void free_socket_envp(char **envp) {
-        size_t i;
-
-        if (!envp)
-                return;
-
-        for (i = 0; envp[i]; i++)
-                if (strncmp(envp[i], "NOTIFY_SOCKET=", strlen("NOTIFY_SOCKET=")) == 0 ||
-                    strncmp(envp[i], "LISTEN_FDS=", strlen("LISTEN_FDS=")) == 0)
-                        free(envp[i]);
-
-        free(envp);
 }
 
 /*
@@ -728,10 +767,11 @@ static void child_attach_cgroup(const struct pico_cgroup *cg) {
  * service_spawn(), before fork()) are the fds this start is passing via
  * LISTEN_FDS -- excluded from the close-everything sweep at step 5, then
  * renumbered and unflagged at step 5b. `envp`/`pid_slot` are likewise
- * parent-built (build_socket_envp()); envp is NULL only when this start
- * passes neither socket-activation fds nor a NOTIFY_SOCKET=, in which case
- * the inherited environ is used unchanged; pid_slot is meaningful only when
- * n_sock_fds > 0 (see build_socket_envp()'s own layout-invariant comment).
+ * parent-built (build_exec_envp()); envp is NULL only when this start passes
+ * neither socket-activation fds nor a NOTIFY_SOCKET= and the unit has no
+ * Environment=/EnvironmentFile=, in which case the inherited environ is used
+ * unchanged; pid_slot is meaningful only when n_sock_fds > 0 (see
+ * build_exec_envp()'s own layout-invariant comment).
  * `stdout_fd` (create_stdout_socket(), also parent-built) is likewise
  * excluded from the sweep, then dup2()'d over stdout/stderr at step 8;
  * -1 means "logd unavailable", the console fallback (plan §3.6). `creds`
@@ -951,10 +991,8 @@ static _Noreturn void
 
         /* 11. Does not return on success. Its failure is reported purely by
          * exit code -- there is no other channel back to the parent. envp is
-         * NULL exactly when this start passes neither socket-activation fds
-         * nor NOTIFY_SOCKET= (no Environment= directive exists in this MVP
-         * to need one otherwise), in which case the inherited `environ` is
-         * used unchanged, same as always.
+         * NULL exactly when service_spawn() had nothing to add to or remove
+         * from the inherited `environ`, which is then used unchanged.
          *
          * Type=exec (upstream's exec_fd, exec-invoke.c): a 1 goes down the
          * pipe right before execve(), a 0 right after a failed one. Success
@@ -984,6 +1022,8 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
         char **envp = NULL;
         size_t pid_slot = 0;
         const char *notify_socket;
+        char **file_env = NULL;
+        bool has_unit_env;
         ExecCreds creds;
         int stdout_fd;
         int exec_pipe[2] = { -1, -1 };
@@ -1008,6 +1048,15 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
                 exec_creds_free(&creds);
                 return r;
         }
+
+        /* Same placement reasoning: a required EnvironmentFile= that cannot
+         * be read fails the start before any side effect. */
+        r = load_environment_files(s, &file_env);
+        if (r < 0) {
+                exec_creds_free(&creds);
+                return r;
+        }
+        has_unit_env = s->environment || s->environment_files;
 
         /*
          * Only the main command inherits socket-activation fds, matching
@@ -1043,15 +1092,29 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
          * scrub below still runs so an inherited value cannot leak through. */
         notify_socket = manager_notify_socket_path(UNIT(s)->manager);
 
-        if (n_sock_fds > 0 || notify_socket) {
-                envp = build_socket_envp((unsigned) n_sock_fds, notify_socket, &pid_slot);
+        /* With none of these, envp stays NULL and the child inherits
+         * environ as-is: a unit with nothing to add pays nothing. */
+        if (n_sock_fds > 0 || notify_socket || has_unit_env) {
+                envp = build_exec_envp(
+                                s->environment, file_env, (unsigned) n_sock_fds, notify_socket, &pid_slot);
                 if (!envp) {
+                        /* Starting without the unit's own environment would
+                         * run it misconfigured; starting without only
+                         * LISTEN_FDS/NOTIFY_SOCKET is the long-standing
+                         * degraded fallback. */
+                        if (has_unit_env) {
+                                pico_log(PICO_LOG_ERR, "%s: could not build the child environment", UNIT(s)->id);
+                                pico_strv_free(file_env);
+                                exec_creds_free(&creds);
+                                return -ENOMEM;
+                        }
                         pico_log(PICO_LOG_WARNING,
                                  "%s: could not build the child environment, starting without LISTEN_FDS/NOTIFY_SOCKET",
                                  UNIT(s)->id);
                         n_sock_fds = 0;
                 }
         }
+        file_env = pico_strv_free(file_env);
 
         /* Every start, not only ExecStart= (plan §3.6: nothing scopes stdout
          * capture to the main command the way LISTEN_FDS is scoped above).
@@ -1067,7 +1130,7 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
         if (argv == s->exec_start && s->type == SERVICE_TYPE_EXEC) {
                 if (pipe2(exec_pipe, O_CLOEXEC | O_NONBLOCK) < 0) {
                         r = -errno;
-                        free_socket_envp(envp);
+                        pico_strv_free(envp);
                         exec_creds_free(&creds);
                         if (stdout_fd >= 0)
                                 close(stdout_fd);
@@ -1078,7 +1141,7 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
         pid = fork();
         if (pid < 0) {
                 r = -errno; /* 74129a1276: never a stale success value */
-                free_socket_envp(envp);
+                pico_strv_free(envp);
                 exec_creds_free(&creds);
                 if (stdout_fd >= 0)
                         close(stdout_fd);
@@ -1102,9 +1165,9 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
 
         /* COW: the child already has its own copy of everything envp/
          * creds/stdout_fd point to, made at fork() -- freeing/closing the
-         * parent's copies here cannot affect it. See build_socket_envp()'s
-         * and free_socket_envp()'s own notes; same reasoning for the rest. */
-        free_socket_envp(envp);
+         * parent's copies here cannot affect it. See build_exec_envp()'s own
+         * layout note; same reasoning for the rest. */
+        pico_strv_free(envp);
         exec_creds_free(&creds);
         if (stdout_fd >= 0)
                 close(stdout_fd);

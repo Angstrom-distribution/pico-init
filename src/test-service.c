@@ -31,6 +31,7 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -1544,6 +1545,192 @@ static void test_forking_pidfile_of_parent_refused(void) {
         free(dir);
 }
 
+/* --- Environment=/EnvironmentFile= (plans/41 E2) --- */
+
+/* util.c's quarried helpers directly: merge order and in-place override,
+ * lookup, and the env-file line grammar. */
+static void test_env_helpers(void) {
+        char *base[] = { "A=1", "B=2", NULL };
+        char *over[] = { "B=3", "C=4", "A=", NULL };
+        char **m, **l = NULL;
+        char *dir;
+        char path[PATH_MAX];
+
+        m = pico_strv_env_merge(3, base, NULL, over);
+        ASSERT_TRUE(m != NULL);
+        ASSERT_EQ_INT((int) pico_strv_length(m), 3);
+        ASSERT_STREQ(m[0], "A="); /* overridden in place, empty value kept */
+        ASSERT_STREQ(m[1], "B=3");
+        ASSERT_STREQ(m[2], "C=4");
+        ASSERT_STREQ(pico_strv_env_get(m, "B"), "3");
+        ASSERT_STREQ(pico_strv_env_get(m, "A"), "");
+        ASSERT_TRUE(pico_strv_env_get(m, "D") == NULL);
+        ASSERT_TRUE(pico_strv_env_get(NULL, "A") == NULL);
+        pico_strv_free(m);
+
+        m = pico_strv_env_merge(1, NULL);
+        ASSERT_TRUE(m != NULL && m[0] == NULL);
+        pico_strv_free(m);
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "vars",
+                                      "# comment\n"
+                                      "; also a comment\n"
+                                      "\n"
+                                      "FOO=bar\n"
+                                      "  SPACED = ' padded '  \n"
+                                      "QUOTED=\"a b\"\n"
+                                      "HALF=\"open\n"
+                                      "NOEQUALS\n"
+                                      "=novalue\n"
+                                      "EMPTY=\n"
+                                      "FOO=again"),
+                      0);
+        snprintf(path, sizeof(path), "%s/vars", dir);
+        ASSERT_EQ_INT(pico_load_env_file(path, &l), 0);
+        ASSERT_EQ_INT((int) pico_strv_length(l), 6);
+        ASSERT_STREQ(l[0], "FOO=bar");
+        ASSERT_STREQ(l[1], "SPACED= padded ");
+        ASSERT_STREQ(l[2], "QUOTED=a b");
+        ASSERT_STREQ(l[3], "HALF=\"open");
+        ASSERT_STREQ(l[4], "EMPTY=");
+        ASSERT_STREQ(l[5], "FOO=again"); /* the merge, not the loader, dedups */
+        pico_strv_free(l);
+
+        l = NULL;
+        ASSERT_EQ_INT(test_write_file(dir, "blank", "# nothing\n"), 0);
+        snprintf(path, sizeof(path), "%s/blank", dir);
+        ASSERT_EQ_INT(pico_load_env_file(path, &l), 0);
+        ASSERT_TRUE(l == NULL);
+
+        snprintf(path, sizeof(path), "%s/missing", dir);
+        ASSERT_EQ_INT(pico_load_env_file(path, &l), -ENOENT);
+
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* The line in `path` starting with `name=`, value only; "" when absent. */
+static void read_env_line(const char *path, const char *name, char *out, size_t out_size) {
+        char line[512];
+        size_t n = strlen(name);
+        FILE *f;
+
+        out[0] = '\0';
+        f = fopen(path, "re");
+        ASSERT_TRUE(f != NULL);
+        while (fgets(line, sizeof(line), f))
+                if (strncmp(line, name, n) == 0 && line[n] == '=') {
+                        line[strcspn(line, "\n")] = '\0';
+                        snprintf(out, out_size, "%s", line + n + 1);
+                        break;
+                }
+        fclose(f);
+}
+
+/*
+ * The child sees, in v30's merge order: inherited environ, overridden by
+ * Environment=, overridden by EnvironmentFile= contents (a later file beating
+ * an earlier one). The files are read per spawn, so a file ExecStartPre=
+ * writes reaches ExecStart=; a missing '-' file is skipped.
+ */
+static void test_environment_reaches_child(void) {
+        Manager *m;
+        Service *s;
+        char *dir;
+        char unit[4 * PATH_MAX], out[PATH_MAX], v[256];
+
+        setenv("PICO_TEST_INHERITED", "inherited", 1);
+        setenv("PICO_TEST_OVERRIDDEN", "inherited", 1);
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "static.env",
+                                      "# defaults\n"
+                                      "FOO=file-wins\n"
+                                      "QUOTED=\"a b\"\n"
+                                      "ORDER=first\n"
+                                      "NOEQUALS\n"),
+                      0);
+        snprintf(out, sizeof(out), "%s/out", dir);
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Unit]\n[Service]\nType=oneshot\n"
+                 "Environment=FOO=unit BAR=unit-only PICO_TEST_OVERRIDDEN=unit\n"
+                 "EnvironmentFile=%s/static.env\n"
+                 "EnvironmentFile=-%s/missing.env\n"
+                 "EnvironmentFile=-%s/pre.env\n"
+                 "ExecStartPre=/bin/sh -c \"echo ORDER=second > %s/pre.env\"\n"
+                 "ExecStart=/bin/sh -c \"env > %s.tmp && mv %s.tmp %s\"\n",
+                 dir,
+                 dir,
+                 dir,
+                 dir,
+                 out,
+                 out,
+                 out);
+        s = load_service(m, dir, "env.service", unit);
+
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, s, 1000));
+        ASSERT_EQ_INT(s->state, SERVICE_DEAD);
+        ASSERT_EQ_INT(s->result, SERVICE_SUCCESS);
+
+        read_env_line(out, "FOO", v, sizeof(v));
+        ASSERT_STREQ(v, "file-wins");
+        read_env_line(out, "BAR", v, sizeof(v));
+        ASSERT_STREQ(v, "unit-only");
+        read_env_line(out, "QUOTED", v, sizeof(v));
+        ASSERT_STREQ(v, "a b");
+        read_env_line(out, "ORDER", v, sizeof(v));
+        ASSERT_STREQ(v, "second");
+        read_env_line(out, "PICO_TEST_OVERRIDDEN", v, sizeof(v));
+        ASSERT_STREQ(v, "unit");
+        read_env_line(out, "PICO_TEST_INHERITED", v, sizeof(v));
+        ASSERT_STREQ(v, "inherited");
+
+        unsetenv("PICO_TEST_INHERITED");
+        unsetenv("PICO_TEST_OVERRIDDEN");
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* A required EnvironmentFile= that cannot be read fails the start in the
+ * parent, before anything is forked -- ExecStartPre= included. */
+static void test_environment_file_missing_fails_start(void) {
+        Manager *m;
+        Service *s;
+        char *dir;
+        char unit[PATH_MAX + 256];
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Unit]\n[Service]\nType=oneshot\nEnvironmentFile=%s/nope.env\n"
+                 "ExecStartPre=/bin/true\nExecStart=/bin/true\n",
+                 dir);
+        s = load_service(m, dir, "noenv.service", unit);
+        ASSERT_EQ_INT(UNIT(s)->load_state, UNIT_LOADED);
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        ASSERT_EQ_INT(s->state, SERVICE_FAILED);
+        ASSERT_EQ_INT(s->result, SERVICE_FAILURE_RESOURCES);
+        ASSERT_EQ_INT(s->main_pid, 0);
+        ASSERT_EQ_INT(s->control_pid, 0);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
         test_lifecycle_simple();
         test_oneshot_completes_only_on_exit();
@@ -1568,6 +1755,9 @@ int main(void) {
         test_forking_parent_failure_fails_start();
         test_forking_pidfile_outside_cgroup_refused();
         test_forking_pidfile_of_parent_refused();
+        test_env_helpers();
+        test_environment_reaches_child();
+        test_environment_file_missing_fails_start();
 
         printf("test-service: all checks passed\n");
         return 0;

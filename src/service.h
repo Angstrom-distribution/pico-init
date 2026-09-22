@@ -113,10 +113,10 @@ typedef struct Service {
         char **exec_start;
 
         /*
-         * Environment=/EnvironmentFile=, parsed and stored only (E1); not yet
-         * consumed at spawn time (E2). "NAME=value" strv and a strv of paths,
-         * each optionally '-'-prefixed (missing file is not an error) -- the
-         * prefix is kept in the stored string itself. Either may be NULL.
+         * Environment=/EnvironmentFile=: a "NAME=value" strv and a strv of
+         * paths, each optionally '-'-prefixed (missing file is not an error)
+         * -- the prefix is kept in the stored string itself. Either may be
+         * NULL. The files are read on every spawn, not here (service-exec.c).
          */
         char **environment;
         char **environment_files;

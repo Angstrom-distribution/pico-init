@@ -817,14 +817,14 @@ static int config_parse_exec_start_pre(
 }
 
 /*
- * Environment= (E1 -- parse only, service-exec.c does not read this field
- * yet). Tokenized with the same extract_first_word() ExecStart= uses, so
- * quoting is identical: Environment="FOO=a b" is one word. Each word is then
- * %-expanded individually through expand_word(), matching parse_exec_line()'s
- * per-word-not-per-line order for the reason recorded at that function's own
- * comment. A word with no '=' or an empty name is warned and skipped, not
- * stored -- v30 stored it unchecked; that is not worth copying. An empty
- * rvalue resets the list, the same precedent as config_parse_condition_path().
+ * Environment=. Tokenized with the same extract_first_word() ExecStart=
+ * uses, so quoting is identical: Environment="FOO=a b" is one word. Each word
+ * is then %-expanded individually through expand_word(), matching
+ * parse_exec_line()'s per-word-not-per-line order for the reason recorded at
+ * that function's own comment. A word with no '=' or an empty name is warned
+ * and skipped, not stored -- v30 stored it unchecked; that is not worth
+ * copying. An empty rvalue resets the list, the same precedent as
+ * config_parse_condition_path().
  */
 static int config_parse_environment(
                 Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
@@ -879,11 +879,10 @@ static int config_parse_environment(
 }
 
 /*
- * EnvironmentFile= (E1 -- parse only, same not-yet-consumed caveat as
- * config_parse_environment() above). Unlike Environment=, the whole rvalue is
- * one path: %-expanded as a single value (v30 does the same), not tokenized.
- * An optional leading '-' (missing file is not an error) is kept in the
- * stored string so E2's loader sees it; what follows it must be absolute.
+ * EnvironmentFile=. Unlike Environment=, the whole rvalue is one path:
+ * %-expanded as a single value (v30 does the same), not tokenized. An
+ * optional leading '-' (missing file is not an error) is kept in the stored
+ * string so the spawn-time loader sees it; what follows it must be absolute.
  * Accumulates like Environment=, and an empty rvalue resets the list.
  */
 static int config_parse_environment_file(

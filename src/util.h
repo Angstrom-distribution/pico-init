@@ -72,3 +72,22 @@ void *pico_mfree(void *p);
 int pico_strv_extend(char ***strv, const char *value); /* 0 or -ENOMEM */
 char **pico_strv_free(char **strv);                    /* frees elements + vector, returns NULL */
 size_t pico_strv_length(char * const *strv);
+
+/*
+ * "NAME=value" environment vectors, quarried from systemd v30's strv.c/util.c.
+ * pico_strv_env_merge() takes `n_lists` strvs (any may be NULL) and returns a
+ * freshly owned strv with every string copied: a later list's NAME= replaces
+ * an earlier one in place, so each name appears once, at the position it was
+ * first seen. NULL on OOM. pico_strv_env_get() points at NAME's value inside
+ * `l`, or returns NULL when NAME is not set.
+ */
+char **pico_strv_env_merge(size_t n_lists, ...);
+char *pico_strv_env_get(char * const *l, const char *name);
+
+/*
+ * Reads an EnvironmentFile=: one NAME=value per line; blank lines and
+ * '#'/';' comments are skipped, surrounding whitespace and one pair of
+ * matching quotes around the value are stripped. *ret is an owned strv, NULL
+ * for a file with no assignments. 0 or -errno.
+ */
+int pico_load_env_file(const char *path, char ***ret);
