@@ -742,6 +742,15 @@ static int config_parse_exec_start(
         if (r < 0)
                 return 0;
 
+        if (s->exec_start) {
+                pico_log(PICO_LOG_DEBUG,
+                         "%s:%u: multiple ExecStart= not supported, replacing "
+                         "previous value",
+                         path,
+                         line);
+                (void) unit_add_degradation(u, "ExecStart=multiple");
+        }
+
         s->exec_start = pico_strv_free(s->exec_start);
         s->exec_start = argv;
         return 0;

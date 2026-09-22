@@ -327,6 +327,44 @@ static void test_degradation_record(void) {
 }
 
 /*
+ * E0: a second, independently-valid ExecStart= line still replaces the
+ * first (no command list exists to run both), but that replacement is now
+ * visible in the degradation record -- config_parse_exec_start() mirrors
+ * config_parse_exec_start_pre()'s existing "multiple ... not supported"
+ * pattern instead of silently dropping the first value with no trace.
+ */
+static void test_repeated_exec_start_is_recorded(void) {
+        Manager *m;
+        char *dir;
+        Unit *u;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "two.service",
+                                      "[Service]\n"
+                                      "ExecStart=/bin/true one\n"
+                                      "ExecStart=/bin/true two\n"),
+                      0);
+
+        m = manager_for(dir);
+        u = load_one(m, "two.service");
+
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        ASSERT_STREQ(((Service *) u)->exec_start[0], "/bin/true");
+        ASSERT_STREQ(((Service *) u)->exec_start[1], "two");
+        ASSERT_TRUE(((Service *) u)->exec_start[2] == NULL);
+
+        ASSERT_EQ_INT(u->n_degraded_directives, 1);
+        ASSERT_STREQ(u->degraded_directives[0], "ExecStart=multiple");
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
  * E1: Environment=/EnvironmentFile= are parsed and stored, not degraded.
  * Quoting matches ExecStart= (pico_extract_first_word()), each word is
  * %-expanded individually, an empty rvalue resets the accumulated list, and
@@ -1296,6 +1334,7 @@ int main(void) {
         test_service_fields();
         test_unknown_directives_are_tolerated();
         test_degradation_record();
+        test_repeated_exec_start_is_recorded();
         test_environment_directives();
         test_malformed_line_skips_only_that_line();
         test_bom_comments_and_continuations();
