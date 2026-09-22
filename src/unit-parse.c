@@ -39,8 +39,8 @@
  *    validate-and-reject chain; parse_exec_line() follows that template.
  *  - a2a5291b3 / b2fadec60 "conf-parser: fix potentially bad memory
  *    accesses" -- an unterminated quote or trailing garbage after a
- *    closing quote was silently accepted; extract_first_word() below
- *    rejects both.
+ *    closing quote was silently accepted; pico_extract_first_word() (util.c,
+ *    shared with $VAR splitting at spawn time) rejects both.
  *  - 92c1622e14 / 36c16a7cdd (M3, service.c quarry) -- TimeoutStartSec=/
  *    TimeoutStopSec= and RestartSec= have opposite zero-semantics upstream
  *    (0 means "never time out" for the former, "restart immediately" for
@@ -111,90 +111,6 @@ typedef struct ConfigItem {
         ConfigParseFn parse;
 } ConfigItem;
 
-/* --- word splitting for ExecStart=/ExecStartPre= --- */
-
-/*
- * Extracts one whitespace-separated word from *state, honoring a single
- * level of double-quoting so "a b" is one argument. *state is advanced
- * past the word. Returns 1 with *ret set (caller owns it), 0 at end of
- * string, -EINVAL on an unterminated quote or on trailing garbage right
- * after a closing quote (a2a5291b3/b2fadec60 -- both used to be silently
- * accepted).
- */
-static int extract_first_word(const char **state, char **ret) {
-        const char *p = *state;
-        char *buf, *w;
-        bool quoted = false;
-
-        while (*p == ' ' || *p == '\t')
-                p++;
-        if (*p == '\0') {
-                *state = p;
-                return 0;
-        }
-
-        buf = malloc(strlen(p) + 1);
-        if (!buf)
-                return -ENOMEM;
-        w = buf;
-
-        for (;;) {
-                if (*p == '\0') {
-                        if (quoted) {
-                                free(buf);
-                                return -EINVAL; /* unterminated quote */
-                        }
-                        break;
-                }
-                if (*p == '"') {
-                        if (quoted) {
-                                /*
-                                 * Closing a quote: the next character must be
-                                 * unquoted whitespace or end-of-string, or
-                                 * that's trailing garbage right after the
-                                 * quote (foo="bar"baz). This is the actual
-                                 * a2a5291b3/b2fadec60 check -- a prior version
-                                 * of this function had the equivalent check
-                                 * placed after the loop, where it could never
-                                 * fire (the loop's own exit conditions mean
-                                 * *p is always '\0'/' '/'\t' by the time it's
-                                 * reached), so foo="bar"baz was silently
-                                 * accepted as "barbaz". Found by review
-                                 * before this ever shipped.
-                                 */
-                                if (p[1] != '\0' && p[1] != ' ' && p[1] != '\t') {
-                                        free(buf);
-                                        return -EINVAL;
-                                }
-                        }
-                        quoted = !quoted;
-                        p++;
-                        continue;
-                }
-                if (*p == '\\' && p[1] != '\0') {
-                        *w++ = p[1];
-                        p += 2;
-                        continue;
-                }
-                if (!quoted && (*p == ' ' || *p == '\t'))
-                        break;
-                *w++ = *p++;
-        }
-        *w = '\0';
-
-        /*
-         * No trailing-garbage check needed here: the loop above only ever
-         * exits with *p == '\0' or (unquoted) *p being a space/tab -- the
-         * real trailing-garbage rejection happens at the point a quote
-         * closes, above, where the actual violating character is still
-         * known.
-         */
-
-        *state = p;
-        *ret = buf;
-        return 1;
-}
-
 /*
  * Parses one ExecStart=/ExecStartPre= value into a NULL-terminated argv.
  * Supports the "-" modifier (ignore exit status) only when it's not
@@ -251,7 +167,7 @@ static int parse_exec_line(
                 return -EINVAL;
         }
 
-        r = extract_first_word(&p, &word);
+        r = pico_extract_first_word(&p, &word);
         if (r <= 0) {
                 pico_log(PICO_LOG_WARNING,
                          "%s:%u: %s in ExecStart=, ignoring",
@@ -262,7 +178,7 @@ static int parse_exec_line(
         }
 
         /*
-         * Expanded here, after extract_first_word() and before the
+         * Expanded here, after pico_extract_first_word() and before the
          * absolute-path check below -- so the check judges the expanded
          * path, and so a %I that unescapes to something containing a space
          * (e.g. an instance "a\x20b") stays one argv element instead of
@@ -271,7 +187,8 @@ static int parse_exec_line(
          * (unit_full_printf_strv() from service.c, already-tokenized argv
          * in hand by then) rather than here at parse time -- pico expands
          * earlier for the same per-word-not-per-line reason, just applied
-         * sooner, since pico has no separate spawn-time expansion pass.
+         * sooner. $VAR expansion is the one spawn-time pass (service-exec.c),
+         * and runs on these already-%-expanded words, v30's own order.
          */
         r = expand_word(u, &word);
         if (r < 0)
@@ -302,7 +219,7 @@ static int parse_exec_line(
                 return r;
 
         for (;;) {
-                r = extract_first_word(&p, &word);
+                r = pico_extract_first_word(&p, &word);
                 if (r < 0) {
                         pico_log(PICO_LOG_WARNING,
                                  "%s:%u: malformed quoting in ExecStart=, ignoring",
@@ -856,7 +773,7 @@ static int config_parse_exec_start_pre(
 }
 
 /*
- * Environment=. Tokenized with the same extract_first_word() ExecStart=
+ * Environment=. Tokenized with the same pico_extract_first_word() ExecStart=
  * uses, so quoting is identical: Environment="FOO=a b" is one word. Each word
  * is then %-expanded individually through expand_word(), matching
  * parse_exec_line()'s per-word-not-per-line order for the reason recorded at
@@ -883,7 +800,7 @@ static int config_parse_environment(
         }
 
         for (;;) {
-                r = extract_first_word(&p, &word);
+                r = pico_extract_first_word(&p, &word);
                 if (r < 0) {
                         pico_log(PICO_LOG_WARNING,
                                  "%s:%u: malformed quoting in Environment=, ignoring",

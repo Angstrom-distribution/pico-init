@@ -328,7 +328,7 @@ static void test_degradation_record(void) {
 
 /*
  * E1: Environment=/EnvironmentFile= are parsed and stored, not degraded.
- * Quoting matches ExecStart= (extract_first_word()), each word is
+ * Quoting matches ExecStart= (pico_extract_first_word()), each word is
  * %-expanded individually, an empty rvalue resets the accumulated list, and
  * EnvironmentFile='s optional leading '-' is kept verbatim.
  */

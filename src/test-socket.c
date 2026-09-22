@@ -231,6 +231,44 @@ finish:
         return rename(tmp_path, result_path) < 0 ? 92 : ret;
 }
 
+/* --recv-echo plus its own argv after the mode flag -- the unit's ExecStart=
+ * passes it $VAR-expanded, so this proves the expanded main command still
+ * got LISTEN_FDS/LISTEN_PID and fd 3. Same write-aside-and-rename as above. */
+static int helper_recv_echo_argv(int argc, char **argv) {
+        const char *result_path = getenv("TEST_RESULT_PATH");
+        char buf[64], tmp_path[PATH_MAX];
+        int ret = 1, i;
+        ssize_t n;
+        FILE *f;
+
+        if (!result_path)
+                return 90;
+        snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", result_path);
+        f = fopen(tmp_path, "we");
+        if (!f)
+                return 91;
+
+        if (!check_listen_env(f))
+                goto finish;
+
+        n = recv(3, buf, sizeof(buf) - 1, 0);
+        if (n <= 0) {
+                fprintf(f, "FAIL recv\n");
+                goto finish;
+        }
+        buf[n] = '\0';
+
+        fprintf(f, "OK %s argc=%d", buf, argc - 2);
+        for (i = 2; i < argc; i++)
+                fprintf(f, " [%s]", argv[i]);
+        fputc('\n', f);
+        ret = 0;
+
+finish:
+        fclose(f);
+        return rename(tmp_path, result_path) < 0 ? 92 : ret;
+}
+
 /* Exits immediately without ever touching fd 3 -- the crash-without-
  * draining shape H4/the datagram-livelock test needs: a service that keeps
  * getting (re-)triggered but never consumes what triggered it. */
@@ -238,13 +276,17 @@ static int helper_instant_exit(void) {
         return 0;
 }
 
-static int run_as_helper(const char *mode) {
+static int run_as_helper(int argc, char **argv) {
+        const char *mode = argv[1];
+
         if (strcmp(mode, "--accept-echo") == 0)
                 return helper_accept_echo();
         if (strcmp(mode, "--recv-echo") == 0)
                 return helper_recv_echo();
         if (strcmp(mode, "--recv-echo-env") == 0)
                 return helper_recv_echo_env();
+        if (strcmp(mode, "--recv-echo-argv") == 0)
+                return helper_recv_echo_argv(argc, argv);
         if (strcmp(mode, "--instant-exit") == 0)
                 return helper_instant_exit();
 
@@ -914,6 +956,75 @@ static void test_socket_activation_with_unit_environment(void) {
         free(dir);
 }
 
+/*
+ * plans/41 E3's named hazard: service_spawn() recognizes the main command by
+ * pointer identity, and a $VAR-expanded ExecStart= runs from a fresh copy.
+ * The socket fds must still be handed over, alongside the expanded argv: a
+ * bare $VAR split into two words, a ${VAR} substituted, an unset $VAR gone.
+ */
+static void test_socket_activation_with_expanded_argv(void) {
+        Manager *m;
+        Unit *sock_u, *svc_u;
+        char *dir = test_tmpdir_new();
+        char sockpath[PATH_MAX], resultpath[PATH_MAX];
+        int cfd;
+        struct sockaddr_un addr;
+        FILE *f;
+        char line[128] = "";
+
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+        snprintf(sockpath, sizeof(sockpath), "%s/argv.sock", dir);
+        snprintf(resultpath, sizeof(resultpath), "%s/result", dir);
+        setenv("TEST_RESULT_PATH", resultpath, 1);
+
+        {
+                char content[PATH_MAX + 256];
+                snprintf(content, sizeof(content), "[Socket]\nListenDatagram=%s\n", sockpath);
+                ASSERT_EQ_INT(test_write_file(dir, "argv.socket", content), 0);
+        }
+        write_helper_service(
+                        dir,
+                        "argv.service",
+                        "--recv-echo-argv $PICO_ARGS $PICO_UNSET x${PICO_ONE}",
+                        "Environment=\"PICO_ARGS=alpha beta\" PICO_ONE=gamma\n");
+        ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+
+        sock_u = manager_get_unit(m, "argv.socket");
+        svc_u = manager_get_unit(m, "argv.service");
+        ASSERT_TRUE(sock_u != NULL && svc_u != NULL);
+
+        ASSERT_EQ_INT(unit_start(sock_u), 0);
+        ASSERT_EQ_INT(unit_start(svc_u), 0);
+        ASSERT_EQ_INT(unit_active_state(svc_u), UNIT_ACTIVE);
+        ASSERT_EQ_INT(SOCKET(sock_u)->state, SOCKET_RUNNING); /* fds were collected */
+
+        cfd = socket(AF_UNIX, SOCK_DGRAM, 0);
+        ASSERT_TRUE(cfd >= 0);
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        strncpy(addr.sun_path, sockpath, sizeof(addr.sun_path) - 1);
+        ASSERT_EQ_INT((int) sendto(cfd, "world", 5, 0, (struct sockaddr *) &addr, sizeof(addr)), 5);
+        close(cfd);
+
+        {
+                DriveWait wait = { .kind = DRIVE_WAIT_FILE, .path = resultpath };
+
+                ASSERT_TRUE(drive_until(m, svc_u, &wait, 4000));
+        }
+
+        f = fopen(resultpath, "re");
+        ASSERT_TRUE(f != NULL);
+        ASSERT_TRUE(fgets(line, sizeof(line), f) != NULL);
+        fclose(f);
+        ASSERT_STREQ(line, "OK world argc=3 [alpha] [beta] [xgamma]\n");
+
+        unsetenv("TEST_RESULT_PATH");
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 /* --- S2: lifecycle hardening --- */
 
 /* kill-the-service -> re-listen -> next-connect-retriggers, repeated. */
@@ -1211,7 +1322,7 @@ static void test_datagram_livelock_terminates_failed(void) {
 
 int main(int argc, char **argv) {
         if (argc >= 2 && argv[1][0] == '-' && argv[1][1] == '-')
-                return run_as_helper(argv[1]);
+                return run_as_helper(argc, argv);
 
         g_self_exe = self_exe_path();
         ASSERT_TRUE(g_self_exe != NULL);
@@ -1227,6 +1338,7 @@ int main(int argc, char **argv) {
         test_stream_end_to_end();
         test_boot_ordered_collects_fds_without_trigger();
         test_socket_activation_with_unit_environment();
+        test_socket_activation_with_expanded_argv();
 
         test_relisten_repeated_cycles();
         test_service_start_limit_yields_socket_failed();

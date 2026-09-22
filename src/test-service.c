@@ -24,6 +24,7 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <grp.h>
 #include <limits.h>
 #include <poll.h>
@@ -1731,6 +1732,159 @@ static void test_environment_file_missing_fails_start(void) {
         free(dir);
 }
 
+/* --- $VAR/${VAR} in exec lines (plans/41 E3) --- */
+
+/* util.c's quarried replace_env()/replace_env_argv() directly. */
+static void test_replace_env_helpers(void) {
+        char *env[] = { "FOO=a b", "Q=x \"y z\"", "EMPTY=", "BAD=\"open", NULL };
+        char *argv[] = { "$FOO",    "$UNSET", "pre${FOO}post", "${UNSET}", "$$",     "cost:$$5",
+                         "$${FOO}", "$FOO/x", "${FOO",         "$Q",       "$EMPTY", "$",
+                         NULL };
+        char *bad[] = { "$BAD", NULL };
+        char **r = NULL, *x;
+
+        x = pico_replace_env("<${FOO}|${UNSET}|$$|$FOO>", env);
+        ASSERT_STREQ(x, "<a b||$|$FOO>");
+        free(x);
+
+        ASSERT_EQ_INT(pico_replace_env_argv(argv, env, &r), 0);
+        ASSERT_EQ_INT((int) pico_strv_length(r), 12);
+        ASSERT_STREQ(r[0], "a"); /* $FOO split into two words */
+        ASSERT_STREQ(r[1], "b");
+        /* $UNSET: no word at all */
+        ASSERT_STREQ(r[2], "prea bpost"); /* ${FOO} embedded: one word, unsplit */
+        ASSERT_STREQ(r[3], "");           /* ${UNSET} alone: an empty word */
+        ASSERT_STREQ(r[4], "$");
+        ASSERT_STREQ(r[5], "cost:$5");
+        ASSERT_STREQ(r[6], "${FOO}");
+        ASSERT_STREQ(r[7], "$FOO/x"); /* not a whole-word name: literal */
+        ASSERT_STREQ(r[8], "${FOO");  /* unterminated: literal */
+        ASSERT_STREQ(r[9], "x");      /* quoted value: same tokenizer as ExecStart= */
+        ASSERT_STREQ(r[10], "y z");
+        /* $EMPTY: no word */
+        ASSERT_STREQ(r[11], "$");
+        r = pico_strv_free(r);
+
+        ASSERT_EQ_INT(pico_replace_env_argv(bad, env, &r), -EINVAL);
+        pico_strv_free(r);
+}
+
+/* `path`'s whole contents, NUL-terminated. */
+static void read_file(const char *path, char *out, size_t out_size) {
+        size_t n;
+        FILE *f = fopen(path, "re");
+
+        ASSERT_TRUE(f != NULL);
+        n = fread(out, 1, out_size - 1, f);
+        out[n] = '\0';
+        fclose(f);
+}
+
+/*
+ * End to end, ExecStartPre= and ExecStart= alike: a bare $FOO splits into
+ * several arguments, an unset one adds none, ${FOO} is substituted inside a
+ * longer word after %-specifiers, $$ is a literal $, and argv[0] (the exec
+ * path) is never expanded. The values come from the E2 merge, a file
+ * overriding Environment=.
+ */
+static void test_exec_line_expansion(void) {
+        Manager *m;
+        Service *s;
+        char *dir;
+        char unit[4 * PATH_MAX], v[512];
+        const char *script = "\"for a; do echo \\\"[$a]\\\"; done > %s/%s\"";
+        char pre_script[PATH_MAX + 64], main_script[PATH_MAX + 64];
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        ASSERT_EQ_INT(test_write_file(dir, "argv.env", "SPLIT=\"one two  three\"\n"), 0);
+        snprintf(pre_script, sizeof(pre_script), script, dir, "pre.out");
+        snprintf(main_script, sizeof(main_script), script, dir, "main.out");
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Unit]\n[Service]\nType=oneshot\n"
+                 "Environment=SPLIT=overridden BRACED=val\n"
+                 "EnvironmentFile=%s/argv.env\n"
+                 "ExecStartPre=/bin/sh -c %s sh $SPLIT\n"
+                 "ExecStart=/bin/sh -c %s sh $SPLIT $UNSET %%N-${BRACED} x${UNSET}y literal$$dollar\n",
+                 dir,
+                 pre_script,
+                 main_script);
+        s = load_service(m, dir, "argv.service", unit);
+
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, s, 1000));
+        ASSERT_EQ_INT(s->state, SERVICE_DEAD);
+        ASSERT_EQ_INT(s->result, SERVICE_SUCCESS);
+
+        /* The stored argv is untouched: expansion is per spawn, on a copy. */
+        ASSERT_STREQ(s->exec_start[4], "$SPLIT");
+
+        snprintf(unit, sizeof(unit), "%s/pre.out", dir);
+        read_file(unit, v, sizeof(v));
+        ASSERT_STREQ(v, "[one]\n[two]\n[three]\n");
+
+        snprintf(unit, sizeof(unit), "%s/main.out", dir);
+        read_file(unit, v, sizeof(v));
+        ASSERT_STREQ(v, "[one]\n[two]\n[three]\n[argv-val]\n[xy]\n[literal$dollar]\n");
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * The hazard E3 names: service_spawn() recognizes the main command by
+ * pointer identity, and the expanded argv is a different pointer. A Type=exec
+ * unit whose ExecStart= uses $VAR must still get its readiness pipe, and the
+ * process must really run the expanded command line.
+ */
+static void test_exec_type_with_expanded_argv(void) {
+        Manager *m;
+        Service *a;
+        static const char want[] = "/bin/sleep\000100"; /* \000 then "100" */
+        char *dir, path[64], cmdline[256];
+        ssize_t n;
+        int fd;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        a = load_service(
+                        m,
+                        dir,
+                        "exec-var.service",
+                        "[Unit]\n[Service]\nType=exec\nEnvironment=SECS=100\nExecStart=/bin/sleep $SECS\n");
+
+        ASSERT_EQ_INT(unit_start(UNIT(a)), 0);
+        ASSERT_EQ_INT(a->state, SERVICE_EXEC_START);
+        ASSERT_TRUE(a->main_pid > 0);
+        ASSERT_TRUE(a->exec_fd >= 0);
+
+        ASSERT_TRUE(drive_until(m, service_running_done, a, 400));
+        ASSERT_EQ_INT(a->state, SERVICE_RUNNING);
+        ASSERT_TRUE(a->exec_fd < 0);
+
+        snprintf(path, sizeof(path), "/proc/%d/cmdline", (int) a->main_pid);
+        fd = open(path, O_RDONLY | O_CLOEXEC);
+        ASSERT_TRUE(fd >= 0);
+        n = read(fd, cmdline, sizeof(cmdline));
+        close(fd);
+        ASSERT_EQ_INT((int) n, (int) sizeof(want));
+        ASSERT_EQ_INT(memcmp(cmdline, want, sizeof(want)), 0);
+
+        ASSERT_EQ_INT(unit_stop(UNIT(a)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, a, 400));
+        ASSERT_EQ_INT(a->state, SERVICE_DEAD);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
         test_lifecycle_simple();
         test_oneshot_completes_only_on_exit();
@@ -1758,6 +1912,9 @@ int main(void) {
         test_env_helpers();
         test_environment_reaches_child();
         test_environment_file_missing_fails_start();
+        test_replace_env_helpers();
+        test_exec_line_expansion();
+        test_exec_type_with_expanded_argv();
 
         printf("test-service: all checks passed\n");
         return 0;

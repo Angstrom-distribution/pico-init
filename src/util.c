@@ -8,7 +8,8 @@
  * The environment helpers at the end are quarried from systemd v30 (commit
  * 501c92c, copyright 2010 Lennart Poettering, GPL-2.0-or-later): strv.c's
  * env_append()/strv_env_merge()/strv_env_get() and util.c's load_env_file()/
- * normalize_env_assignment(). env_append() and pico_load_env_file() say where
+ * normalize_env_assignment()/replace_env()/replace_env_argv().
+ * env_append(), pico_load_env_file() and pico_replace_env_argv() say where
  * they differ.
  */
 
@@ -253,9 +254,8 @@ char **pico_strv_env_merge(size_t n_lists, ...) {
         return r;
 }
 
-char *pico_strv_env_get(char * const *l, const char *name) {
-        size_t k = strlen(name);
-
+/* v30's strv_env_get_with_length(): `name` need not be NUL-terminated. */
+static char *env_get_n(char * const *l, const char *name, size_t k) {
         if (!l)
                 return NULL;
 
@@ -264,6 +264,203 @@ char *pico_strv_env_get(char * const *l, const char *name) {
                         return *l + k + 1;
 
         return NULL;
+}
+
+char *pico_strv_env_get(char * const *l, const char *name) {
+        return env_get_n(l, name, strlen(name));
+}
+
+/*
+ * Pico's own tokenizer, carrying two upstream fixes: a2a5291b3/b2fadec60
+ * "conf-parser: fix potentially bad memory accesses" -- an unterminated quote
+ * or trailing garbage after a closing quote used to be silently accepted.
+ */
+int pico_extract_first_word(const char **state, char **ret) {
+        const char *p = *state;
+        char *buf, *w;
+        bool quoted = false;
+
+        while (*p == ' ' || *p == '\t')
+                p++;
+        if (*p == '\0') {
+                *state = p;
+                return 0;
+        }
+
+        buf = malloc(strlen(p) + 1);
+        if (!buf)
+                return -ENOMEM;
+        w = buf;
+
+        for (;;) {
+                if (*p == '\0') {
+                        if (quoted) {
+                                free(buf);
+                                return -EINVAL; /* unterminated quote */
+                        }
+                        break;
+                }
+                if (*p == '"') {
+                        if (quoted) {
+                                /*
+                                 * Closing a quote: the next character must be
+                                 * unquoted whitespace or end-of-string, or
+                                 * that's trailing garbage right after the
+                                 * quote (foo="bar"baz). This is the actual
+                                 * a2a5291b3/b2fadec60 check -- a prior version
+                                 * of this function had the equivalent check
+                                 * placed after the loop, where it could never
+                                 * fire (the loop's own exit conditions mean
+                                 * *p is always '\0'/' '/'\t' by the time it's
+                                 * reached), so foo="bar"baz was silently
+                                 * accepted as "barbaz". Found by review
+                                 * before this ever shipped.
+                                 */
+                                if (p[1] != '\0' && p[1] != ' ' && p[1] != '\t') {
+                                        free(buf);
+                                        return -EINVAL;
+                                }
+                        }
+                        quoted = !quoted;
+                        p++;
+                        continue;
+                }
+                if (*p == '\\' && p[1] != '\0') {
+                        *w++ = p[1];
+                        p += 2;
+                        continue;
+                }
+                if (!quoted && (*p == ' ' || *p == '\t'))
+                        break;
+                *w++ = *p++;
+        }
+        *w = '\0';
+
+        /*
+         * No trailing-garbage check needed here: the loop above only ever
+         * exits with *p == '\0' or (unquoted) *p being a space/tab -- the
+         * real trailing-garbage rejection happens at the point a quote
+         * closes, above, where the actual violating character is still
+         * known.
+         */
+
+        *state = p;
+        *ret = buf;
+        return 1;
+}
+
+static int buf_append(char **buf, size_t *len, const char *s, size_t n) {
+        char *t = realloc(*buf, *len + n + 1);
+
+        if (!t)
+                return -ENOMEM;
+
+        memcpy(t + *len, s, n);
+        *len += n;
+        t[*len] = '\0';
+        *buf = t;
+        return 0;
+}
+
+/* v30's replace_env() state machine; an unterminated ${ stays literal. */
+char *pico_replace_env(const char *format, char * const *env) {
+        enum { WORD, CURLY, VARIABLE } state = WORD;
+        const char *e, *word = format;
+        char *r = NULL;
+        size_t len = 0;
+
+        for (e = format; *e; e++) {
+                switch (state) {
+                case WORD:
+                        if (*e == '$')
+                                state = CURLY;
+                        break;
+
+                case CURLY:
+                        if (*e == '{') {
+                                if (buf_append(&r, &len, word, (size_t) (e - word - 1)) < 0)
+                                        goto fail;
+                                word = e - 1;
+                                state = VARIABLE;
+                        } else if (*e == '$') {
+                                if (buf_append(&r, &len, word, (size_t) (e - word)) < 0)
+                                        goto fail;
+                                word = e + 1;
+                                state = WORD;
+                        } else
+                                state = WORD;
+                        break;
+
+                case VARIABLE:
+                        if (*e == '}') {
+                                const char *t = env_get_n(env, word + 2, (size_t) (e - word - 2));
+
+                                if (!t)
+                                        t = "";
+                                if (buf_append(&r, &len, t, strlen(t)) < 0)
+                                        goto fail;
+                                word = e + 1;
+                                state = WORD;
+                        }
+                        break;
+                }
+        }
+
+        if (buf_append(&r, &len, word, (size_t) (e - word)) < 0)
+                goto fail;
+
+        return r;
+
+fail:
+        free(r);
+        return NULL;
+}
+
+#define ENV_NAME_CHARS "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_"
+
+/*
+ * v30's replace_env_argv(). The whole-word test is narrower than v30's
+ * "starts with $, not ${": the rest must be a non-empty variable name, so a
+ * word like $$ or $FOO/bar goes through pico_replace_env() instead of being
+ * looked up as a name that can never exist and silently dropped.
+ */
+int pico_replace_env_argv(char * const *argv, char * const *env, char ***strv) {
+        int r = 0;
+
+        for (; argv && *argv; argv++) {
+                const char *w = *argv;
+
+                if (w[0] == '$' && w[1] != '\0' && w[1 + strspn(w + 1, ENV_NAME_CHARS)] == '\0') {
+                        const char *p = pico_strv_env_get(env, w + 1);
+                        char *word;
+
+                        while (p && (r = pico_extract_first_word(&p, &word)) > 0) {
+                                r = pico_strv_extend(strv, word);
+                                free(word);
+                                if (r < 0)
+                                        return r;
+                        }
+                        if (p && r < 0) {
+                                if (r == -EINVAL)
+                                        pico_log(PICO_LOG_WARNING, "%s: malformed quoting in the value", w);
+                                return r;
+                        }
+                        continue;
+                }
+
+                {
+                        char *x = pico_replace_env(w, env);
+
+                        if (!x)
+                                return -ENOMEM;
+                        r = pico_strv_extend(strv, x);
+                        free(x);
+                        if (r < 0)
+                                return r;
+                }
+        }
+
+        return 0;
 }
 
 static char *env_strip(char *s) {

@@ -120,6 +120,13 @@
  * console path unmodified: degradation, never a spawn failure, so an
  * image without logd behaves exactly as one that never shipped this
  * feature would.
+ *
+ * $VAR/${VAR} expansion in exec lines (v30's replace_env_argv()) runs in the
+ * PARENT, against the finished envp, producing a freshly owned argv for the
+ * child. v30 does it in the child (execute.c:1377), which this file's
+ * no-malloc rule forbids; the result is the same, the environment is final
+ * by then either way. argv[0] is kept verbatim: it is also the exec path,
+ * which v30 never expanded either.
  */
 
 /* close_range() is a glibc >= 2.34 wrapper; -std=gnu17 alone does not imply
@@ -487,6 +494,35 @@ finish:
                 free(ours[0]);
         free(inherited);
         return envp;
+}
+
+/*
+ * *ret is a freshly owned copy of `argv` with $VAR/${VAR} expanded against
+ * `env`, or NULL when no argument contains a '$' and `argv` can be used as
+ * is. 0 or -errno.
+ */
+static int expand_exec_argv(char **argv, char * const *env, char ***ret) {
+        char **i, **copy = NULL;
+        int r;
+
+        *ret = NULL;
+
+        for (i = argv + 1; *i; i++)
+                if (strchr(*i, '$'))
+                        break;
+        if (!*i)
+                return 0;
+
+        r = pico_strv_extend(&copy, argv[0]);
+        if (r >= 0)
+                r = pico_replace_env_argv(argv + 1, env, &copy);
+        if (r < 0) {
+                pico_strv_free(copy);
+                return r;
+        }
+
+        *ret = copy;
+        return 0;
 }
 
 /*
@@ -1022,8 +1058,8 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
         char **envp = NULL;
         size_t pid_slot = 0;
         const char *notify_socket;
-        char **file_env = NULL;
-        bool has_unit_env;
+        char **file_env = NULL, **expanded_argv = NULL;
+        bool has_unit_env, is_main;
         ExecCreds creds;
         int stdout_fd;
         int exec_pipe[2] = { -1, -1 };
@@ -1039,6 +1075,11 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
          * caller mistake never even forks. */
         if (!argv || !argv[0] || argv[0][0] == '\0')
                 return -ENOEXEC;
+
+        /* The main command is recognized by pointer identity, so decide it
+         * from the caller's argv: the $VAR-expanded copy below is never
+         * s->exec_start. */
+        is_main = argv == s->exec_start;
 
         /* User=/Group= resolution: NSS, so parent-only, and before any
          * side effect (socket_notify_service_starting() below) so an
@@ -1066,7 +1107,7 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
          * socket_trigger() ran or the socket was merely already listening
          * when boot order reached this service.
          */
-        if (argv == s->exec_start) {
+        if (is_main) {
                 r = socket_collect_fds(UNIT(s), sock_fds, PICO_MAX_SOCKET_FDS);
                 if (r < 0) {
                         pico_log(PICO_LOG_WARNING,
@@ -1087,7 +1128,7 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
         /* NOTIFY_SOCKET= for every spawn, ExecStartPre= included (matching
          * upstream, and consistent with the listener accepting a
          * control_pid sender too) -- unlike LISTEN_FDS, not scoped to
-         * argv == s->exec_start. NULL when the listener never came up
+         * the main command. NULL when the listener never came up
          * (manager_notify_setup() failed or has not run), in which case the
          * scrub below still runs so an inherited value cannot leak through. */
         notify_socket = manager_notify_socket_path(UNIT(s)->manager);
@@ -1116,6 +1157,22 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
         }
         file_env = pico_strv_free(file_env);
 
+        /* Against exactly what the child will see: envp, or the inherited
+         * environ when there is none. */
+        r = expand_exec_argv(argv, envp ? envp : environ, &expanded_argv);
+        if (r < 0) {
+                pico_log(PICO_LOG_ERR,
+                         "%s: could not expand $ variables in %s: %s",
+                         UNIT(s)->id,
+                         argv[0],
+                         strerror(-r));
+                pico_strv_free(envp);
+                exec_creds_free(&creds);
+                return r;
+        }
+        if (expanded_argv)
+                argv = expanded_argv;
+
         /* Every start, not only ExecStart= (plan §3.6: nothing scopes stdout
          * capture to the main command the way LISTEN_FDS is scoped above).
          * Best-effort: -1 on any failure just means "no logd, use the
@@ -1127,9 +1184,10 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
          * ends O_CLOEXEC -- the child's end closing on execve() IS the
          * signal. A pipe failure is a real spawn failure, not a fallback to
          * simple: the unit asked for exec semantics. */
-        if (argv == s->exec_start && s->type == SERVICE_TYPE_EXEC) {
+        if (is_main && s->type == SERVICE_TYPE_EXEC) {
                 if (pipe2(exec_pipe, O_CLOEXEC | O_NONBLOCK) < 0) {
                         r = -errno;
+                        pico_strv_free(expanded_argv);
                         pico_strv_free(envp);
                         exec_creds_free(&creds);
                         if (stdout_fd >= 0)
@@ -1141,6 +1199,7 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
         pid = fork();
         if (pid < 0) {
                 r = -errno; /* 74129a1276: never a stale success value */
+                pico_strv_free(expanded_argv);
                 pico_strv_free(envp);
                 exec_creds_free(&creds);
                 if (stdout_fd >= 0)
@@ -1163,10 +1222,11 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
                            exec_pipe[1],
                            &creds); /* never returns */
 
-        /* COW: the child already has its own copy of everything envp/
+        /* COW: the child already has its own copy of everything argv/envp/
          * creds/stdout_fd point to, made at fork() -- freeing/closing the
          * parent's copies here cannot affect it. See build_exec_envp()'s own
          * layout note; same reasoning for the rest. */
+        pico_strv_free(expanded_argv);
         pico_strv_free(envp);
         exec_creds_free(&creds);
         if (stdout_fd >= 0)

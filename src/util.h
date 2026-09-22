@@ -91,3 +91,25 @@ char *pico_strv_env_get(char * const *l, const char *name);
  * for a file with no assignments. 0 or -errno.
  */
 int pico_load_env_file(const char *path, char ***ret);
+
+/*
+ * Extracts one whitespace-separated word from *state, honoring double quotes
+ * ("a b" is one word) and backslash escapes. *state is advanced past the
+ * word. 1 with *ret set (caller owns it), 0 at end of string, -EINVAL on an
+ * unterminated quote or trailing garbage right after a closing quote, or
+ * -ENOMEM. ExecStart=, Environment= and $VAR splitting all use this one.
+ */
+int pico_extract_first_word(const char **state, char **ret);
+
+/*
+ * $VAR expansion, v30's replace_env()/replace_env_argv(). pico_replace_env():
+ * ${NAME} anywhere in `format` becomes NAME's value in `env` ("" when unset),
+ * and $$ becomes a literal $; NULL on OOM. pico_replace_env_argv() appends
+ * each word of `argv` to *strv: a word that is exactly $NAME becomes zero or
+ * more words, NAME's value split by pico_extract_first_word() (none when
+ * unset); any other word goes through pico_replace_env(). 0, -ENOMEM, or
+ * -EINVAL for a $NAME value with malformed quoting. On error *strv holds
+ * whatever was appended before it, still the caller's to free.
+ */
+char *pico_replace_env(const char *format, char * const *env);
+int pico_replace_env_argv(char * const *argv, char * const *env, char ***strv);
