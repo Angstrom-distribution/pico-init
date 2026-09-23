@@ -2,7 +2,7 @@
 
 A small, systemd-inspired PID1 for constrained embedded Linux targets —
 starting with [Angstrom Linux](https://github.com/koenkooi)'s `angstrom-pico`
-distro, aimed at ARMv5TE-class hardware with roughly 64MiB of RAM.
+distro, aimed at 200MHz-class hardware with roughly 64MiB of RAM.
 
 ## What this is
 
