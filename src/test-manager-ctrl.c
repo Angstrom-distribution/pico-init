@@ -726,6 +726,49 @@ static void test_start_unknown_name_leaves_no_junk_unit(void) {
         ctrl_fixture_teardown(&f);
 }
 
+static bool unit_in_table(Manager *m, Unit *u) {
+        size_t i;
+
+        for (i = 0; i < m->n_units; i++)
+                if (m->units[i] == u)
+                        return true;
+
+        return false;
+}
+
+/*
+ * A fragment added after boot that parses but fails validation (here: no
+ * ExecStart=) still had its After= applied while it was parsed, and that
+ * wrote the inverse Before= edge into default.target. Freeing the unit left
+ * default.target pointing at freed memory; every later job on it read it.
+ */
+static void test_start_invalid_unit_leaves_no_dangling_edge(void) {
+        struct ctrl_fixture f;
+        Unit *target;
+        size_t i;
+
+        ctrl_fixture_setup(&f);
+        ctrl_fixture_boot(&f);
+
+        target = manager_get_unit(f.m, "default.target");
+        ASSERT_TRUE(target != NULL);
+
+        ASSERT_EQ_INT(test_write_file(f.unitdir,
+                                      "new.service",
+                                      "[Unit]\nAfter=default.target\n[Service]\nType=simple\n"),
+                      0);
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 start new.service", "err no-such-unit\n", 100);
+
+        for (i = 0; i < target->n_dependencies[UNIT_BEFORE]; i++)
+                ASSERT_TRUE(unit_in_table(f.m, target->dependencies[UNIT_BEFORE][i]));
+
+        /* a job on the peer walks its Before= neighbours when it finishes */
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 restart default.target", "ok done\n", 400);
+
+        ctrl_fixture_teardown(&f);
+}
+
 /* A template id is rejected by manager_load_unit() itself before the
  * fallback ever gets a fragment to find -- covered here as the ctrl-visible
  * consequence, not a retest of manager.c's own rejection. */
@@ -759,6 +802,7 @@ int main(void) {
         test_stop_does_not_fall_back();
         test_reset_failed_does_not_fall_back();
         test_start_unknown_name_leaves_no_junk_unit();
+        test_start_invalid_unit_leaves_no_dangling_edge();
         test_start_template_is_refused();
 
         printf("test-manager-ctrl: all checks passed\n");

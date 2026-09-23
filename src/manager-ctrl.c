@@ -366,6 +366,23 @@ static const char *ctrl_reset_failed(Unit *u) {
 
 /* --- start/stop/restart: enqueue, then defer or reply immediately --- */
 
+/* No edge from u, and no edge to u from any unit in the table. */
+static bool ctrl_unit_is_unreferenced(Manager *m, Unit *u) {
+        size_t i;
+        int d;
+
+        for (d = 0; d < _UNIT_DEPENDENCY_MAX; d++)
+                if (u->n_dependencies[d] > 0)
+                        return false;
+
+        for (i = 0; i < m->n_units; i++)
+                for (d = 0; d < _UNIT_DEPENDENCY_MAX; d++)
+                        if (unit_has_dependency(m->units[i], d, u))
+                                return false;
+
+        return true;
+}
+
 static void ctrl_handle_request(struct ctrl_conn *conn, const char *buf, size_t len) {
         struct pico_manager_ctrl *ctrl = conn->ctrl;
         struct ctrl_request req;
@@ -411,15 +428,16 @@ static void ctrl_handle_request(struct ctrl_conn *conn, const char *buf, size_t 
                          * since the ctrl socket lets anyone with a shell
                          * spell a unit name that was never going to exist.
                          *
-                         * Removing it here is provably safe for this node
-                         * specifically, which is the only condition under
-                         * which manager_remove_unit() may ever be called
-                         * (see its own header): UNIT_ERROR means no fragment
-                         * was parsed, so it has no outgoing edges, and
-                         * nothing else can have referenced a name that
-                         * manager_get_unit() just reported as absent.
+                         * Removed only while nothing has an edge to it, the
+                         * one condition manager_remove_unit() allows (see its
+                         * header). With no fragment at all that always holds.
+                         * A fragment that parsed but then failed validation
+                         * had its After=/Before= applied during the parse,
+                         * inverse edges in its peers included, so that node
+                         * stays in the table as UNIT_ERROR.
                          */
-                        manager_remove_unit(ctrl->manager, u);
+                        if (ctrl_unit_is_unreferenced(ctrl->manager, u))
+                                manager_remove_unit(ctrl->manager, u);
                         u = NULL;
                 }
         }
