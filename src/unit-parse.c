@@ -326,6 +326,26 @@ static int config_parse_unit_deps(Unit *u, const char *path, unsigned line, Unit
                  * ever becomes a path.
                  */
                 if (!unit_name_is_valid(expanded)) {
+                        /*
+                         * A syntactically real unit name of a type pico has
+                         * no vtable for (.mount, .device, ...) is a
+                         * compatibility gap, not a malformed directive --
+                         * the degradation record is the stated visibility
+                         * mechanism for exactly this (picoctl show,
+                         * pico-unit-lint), so it must not go missing here
+                         * the way "../evil.service" silently and correctly
+                         * does.
+                         */
+                        if (unit_name_has_unsupported_type(expanded)) {
+                                char what[UNIT_NAME_MAX + 32];
+
+                                snprintf(what,
+                                         sizeof(what),
+                                         "%s=%s",
+                                         unit_dependency_to_string(d),
+                                         strrchr(expanded, '.'));
+                                (void) unit_add_degradation(u, what);
+                        }
                         pico_log(PICO_LOG_WARNING,
                                  "%s:%u: '%s' is not a valid unit name, ignoring",
                                  path,
@@ -947,10 +967,34 @@ static int config_parse_restart(Unit *u, const char *path, unsigned line, const 
                 s->restart = SERVICE_RESTART_NO;
         else if (strcmp(rvalue, "on-failure") == 0)
                 s->restart = SERVICE_RESTART_ON_FAILURE;
-        else {
+        else if (strcmp(rvalue, "always") == 0 || strcmp(rvalue, "on-success") == 0 ||
+                 strcmp(rvalue, "on-abnormal") == 0 || strcmp(rvalue, "on-abort") == 0 ||
+                 strcmp(rvalue, "on-watchdog") == 0) {
+                char what[32];
+
+                /*
+                 * "always" is common enough upstream (and the most likely to
+                 * surprise a unit author expecting a restart) that falling
+                 * all the way back to "no" -- never restart -- would be a
+                 * worse approximation than the nearest value this project
+                 * does implement. The other four recognized values have no
+                 * comparably obvious nearest neighbour, so they keep the
+                 * conservative "no" default; either way, the degradation
+                 * record (picoctl show, pico-unit-lint) is the point: this
+                 * used to be a WARNING only, invisible to both.
+                 */
+                s->restart = strcmp(rvalue, "always") == 0 ? SERVICE_RESTART_ON_FAILURE : SERVICE_RESTART_NO;
                 pico_log(PICO_LOG_WARNING,
-                         "%s:%u: Restart=%s not supported (only 'no'/'on-failure'), "
-                         "defaulting to 'no'",
+                         "%s:%u: Restart=%s not supported (only 'no'/'on-failure' are), defaulting to '%s'",
+                         path,
+                         line,
+                         rvalue,
+                         s->restart == SERVICE_RESTART_ON_FAILURE ? "on-failure" : "no");
+                snprintf(what, sizeof(what), "Restart=%s", rvalue);
+                (void) unit_add_degradation(u, what);
+        } else {
+                pico_log(PICO_LOG_WARNING,
+                         "%s:%u: Restart=%s not recognized, defaulting to 'no'",
                          path,
                          line,
                          rvalue);
@@ -1020,8 +1064,10 @@ static int config_parse_restart_sec(
                 return 0;
 
         r = parse_usec(rvalue, &s->restart_usec);
-        if (r < 0)
+        if (r < 0) {
                 pico_log(PICO_LOG_WARNING, "%s:%u: invalid RestartSec= value '%s', ignoring", path, line, rvalue);
+                (void) unit_add_degradation(u, "RestartSec=");
+        }
         return 0;
 }
 
@@ -1041,6 +1087,7 @@ static int config_parse_timeout_start_sec(
                          path,
                          line,
                          rvalue);
+                (void) unit_add_degradation(u, "TimeoutStartSec=");
                 return 0;
         }
 
@@ -1071,6 +1118,7 @@ static int config_parse_timeout_stop_sec(
                          path,
                          line,
                          rvalue);
+                (void) unit_add_degradation(u, "TimeoutStopSec=");
                 return 0;
         }
 

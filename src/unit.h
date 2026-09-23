@@ -209,6 +209,12 @@ UnitType unit_type_from_name(const char *id); /* by suffix; _UNIT_TYPE_INVALID i
  */
 bool unit_name_is_valid(const char *name);
 
+/* A name shaped like a real unit name (passes every unit_name_is_valid()
+ * check except the type-suffix one) but naming a type pico has no vtable
+ * for, e.g. a Requires= on a .mount/.device -- worth a degradation record,
+ * unlike a name that fails unit_name_is_valid() for any other reason. */
+bool unit_name_has_unsupported_type(const char *name);
+
 /*
  * %n %N %p %i -- safe to put in a dependency or install name, since none of
  * them can introduce whitespace or a path separator. %I additionally

@@ -327,6 +327,53 @@ static void test_degradation_record(void) {
 }
 
 /*
+ * units-degradation-record-holes: Restart=always, a Requires= on a unit type
+ * pico has no vtable for, and an unparseable TimeoutStartSec= were each
+ * dropped with only a WARNING -- invisible to picoctl show/pico-unit-lint,
+ * which read the degradation record, not the log.
+ */
+static void test_degradation_record_covers_restart_deps_and_timeouts(void) {
+        Manager *m;
+        char *dir;
+        char *joined;
+        Unit *u;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "holes.service",
+                                      "[Unit]\n"
+                                      "Requires=foo.mount\n"
+                                      "\n"
+                                      "[Service]\n"
+                                      "Type=simple\n"
+                                      "ExecStart=/bin/true\n"
+                                      "Restart=always\n"
+                                      "TimeoutStartSec=1min 30s\n"),
+                      0);
+
+        m = manager_for(dir);
+        u = load_one(m, "holes.service");
+
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+
+        /* Restart=always falls back to the nearest implemented value
+         * (on-failure), not all the way to "never restart". */
+        ASSERT_EQ_INT(((Service *) u)->restart, SERVICE_RESTART_ON_FAILURE);
+        /* An unparseable value leaves the default (90s) untouched. */
+        ASSERT_TRUE(((Service *) u)->timeout_start_usec == 90 * USEC_PER_SEC);
+
+        joined = unit_degraded_directives_string(u);
+        ASSERT_STREQ(joined, "Requires=.mount Restart=always TimeoutStartSec=");
+        free(joined);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
  * E0: a second, independently-valid ExecStart= line still replaces the
  * first (no command list exists to run both), but that replacement is now
  * visible in the degradation record -- config_parse_exec_start() mirrors
@@ -1470,6 +1517,7 @@ int main(void) {
         test_service_fields();
         test_unknown_directives_are_tolerated();
         test_degradation_record();
+        test_degradation_record_covers_restart_deps_and_timeouts();
         test_repeated_exec_start_is_recorded();
         test_environment_directives();
         test_malformed_line_skips_only_that_line();

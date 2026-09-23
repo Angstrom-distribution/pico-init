@@ -497,7 +497,15 @@ UnitType unit_type_from_name(const char *id) {
         "ABCDEFGHIJKLMNOPQRSTUVWXYZ" \
         ":-_.\\@"
 
-bool unit_name_is_valid(const char *name) {
+/*
+ * Every unit_name_is_valid() check except the final "names a type we can
+ * actually instantiate" one -- split out so a caller that wants to tell "not
+ * a unit name at all" from "a syntactically fine name of a type pico has no
+ * vtable for" (e.g. a Requires= on a .mount/.device) can do so without
+ * duplicating the security-relevant character/path checks. See
+ * unit_name_is_valid()'s own header for why those exist.
+ */
+static bool unit_name_shape_is_valid(const char *name) {
         size_t len;
 
         if (!name)
@@ -544,11 +552,27 @@ bool unit_name_is_valid(const char *name) {
                 }
         }
 
+        return true;
+}
+
+bool unit_name_is_valid(const char *name) {
+        if (!unit_name_shape_is_valid(name))
+                return false;
+
         /* and it has to name a type we can actually instantiate */
         if (unit_type_from_name(name) == _UNIT_TYPE_INVALID)
                 return false;
 
         return true;
+}
+
+/* A name whose shape is a real unit name but whose suffix names a type pico
+ * has no vtable for (.mount, .device, .timer, ...) -- distinct from
+ * unit_name_is_valid() failing outright, so a caller can record the former
+ * as a degradation rather than silently dropping it like a malformed name. */
+bool unit_name_has_unsupported_type(const char *name) {
+        return unit_name_shape_is_valid(name) && unit_type_from_name(name) == _UNIT_TYPE_INVALID &&
+                        strrchr(name, '.') != NULL;
 }
 
 /*
