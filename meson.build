@@ -98,6 +98,9 @@ pico_init_core_sources = files(
   # UUID=/LABEL=/PARTUUID=/PARTLABEL= resolution by walking sysfs, and the
   # bounded wait for a device that has not appeared yet.
   'src/fstab-resolve.c',
+  # ubi.mtd= read from the kernel command line and carried out through
+  # /dev/ubi_ctrl, for fstab's ubifs lines when UBI is a module.
+  'src/ubi-attach.c',
   'src/unit.c',
   # Template/instance name parsing (G2), split out of unit.c because it
   # needs nothing from Unit itself -- unit.c calls into it, not vice versa.
@@ -234,6 +237,9 @@ pico_tests = [
   # Source resolution against a fixture sysfs tree and image files, and the
   # device wait driven through its poll hook.
   'test-fstab-resolve',
+  # The ubi.mtd= grammar and the attach state machine, against a fixture
+  # sysfs tree and a fake UBI_IOCATT.
+  'test-ubi-attach',
   # Manager-level regression test for the SIGCHLD-before-cgroup-empty
   # dispatch-order property (manager.h's EVENT_PRIORITY_* table): drives
   # m->event directly, one dispatch at a time, since manager_loop() itself
