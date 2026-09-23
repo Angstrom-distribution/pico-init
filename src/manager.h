@@ -84,6 +84,11 @@ enum {
  */
 #define PICO_RUNTIME_DIR "/run/pico-init"
 
+/* The fstab pass's outcome record (fstab.h), beside the unit state it is read
+ * together with. Written pre-manager, so it cannot follow a runtime_dir a test
+ * sets on the Manager; the pass takes its own path instead. */
+#define PICO_FSTAB_RECORD PICO_RUNTIME_DIR "/fstab"
+
 /* Why the loop ended; main.c maps these to reboot(), poweroff, or a plain
  * return. MANAGER_EXIT is only legal when the manager is not PID 1 -- see
  * manager_dispatch_signal() and main(). */

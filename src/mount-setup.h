@@ -20,6 +20,9 @@
 
 #pragma once
 
+#include <stdbool.h>
+#include <stdint.h>
+
 /*
  * Mount everything in the table, in order. Idempotent: a filesystem the kernel
  * or an initramfs already mounted is left alone rather than stacked on.
@@ -30,6 +33,18 @@
  * console where someone can debug it.
  */
 int mount_setup(void);
+
+/*
+ * Whether `where` is one of the table's mount points, and if so its hardening
+ * floor: the MOUNT_ATTR_NOSUID/NODEV/NOEXEC bits the table mounts it with.
+ *
+ * For the fstab pass, which reapplies an fstab line's options to these mounts
+ * rather than mounting them a second time -- and must never drop the floor
+ * while doing it, since a "defaults" line rebuilt into a remount would
+ * otherwise clear exactly the flags the comment above the table says are not
+ * decoration.
+ */
+bool mount_setup_api_floor(const char *where, uint64_t *ret_floor);
 
 /*
  * The five /dev symlinks PID 1 owns: /dev/fd, /dev/stdin, /dev/stdout,

@@ -109,6 +109,31 @@ static bool is_mount_point(const char *where) {
         return a.st_dev != b.st_dev;
 }
 
+bool mount_setup_api_floor(const char *where, uint64_t *ret_floor) {
+        size_t i;
+
+        for (i = 0; where && i < sizeof(mount_table) / sizeof(mount_table[0]); i++) {
+                unsigned long f = mount_table[i].flags;
+                uint64_t floor = 0;
+
+                if (strcmp(where, mount_table[i].where) != 0)
+                        continue;
+
+                if (f & MS_NOSUID)
+                        floor |= MOUNT_ATTR_NOSUID;
+                if (f & MS_NODEV)
+                        floor |= MOUNT_ATTR_NODEV;
+                if (f & MS_NOEXEC)
+                        floor |= MOUNT_ATTR_NOEXEC;
+
+                if (ret_floor)
+                        *ret_floor = floor;
+                return true;
+        }
+
+        return false;
+}
+
 /* Create the mount point if it is missing. Failure is the caller's problem. */
 static int make_dir(const char *where) {
         if (mkdir(where, 0755) < 0 && errno != EEXIST)

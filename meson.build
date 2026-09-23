@@ -83,6 +83,9 @@ pico_init_core_sources = files(
   # /etc/fstab: the parser, option table and outcome record, kept apart from
   # the half that mounts so the decisions can be tested as values.
   'src/fstab.c',
+  # The boot-time fstab pass main.c runs between the root check and swap
+  # discovery, on the kernel's new mount API.
+  'src/fstab-mount.c',
   'src/unit.c',
   # Template/instance name parsing (G2), split out of unit.c because it
   # needs nothing from Unit itself -- unit.c calls into it, not vice versa.
@@ -202,6 +205,8 @@ pico_tests = [
   'test-root-check',
   # The fstab grammar, option routing, mount order and outcome record.
   'test-fstab',
+  # The pass against real mounts, inside a private user + mount namespace.
+  'test-fstab-mount',
   # Manager-level regression test for the SIGCHLD-before-cgroup-empty
   # dispatch-order property (manager.h's EVENT_PRIORITY_* table): drives
   # m->event directly, one dispatch at a time, since manager_loop() itself
