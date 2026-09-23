@@ -1242,8 +1242,92 @@ static void test_start_not_dropped_over_installed_stop(void) {
         free(dir);
 }
 
+/*
+ * The picosplash-quit.service shape, booted end to end: oe-core's
+ * /etc/systemd/system/default.target -> multi-user.target, a oneshot that
+ * fails, and a oneshot WantedBy=default.target ordered After= both
+ * multi-user.target and the failing one. Every job must complete and the
+ * boot must settle; the quit unit's start job used to stay installed forever.
+ */
+static void test_alias_boot_runs_ordered_oneshot(void) {
+        char path[PATH_MAX], text[PATH_MAX + 256], cgroup_root[PATH_MAX];
+        char *etc, *lib, *presets, *rt;
+        Unit *multi, *splash, *quit;
+        Manager *m = NULL;
+
+        etc = test_tmpdir_new();
+        lib = test_tmpdir_new();
+        presets = test_tmpdir_new();
+        rt = test_tmpdir_new();
+        ASSERT_TRUE(etc && lib && presets && rt);
+
+        ASSERT_EQ_INT(test_write_file(lib, "default.target", "[Unit]\nDescription=Packaged default\n"), 0);
+        ASSERT_EQ_INT(test_write_file(lib, "multi-user.target", "[Unit]\nDescription=Multi-User System\n"), 0);
+        ASSERT_EQ_INT(test_write_file(lib,
+                                      "picosplash.service",
+                                      "[Service]\nType=oneshot\nExecStart=/bin/false\n"
+                                      "[Install]\nWantedBy=default.target\n"),
+                      0);
+        snprintf(text,
+                 sizeof(text),
+                 "[Unit]\nAfter=multi-user.target picosplash.service\n"
+                 "[Service]\nType=oneshot\nExecStart=/bin/touch %s/quit-ran\n"
+                 "[Install]\nWantedBy=default.target\n",
+                 rt);
+        ASSERT_EQ_INT(test_write_file(lib, "picosplash-quit.service", text), 0);
+
+        snprintf(path, sizeof(path), "%s/multi-user.target", lib);
+        ASSERT_EQ_INT(test_symlink(etc, "default.target", path), 0);
+
+        ASSERT_EQ_INT(test_write_file(presets,
+                                      "10-test.preset",
+                                      "enable picosplash.service\nenable picosplash-quit.service\n"),
+                      0);
+
+        ASSERT_EQ_INT(manager_new(&m), 0);
+        {
+                const char * const up[] = { etc, lib, NULL };
+                const char * const pd[] = { presets, NULL };
+
+                ASSERT_EQ_INT(manager_set_unit_path(m, up), 0);
+                ASSERT_EQ_INT(manager_set_preset_path(m, pd), 0);
+        }
+        ASSERT_EQ_INT(manager_set_runtime_dir(m, rt), 0);
+        use_private_cgroup_root(m, "alias-boot", cgroup_root, sizeof(cgroup_root));
+
+        ASSERT_EQ_INT(manager_startup(m, NULL), 0);
+
+        multi = manager_get_unit(m, "multi-user.target");
+        splash = manager_get_unit(m, "picosplash.service");
+        quit = manager_get_unit(m, "picosplash-quit.service");
+        ASSERT_TRUE(multi != NULL && splash != NULL && quit != NULL);
+        ASSERT_TRUE(manager_get_unit(m, "default.target") == multi);
+
+        ASSERT_TRUE(drive_until_idle(m, 300));
+
+        ASSERT_EQ_INT(unit_active_state(multi), UNIT_ACTIVE);
+        ASSERT_EQ_INT(unit_active_state(splash), UNIT_FAILED);
+        ASSERT_TRUE(quit->job == NULL);
+        ASSERT_EQ_INT(SERVICE(quit)->result, SERVICE_SUCCESS);
+        snprintf(path, sizeof(path), "%s/quit-ran", rt);
+        ASSERT_EQ_INT(access(path, F_OK), 0);
+        ASSERT_TRUE(m->degradation_summary_logged);
+
+        manager_free(m);
+        free_private_cgroup_root(cgroup_root);
+        test_rm_rf(etc);
+        test_rm_rf(lib);
+        test_rm_rf(presets);
+        test_rm_rf(rt);
+        free(etc);
+        free(lib);
+        free(presets);
+        free(rt);
+}
+
 int main(void) {
         test_oneshot_start_job_finishes();
+        test_alias_boot_runs_ordered_oneshot();
         test_start_not_dropped_over_installed_stop();
         test_requires_failure_propagates_transitively();
         test_restart_of_unit_that_stops_failed();
