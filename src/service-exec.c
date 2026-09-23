@@ -85,7 +85,7 @@
  * -- which turns EVERY service start (not just a socket-activated one) into
  * that many close() syscalls, several real seconds each, discovered because
  * it made this milestone's own multi-cycle S2 tests impractically slow, not
- * from inspection. close_all_except() below uses close_range() (Linux 5.9+,
+ * from inspection. pico_close_all_except() below uses close_range() (Linux 5.9+,
  * glibc >= 2.34, so no new floor beyond what this project already assumes)
  * to close whole gaps between kept fds in one syscall each, falling back to
  * the original per-fd loop if close_range() itself is unavailable at
@@ -161,12 +161,6 @@
  * read by build_exec_envp() and by child_exec()'s NULL-envp fallback. */
 extern char **environ;
 
-/* A generous, fixed bound on how many fds one paired socket unit (or several
- * pairing to the same service) can hand to a single service start. No
- * pico-init consumer needs more than a handful; a fixed stack array here
- * keeps fd collection entirely allocation-free in the parent too. */
-#define PICO_MAX_SOCKET_FDS 16
-
 /*
  * Renumber every fd in `fds` to a contiguous run starting at 3, in place --
  * v30's execute.c:63-101, ported verbatim. F_DUPFD(fd, i+3) always returns
@@ -180,8 +174,8 @@ extern char **environ;
  */
 
 /* Hand-rolled ascending insertion sort -- see this file's header for why
- * qsort(3) is not used here. `n` is at most PICO_MAX_SOCKET_FDS + 1 (the
- * socket-activation set plus the logd stdout socket, J2). */
+ * qsort(3) is not used here. `n` is at most PICO_MAX_SOCKET_FDS + 2 (the
+ * socket-activation set, the logd stdout socket (J2), the Type=exec pipe). */
 static void sort_fds_ascending(int *a, unsigned n) {
         unsigned i, j;
 
@@ -207,17 +201,17 @@ static void sort_fds_ascending(int *a, unsigned n) {
  * close_range() itself first failed, if the kernel does not have it
  * (pre-5.9) -- same fds end up closed either way. Async-signal-safe:
  * close_range()/close() only, plus the insertion sort above (no malloc).
- * `keep` may hold up to PICO_MAX_SOCKET_FDS + 1 entries -- the socket-
- * activation set plus the logd stdout socket (J2); anything beyond that
- * is silently clamped rather than overflowing `sorted` below, which
- * cannot happen in practice since every caller already bounds n_keep
- * itself, but the clamp is the honest contract regardless. */
-static void close_all_except(const int *keep, unsigned n_keep, long max_fd) {
-        int sorted[PICO_MAX_SOCKET_FDS + 1];
+ * `keep` may hold up to PICO_MAX_SOCKET_FDS + 2 entries -- the socket-
+ * activation set, the logd stdout socket (J2) and the Type=exec pipe;
+ * anything beyond that is silently clamped rather than overflowing `sorted`
+ * below, which cannot happen in practice since every caller already bounds
+ * n_keep itself, but the clamp is the honest contract regardless. */
+void pico_close_all_except(const int *keep, unsigned n_keep, long max_fd) {
+        int sorted[PICO_MAX_SOCKET_FDS + 2];
         unsigned i, n, next;
         bool use_close_range = true;
 
-        n = n_keep < PICO_MAX_SOCKET_FDS + 1 ? n_keep : PICO_MAX_SOCKET_FDS + 1;
+        n = n_keep < PICO_MAX_SOCKET_FDS + 2 ? n_keep : PICO_MAX_SOCKET_FDS + 2;
         for (i = 0; i < n; i++)
                 sorted[i] = keep[i];
         sort_fds_ascending(sorted, n);
@@ -866,7 +860,7 @@ static _Noreturn void
          * logd stdout socket (stdout_fd, if create_stdout_socket()
          * succeeded). The cgroup control file (step 7) and the console
          * (step 8) are both reopened fresh by path below, so nothing else
-         * needs to survive this. See close_all_except()'s own comment for
+         * needs to survive this. See pico_close_all_except()'s own comment for
          * why this is not simply a close() per fd number any more. */
         {
                 int keep_fds[PICO_MAX_SOCKET_FDS + 2];
@@ -882,7 +876,7 @@ static _Noreturn void
                 max_fd = sysconf(_SC_OPEN_MAX);
                 if (max_fd < 0)
                         max_fd = 1024; /* sane fallback if the syscall itself fails */
-                close_all_except(keep_fds, n_keep, max_fd);
+                pico_close_all_except(keep_fds, n_keep, max_fd);
         }
 
         /* 5b. LISTEN_FDS/sd_listen_fds(): renumber the kept fds to a

@@ -2055,7 +2055,55 @@ static void test_exec_type_with_expanded_argv(void) {
         free(dir);
 }
 
+/*
+ * The spawn-time fd sweep must keep every fd it is handed. child_exec()
+ * passes up to PICO_MAX_SOCKET_FDS socket fds plus logd's stdout socket plus
+ * the Type=exec pipe; losing the last one closes the exec pipe and a healthy
+ * Type=exec daemon is never confirmed started. Run in a child, since it
+ * closes most of the process's fds.
+ */
+static void test_close_all_except_keeps_every_fd(void) {
+        enum { N_KEEP = PICO_MAX_SOCKET_FDS + 2, N_OPEN = N_KEEP + 4 };
+        pid_t pid;
+        int status = 0;
+
+        pid = fork();
+        ASSERT_TRUE(pid >= 0);
+        if (pid == 0) {
+                int fds[N_OPEN], keep[N_KEEP];
+                unsigned i, n_keep = 0;
+
+                for (i = 0; i < N_OPEN; i++) {
+                        fds[i] = open("/dev/null", O_RDONLY);
+                        if (fds[i] < 0)
+                                _exit(10);
+                }
+                /* four fds dropped from among the low ones, the highest kept
+                 * last in the list */
+                for (i = 0; i < N_OPEN; i++)
+                        if (!(i % 5 == 1 && i / 5 < 4))
+                                keep[n_keep++] = fds[i];
+                if (n_keep != N_KEEP)
+                        _exit(11);
+
+                pico_close_all_except(keep, n_keep, 4096);
+
+                for (i = 0; i < n_keep; i++)
+                        if (fcntl(keep[i], F_GETFD) < 0)
+                                _exit(20 + (int) i);
+                for (i = 1; i < 20; i += 5)
+                        if (fcntl(fds[i], F_GETFD) >= 0)
+                                _exit(12);
+                _exit(0);
+        }
+
+        ASSERT_EQ_INT(waitpid(pid, &status, 0), pid);
+        ASSERT_TRUE(WIFEXITED(status));
+        ASSERT_EQ_INT(WEXITSTATUS(status), 0);
+}
+
 int main(void) {
+        test_close_all_except_keeps_every_fd();
         test_lifecycle_simple();
         test_oneshot_completes_only_on_exit();
         test_exec_start_pre_dash_ignores_failure();

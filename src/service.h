@@ -276,5 +276,16 @@ const char *service_restart_to_string(ServiceRestart r);
 const char *service_result_to_string(ServiceResult r);
 
 /* --- service-exec.c --- */
+
+/* A generous, fixed bound on how many fds one paired socket unit (or several
+ * pairing to the same service) can hand to a single service start. No
+ * pico-init consumer needs more than a handful; a fixed stack array here
+ * keeps fd collection entirely allocation-free in the parent too. */
+#define PICO_MAX_SOCKET_FDS 16
+
 /* fork/exec argv into s's cgroup with fds set up; child pid via ret_pid. 0 or -errno. */
 int service_spawn(Service *s, char **argv, pid_t *ret_pid);
+
+/* The child's fd sweep: close every fd below max_fd not in `keep`.
+ * Async-signal-safe. Exported for test-service only. */
+void pico_close_all_except(const int *keep, unsigned n_keep, long max_fd);
