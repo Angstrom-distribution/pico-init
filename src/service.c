@@ -800,7 +800,7 @@ static void service_enter_start_pre(Service *s) {
 /* Shared by service_start() (after its own state-legality checks) and the
  * restart timer (which reaches here directly from SERVICE_AUTO_RESTART, an
  * inherently legal predecessor). */
-static void service_do_start(Service *s) {
+static int service_do_start(Service *s) {
         int r;
 
         /* B7: after "is a start even legal" (the caller already checked),
@@ -826,7 +826,11 @@ static void service_do_start(Service *s) {
                  * it re-triggers the crash loop its own start limit just
                  * stopped (c2f3480897, "so sockets won't act as tarpits"). */
                 socket_notify_service_dead(UNIT(s));
-                return;
+
+                /* From FAILED the state change above was a no-op and nothing
+                 * finished the start job: fail it (v30 service_start()
+                 * returns -ECANCELED here). */
+                return -ECANCELED;
         }
 
         s->result = SERVICE_SUCCESS;
@@ -849,6 +853,8 @@ static void service_do_start(Service *s) {
                 service_enter_start_pre(s);
         else
                 service_enter_start(s);
+
+        return 0;
 }
 
 int service_start(Service *s) {
@@ -881,8 +887,7 @@ int service_start(Service *s) {
         }
 
         s->forbid_restart = false;
-        service_do_start(s);
-        return 0;
+        return service_do_start(s);
 }
 
 int service_stop(Service *s) {
@@ -1264,7 +1269,7 @@ static void service_timer_restart(void *userdata, usec_t now) {
                 return;
         }
 
-        service_do_start(s);
+        (void) service_do_start(s); /* no job to fail: AUTO_RESTART -> FAILED notifies */
 }
 
 /* --- service_verify() (B9) --- */

@@ -624,6 +624,49 @@ static void test_b7_start_limit_stops_the_loop(void) {
         free(dir);
 }
 
+static bool jobs_idle_done(void *userdata) {
+        return ((Manager *) userdata)->n_jobs == 0;
+}
+
+/*
+ * The start limit hit from FAILED: the refusal leaves the state where it
+ * was, so no state change finishes the job. Each start goes through a real
+ * job, the way a socket trigger or `picoctl start` reaches it; the sixth
+ * must still finish, failed, and leave nothing installed.
+ */
+static void test_start_limit_from_failed_finishes_job(void) {
+        Manager *m;
+        Service *s;
+        char *dir;
+        unsigned i;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        s = load_service(m, dir, "limit-job.service", "[Service]\nType=simple\nExecStart=/nonexistent/limit-job\n");
+
+        for (i = 0; i < s->start_limit_burst; i++) {
+                ASSERT_EQ_INT(manager_add_job(m, JOB_START, UNIT(s), NULL), 0);
+                ASSERT_TRUE(drive_until(m, jobs_idle_done, m, 400));
+                ASSERT_TRUE(drive_until(m, service_settled_done, s, 400));
+                ASSERT_EQ_INT(s->state, SERVICE_FAILED);
+                ASSERT_TRUE(s->result != SERVICE_FAILURE_START_LIMIT);
+        }
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, UNIT(s), NULL), 0);
+        ASSERT_TRUE(drive_until(m, jobs_idle_done, m, 400));
+
+        ASSERT_TRUE(UNIT(s)->job == NULL);
+        ASSERT_EQ_INT(m->n_jobs, 0);
+        ASSERT_EQ_INT(s->state, SERVICE_FAILED);
+        ASSERT_EQ_INT(s->result, SERVICE_FAILURE_START_LIMIT);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 /*
  * Bug found during this milestone's own review, not upstream: every branch
  * of service_enter_running() leaves the start attempt behind for good, so
@@ -1939,6 +1982,7 @@ int main(void) {
         test_start_timeout();
         test_crash_restart();
         test_b7_start_limit_stops_the_loop();
+        test_start_limit_from_failed_finishes_job();
         test_bug_running_timer_not_cancelled();
         test_b9_service_verify_refuses_no_execstart();
         test_b1_zero_timeout_means_infinity();
