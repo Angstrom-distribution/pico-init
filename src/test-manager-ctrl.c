@@ -903,6 +903,56 @@ static void test_start_invalid_unit_leaves_no_dangling_edge(void) {
         ctrl_fixture_teardown(&f);
 }
 
+/*
+ * Trigger B from units-ctrl-remove-partial-unit-uaf: since bf41120,
+ * manager_load_unit() resolves an unseen name as an alias and hands back an
+ * *existing* unit -- which can be a boot-time UNIT_ERROR unit with incoming
+ * Wants= from a target, not one this ctrl call created at all. The generic
+ * "only remove while nothing has an edge to it" check above must catch this
+ * the same way it catches a freshly-parsed-and-failed fragment.
+ */
+static void test_start_alias_to_referenced_error_unit_leaves_no_dangling_edge(void) {
+        struct ctrl_fixture f;
+        Unit *target;
+        size_t i;
+
+        ctrl_fixture_setup(&f);
+
+        /* Overwrites ctrl_fixture_setup()'s own boilerplate default.target:
+         * broken.service has no ExecStart=, so it fails validation into
+         * UNIT_ERROR while default.target's own parse is still what adds
+         * the Wants= edge onto it (manager_load_unit() succeeds
+         * structurally even though the unit it loads does not). */
+        ASSERT_EQ_INT(test_write_file(f.unitdir,
+                                      "default.target",
+                                      "[Unit]\nDescription=Default\nWants=broken.service\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(f.unitdir, "broken.service", "[Unit]\n[Service]\nType=simple\n"), 0);
+
+        ctrl_fixture_boot(&f);
+
+        target = manager_get_unit(f.m, "default.target");
+        ASSERT_TRUE(target != NULL);
+        ASSERT_TRUE(manager_get_unit(f.m, "broken.service") != NULL);
+        ASSERT_EQ_INT(manager_get_unit(f.m, "broken.service")->load_state, UNIT_ERROR);
+        ASSERT_TRUE(unit_has_dependency(target, UNIT_WANTS, manager_get_unit(f.m, "broken.service")));
+
+        /* An alias created after boot, resolving to the already-loaded,
+         * already-referenced broken.service -- never a node this ctrl call
+         * itself created. */
+        ASSERT_EQ_INT(test_symlink(f.unitdir, "alias.service", "broken.service"), 0);
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 start alias.service", "err no-such-unit\n", 100);
+
+        for (i = 0; i < target->n_dependencies[UNIT_WANTS]; i++)
+                ASSERT_TRUE(unit_in_table(f.m, target->dependencies[UNIT_WANTS][i]));
+
+        /* a job on default.target walks its Wants= neighbours when it starts */
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 restart default.target", "ok done\n", 400);
+
+        ctrl_fixture_teardown(&f);
+}
+
 /* A template id is rejected by manager_load_unit() itself before the
  * fallback ever gets a fragment to find -- covered here as the ctrl-visible
  * consequence, not a retest of manager.c's own rejection. */
@@ -940,6 +990,7 @@ int main(void) {
         test_reset_failed_does_not_fall_back();
         test_start_unknown_name_leaves_no_junk_unit();
         test_start_invalid_unit_leaves_no_dangling_edge();
+        test_start_alias_to_referenced_error_unit_leaves_no_dangling_edge();
         test_start_template_is_refused();
 
         printf("test-manager-ctrl: all checks passed\n");
