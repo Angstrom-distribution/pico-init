@@ -210,7 +210,8 @@ int gpt_boot_disk(const char *mountinfo, char *ret_node, size_t node_size, char 
  *
  * Restricted to the boot disk on purpose, following upstream's own generator: a
  * removable card carrying its own swap-typed partition must not be swapped onto
- * just because it was plugged in.
+ * just because it was plugged in. And, like that generator, main() does not
+ * call this at all when /etc/fstab has a swap line of its own.
  *
  * Returns the number of partitions activated (possibly 0), or -errno for a
  * failure worth a line in the log. A root filesystem with no block device under

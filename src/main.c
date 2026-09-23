@@ -9,6 +9,7 @@
  */
 
 #include <errno.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,6 +42,7 @@ static _Noreturn void freeze(const char *reason) {
 
 int main(void) {
         FstabTable fstab = { 0 };
+        bool fstab_swap;
         Manager *m = NULL;
         int objective;
         int r;
@@ -166,6 +168,7 @@ int main(void) {
                 pico_log(PICO_LOG_WARNING, "fstab_pass: %s", strerror(-r));
         else if (r > 0)
                 pico_log(PICO_LOG_WARNING, "%d /etc/fstab line(s) not mounted, see %s", r, PICO_FSTAB_RECORD);
+        fstab_swap = fstab_has_swap(&fstab);
         fstab_table_done(&fstab);
 
         /*
@@ -179,12 +182,20 @@ int main(void) {
          *
          * Before manager_new() and not a unit: gpt-scan.h says why the whole
          * mechanism is a function call.
+         *
+         * Not at all once /etc/fstab names any swap, noauto lines included:
+         * upstream's gpt-auto generator stands down on exactly that rule
+         * (systemd #6192), since fstab then says what the swap is.
          */
-        r = dps_scan();
-        if (r < 0)
-                pico_log(PICO_LOG_WARNING, "dps_scan: %s", strerror(-r));
-        else if (r > 0)
-                pico_log(PICO_LOG_DEBUG, "dps_scan: %d discovered swap partition(s) activated", r);
+        if (fstab_swap)
+                pico_log(PICO_LOG_INFO, "/etc/fstab names swap, not discovering swap partitions");
+        else {
+                r = dps_scan();
+                if (r < 0)
+                        pico_log(PICO_LOG_WARNING, "dps_scan: %s", strerror(-r));
+                else if (r > 0)
+                        pico_log(PICO_LOG_DEBUG, "dps_scan: %d discovered swap partition(s) activated", r);
+        }
 
         r = manager_new(&m);
         if (r < 0) {
