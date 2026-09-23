@@ -45,6 +45,7 @@ typedef enum PicoFsKind {
         PICO_FS_EXT,
         PICO_FS_SWAP,
         PICO_FS_VFAT,
+        PICO_FS_EXFAT,
         _PICO_FS_KIND_MAX, /* as a hint: a type none of the readers handles */
 } PicoFsKind;
 
@@ -96,6 +97,7 @@ int pico_fs_probe_fd(int fd, PicoFsKind hint, PicoFsId *ret);
 int pico_fs_probe_ext(int fd, PicoFsId *ret);
 int pico_fs_probe_swap(int fd, PicoFsId *ret);
 int pico_fs_probe_vfat(int fd, PicoFsId *ret);
+int pico_fs_probe_exfat(int fd, PicoFsId *ret);
 
 /* --- shared by the readers, and tested on their own --- */
 
@@ -134,6 +136,12 @@ bool pico_fs_bytes_zero(const uint8_t *p, size_t n);
 
 /* A 16-byte UUID in byte order, lower-case 8-4-4-4-12; "" when all zero. */
 void pico_fs_uuid_format(const uint8_t uuid[16], char ret[static PICO_FS_UUID_MAX]);
+
+/*
+ * A 32-bit FAT/exFAT volume serial, stored little-endian, as blkid prints it:
+ * "1A2B-3C4D", upper case, high half first; "" when all zero.
+ */
+void pico_fs_serial32_format(const uint8_t serial[4], char ret[static PICO_FS_UUID_MAX]);
 
 /*
  * An 8-bit label field of up to `n` bytes: stops at the first NUL, drops

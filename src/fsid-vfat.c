@@ -286,26 +286,6 @@ static int fat32_fsinfo_ok(int fd, const uint8_t *bs, const FatGeometry *g) {
         return 1;
 }
 
-static void format_serial(const uint8_t *s, char ret[static PICO_FS_UUID_MAX]) {
-        static const char hex[] = "0123456789ABCDEF";
-
-        if (pico_fs_bytes_zero(s, 4)) {
-                ret[0] = '\0';
-                return;
-        }
-
-        ret[0] = hex[s[3] >> 4];
-        ret[1] = hex[s[3] & 0xf];
-        ret[2] = hex[s[2] >> 4];
-        ret[3] = hex[s[2] & 0xf];
-        ret[4] = '-';
-        ret[5] = hex[s[1] >> 4];
-        ret[6] = hex[s[1] & 0xf];
-        ret[7] = hex[s[0] >> 4];
-        ret[8] = hex[s[0] & 0xf];
-        ret[9] = '\0';
-}
-
 int pico_fs_probe_vfat(int fd, PicoFsId *ret) {
         uint8_t bs[FAT_BS_SIZE], label[11];
         const uint8_t *serial = NULL;
@@ -353,7 +333,7 @@ int pico_fs_probe_vfat(int fd, PicoFsId *ret) {
         if (have_label)
                 pico_fs_label_set(ret->label, sizeof(ret->label), label, sizeof(label));
         if (serial)
-                format_serial(serial, ret->uuid);
+                pico_fs_serial32_format(serial, ret->uuid);
 
         return 1;
 }

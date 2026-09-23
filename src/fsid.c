@@ -21,6 +21,7 @@ static const char * const kind_table[_PICO_FS_KIND_MAX] = {
         [PICO_FS_EXT] = "ext4",
         [PICO_FS_SWAP] = "swap",
         [PICO_FS_VFAT] = "vfat",
+        [PICO_FS_EXFAT] = "exfat",
 };
 
 const char *pico_fs_kind_to_string(PicoFsKind k) {
@@ -35,13 +36,14 @@ static const struct {
         const char *type;
         PicoFsKind kind;
 } type_table[] = {
-        {    "ext2",  PICO_FS_EXT },
-        {    "ext3",  PICO_FS_EXT },
-        {    "ext4",  PICO_FS_EXT },
-        { "ext4dev",  PICO_FS_EXT },
-        {    "swap", PICO_FS_SWAP },
-        {    "vfat", PICO_FS_VFAT },
-        {   "msdos", PICO_FS_VFAT },
+        {    "ext2",   PICO_FS_EXT },
+        {    "ext3",   PICO_FS_EXT },
+        {    "ext4",   PICO_FS_EXT },
+        { "ext4dev",   PICO_FS_EXT },
+        {    "swap",  PICO_FS_SWAP },
+        {    "vfat",  PICO_FS_VFAT },
+        {   "msdos",  PICO_FS_VFAT },
+        {   "exfat", PICO_FS_EXFAT },
 };
 
 PicoFsKind pico_fs_kind_from_type(const char *fstype) {
@@ -67,9 +69,10 @@ static const struct {
         PicoFsKind kind;
         int (*probe)(int fd, PicoFsId *ret);
 } probe_table[] = {
-        {  PICO_FS_EXT,  pico_fs_probe_ext },
-        { PICO_FS_VFAT, pico_fs_probe_vfat },
-        { PICO_FS_SWAP, pico_fs_probe_swap },
+        {   PICO_FS_EXT,   pico_fs_probe_ext },
+        { PICO_FS_EXFAT, pico_fs_probe_exfat },
+        {  PICO_FS_VFAT,  pico_fs_probe_vfat },
+        {  PICO_FS_SWAP,  pico_fs_probe_swap },
 };
 
 int pico_fs_probe_fd(int fd, PicoFsKind hint, PicoFsId *ret) {
@@ -189,6 +192,24 @@ void pico_fs_uuid_format(const uint8_t u[16], char ret[static PICO_FS_UUID_MAX])
                         ret[o++] = '-';
                 ret[o++] = hex[u[i] >> 4];
                 ret[o++] = hex[u[i] & 0xf];
+        }
+        ret[o] = '\0';
+}
+
+void pico_fs_serial32_format(const uint8_t s[4], char ret[static PICO_FS_UUID_MAX]) {
+        static const char hex[] = "0123456789ABCDEF";
+        size_t i, o = 0;
+
+        if (pico_fs_bytes_zero(s, 4)) {
+                ret[0] = '\0';
+                return;
+        }
+
+        for (i = 4; i-- > 0;) {
+                if (i == 1)
+                        ret[o++] = '-';
+                ret[o++] = hex[s[i] >> 4];
+                ret[o++] = hex[s[i] & 0xf];
         }
         ret[o] = '\0';
 }
