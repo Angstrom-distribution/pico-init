@@ -93,6 +93,43 @@ static void test_monitor_never_delivers(void) {
         udev_unref(udev);
 }
 
+/* "kernel" (group 1) and "udev" (group 2) currently produce byte-identical,
+ * permanently-silent behaviour (libudev-monitor.c's top comment): neither
+ * name is wired to a real netlink group yet. Pinned here so a future change
+ * that makes one of them real (e.g. joining group 1 for the sd_device_monitor
+ * receive path already used elsewhere) can't silently leave the other one
+ * behind without a test noticing. */
+static void test_kernel_and_udev_names_are_equivalent(void) {
+        struct udev *udev = udev_new();
+        struct udev_monitor *km, *um;
+        int kfd, ufd;
+
+        ASSERT_TRUE(udev != NULL);
+
+        km = udev_monitor_new_from_netlink(udev, "kernel");
+        um = udev_monitor_new_from_netlink(udev, "udev");
+        ASSERT_TRUE(km != NULL);
+        ASSERT_TRUE(um != NULL);
+
+        kfd = udev_monitor_get_fd(km);
+        ufd = udev_monitor_get_fd(um);
+        ASSERT_TRUE(kfd >= 0);
+        ASSERT_TRUE(ufd >= 0);
+
+        ASSERT_EQ_INT(udev_monitor_enable_receiving(km), udev_monitor_enable_receiving(um));
+
+        errno = 0;
+        ASSERT_TRUE(udev_monitor_receive_device(km) == NULL);
+        ASSERT_EQ_INT(errno, EAGAIN);
+        errno = 0;
+        ASSERT_TRUE(udev_monitor_receive_device(um) == NULL);
+        ASSERT_EQ_INT(errno, EAGAIN);
+
+        udev_monitor_unref(km);
+        udev_monitor_unref(um);
+        udev_unref(udev);
+}
+
 static void test_queue_and_hwdb(void) {
         struct udev *udev = udev_new();
         struct udev_queue *q;
@@ -143,6 +180,7 @@ static void test_queue_and_hwdb(void) {
 
 int main(void) {
         test_monitor_never_delivers();
+        test_kernel_and_udev_names_are_equivalent();
         test_queue_and_hwdb();
 
         printf("test-libudev-monitor: OK\n");
