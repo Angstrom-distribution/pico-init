@@ -26,6 +26,7 @@
 #include "manager.h"
 #include "service.h"
 #include "test-util.h"
+#include "timer.h"
 #include "unit.h"
 
 static Manager *manager_for(const char *dir) {
@@ -37,6 +38,64 @@ static Manager *manager_for(const char *dir) {
         ASSERT_EQ_INT(manager_set_unit_path(m, path), 0);
 
         return m;
+}
+
+/*
+ * A per-test cgroup root, pid- and tag-qualified: meson runs test binaries
+ * concurrently, and two of them spawning a same-named unit under the default
+ * root would share /sys/fs/cgroup/system.slice/<unit>.
+ */
+static void use_private_cgroup_root(Manager *m, const char *tag, char *out, size_t out_size) {
+        int n = snprintf(out, out_size, "/sys/fs/cgroup/pico-job-test-%s-%lld", tag, (long long) getpid());
+
+        ASSERT_TRUE(n > 0 && (size_t) n < out_size);
+        if (mkdir(out, 0755) < 0)
+                ASSERT_TRUE(errno == EEXIST);
+        ASSERT_EQ_INT(manager_set_cgroup_root(m, out), 0);
+}
+
+static void free_private_cgroup_root(const char *root) {
+        char slice[PATH_MAX];
+
+        snprintf(slice, sizeof(slice), "%s/system.slice", root);
+        rmdir(slice);
+        rmdir(root);
+}
+
+/* --- drive the real manager_loop() until no job is installed, or a budget --- */
+
+static Manager *g_drive_m;
+static int g_drive_ticks;
+static int g_drive_max_ticks;
+
+static void drive_tick(void *userdata, usec_t now) {
+        (void) userdata;
+        (void) now;
+
+        if (g_drive_m->n_jobs == 0 || ++g_drive_ticks >= g_drive_max_ticks)
+                g_drive_m->objective = MANAGER_EXIT;
+        else
+                ASSERT_EQ_INT(pico_timer_add(g_drive_m->timer,
+                                             now_monotonic() + 10 * USEC_PER_MSEC,
+                                             drive_tick,
+                                             NULL,
+                                             NULL),
+                              0);
+}
+
+/* 10ms ticks: max_ticks = 300 bounds the wait at about 3s. Returns whether
+ * every job finished. */
+static bool drive_until_idle(Manager *m, int max_ticks) {
+        g_drive_m = m;
+        g_drive_ticks = 0;
+        g_drive_max_ticks = max_ticks;
+
+        m->objective = MANAGER_RUNNING;
+        ASSERT_EQ_INT(pico_timer_add(m->timer, now_monotonic() + 10 * USEC_PER_MSEC, drive_tick, NULL, NULL),
+                      0);
+        manager_loop(m);
+
+        return m->n_jobs == 0;
 }
 
 /* Read the run queue back as a list of unit ids, in order. */
@@ -928,10 +987,7 @@ static void test_negated_condition_inverts_result(void) {
 
         /* negated against an existing path: the raw test is true, negation
          * flips it to false, so the unit is skipped */
-        snprintf(unit_text,
-                 sizeof(unit_text),
-                 "[Unit]\nDescription=B\nConditionPathExists=!%s\n",
-                 existing);
+        snprintf(unit_text, sizeof(unit_text), "[Unit]\nDescription=B\nConditionPathExists=!%s\n", existing);
         ASSERT_EQ_INT(test_write_file(dir, "b.target", unit_text), 0);
         ASSERT_EQ_INT(test_write_file(dir, "a.target", "[Unit]\nRequires=b.target\nAfter=b.target\n"), 0);
 
@@ -956,10 +1012,7 @@ static void test_negated_condition_inverts_result(void) {
         dir = test_tmpdir_new();
         ASSERT_TRUE(dir != NULL);
 
-        snprintf(unit_text,
-                 sizeof(unit_text),
-                 "[Unit]\nDescription=B\nConditionPathExists=!%s\n",
-                 missing);
+        snprintf(unit_text, sizeof(unit_text), "[Unit]\nDescription=B\nConditionPathExists=!%s\n", missing);
         ASSERT_EQ_INT(test_write_file(dir, "b.target", unit_text), 0);
         ASSERT_EQ_INT(test_write_file(dir, "a.target", "[Unit]\nRequires=b.target\nAfter=b.target\n"), 0);
 
@@ -980,7 +1033,49 @@ static void test_negated_condition_inverts_result(void) {
         free(dir);
 }
 
+/*
+ * A Type=oneshot without RemainAfterExit= goes ACTIVATING -> INACTIVE on a
+ * clean exit and never passes through ACTIVE. Its start job must still finish
+ * DONE, or it stays installed forever and everything ordered After= it never
+ * runs -- the picosplash-quit.service hang.
+ */
+static void test_oneshot_start_job_finishes(void) {
+        char cgroup_root[PATH_MAX];
+        Manager *m;
+        char *dir;
+        Unit *a, *b;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir, "a.service", "[Service]\nType=oneshot\nExecStart=/bin/true\n"), 0);
+        ASSERT_EQ_INT(test_write_file(dir, "b.target", "[Unit]\nWants=a.service\nAfter=a.service\n"), 0);
+
+        m = manager_for(dir);
+        use_private_cgroup_root(m, "oneshot", cgroup_root, sizeof(cgroup_root));
+        ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+
+        a = manager_get_unit(m, "a.service");
+        b = manager_get_unit(m, "b.target");
+        ASSERT_TRUE(a != NULL && b != NULL);
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, b, NULL), 0);
+        ASSERT_TRUE(drive_until_idle(m, 300));
+
+        ASSERT_TRUE(a->job == NULL);
+        ASSERT_EQ_INT(SERVICE(a)->result, SERVICE_SUCCESS);
+        ASSERT_EQ_INT(unit_active_state(a), UNIT_INACTIVE);
+        ASSERT_EQ_INT(unit_active_state(b), UNIT_ACTIVE);
+        ASSERT_EQ_INT(m->n_jobs, 0);
+
+        manager_free(m);
+        free_private_cgroup_root(cgroup_root);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
+        test_oneshot_start_job_finishes();
         test_ordering_c_b_a();
         test_unit_free_cancels_its_job();
         test_all_verb_state_combinations();

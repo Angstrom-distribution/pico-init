@@ -375,7 +375,10 @@ void unit_notify(Unit *u, UnitActiveState old_state, UnitActiveState new_state) 
          */
         switch (j->type) {
         case JOB_START:
-                if (new_state == UNIT_ACTIVE)
+                /* A oneshot without RemainAfterExit= finishes by going
+                 * straight back to INACTIVE and never reaches ACTIVE: that
+                 * is a completed start too (v30 src/unit.c unit_notify()). */
+                if (new_state == UNIT_ACTIVE || new_state == UNIT_INACTIVE)
                         job_finish(j, JOB_DONE);
                 else if (new_state == UNIT_FAILED)
                         job_finish(j, JOB_FAILED);

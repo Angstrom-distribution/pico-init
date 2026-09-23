@@ -376,6 +376,29 @@ static void test_start_failing_unit_replies_with_real_result(void) {
         ctrl_fixture_teardown(&f);
 }
 
+/* A successful Type=oneshot without RemainAfterExit= ends INACTIVE, never
+ * ACTIVE; the deferred reply must still arrive, as "ok done". */
+static void test_start_oneshot_replies_done(void) {
+        struct ctrl_fixture f;
+        Unit *u;
+
+        ctrl_fixture_setup(&f);
+        ASSERT_EQ_INT(test_write_file(f.unitdir,
+                                      "oneshot.service",
+                                      "[Unit]\n[Service]\nType=oneshot\nExecStart=/bin/true\n"),
+                      0);
+        ctrl_fixture_boot(&f);
+
+        u = manager_get_unit(f.m, "oneshot.service");
+        ASSERT_TRUE(u != NULL);
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 start oneshot.service", "ok done\n", 400);
+        ASSERT_EQ_INT(unit_active_state(u), UNIT_INACTIVE);
+        ASSERT_TRUE(u->job == NULL);
+
+        ctrl_fixture_teardown(&f);
+}
+
 /* reset-failed: a FAILED unit returns to inactive; an already-non-FAILED
  * unit is a harmless no-op success (real systemctl's own behaviour); an
  * unknown unit is a real error, not a silent no-op. */
@@ -724,6 +747,7 @@ static void test_start_template_is_refused(void) {
 int main(void) {
         test_start_stop_restart_active_and_inactive();
         test_start_failing_unit_replies_with_real_result();
+        test_start_oneshot_replies_done();
         test_reset_failed();
         test_no_block_replies_immediately();
         test_early_disconnect_leaks_nothing();
