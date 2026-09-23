@@ -549,6 +549,7 @@ static void react_disk(Devd *d, const char *disk, const char *only_part) {
 
                 r = devd_media_mount(
                                 d->media_root,
+                                NULL,
                                 part_node,
                                 p->name,
                                 part,

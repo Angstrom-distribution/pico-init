@@ -71,12 +71,20 @@ int devd_media_mount_point(
  * Mount `node` at its mount point, creating the directory. `read_only` comes
  * from the GPT entry's read-only attribute bit.
  *
+ * A device `mountinfo` (NULL: /proc/self/mountinfo) shows mounted anywhere
+ * else is not mounted a second time: PID 1's boot-time fstab pass mounts
+ * non-boot-disk partitions too, and so may an administrator. One already at
+ * this very mount point is devd's own from before a restart, and is adopted.
+ *
  * Returns 1 mounted (with *ret_dir set), 0 when there was no filesystem devd
- * mounts on it, or -errno. Already-mounted (-EBUSY from the kernel) is reported
- * as 1, not as a failure: the outcome asked for is the outcome there is.
+ * mounts on it or it is mounted elsewhere, or -errno -- including when
+ * `mountinfo` cannot be read, since guessing "not mounted" could stack a
+ * second mount. Already-mounted (-EBUSY from the kernel) is reported as 1, not
+ * as a failure: the outcome asked for is the outcome there is.
  */
 int devd_media_mount(
                 const char *media_root,
+                const char *mountinfo,
                 const char *node,
                 const char *partlabel,
                 const char *devname,

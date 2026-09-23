@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #include "../ext-super.h"
+#include "../fstab-mount.h"
 #include "../util.h"
 #include "devd-probe.h"
 
@@ -74,6 +75,7 @@ int devd_media_mount_point(
 
 int devd_media_mount(
                 const char *media_root,
+                const char *mountinfo,
                 const char *node,
                 const char *partlabel,
                 const char *devname,
@@ -81,7 +83,7 @@ int devd_media_mount(
                 char *ret_dir,
                 size_t size) {
 
-        char dir[PATH_MAX];
+        char dir[PATH_MAX], where[PATH_MAX];
         PicoExtInfo fs;
         unsigned long flags = DEVD_MEDIA_FLAGS;
         int r;
@@ -108,6 +110,27 @@ int devd_media_mount(
         r = devd_media_mount_point(media_root, partlabel, devname, dir, sizeof(dir));
         if (r < 0)
                 return r;
+
+        /*
+         * Mounted anywhere already -- by PID 1's fstab pass, by hand -- is
+         * left where it is: a second mount under /media would be a surprise
+         * and would be pulled out from under its owner on eject. Mounted at
+         * this very directory is devd's own mount from before a restart, and
+         * is adopted. Unknown is not "not mounted".
+         */
+        r = fstab_device_mounted(mountinfo ? mountinfo : "/proc/self/mountinfo", node, where, sizeof(where));
+        if (r < 0)
+                return r;
+        if (r > 0) {
+                if (strcmp(where, dir) == 0) {
+                        if (ret_dir && (size_t) snprintf(ret_dir, size, "%s", dir) >= size)
+                                return -ENAMETOOLONG;
+                        return 1;
+                }
+
+                pico_log(PICO_LOG_INFO, "devd: %s is already mounted on %s, not mounting it again", node, where);
+                return 0;
+        }
 
         if (mkdir(media_root, 0755) < 0 && errno != EEXIST)
                 return -errno;
