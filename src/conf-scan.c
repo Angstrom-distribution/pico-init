@@ -16,9 +16,11 @@
  *    silently truncated the way a fixed LINE_MAX buffer would.
  *  - 2d4fffb00 "conf-parser: ignore lines without '='" -- one malformed
  *    line is logged and skipped, not a whole-file -EINVAL.
- *  - 9adbfeb38 + 0ef695858 -- a comment line ending in backslash must not
- *    start a continuation, and a blank/comment line must still be able to
- *    terminate one already in progress.
+ *  - 9adbfeb38 + 0ef695858 -- a comment line is skipped entirely: it must not
+ *    start a continuation, and it must not end one already in progress
+ *    either (9adbfeb38a's own fix broke that second half, which
+ *    0ef69585d8 then restored for a genuinely blank line specifically --
+ *    a comment mid-continuation stays transparent, only blank still ends it).
  *  - 4f29e0db1 "conf-parser: parse last line of file even if it's an
  *    unterminated continuation" -- flushed explicitly after the read loop.
  *  - 9dd7ea9a7 "conf-parser: skip UTF-8 byte order mark" -- a BOM on the
@@ -69,6 +71,20 @@ static char *cs_strip(char *s) {
 static bool cs_line_is_blank_or_comment(const char *l) {
         l += strspn(l, " \t");
         return *l == '\0' || *l == '#' || *l == ';';
+}
+
+/* A genuinely empty line (after stripping whitespace), as opposed to a
+ * comment -- see the continuation-vs-comment split below for why the two
+ * cannot share one predicate there. */
+static bool cs_line_is_blank(const char *l) {
+        l += strspn(l, " \t");
+        return *l == '\0';
+}
+
+/* A non-blank comment line. */
+static bool cs_line_is_comment(const char *l) {
+        l += strspn(l, " \t");
+        return *l == '#' || *l == ';';
 }
 
 /*
@@ -172,10 +188,23 @@ int pico_conf_scan(const char *filename, pico_conf_handler_t handler, void *user
                         l[--n] = '\0';
 
                 if (continuation) {
-                        /* 0ef695858: a blank/comment line still ends an
+                        /*
+                         * 9adbfeb38a's own refinement, 0ef69585d8 (real
+                         * origin/main upstream: verified via `git log` on the
+                         * mirror, no post-2012 LGPL code copied, only the
+                         * behaviour) -- a comment is skipped entirely,
+                         * continuation untouched, not treated as ending one.
+                         * Only a genuinely blank line still ends an
                          * in-progress continuation instead of being folded
-                         * into it. */
-                        if (cs_line_is_blank_or_comment(l)) {
+                         * into it; the earlier cs_line_is_blank_or_comment()
+                         * check here flushed on either, which silently
+                         * dropped the rest of the command line on a real
+                         * unit file's mid-ExecStart= comment.
+                         */
+                        if (cs_line_is_comment(l))
+                                continue;
+
+                        if (cs_line_is_blank(l)) {
                                 r = cs_scan_line(handler, userdata, filename, line, &section, continuation);
                                 continuation = pico_mfree(continuation);
                                 if (r < 0)

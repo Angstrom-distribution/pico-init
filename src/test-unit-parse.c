@@ -545,6 +545,60 @@ static void test_bom_comments_and_continuations(void) {
 }
 
 /*
+ * units-conf-comment-ends-continuation: a comment line inside a backslash
+ * continuation must be skipped entirely (9adbfeb38a's own test case, kept
+ * exact: "1\\\n#hogehoge\\\n2\\\n3\n" => "1 2 3"), not flush what has been
+ * accumulated so far and lose the rest of the command line. A genuinely
+ * blank line must still end the continuation (0ef69585d8).
+ */
+static void test_comment_inside_continuation_is_skipped(void) {
+        Service *s;
+        Manager *m;
+        char *dir;
+        Unit *u;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "e.service",
+                                      "[Service]\n"
+                                      "ExecStart=/bin/echo one \\\n"
+                                      "# a comment in the middle \\\n"
+                                      "    two \\\n"
+                                      "    three\n"
+                                      "ExecStartPre=/bin/true a \\\n"
+                                      "\n"
+                                      "b\n"),
+                      0);
+
+        m = manager_for(dir);
+        u = load_one(m, "e.service");
+        s = (Service *) u;
+
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+
+        /* The comment line contributed nothing, and did not cut the
+         * continuation short: all three words survive. */
+        ASSERT_STREQ(s->exec_start[0], "/bin/echo");
+        ASSERT_STREQ(s->exec_start[1], "one");
+        ASSERT_STREQ(s->exec_start[2], "two");
+        ASSERT_STREQ(s->exec_start[3], "three");
+        ASSERT_TRUE(s->exec_start[4] == NULL);
+
+        /* A genuinely blank line still ends a continuation: ExecStartPre=
+         * stops at "a", and the bare "b" on its own line is a malformed
+         * line (no '='), not part of the command. */
+        ASSERT_STREQ(s->exec_start_pre[0], "/bin/true");
+        ASSERT_STREQ(s->exec_start_pre[1], "a");
+        ASSERT_TRUE(s->exec_start_pre[2] == NULL);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
  * Quoting, and the trailing-garbage case the M1 review caught.
  *
  * `"bar"baz` was silently accepted and glued into `barbaz`, despite a comment
@@ -1420,6 +1474,7 @@ int main(void) {
         test_environment_directives();
         test_malformed_line_skips_only_that_line();
         test_bom_comments_and_continuations();
+        test_comment_inside_continuation_is_skipped();
         test_quoting_and_trailing_garbage();
         test_invalid_dependency_names_are_rejected();
         test_huge_requires_line_does_not_crash();
