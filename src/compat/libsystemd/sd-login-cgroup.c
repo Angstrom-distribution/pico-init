@@ -85,7 +85,12 @@ static int extract_unified_cgroup(const char *content, char **ret) {
                 path[len] = '\0';
         }
 
-        *ret = path;
+        /* ret is optional, matching sd_pid_get_cgroup()'s own upstream
+         * `if (ret_cgroup) *ret_cgroup = TAKE_PTR(c);` idiom. */
+        if (ret)
+                *ret = path;
+        else
+                free(path);
         return 0;
 }
 
@@ -174,7 +179,11 @@ static int extract_unit_component(const char *cgroup_path, char **ret) {
                 return -ENODATA;
         }
 
-        *ret = name;
+        /* ret is optional, same idiom as extract_unified_cgroup() above. */
+        if (ret)
+                *ret = name;
+        else
+                free(name);
         return 0;
 }
 
@@ -236,7 +245,11 @@ static int extract_slice_component(const char *cgroup_path, char **ret) {
                         p++;
         }
 
+        /* ret is optional throughout, same idiom as extract_unified_cgroup()
+         * and extract_unit_component() above. */
         if (!best) {
+                if (!ret)
+                        return 0;
                 *ret = strdup("-.slice");
                 return *ret ? 0 : -ENOMEM;
         }
@@ -251,11 +264,16 @@ static int extract_slice_component(const char *cgroup_path, char **ret) {
 
                 if (!is_valid_unit_component(name, ".slice")) {
                         free(name);
+                        if (!ret)
+                                return 0;
                         *ret = strdup("-.slice");
                         return *ret ? 0 : -ENOMEM;
                 }
 
-                *ret = name;
+                if (ret)
+                        *ret = name;
+                else
+                        free(name);
                 return 0;
         }
 }

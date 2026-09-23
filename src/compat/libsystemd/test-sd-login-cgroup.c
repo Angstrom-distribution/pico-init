@@ -129,6 +129,11 @@ int main(void) {
         ASSERT_STREQ(ret, "system.slice");
         free(ret);
 
+        /* NULL ret (existence-only query): must not crash. */
+        ASSERT_EQ_INT(sd_pid_get_cgroup(child, NULL), 0);
+        ASSERT_EQ_INT(sd_pid_get_unit(child, NULL), 0);
+        ASSERT_EQ_INT(sd_pid_get_slice(child, NULL), 0);
+
         /* --- pidfd --- */
         pidfd = pico_pidfd_open(child);
         ASSERT_TRUE(pidfd >= 0);
@@ -142,6 +147,11 @@ int main(void) {
         ASSERT_EQ_INT(sd_pidfd_get_slice(pidfd, &ret), 0);
         ASSERT_STREQ(ret, "system.slice");
         free(ret);
+
+        /* NULL ret (existence-only query): must not crash. */
+        ASSERT_EQ_INT(sd_pidfd_get_cgroup(pidfd, NULL), 0);
+        ASSERT_EQ_INT(sd_pidfd_get_unit(pidfd, NULL), 0);
+        ASSERT_EQ_INT(sd_pidfd_get_slice(pidfd, NULL), 0);
         close(pidfd);
 
         /* --- peer --- */
@@ -154,6 +164,11 @@ int main(void) {
         ASSERT_EQ_INT(sd_peer_get_slice(conn_fd, &ret), 0);
         ASSERT_STREQ(ret, "system.slice");
         free(ret);
+
+        /* NULL ret (existence-only query): must not crash. */
+        ASSERT_EQ_INT(sd_peer_get_cgroup(conn_fd, NULL), 0);
+        ASSERT_EQ_INT(sd_peer_get_unit(conn_fd, NULL), 0);
+        ASSERT_EQ_INT(sd_peer_get_slice(conn_fd, NULL), 0);
 
         /* --- own process: no unit, but real cgroup path answered --- */
         ret = NULL;
