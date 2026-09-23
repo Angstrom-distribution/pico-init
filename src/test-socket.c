@@ -276,6 +276,65 @@ static int helper_instant_exit(void) {
         return 0;
 }
 
+/*
+ * --exec-fds N: LISTEN_FDS=N with fds 3..N+2 open, inherited (no
+ * FD_CLOEXEC), and sockets; nothing else open above them (the exec pipe
+ * and every other manager fd gone). Then recv()s one datagram on the last
+ * of them. Same write-aside-and-rename as above.
+ */
+static int helper_exec_fds(int argc, char **argv) {
+        const char *result_path = getenv("TEST_RESULT_PATH");
+        const char *fds_s = getenv("LISTEN_FDS");
+        char buf[64], tmp_path[PATH_MAX];
+        int ret = 1, n, fd, type;
+        socklen_t sl = sizeof(type);
+        ssize_t r;
+        FILE *f;
+
+        if (!result_path || argc < 3)
+                return 90;
+        n = atoi(argv[2]);
+        snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", result_path);
+        f = fopen(tmp_path, "we");
+        if (!f)
+                return 91;
+        /* fopen() took the lowest free fd, above the passed ones */
+
+        if (!fds_s || atoi(fds_s) != n) {
+                fprintf(f, "FAIL LISTEN_FDS %s != %d\n", fds_s ? fds_s : "(unset)", n);
+                goto finish;
+        }
+
+        for (fd = 3; fd < 3 + n; fd++) {
+                int flags = fcntl(fd, F_GETFD);
+
+                if (flags < 0 || (flags & FD_CLOEXEC) || getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &sl) < 0) {
+                        fprintf(f, "FAIL fd %d not an inherited socket\n", fd);
+                        goto finish;
+                }
+        }
+
+        for (fd = 3 + n; fd < 256; fd++)
+                if (fd != fileno(f) && fcntl(fd, F_GETFD) >= 0) {
+                        fprintf(f, "FAIL stray fd %d\n", fd);
+                        goto finish;
+                }
+
+        r = recv(3 + n - 1, buf, sizeof(buf) - 1, 0);
+        if (r <= 0) {
+                fprintf(f, "FAIL recv\n");
+                goto finish;
+        }
+        buf[r] = '\0';
+
+        fprintf(f, "OK %s\n", buf);
+        ret = 0;
+
+finish:
+        fclose(f);
+        return rename(tmp_path, result_path) < 0 ? 92 : ret;
+}
+
 static int run_as_helper(int argc, char **argv) {
         const char *mode = argv[1];
 
@@ -289,6 +348,8 @@ static int run_as_helper(int argc, char **argv) {
                 return helper_recv_echo_argv(argc, argv);
         if (strcmp(mode, "--instant-exit") == 0)
                 return helper_instant_exit();
+        if (strcmp(mode, "--exec-fds") == 0)
+                return helper_exec_fds(argc, argv);
 
         fprintf(stderr, "test-socket: unknown helper mode '%s'\n", mode);
         return 99;
@@ -655,6 +716,7 @@ typedef enum DriveWaitKind {
         DRIVE_WAIT_FILE,
         DRIVE_WAIT_SOCKET_STATE,
         DRIVE_WAIT_SERVICE_RESULT,
+        DRIVE_WAIT_SERVICE_STATE,
 } DriveWaitKind;
 
 typedef struct DriveWait {
@@ -664,6 +726,7 @@ typedef struct DriveWait {
         SocketState want_state;
         Service *svc;
         ServiceResult want_result;
+        ServiceState want_svc_state;
 } DriveWait;
 
 static bool drive_wait_done(const DriveWait *w) {
@@ -674,6 +737,8 @@ static bool drive_wait_done(const DriveWait *w) {
                 return w->sock->state == w->want_state;
         case DRIVE_WAIT_SERVICE_RESULT:
                 return w->svc->result == w->want_result;
+        case DRIVE_WAIT_SERVICE_STATE:
+                return w->svc->state == w->want_svc_state;
         default:
                 return false;
         }
@@ -1403,6 +1468,90 @@ static void test_skipped_start_rearms_socket(void) {
                         "[Service]\nType=oneshot\nExecStart=/bin/false\n");
 }
 
+/*
+ * Type=exec with several socket fds: the exec pipe has to stay out of the
+ * fd range LISTEN_FDS renumbers into (child_exec() step 5b), survive the fd
+ * sweep, and be gone after execve(). The start completes only on the
+ * confirmed execve(), and the service then sees exactly its N sockets.
+ */
+static void test_exec_type_with_socket_fds(void) {
+        enum { N_PORTS = 3 };
+        Manager *m;
+        Unit *sock_u, *svc_u;
+        Service *svc;
+        char *dir = test_tmpdir_new();
+        char sockpath[N_PORTS][PATH_MAX], resultpath[PATH_MAX];
+        char content[N_PORTS * (PATH_MAX + 32) + 64];
+        size_t off = 0;
+        struct sockaddr_un addr;
+        FILE *f;
+        char line[128] = "";
+        int cfd, i;
+
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+        snprintf(resultpath, sizeof(resultpath), "%s/result", dir);
+        setenv("TEST_RESULT_PATH", resultpath, 1);
+
+        off += (size_t) snprintf(content + off, sizeof(content) - off, "[Socket]\n");
+        for (i = 0; i < N_PORTS; i++) {
+                snprintf(sockpath[i], sizeof(sockpath[i]), "%s/exec%d.sock", dir, i);
+                off += (size_t) snprintf(
+                                content + off, sizeof(content) - off, "ListenDatagram=%s\n", sockpath[i]);
+        }
+        ASSERT_EQ_INT(test_write_file(dir, "execfds.socket", content), 0);
+
+        snprintf(content,
+                 sizeof(content),
+                 "[Service]\nType=exec\nExecStart=%s --exec-fds %d\n",
+                 g_self_exe,
+                 N_PORTS);
+        ASSERT_EQ_INT(test_write_file(dir, "execfds.service", content), 0);
+        ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+
+        sock_u = manager_get_unit(m, "execfds.socket");
+        svc_u = manager_get_unit(m, "execfds.service");
+        ASSERT_TRUE(sock_u != NULL && svc_u != NULL);
+        svc = SERVICE(svc_u);
+
+        ASSERT_EQ_INT(unit_start(sock_u), 0);
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, svc_u, NULL), 0);
+
+        {
+                DriveWait wait = { .kind = DRIVE_WAIT_SERVICE_STATE,
+                                   .svc = svc,
+                                   .want_svc_state = SERVICE_RUNNING };
+
+                ASSERT_TRUE(drive_until(m, NULL, &wait, 400));
+        }
+        ASSERT_TRUE(svc_u->job == NULL);
+
+        cfd = socket(AF_UNIX, SOCK_DGRAM, 0);
+        ASSERT_TRUE(cfd >= 0);
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        strncpy(addr.sun_path, sockpath[N_PORTS - 1], sizeof(addr.sun_path) - 1);
+        ASSERT_EQ_INT((int) sendto(cfd, "last", 4, 0, (struct sockaddr *) &addr, sizeof(addr)), 4);
+        close(cfd);
+
+        {
+                DriveWait wait = { .kind = DRIVE_WAIT_FILE, .path = resultpath };
+
+                ASSERT_TRUE(drive_until(m, NULL, &wait, 400));
+        }
+
+        f = fopen(resultpath, "re");
+        ASSERT_TRUE(f != NULL);
+        ASSERT_TRUE(fgets(line, sizeof(line), f) != NULL);
+        fclose(f);
+        ASSERT_STREQ(line, "OK last\n");
+
+        unsetenv("TEST_RESULT_PATH");
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(int argc, char **argv) {
         if (argc >= 2 && argv[1][0] == '-' && argv[1][1] == '-')
                 return run_as_helper(argc, argv);
@@ -1422,6 +1571,7 @@ int main(int argc, char **argv) {
         test_boot_ordered_collects_fds_without_trigger();
         test_socket_activation_with_unit_environment();
         test_socket_activation_with_expanded_argv();
+        test_exec_type_with_socket_fds();
 
         test_relisten_repeated_cycles();
         test_service_start_limit_yields_socket_failed();
