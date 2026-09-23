@@ -116,6 +116,15 @@ void fstab_remount_attrs(const FstabOptions *o, uint64_t floor, uint64_t *ret_se
  * sees a bind mount of a directory onto its own filesystem too. */
 int fstab_is_mounted(const char *mountinfo, const char *where);
 
+/*
+ * Is the device at `node` mounted anywhere, per `mountinfo`? Matched by its
+ * device number when `node` is a block device, and by the mount source
+ * otherwise -- which also catches btrfs, whose mountinfo lines carry an
+ * anonymous device number rather than the block device's. 1 with the first
+ * mount point in `ret_where` (may be NULL), 0, or -errno.
+ */
+int fstab_device_mounted(const char *mountinfo, const char *node, char *ret_where, size_t size);
+
 /* mkdir -p. An existing path of any type is success, so a bind mount's file
  * target is left alone. 0 or -errno. */
 int fstab_mkdir_p(const char *path, mode_t mode);

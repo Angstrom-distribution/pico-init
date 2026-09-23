@@ -28,6 +28,7 @@
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 
 #include "fstab-mount.h"
@@ -139,6 +140,51 @@ static void test_is_mounted_and_mkdir(void) {
         snprintf(file, sizeof(file), "%s/mountinfo/x", dir);
         ASSERT_EQ_INT(fstab_mkdir_p(file, 0755), -ENOTDIR);
         ASSERT_EQ_INT(fstab_mkdir_p("relative/path", 0755), -EINVAL);
+
+        test_rm_rf(dir);
+        free(dir);
+}
+
+static void test_device_mounted(void) {
+        char *dir, path[PATH_MAX], where[PATH_MAX], line[PATH_MAX];
+        struct stat st;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        snprintf(path, sizeof(path), "%s/mountinfo", dir);
+
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "mountinfo",
+                                      "22 1 0:21 / /proc rw - proc proc rw\n"
+                                      "30 1 8:2 / / rw - ext4 /dev/root rw\n"
+                                      "36 30 8:17 / /mnt/my\\040card rw - vfat /dev/sdb1 rw\n"
+                                      "40 30 0:45 / /data rw - btrfs /dev/sdc1 rw\n"
+                                      "no separator here\n"),
+                      0);
+
+        /* By source, for nodes that are not block devices here. */
+        ASSERT_EQ_INT(fstab_device_mounted(path, "/dev/sdb1", where, sizeof(where)), 1);
+        ASSERT_STREQ(where, "/mnt/my card");
+        /* btrfs lists an anonymous 0:N, so only the source can match. */
+        ASSERT_EQ_INT(fstab_device_mounted(path, "/dev/sdc1", NULL, 0), 1);
+        ASSERT_EQ_INT(fstab_device_mounted(path, "/dev/sdb", NULL, 0), 0);
+        ASSERT_EQ_INT(fstab_device_mounted(path, "/dev/sdb10", NULL, 0), 0);
+
+        /* By device number, for a real block device: whatever mountinfo
+         * calls its source. Needs one to exist on this host. */
+        if (stat("/dev/loop0", &st) == 0 && S_ISBLK(st.st_mode)) {
+                snprintf(line,
+                         sizeof(line),
+                         "50 30 %u:%u / /srv rw - ext4 /dev/some-other-name rw\n",
+                         major(st.st_rdev),
+                         minor(st.st_rdev));
+                ASSERT_EQ_INT(test_write_file(dir, "mountinfo", line), 0);
+                ASSERT_EQ_INT(fstab_device_mounted(path, "/dev/loop0", where, sizeof(where)), 1);
+                ASSERT_STREQ(where, "/srv");
+        }
+
+        snprintf(path, sizeof(path), "%s/missing", dir);
+        ASSERT_EQ_INT(fstab_device_mounted(path, "/dev/sdb1", NULL, 0), -ENOENT);
 
         test_rm_rf(dir);
         free(dir);
@@ -622,6 +668,7 @@ int main(void) {
         test_attr_masks();
         test_api_floor();
         test_is_mounted_and_mkdir();
+        test_device_mounted();
         test_pass_skips();
 
         dir = test_tmpdir_new();

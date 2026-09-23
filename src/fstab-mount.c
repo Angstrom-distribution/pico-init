@@ -19,6 +19,7 @@
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 
 #include "manager.h"
@@ -366,6 +367,60 @@ int fstab_is_mounted(const char *mountinfo, const char *where) {
 
                 fstab_unescape(field[4]);
                 found = strcmp(field[4], where) == 0;
+        }
+
+        free(line);
+        fclose(f);
+
+        return found;
+}
+
+int fstab_device_mounted(const char *mountinfo, const char *node, char *ret_where, size_t size) {
+        char real[PATH_MAX], *line = NULL;
+        bool by_devnum = false;
+        unsigned maj = 0, min = 0;
+        size_t cap = 0;
+        struct stat st;
+        int found = 0;
+        FILE *f;
+
+        if (!mountinfo || !node)
+                return -EINVAL;
+
+        if (stat(node, &st) == 0 && S_ISBLK(st.st_mode)) {
+                by_devnum = true;
+                maj = major(st.st_rdev);
+                min = minor(st.st_rdev);
+        }
+        if (!realpath(node, real))
+                snprintf(real, sizeof(real), "%s", node);
+
+        f = fopen(mountinfo, "re");
+        if (!f)
+                return -errno;
+
+        while (!found && getline(&line, &cap, f) >= 0) {
+                char *field[5], *sep, *rest[2];
+                unsigned a, b;
+
+                sep = strstr(line, " - ");
+                if (!sep)
+                        continue;
+                *sep = '\0';
+
+                if (split_fields(line, field, 5) < 0 || split_fields(sep + 3, rest, 2) < 0)
+                        continue;
+
+                fstab_unescape(field[4]);
+                fstab_unescape(rest[1]);
+
+                if (by_devnum && sscanf(field[2], "%u:%u", &a, &b) == 2 && a == maj && b == min)
+                        found = 1;
+                else if (strcmp(rest[1], real) == 0 || strcmp(rest[1], node) == 0)
+                        found = 1;
+
+                if (found && ret_where)
+                        snprintf(ret_where, size, "%s", field[4]);
         }
 
         free(line);
