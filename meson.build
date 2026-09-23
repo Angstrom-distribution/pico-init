@@ -80,6 +80,9 @@ pico_init_core_sources = files(
   # Beside gpt-scan.c for the same reason: it is boot-path code main.c calls
   # once, and the two decision tables inside it are what the tests link.
   'src/root-check.c',
+  # /etc/fstab: the parser, option table and outcome record, kept apart from
+  # the half that mounts so the decisions can be tested as values.
+  'src/fstab.c',
   'src/unit.c',
   # Template/instance name parsing (G2), split out of unit.c because it
   # needs nothing from Unit itself -- unit.c calls into it, not vice versa.
@@ -197,6 +200,8 @@ pico_tests = [
   # The root check's two decision tables (plan §10, R1). The I/O half of it
   # remounts "/" and is proven by a boot instead.
   'test-root-check',
+  # The fstab grammar, option routing, mount order and outcome record.
+  'test-fstab',
   # Manager-level regression test for the SIGCHLD-before-cgroup-empty
   # dispatch-order property (manager.h's EVENT_PRIORITY_* table): drives
   # m->event directly, one dispatch at a time, since manager_loop() itself
