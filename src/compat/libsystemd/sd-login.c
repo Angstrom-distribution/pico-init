@@ -356,7 +356,12 @@ int sd_machine_get_class(const char *machine, char **ret_clazz) {
                 s = strdup("host");
                 if (!s)
                         return -ENOMEM;
-                *ret_clazz = s;
+                /* ret_clazz is optional, matching upstream's own
+                 * `if (ret_clazz) *ret_clazz = TAKE_PTR(c);` idiom. */
+                if (ret_clazz)
+                        *ret_clazz = s;
+                else
+                        free(s);
                 return 0;
         }
 

@@ -79,6 +79,9 @@ static void test_machine_functions(void) {
         ASSERT_STREQ(clazz, "host");
         free(clazz);
 
+        /* NULL argument (existence-only query): must not crash. */
+        ASSERT_EQ_INT(sd_machine_get_class(".host", NULL), 0);
+
         ASSERT_EQ_INT(sd_machine_get_class("not-a-real-machine", &clazz), -ENXIO);
         ASSERT_EQ_INT(sd_machine_get_class("bad/name", &clazz), -EINVAL);
 
