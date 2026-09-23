@@ -399,6 +399,62 @@ static void test_start_oneshot_replies_done(void) {
         ctrl_fixture_teardown(&f);
 }
 
+static bool ctrl_service_state_done(void *userdata) {
+        void **args = userdata;
+
+        return SERVICE((Unit *) args[0])->state == *(ServiceState *) args[1];
+}
+
+static void drive_until_service_state(Manager *m, Unit *u, ServiceState state) {
+        void *args[2] = { u, &state };
+
+        ASSERT_TRUE(drive_until(m, ctrl_service_state_done, args, 400));
+}
+
+/*
+ * Stop and restart of a unit whose stop ends in FAILED -- a running oneshot
+ * killed by SIGTERM, a unit waiting out RestartSec= after a crash. The unit
+ * is down either way, so both jobs are done (v30 unit_notify()); failing them
+ * replied "err failed" and left a restart never starting the unit again.
+ */
+static void test_stop_and_restart_ending_failed_reply_done(void) {
+        struct ctrl_fixture f;
+        Unit *oneshot, *crashy;
+
+        ctrl_fixture_setup(&f);
+        ASSERT_EQ_INT(test_write_file(f.unitdir,
+                                      "long-oneshot.service",
+                                      "[Unit]\n[Service]\nType=oneshot\nExecStart=/bin/sleep 30\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(f.unitdir,
+                                      "crashy.service",
+                                      "[Unit]\n[Service]\nType=simple\nExecStart=/bin/false\n"
+                                      "Restart=on-failure\nRestartSec=10\n"),
+                      0);
+        ctrl_fixture_boot(&f);
+
+        oneshot = manager_get_unit(f.m, "long-oneshot.service");
+        crashy = manager_get_unit(f.m, "crashy.service");
+        ASSERT_TRUE(oneshot != NULL && crashy != NULL);
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 start long-oneshot.service --no-block", "ok queued\n", 100);
+        drive_until_service_state(f.m, oneshot, SERVICE_EXEC_START);
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 stop long-oneshot.service", "ok done\n", 400);
+        ASSERT_EQ_INT(unit_active_state(oneshot), UNIT_FAILED);
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 start crashy.service", "ok done\n", 400);
+        drive_until_service_state(f.m, crashy, SERVICE_AUTO_RESTART);
+        ASSERT_EQ_INT(SERVICE(crashy)->n_restarts, 1);
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 restart crashy.service", "ok done\n", 400);
+
+        /* started again, so it crashed again */
+        drive_until_service_state(f.m, crashy, SERVICE_AUTO_RESTART);
+        ASSERT_EQ_INT(SERVICE(crashy)->n_restarts, 2);
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 stop crashy.service", "ok done\n", 400);
+
+        ctrl_fixture_teardown(&f);
+}
+
 /* reset-failed: a FAILED unit returns to inactive; an already-non-FAILED
  * unit is a harmless no-op success (real systemctl's own behaviour); an
  * unknown unit is a real error, not a silent no-op. */
@@ -791,6 +847,7 @@ int main(void) {
         test_start_stop_restart_active_and_inactive();
         test_start_failing_unit_replies_with_real_result();
         test_start_oneshot_replies_done();
+        test_stop_and_restart_ending_failed_reply_done();
         test_reset_failed();
         test_no_block_replies_immediately();
         test_early_disconnect_leaks_nothing();

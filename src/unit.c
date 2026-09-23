@@ -385,10 +385,11 @@ void unit_notify(Unit *u, UnitActiveState old_state, UnitActiveState new_state) 
                 break;
 
         case JOB_STOP:
-                if (new_state == UNIT_INACTIVE)
+                /* Down is down: a unit that stops FAILED (SIGTERM ending a
+                 * oneshot, a crash while in AUTO_RESTART) still completed
+                 * the stop (v30 src/unit.c unit_notify()). */
+                if (new_state == UNIT_INACTIVE || new_state == UNIT_FAILED)
                         job_finish(j, JOB_DONE);
-                else if (new_state == UNIT_FAILED)
-                        job_finish(j, JOB_FAILED);
                 break;
 
         case JOB_RESTART:
@@ -405,11 +406,10 @@ void unit_notify(Unit *u, UnitActiveState old_state, UnitActiveState new_state) 
                  * unreachable, so a restart stopped a unit and never started
                  * it again. Reporting the stop half here is the whole of the
                  * missing link; the conversion itself stays in job.c.
+                 * FAILED counts as down too, as for JOB_STOP above.
                  */
-                if (new_state == UNIT_INACTIVE)
+                if (new_state == UNIT_INACTIVE || new_state == UNIT_FAILED)
                         job_finish(j, JOB_DONE);
-                else if (new_state == UNIT_FAILED)
-                        job_finish(j, JOB_FAILED);
                 break;
 
         default:

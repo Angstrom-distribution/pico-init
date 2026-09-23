@@ -500,6 +500,7 @@ static void job_propagate_failure(Manager *m, Unit *failed, JobResult result) {
 }
 
 int job_finish_full(Job *j, JobResult result, bool recursive) {
+        JobType type;
         Manager *m;
         Unit *u;
         size_t i;
@@ -509,6 +510,7 @@ int job_finish_full(Job *j, JobResult result, bool recursive) {
 
         u = j->unit;
         m = j->manager;
+        type = j->type;
 
         j->result = result;
 
@@ -599,9 +601,11 @@ int job_finish_full(Job *j, JobResult result, bool recursive) {
         /*
          * Propagation is gated on `recursive` so a job completing inside
          * transaction activation cannot re-enter code that is still iterating
-         * the transaction (563ba9ea6e, 1abc85b8d0).
+         * the transaction (563ba9ea6e, 1abc85b8d0). Only a failed start
+         * means a requirement is missing (v30 job_finish_and_invalidate());
+         * a restart that failed in its stop half is not one.
          */
-        if (result != JOB_DONE && recursive)
+        if (result != JOB_DONE && recursive && type == JOB_START)
                 job_propagate_failure(m, u, JOB_FAILED);
 
 finish:

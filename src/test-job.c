@@ -62,9 +62,11 @@ static void free_private_cgroup_root(const char *root) {
         rmdir(root);
 }
 
-/* --- drive the real manager_loop() until no job is installed, or a budget --- */
+/* --- drive the real manager_loop() until a condition holds, or a budget --- */
 
 static Manager *g_drive_m;
+static bool (*g_drive_done)(Manager *m, void *ctx);
+static void *g_drive_ctx;
 static int g_drive_ticks;
 static int g_drive_max_ticks;
 
@@ -72,7 +74,7 @@ static void drive_tick(void *userdata, usec_t now) {
         (void) userdata;
         (void) now;
 
-        if (g_drive_m->n_jobs == 0 || ++g_drive_ticks >= g_drive_max_ticks)
+        if (g_drive_done(g_drive_m, g_drive_ctx) || ++g_drive_ticks >= g_drive_max_ticks)
                 g_drive_m->objective = MANAGER_EXIT;
         else
                 ASSERT_EQ_INT(pico_timer_add(g_drive_m->timer,
@@ -84,9 +86,11 @@ static void drive_tick(void *userdata, usec_t now) {
 }
 
 /* 10ms ticks: max_ticks = 300 bounds the wait at about 3s. Returns whether
- * every job finished. */
-static bool drive_until_idle(Manager *m, int max_ticks) {
+ * `done` held when the loop stopped. */
+static bool drive_until(Manager *m, bool (*done)(Manager *m, void *ctx), void *ctx, int max_ticks) {
         g_drive_m = m;
+        g_drive_done = done;
+        g_drive_ctx = ctx;
         g_drive_ticks = 0;
         g_drive_max_ticks = max_ticks;
 
@@ -95,7 +99,16 @@ static bool drive_until_idle(Manager *m, int max_ticks) {
                       0);
         manager_loop(m);
 
+        return done(m, ctx);
+}
+
+static bool no_jobs(Manager *m, void *ctx) {
+        (void) ctx;
         return m->n_jobs == 0;
+}
+
+static bool drive_until_idle(Manager *m, int max_ticks) {
+        return drive_until(m, no_jobs, NULL, max_ticks);
 }
 
 /* Read the run queue back as a list of unit ids, in order. */
@@ -1074,8 +1087,73 @@ static void test_oneshot_start_job_finishes(void) {
         free(dir);
 }
 
+struct restarted_ctx {
+        Unit *u;
+        pid_t old_pid;
+};
+
+/* The restart's start half is running a new process. */
+static bool restarted(Manager *m, void *userdata) {
+        struct restarted_ctx *c = userdata;
+        Service *s = SERVICE(c->u);
+
+        (void) m;
+        return c->u->job && c->u->job->type == JOB_START && c->u->job->state == JOB_RUNNING &&
+                        s->state == SERVICE_EXEC_START && s->main_pid > 0 && s->main_pid != c->old_pid;
+}
+
+/*
+ * SIGTERM ends a running oneshot as FAILED (a signal death), so the stop half
+ * of a restart lands in UNIT_FAILED. The unit is down either way: v30 finishes
+ * stop and restart jobs DONE on inactive-or-failed. Finishing it FAILED
+ * skipped the restart-to-start conversion, so the unit was never started
+ * again.
+ */
+static void test_restart_of_unit_that_stops_failed(void) {
+        char cgroup_root[PATH_MAX];
+        struct restarted_ctx ctx;
+        Manager *m;
+        char *dir;
+        Unit *a;
+        pid_t pid;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir, "a.service", "[Service]\nType=oneshot\nExecStart=/bin/sleep 30\n"),
+                      0);
+
+        m = manager_for(dir);
+        use_private_cgroup_root(m, "restart-failed", cgroup_root, sizeof(cgroup_root));
+        ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+
+        a = manager_get_unit(m, "a.service");
+        ASSERT_TRUE(a != NULL);
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, a, NULL), 0);
+        ASSERT_EQ_INT(manager_dispatch_run_queue(m), 1);
+        ASSERT_EQ_INT(SERVICE(a)->state, SERVICE_EXEC_START);
+
+        ctx.u = a;
+        ctx.old_pid = SERVICE(a)->main_pid;
+        ASSERT_TRUE(ctx.old_pid > 0);
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_RESTART, a, NULL), 0);
+        ASSERT_TRUE(drive_until(m, restarted, &ctx, 300));
+
+        pid = SERVICE(a)->main_pid;
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
+
+        manager_free(m);
+        free_private_cgroup_root(cgroup_root);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
         test_oneshot_start_job_finishes();
+        test_restart_of_unit_that_stops_failed();
         test_ordering_c_b_a();
         test_unit_free_cancels_its_job();
         test_all_verb_state_combinations();
