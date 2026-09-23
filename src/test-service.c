@@ -1308,6 +1308,13 @@ static void test_notify_exit_before_ready_is_protocol_failure(void) {
  * session leader and its exit SIGHUPs whatever it left in its own session.
  * A daemon that does not detach from the session it was started in is
  * broken under a real getty too; this is not the case being tested.
+ *
+ * setsid(1) only detaches once it has been exec'd, though, and the parent
+ * may exit first: the child is still in the leader's process group then
+ * and takes the SIGHUP. The fixtures ignore SIGHUP (inherited across fork
+ * and exec) so that race cannot kill the daemon. It is why these tests
+ * failed intermittently, most often when test-service ran alone and so
+ * was the only process holding the console.
  */
 static void write_forkd(const char *dir, const char *name, const char *body) {
         char path[PATH_MAX];
@@ -1345,7 +1352,7 @@ static void test_forking_pidfile_gates_activation(void) {
         ASSERT_TRUE(dir != NULL);
         m = manager_for(dir);
 
-        write_forkd(dir, "forkd.sh", "#!/bin/sh\nsetsid sleep 100 &\necho $! > \"$1\"\nexit 0\n");
+        write_forkd(dir, "forkd.sh", "#!/bin/sh\ntrap '' HUP\nsetsid sleep 100 &\necho $! > \"$1\"\nexit 0\n");
         snprintf(pidfile, sizeof(pidfile), "%s/a.pid", dir);
         snprintf(unit,
                  sizeof(unit),
@@ -1412,7 +1419,7 @@ static void test_forking_guess_main_pid_from_cgroup(void) {
         ASSERT_TRUE(dir != NULL);
         m = manager_for(dir);
 
-        write_forkd(dir, "forkd.sh", "#!/bin/sh\nsetsid sleep 100 &\nexit 0\n");
+        write_forkd(dir, "forkd.sh", "#!/bin/sh\ntrap '' HUP\nsetsid sleep 100 &\nexit 0\n");
         snprintf(unit, sizeof(unit), "[Unit]\n[Service]\nType=forking\nExecStart=%s/forkd.sh\n", dir);
         s = load_service(m, dir, "fork-guess.service", unit);
 
@@ -1513,7 +1520,7 @@ static void test_forking_pidfile_outside_cgroup_refused(void) {
         ASSERT_TRUE(dir != NULL);
         m = manager_for(dir);
 
-        write_forkd(dir, "liar.sh", "#!/bin/sh\nsetsid sleep 100 &\necho 1 > \"$1\"\nexit 0\n");
+        write_forkd(dir, "liar.sh", "#!/bin/sh\ntrap '' HUP\nsetsid sleep 100 &\necho 1 > \"$1\"\nexit 0\n");
         snprintf(pidfile, sizeof(pidfile), "%s/liar.pid", dir);
         snprintf(unit,
                  sizeof(unit),
@@ -1558,7 +1565,7 @@ static void test_forking_pidfile_of_parent_refused(void) {
         ASSERT_TRUE(dir != NULL);
         m = manager_for(dir);
 
-        write_forkd(dir, "early.sh", "#!/bin/sh\necho $$ > \"$1\"\nsetsid sleep 100 &\nexit 0\n");
+        write_forkd(dir, "early.sh", "#!/bin/sh\ntrap '' HUP\necho $$ > \"$1\"\nsetsid sleep 100 &\nexit 0\n");
         snprintf(pidfile, sizeof(pidfile), "%s/early.pid", dir);
         snprintf(unit,
                  sizeof(unit),
