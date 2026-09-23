@@ -585,6 +585,50 @@ static void test_services_ordered_after_sockets_target(void) {
         free(udir);
 }
 
+/*
+ * units-global-cycle-check-fatal: a cycle among units the default target's
+ * boot transaction never reaches (nothing Wants=/Requires= either one) must
+ * not stop the whole boot -- the real, transaction-scoped cycle breaker
+ * (job.c transaction_verify_order()) is what has to answer for units that
+ * are actually part of the transaction.
+ */
+static void test_startup_survives_a_cycle_outside_the_transaction(void) {
+        Manager *m;
+        Unit *target;
+        char *udir;
+
+        udir = test_tmpdir_new();
+        ASSERT_TRUE(udir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(udir, "default.target", default_target_unit), 0);
+
+        /* Neither unit is WantedBy=/RequiredBy= anything, and neither is
+         * listed in any .wants/.requires dir -- nothing in the boot
+         * transaction ever reaches them. */
+        ASSERT_EQ_INT(test_write_file(udir,
+                                      "a.service",
+                                      "[Unit]\nAfter=b.service\n[Service]\nExecStart=/bin/true\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(udir,
+                                      "b.service",
+                                      "[Unit]\nAfter=a.service\n[Service]\nExecStart=/bin/true\n"),
+                      0);
+
+        m = manager_for(udir);
+
+        ASSERT_EQ_INT(manager_startup(m, "default.target"), 0);
+
+        target = manager_get_unit(m, "default.target");
+        ASSERT_TRUE(target != NULL);
+        ASSERT_EQ_INT(target->load_state, UNIT_LOADED);
+        ASSERT_TRUE(target->job != NULL);
+        ASSERT_EQ_INT(target->job->type, JOB_START);
+
+        manager_free(m);
+        test_rm_rf(udir);
+        free(udir);
+}
+
 int main(void) {
         test_services_ordered_after_sockets_target();
         test_wants_dir_produces_wants_edges();
@@ -599,6 +643,7 @@ int main(void) {
         test_symlink_enabled_survives_disable_preset();
         test_real_angstrom_pico_preset_parses();
         test_default_target_boots_hand_built_set();
+        test_startup_survives_a_cycle_outside_the_transaction();
 
         printf("test-boot-root: all checks passed\n");
         return 0;

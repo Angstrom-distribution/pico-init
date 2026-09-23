@@ -220,17 +220,20 @@ int manager_startup(Manager *m, const char *default_target) {
         manager_add_socket_default_ordering(m);
 
         /*
-         * 6. Refuse to build a transaction over a graph that cannot be
-         * ordered. This is fatal on purpose: a cycle means there is no boot
-         * order at all, and starting units in an arbitrary one would be worse
-         * than stopping and saying so. unit_dependency_detect_cycles() logs
-         * the units involved.
+         * 6. Diagnostic only, not fatal: unit_dependency_detect_cycles() walks
+         * every loaded unit, including ones the boot transaction below never
+         * reaches (disabled, pulled in by nothing). A cycle there is real and
+         * worth logging, but it says nothing about whether default_target can
+         * actually boot -- and step 7's transaction_activate() (job.c) already
+         * detects and breaks any cycle that *is* inside the boot transaction,
+         * sacrificing a non-anchor job the same way v30 does, so failing the
+         * whole boot here over a cycle outside it would stop a system that
+         * could otherwise have come up. unit_dependency_detect_cycles() itself
+         * logs which units are involved.
          */
         r = unit_dependency_detect_cycles(m);
-        if (r < 0) {
-                pico_log(PICO_LOG_ERR, "ordering graph has a cycle, not starting the default target");
-                return r;
-        }
+        if (r < 0)
+                pico_log(PICO_LOG_WARNING, "ordering graph has a cycle outside any transaction, continuing");
 
         /* 7. Root the boot transaction. */
         r = manager_load_unit(m, default_target, &target);
