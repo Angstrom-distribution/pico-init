@@ -8,6 +8,7 @@
  * the core library directly rather than through here.
  */
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -166,6 +167,13 @@ int main(void) {
                 pico_log(PICO_LOG_ERR, "manager_new: %s", strerror(-r));
                 freeze("could not create the manager");
         }
+
+        /* With C-A-D left enabled the kernel reboots at once, unsynced; this
+         * makes it send SIGINT, which the manager turns into an orderly
+         * reboot (v30 src/manager.c enable_special_signals()). After
+         * manager_new(), which has SIGINT blocked into its signalfd. */
+        if (m->is_system && reboot(RB_DISABLE_CAD) < 0)
+                pico_log(PICO_LOG_WARNING, "failed to enable ctrl-alt-del handling: %s", strerror(errno));
 
         /*
          * A failed startup is not fatal. A board that cannot reach
