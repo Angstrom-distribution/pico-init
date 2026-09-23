@@ -46,6 +46,7 @@ typedef enum PicoFsKind {
         PICO_FS_SWAP,
         PICO_FS_VFAT,
         PICO_FS_EXFAT,
+        PICO_FS_XFS,
         _PICO_FS_KIND_MAX, /* as a hint: a type none of the readers handles */
 } PicoFsKind;
 
@@ -98,6 +99,7 @@ int pico_fs_probe_ext(int fd, PicoFsId *ret);
 int pico_fs_probe_swap(int fd, PicoFsId *ret);
 int pico_fs_probe_vfat(int fd, PicoFsId *ret);
 int pico_fs_probe_exfat(int fd, PicoFsId *ret);
+int pico_fs_probe_xfs(int fd, PicoFsId *ret);
 
 /* --- shared by the readers, and tested on their own --- */
 
