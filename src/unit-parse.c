@@ -580,14 +580,14 @@ static int config_parse_type(Unit *u, const char *path, unsigned line, const cha
                 return unit_add_degradation(u, "Type=notify-reload");
         } else if (strcmp(rvalue, "dbus") == 0) {
                 /*
-                 * plans/38-pico-init-drop-in-systemd-compat.md SS7.2: readiness
-                 * ("the name appeared on the system bus") is unobtainable in
-                 * principle here, pico-init runs no bus at all -- so this is
-                 * a permanent degrade, not a stopgap. Running as simple is
-                 * how avahi-daemon/bluetooth behaved for years before
-                 * Type=dbus existed; refusing the unit guarantees they never
-                 * start. BusName= itself still falls through to the generic
-                 * unknown-directive degradation below.
+                 * Readiness ("the name appeared on the system bus") is
+                 * unobtainable in principle here, pico-init runs no bus at
+                 * all -- so this is a permanent degrade, not a stopgap.
+                 * Running as simple is how avahi-daemon/bluetooth behaved
+                 * for years before Type=dbus existed; refusing the unit
+                 * guarantees they never start. BusName= itself still falls
+                 * through to the generic unknown-directive degradation
+                 * below.
                  */
                 s->type = SERVICE_TYPE_SIMPLE;
                 pico_log(PICO_LOG_WARNING,
@@ -597,10 +597,10 @@ static int config_parse_type(Unit *u, const char *path, unsigned line, const cha
                          line);
                 return unit_add_degradation(u, "Type=dbus");
         } else if (strcmp(rvalue, "idle") == 0) {
-                /* plans/38 SS7.2: idle is simple with the start delayed until
-                 * the job queue drains -- degrade to simple now, the delay
-                 * itself is a later refinement (every in-image Type=idle
-                 * consumer is a getty pico-init's own units already replace). */
+                /* Real idle is simple with the start delayed until the job
+                 * queue drains -- degrade to simple now, the delay itself is
+                 * a later refinement (every in-image Type=idle consumer is a
+                 * getty pico-init's own units already replace). */
                 s->type = SERVICE_TYPE_SIMPLE;
                 pico_log(PICO_LOG_WARNING,
                          "%s:%u: Type=idle: start-delay not implemented, running as Type=simple",

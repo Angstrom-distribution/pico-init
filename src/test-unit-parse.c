@@ -1377,8 +1377,7 @@ static void test_type_values(void) {
 }
 
 /*
- * units-type-dbus-idle-refused: plans/38-pico-init-drop-in-systemd-compat.md
- * SS7.2 decided dbus/idle degrade to simple, permanently -- not the hard
+ * Type=dbus and Type=idle degrade to simple, permanently -- not the hard
  * refusal every other unrecognized Type= still gets.
  */
 static void test_type_dbus_and_idle_degrade_to_simple(void) {
