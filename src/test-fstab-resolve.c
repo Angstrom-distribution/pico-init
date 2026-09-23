@@ -167,6 +167,10 @@ static void fixture(void) {
         ASSERT_EQ_INT(test_block_device(sys, "mmcblk0", NULL, 0, 2048), 0);
         swap_disk("mmcblk0", "picoswap");
 
+        /* A ram disk: no by-* links upstream, so not read here either. */
+        ASSERT_EQ_INT(test_block_device(sys, "ram0", NULL, 0, 8192), 0);
+        ext_node("ram0", uuid_z, "ramfs");
+
         /* Nothing behind it, and MTD flash: neither is read. */
         ASSERT_EQ_INT(test_block_device(sys, "loop0", NULL, 0, 0), 0);
         ext_node("loop0", uuid_z, "loopfs");
@@ -300,6 +304,7 @@ static void test_resolve(void) {
         /* Never read: nothing behind it, and MTD flash. */
         expect(FSTAB_TAG_LABEL, "loopfs", PICO_FS_NONE, 0, NULL);
         expect(FSTAB_TAG_LABEL, "flashfs", PICO_FS_NONE, 0, NULL);
+        expect(FSTAB_TAG_LABEL, "ramfs", PICO_FS_NONE, 0, NULL);
 
         /* cciss!c0d0 is /dev/cciss/c0d0. */
         expect(FSTAB_TAG_LABEL, "array", PICO_FS_EXT, 1, "cciss/c0d0");
@@ -346,8 +351,14 @@ static void arrive_card(void) {
         ext_node("sdc", uuid_y, "late card");
 }
 
+static void arrive_other(void) {
+        ASSERT_EQ_INT(test_block_device(sys, "sdm", NULL, 0, 2048), 0);
+        ext_node("sdm", uuid_y, "unrelated");
+}
+
 static void test_wait(void) {
-        FstabResolver r = { .sys_root = sys, .dev_root = dev };
+        unsigned scans = 0;
+        FstabResolver r = { .sys_root = sys, .dev_root = dev, .scans = &scans };
         char got[PATH_MAX], path[PATH_MAX + 16], what[PATH_MAX + 16];
         Arrival a = { 0 };
         usec_t t0;
@@ -384,8 +395,10 @@ static void test_wait(void) {
         ASSERT_STREQ(got, path);
 
         /* Never there: the wait ends at its timeout, not before and not
-         * long after. */
+         * long after -- and with nothing changing in sysfs, the devices are
+         * read once, not once per poll. */
         a = (Arrival){ .on_attempt = 99, .arrive = arrive_path };
+        scans = 0;
         t0 = now_monotonic();
         ASSERT_EQ_INT(fstab_wait_device(
                                       &r,
@@ -400,6 +413,22 @@ static void test_wait(void) {
         ASSERT_TRUE(now_monotonic() - t0 >= 250 * USEC_PER_MSEC);
         ASSERT_TRUE(now_monotonic() - t0 < 2 * USEC_PER_SEC);
         ASSERT_TRUE(a.seen >= 2);
+        ASSERT_EQ_INT(scans, 1);
+
+        /* A device arriving is a change, and gets a second read. */
+        a = (Arrival){ .on_attempt = 1, .arrive = arrive_other };
+        scans = 0;
+        ASSERT_EQ_INT(fstab_wait_device(
+                                      &r,
+                                      "LABEL=never",
+                                      PICO_FS_NONE,
+                                      250 * USEC_PER_MSEC,
+                                      hook,
+                                      &a,
+                                      got,
+                                      sizeof(got)),
+                      0);
+        ASSERT_EQ_INT(scans, 2);
 
         /* A zero timeout is exactly one look. */
         a = (Arrival){ .on_attempt = 99, .arrive = arrive_path };

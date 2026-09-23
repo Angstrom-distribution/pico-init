@@ -169,6 +169,52 @@ static int skip_dots(const struct dirent *d) {
         return d->d_name[0] != '.';
 }
 
+/*
+ * The kernel names udev gives /dev/disk/by-* links to, from systemd's
+ * 60-persistent-storage.rules ("mmcblk*[0-9]" and friends must end in a
+ * digit), plus dm-* and md*, which get theirs from the device-mapper and md
+ * rules. Anything else -- ram disks, MTD flash, floppies -- has no by-uuid
+ * link upstream either, so it is not read here.
+ */
+static bool name_has_links(const char *name) {
+        static const struct {
+                const char *prefix;
+                bool digit_last;
+        } table[] = {
+                {   "loop", false },
+                { "mmcblk",  true },
+                {  "msblk",  true },
+                { "mspblk",  true },
+                {   "nvme", false },
+                {     "sd", false },
+                {     "sr", false },
+                {     "vd", false },
+                {    "xvd", false },
+                { "bcache", false },
+                {  "cciss", false },
+                {   "dasd", false },
+                {    "ubd", false },
+                {    "ubi", false },
+                {    "scm", false },
+                {   "pmem", false },
+                {    "nbd", false },
+                {     "zd", false },
+                {    "rbd", false },
+                {   "zram", false },
+                {  "ublkb", false },
+                {    "dm-", false },
+                {     "md", false },
+        };
+        size_t len = strlen(name);
+
+        for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++)
+                if (strncmp(name, table[i].prefix, strlen(table[i].prefix)) == 0 &&
+                    (!table[i].digit_last || (len > 0 && name[len - 1] >= '0' && name[len - 1] <= '9')))
+                        return true;
+
+        return false;
+}
+
 /* The block devices worth reading, in name order. */
 static int block_list(const char *sys_root, BlockDev **ret, size_t *ret_n) {
         struct dirent **names = NULL;
@@ -197,7 +243,7 @@ static int block_list(const char *sys_root, BlockDev **ret, size_t *ret_n) {
                 unsigned long long val;
                 const char *name = names[i]->d_name;
 
-                if (strncmp(name, "mtdblock", 8) == 0)
+                if (!name_has_links(name))
                         continue;
                 if ((size_t) snprintf(link, sizeof(link), "%s/%s", dir, name) >= sizeof(link) ||
                     !realpath(link, real))
@@ -372,6 +418,9 @@ int fstab_resolve(const FstabResolver *r, FstabTag tag, const char *value, PicoF
         if (k < 0)
                 return k;
 
+        if (r && r->scans)
+                (*r->scans)++;
+
         snprintf(what, sizeof(what), "%s=%s", tag_table[tag], value);
 
         if (tag == FSTAB_TAG_PARTUUID || tag == FSTAB_TAG_PARTLABEL)
@@ -393,6 +442,30 @@ static void sleep_usec(usec_t u) {
                 ;
 }
 
+/*
+ * A fingerprint of the readable block devices -- names and sizes -- so that a
+ * wait only reads devices again once one has come, gone, or had media put in
+ * it. Waiting for a tag nobody carries is then a directory listing per poll,
+ * not a read of every disk and a log line per GPT-less one.
+ */
+static uint32_t block_fingerprint(const char *sys_root) {
+        BlockDev *v = NULL;
+        uint32_t crc = 0;
+        size_t n = 0;
+
+        if (block_list(sys_root, &v, &n) < 0)
+                return 0;
+
+        for (size_t i = 0; i < n; i++) {
+                crc = gpt_crc32(v[i].name, strlen(v[i].name) + 1) ^ (crc * 31);
+                crc ^= v[i].empty ? 0x5a5a5a5au : 0;
+                crc += v[i].partno;
+        }
+
+        block_free(v, n);
+        return crc ^ (uint32_t) n;
+}
+
 int fstab_wait_device(
                 const FstabResolver *r,
                 const char *what,
@@ -403,7 +476,9 @@ int fstab_wait_device(
                 char *ret,
                 size_t size) {
 
+        const char *sys_root = r && r->sys_root ? r->sys_root : "/sys";
         char value[PICO_FS_LABEL_MAX];
+        uint32_t seen = 0;
         FstabTag tag;
         usec_t deadline;
         unsigned attempt;
@@ -422,9 +497,14 @@ int fstab_wait_device(
                         hook(userdata, attempt);
 
                 if (tag != FSTAB_TAG_NONE) {
-                        k = fstab_resolve(r, tag, value, hint, ret, size);
-                        if (k != 0)
-                                return k;
+                        uint32_t fp = block_fingerprint(sys_root);
+
+                        if (attempt == 0 || fp != seen) {
+                                seen = fp;
+                                k = fstab_resolve(r, tag, value, hint, ret, size);
+                                if (k != 0)
+                                        return k;
+                        }
                 } else {
                         struct stat st;
 

@@ -28,10 +28,12 @@
  * as the tag it names (udev's \xNN escapes undone), for the same reason: the
  * link will not exist yet.
  *
- * Block devices with nothing behind them (size 0: an unattached loop device,
- * an empty card reader) are not read, and neither is MTD flash through
- * mtdblock, which devd leaves alone for the same reason -- raw NAND is slow to
- * read and carries no filesystem these readers know.
+ * Only the kernel names udev would make those links for are read (the
+ * allowlist in systemd's 60-persistent-storage.rules, plus device-mapper and
+ * md): not ram disks, and not MTD flash through mtdblock, which devd leaves
+ * alone too -- raw NAND is slow to read and carries no filesystem these
+ * readers know. Neither is a device with nothing behind it (size 0: an
+ * unattached loop device, an empty card reader).
  */
 
 #pragma once
@@ -63,10 +65,12 @@ const char *fstab_tag_to_string(FstabTag t);
  */
 FstabTag fstab_source_tag(const char *what, char *value, size_t size);
 
-/* Where to look. NULL members mean "/sys" and "/dev". */
+/* Where to look. NULL members mean "/sys" and "/dev". `scans`, when set,
+ * counts the passes that actually read devices; tests. */
 typedef struct FstabResolver {
         const char *sys_root;
         const char *dev_root;
+        unsigned *scans;
 } FstabResolver;
 
 /*
@@ -104,9 +108,10 @@ typedef void (*fstab_poll_hook_t)(void *userdata, unsigned attempt);
 
 /*
  * Resolve `what` -- a tag, a by-* link, or a plain path -- waiting up to
- * `timeout` for it to appear: re-resolved, or re-stat()ed, every
- * FSTAB_DEVICE_POLL. `hook`, when given, is called before every look but the
- * first.
+ * `timeout` for it to appear: re-stat()ed every FSTAB_DEVICE_POLL, or for a
+ * tag re-resolved whenever the set of block devices (names, partitions, media
+ * present) has changed since the last look. `hook`, when given, is called
+ * before every look but the first.
  *
  * 1 with the node in `ret`, 0 when the time ran out, or a negative error from
  * fstab_resolve() that no amount of waiting would change.
