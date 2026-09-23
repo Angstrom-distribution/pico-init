@@ -6,14 +6,20 @@
  * tree rather than a mocked filesystem.
  */
 
+/* unshare() and CLONE_NEWUSER, for test_enter_mount_namespace(). */
+#define _GNU_SOURCE
+
 #include "test-util.h"
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -142,4 +148,98 @@ void test_rm_rf(const char *path) {
 
         closedir(d);
         rmdir(path);
+}
+
+static int write_proc(const char *path, const char *s) {
+        ssize_t len = (ssize_t) strlen(s);
+        int fd, r = 0;
+
+        fd = open(path, O_WRONLY | O_CLOEXEC);
+        if (fd < 0)
+                return -errno;
+        if (write(fd, s, (size_t) len) != len)
+                r = -errno;
+        close(fd);
+        return r;
+}
+
+bool test_enter_mount_namespace(void) {
+        char map[64];
+        uid_t uid = getuid();
+        gid_t gid = getgid();
+
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNS) < 0) {
+                fprintf(stderr, "unshare(CLONE_NEWUSER|CLONE_NEWNS): %s\n", strerror(errno));
+                return false;
+        }
+
+        /* Map this process's own ids to root inside, which is what makes it
+         * the owner of the new mount namespace's mounts. */
+        if (write_proc("/proc/self/setgroups", "deny") < 0)
+                return false;
+        snprintf(map, sizeof(map), "0 %u 1", (unsigned) uid);
+        if (write_proc("/proc/self/uid_map", map) < 0)
+                return false;
+        snprintf(map, sizeof(map), "0 %u 1", (unsigned) gid);
+        if (write_proc("/proc/self/gid_map", map) < 0)
+                return false;
+
+        /* Nothing mounted from here on may propagate anywhere, whatever the
+         * host's own propagation settings are. */
+        return mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) == 0;
+}
+
+/* mountinfo's \ooo escapes, undone in place. Local rather than borrowed from
+ * the code under test: this file is linked into tests that do not link it. */
+static void unescape(char *s) {
+        char *r = s, *w = s;
+
+        while (*r) {
+                if (r[0] == '\\' && r[1] >= '0' && r[1] <= '7' && r[2] >= '0' && r[2] <= '7' &&
+                    r[3] >= '0' && r[3] <= '7') {
+                        *w++ = (char) (((r[1] - '0') << 6) | ((r[2] - '0') << 3) | (r[3] - '0'));
+                        r += 4;
+                } else
+                        *w++ = *r++;
+        }
+        *w = '\0';
+}
+
+bool test_mount_options(const char *where, char *vfs, size_t vfs_size, char *sb, size_t sb_size) {
+        char line[4096];
+        bool found = false;
+        FILE *f;
+
+        f = fopen("/proc/self/mountinfo", "re");
+        if (!f)
+                return false;
+
+        while (fgets(line, sizeof(line), f)) {
+                char mp[PATH_MAX], opts[1024], type[64], src[PATH_MAX], sopts[1024];
+                char *sep;
+
+                if (sscanf(line, "%*s %*s %*s %*s %4095s %1023s", mp, opts) != 2)
+                        continue;
+                unescape(mp);
+                if (strcmp(mp, where) != 0)
+                        continue;
+
+                sep = strstr(line, " - ");
+                if (!sep || sscanf(sep + 3, "%63s %4095s %1023s", type, src, sopts) != 3)
+                        continue;
+
+                snprintf(vfs, vfs_size, ",%s,", opts);
+                snprintf(sb, sb_size, ",%s,", sopts);
+                found = true;
+        }
+        fclose(f);
+
+        return found;
+}
+
+bool test_has_opt(const char *list, const char *opt) {
+        char tok[128];
+
+        snprintf(tok, sizeof(tok), ",%s,", opt);
+        return strstr(list, tok) != NULL;
 }

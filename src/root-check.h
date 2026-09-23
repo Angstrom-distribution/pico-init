@@ -39,6 +39,16 @@
  * unreadable superblock, a checker that is not installed, a checker that itself
  * failed -- ends in the remount, because a machine that reaches a console is
  * worth more than one that is right about a filesystem.
+ *
+ * The remount honours /etc/fstab's "/" line, as upstream's
+ * systemd-remount-fs.service does and as its v30 ancestor did with a bare
+ * `mount / -o remount` that let mount(8) consult fstab. The line's options are
+ * reapplied -- "ro" included, so a root fstab declares read-only stays that way
+ * after its check -- and with no "/" line the root goes read-write, as it
+ * always has. An already read-write root is remounted only when the line asks
+ * for something a read-write root might not have. Options the kernel refuses do
+ * not cost the boot its writable root: the remount is retried as a plain
+ * read-write one, and the line is recorded as failed.
  */
 
 #pragma once
@@ -46,6 +56,7 @@
 #include <stdbool.h>
 
 #include "ext-super.h"
+#include "fstab.h"
 
 /*
  * What pico_root_check() concluded. Deliberately a return value and not an
@@ -64,7 +75,9 @@ typedef enum PicoRootResult {
 } PicoRootResult;
 
 /*
- * Check the root filesystem and leave it mounted read-write.
+ * Check the root filesystem and leave it mounted as /etc/fstab's "/" line asks
+ * -- `root_line`, NULL when there is none, which means read-write. The outcome
+ * is recorded on `root_line` for the fstab pass's record.
  *
  * Called from main() after status_enable()/status_welcome() -- it needs /proc
  * for the mountinfo, /sys for the block topology, /dev for the node to check,
@@ -76,7 +89,17 @@ typedef enum PicoRootResult {
  * Returns a PicoRootResult, or -errno for a failure worth a line in the log
  * (which the caller also treats as "carry on booting").
  */
-int pico_root_check(void);
+int pico_root_check(FstabEntry *root_line);
+
+/*
+ * The remount that ends the check, on `where` ("/" in production; a test's own
+ * mount otherwise): `root_line`'s options through fstab_remount(), falling back
+ * to a plain read-write remount when the kernel refuses them and the line did
+ * not ask for read-only. Records the outcome on `root_line`.
+ *
+ * Returns PICO_ROOT_CONTINUE, or -errno when not even the fallback worked.
+ */
+int pico_root_remount(const char *where, FstabEntry *root_line);
 
 /*
  * The two decisions above, split out as pure functions so they can be tested

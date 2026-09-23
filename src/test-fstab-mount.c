@@ -236,85 +236,6 @@ static void test_pass_skips(void) {
 
 /* --- inside a private user + mount namespace --- */
 
-static int write_proc(const char *path, const char *s) {
-        int fd = open(path, O_WRONLY | O_CLOEXEC);
-        ssize_t len = (ssize_t) strlen(s);
-        int r = 0;
-
-        if (fd < 0)
-                return -errno;
-        if (write(fd, s, (size_t) len) != len)
-                r = -errno;
-        close(fd);
-        return r;
-}
-
-static bool enter_namespace(void) {
-        char map[64];
-        uid_t uid = getuid();
-        gid_t gid = getgid();
-
-        if (unshare(CLONE_NEWUSER | CLONE_NEWNS) < 0) {
-                fprintf(stderr, "test-fstab-mount: unshare: %s\n", strerror(errno));
-                return false;
-        }
-
-        if (write_proc("/proc/self/setgroups", "deny") < 0)
-                return false;
-        snprintf(map, sizeof(map), "0 %u 1", (unsigned) uid);
-        if (write_proc("/proc/self/uid_map", map) < 0)
-                return false;
-        snprintf(map, sizeof(map), "0 %u 1", (unsigned) gid);
-        if (write_proc("/proc/self/gid_map", map) < 0)
-                return false;
-
-        /* Scaffolding, not code under test: keep every mount below from
-         * propagating anywhere, whatever the host's propagation is. */
-        return mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) == 0;
-}
-
-/*
- * The mountinfo line for `where`: its per-mount option field, and the
- * superblock option field after the " - type source " separator. The last
- * matching line, the mount a lookup lands on. False when not mounted.
- */
-static bool mount_options(const char *where, char *vfs, size_t vfs_size, char *sb, size_t sb_size) {
-        char line[4096];
-        bool found = false;
-        FILE *f = fopen("/proc/self/mountinfo", "re");
-
-        ASSERT_TRUE(f != NULL);
-        while (fgets(line, sizeof(line), f)) {
-                char mp[PATH_MAX], opts[1024], type[64], src[PATH_MAX], sopts[1024];
-                char *sep;
-
-                if (sscanf(line, "%*s %*s %*s %*s %4095s %1023s", mp, opts) != 2)
-                        continue;
-                fstab_unescape(mp);
-                if (strcmp(mp, where) != 0)
-                        continue;
-
-                sep = strstr(line, " - ");
-                ASSERT_TRUE(sep != NULL);
-                ASSERT_EQ_INT(sscanf(sep + 3, "%63s %4095s %1023s", type, src, sopts), 3);
-
-                snprintf(vfs, vfs_size, ",%s,", opts);
-                snprintf(sb, sb_size, ",%s,", sopts);
-                found = true;
-        }
-        fclose(f);
-
-        return found;
-}
-
-/* Whole-token membership in a ",a,b,c," list as mount_options() builds it. */
-static bool has_opt(const char *list, const char *opt) {
-        char tok[128];
-
-        snprintf(tok, sizeof(tok), ",%s,", opt);
-        return strstr(list, tok) != NULL;
-}
-
 static char scratch[PATH_MAX];
 
 static void path_in(char *buf, size_t size, const char *rel) {
@@ -353,12 +274,12 @@ static void test_fresh_mount(void) {
         ASSERT_EQ_INT(fstab_mkdir_p(where, 0755), 0);
         ASSERT_EQ_INT(fstab_mount(&e, where, 0, NULL, err, sizeof(err)), 0);
 
-        ASSERT_TRUE(mount_options(where, vfs, sizeof(vfs), sb, sizeof(sb)));
-        ASSERT_TRUE(has_opt(vfs, "rw"));
-        ASSERT_TRUE(has_opt(vfs, "nosuid") && has_opt(vfs, "nodev") && has_opt(vfs, "noexec"));
-        ASSERT_TRUE(has_opt(vfs, "noatime"));
-        ASSERT_TRUE(has_opt(sb, "size=1024k"));
-        ASSERT_TRUE(has_opt(sb, "mode=700"));
+        ASSERT_TRUE(test_mount_options(where, vfs, sizeof(vfs), sb, sizeof(sb)));
+        ASSERT_TRUE(test_has_opt(vfs, "rw"));
+        ASSERT_TRUE(test_has_opt(vfs, "nosuid") && test_has_opt(vfs, "nodev") && test_has_opt(vfs, "noexec"));
+        ASSERT_TRUE(test_has_opt(vfs, "noatime"));
+        ASSERT_TRUE(test_has_opt(sb, "size=1024k"));
+        ASSERT_TRUE(test_has_opt(sb, "mode=700"));
         ASSERT_TRUE(stat(where, &st) == 0 && (st.st_mode & 07777) == 0700);
         fstab_entry_done(&e);
 
@@ -367,9 +288,9 @@ static void test_fresh_mount(void) {
         path_in(where, sizeof(where), "fresh/ro");
         ASSERT_EQ_INT(fstab_mkdir_p(where, 0755), 0);
         ASSERT_EQ_INT(fstab_mount(&e, where, 0, NULL, err, sizeof(err)), 0);
-        ASSERT_TRUE(mount_options(where, vfs, sizeof(vfs), sb, sizeof(sb)));
-        ASSERT_TRUE(has_opt(vfs, "ro"));
-        ASSERT_TRUE(has_opt(sb, "ro"));
+        ASSERT_TRUE(test_mount_options(where, vfs, sizeof(vfs), sb, sizeof(sb)));
+        ASSERT_TRUE(test_has_opt(vfs, "ro"));
+        ASSERT_TRUE(test_has_opt(sb, "ro"));
         fstab_entry_done(&e);
 
         /* A floor on a fresh mount is applied even though the line never
@@ -378,9 +299,9 @@ static void test_fresh_mount(void) {
         path_in(where, sizeof(where), "fresh/floor");
         ASSERT_EQ_INT(fstab_mkdir_p(where, 0755), 0);
         ASSERT_EQ_INT(fstab_mount(&e, where, MOUNT_ATTR_NOEXEC, NULL, err, sizeof(err)), 0);
-        ASSERT_TRUE(mount_options(where, vfs, sizeof(vfs), sb, sizeof(sb)));
-        ASSERT_TRUE(has_opt(vfs, "noexec"));
-        ASSERT_TRUE(!has_opt(vfs, "nosuid"));
+        ASSERT_TRUE(test_mount_options(where, vfs, sizeof(vfs), sb, sizeof(sb)));
+        ASSERT_TRUE(test_has_opt(vfs, "noexec"));
+        ASSERT_TRUE(!test_has_opt(vfs, "nosuid"));
         fstab_entry_done(&e);
 
         /* The filesystem's own complaint reaches the caller, not just an
@@ -390,7 +311,7 @@ static void test_fresh_mount(void) {
         ASSERT_EQ_INT(fstab_mkdir_p(where, 0755), 0);
         ASSERT_TRUE(fstab_mount(&e, where, 0, NULL, err, sizeof(err)) < 0);
         ASSERT_TRUE(strstr(err, "fsconfig(no_such_tmpfs_option=1)") != NULL);
-        ASSERT_TRUE(!mount_options(where, vfs, sizeof(vfs), sb, sizeof(sb)));
+        ASSERT_TRUE(!test_mount_options(where, vfs, sizeof(vfs), sb, sizeof(sb)));
         fstab_entry_done(&e);
 
         make_entry(&e, "tmpfs", "fresh/nofs", "no_such_filesystem_type", "defaults");
@@ -421,8 +342,8 @@ static void test_auto_and_bind(void) {
         path_in(where, sizeof(where), "auto");
         ASSERT_EQ_INT(fstab_mkdir_p(where, 0755), 0);
         ASSERT_EQ_INT(fstab_mount(&e, where, 0, fs, err, sizeof(err)), 0);
-        ASSERT_TRUE(mount_options(where, vfs, sizeof(vfs), sb, sizeof(sb)));
-        ASSERT_TRUE(has_opt(sb, "size=1024k"));
+        ASSERT_TRUE(test_mount_options(where, vfs, sizeof(vfs), sb, sizeof(sb)));
+        ASSERT_TRUE(test_has_opt(sb, "size=1024k"));
         fstab_entry_done(&e);
 
         {
@@ -446,11 +367,11 @@ static void test_auto_and_bind(void) {
         path_in(where, sizeof(where), "bound");
         ASSERT_EQ_INT(fstab_mkdir_p(where, 0755), 0);
         ASSERT_EQ_INT(fstab_mount(&e, where, 0, NULL, err, sizeof(err)), 0);
-        ASSERT_TRUE(mount_options(where, vfs, sizeof(vfs), sb, sizeof(sb)));
-        ASSERT_TRUE(has_opt(vfs, "ro") && has_opt(vfs, "nosuid"));
+        ASSERT_TRUE(test_mount_options(where, vfs, sizeof(vfs), sb, sizeof(sb)));
+        ASSERT_TRUE(test_has_opt(vfs, "ro") && test_has_opt(vfs, "nosuid"));
         /* The source keeps its own attributes; only the clone is read-only. */
-        ASSERT_TRUE(mount_options(src, vfs, sizeof(vfs), sb, sizeof(sb)));
-        ASSERT_TRUE(has_opt(vfs, "rw") && !has_opt(vfs, "nosuid"));
+        ASSERT_TRUE(test_mount_options(src, vfs, sizeof(vfs), sb, sizeof(sb)));
+        ASSERT_TRUE(test_has_opt(vfs, "rw") && !test_has_opt(vfs, "nosuid"));
         fstab_entry_done(&e);
 }
 
@@ -464,8 +385,8 @@ static void test_remount(void) {
         ASSERT_EQ_INT(fstab_mkdir_p(where, 0755), 0);
         ASSERT_EQ_INT(fstab_mount(&e, where, 0, NULL, err, sizeof(err)), 0);
         fstab_entry_done(&e);
-        ASSERT_TRUE(mount_options(where, vfs, sizeof(vfs), sb, sizeof(sb)));
-        ASSERT_TRUE(has_opt(vfs, "ro") && has_opt(sb, "ro"));
+        ASSERT_TRUE(test_mount_options(where, vfs, sizeof(vfs), sb, sizeof(sb)));
+        ASSERT_TRUE(test_has_opt(vfs, "ro") && test_has_opt(sb, "ro"));
 
         /*
          * The root check's case: a bare rw remount of a read-only mount must
@@ -474,10 +395,10 @@ static void test_remount(void) {
          * nosuid it was not told to keep.
          */
         ASSERT_EQ_INT(fstab_remount(where, NULL, 0, err, sizeof(err)), 0);
-        ASSERT_TRUE(mount_options(where, vfs, sizeof(vfs), sb, sizeof(sb)));
-        ASSERT_TRUE(has_opt(vfs, "rw"));
-        ASSERT_TRUE(has_opt(sb, "rw"));
-        ASSERT_TRUE(!has_opt(vfs, "nosuid"));
+        ASSERT_TRUE(test_mount_options(where, vfs, sizeof(vfs), sb, sizeof(sb)));
+        ASSERT_TRUE(test_has_opt(vfs, "rw"));
+        ASSERT_TRUE(test_has_opt(sb, "rw"));
+        ASSERT_TRUE(!test_has_opt(vfs, "nosuid"));
         {
                 char probe[PATH_MAX + 8];
 
@@ -491,19 +412,19 @@ static void test_remount(void) {
         ASSERT_EQ_INT(fstab_options_parse("ro,size=2m,noexec,noatime", &o), 0);
         ASSERT_EQ_INT(fstab_remount(where, &o, 0, err, sizeof(err)), 0);
         fstab_options_done(&o);
-        ASSERT_TRUE(mount_options(where, vfs, sizeof(vfs), sb, sizeof(sb)));
-        ASSERT_TRUE(has_opt(vfs, "ro") && has_opt(sb, "ro"));
-        ASSERT_TRUE(has_opt(sb, "size=2048k"));
-        ASSERT_TRUE(has_opt(vfs, "noexec") && has_opt(vfs, "noatime"));
+        ASSERT_TRUE(test_mount_options(where, vfs, sizeof(vfs), sb, sizeof(sb)));
+        ASSERT_TRUE(test_has_opt(vfs, "ro") && test_has_opt(sb, "ro"));
+        ASSERT_TRUE(test_has_opt(sb, "size=2048k"));
+        ASSERT_TRUE(test_has_opt(vfs, "noexec") && test_has_opt(vfs, "noatime"));
 
         /* The atime mode survives a remount that does not name one. */
         ASSERT_EQ_INT(fstab_options_parse("rw", &o), 0);
         ASSERT_EQ_INT(fstab_remount(where, &o, 0, err, sizeof(err)), 0);
         fstab_options_done(&o);
-        ASSERT_TRUE(mount_options(where, vfs, sizeof(vfs), sb, sizeof(sb)));
-        ASSERT_TRUE(has_opt(vfs, "rw") && has_opt(sb, "rw"));
-        ASSERT_TRUE(has_opt(vfs, "noatime"));
-        ASSERT_TRUE(!has_opt(vfs, "noexec"));
+        ASSERT_TRUE(test_mount_options(where, vfs, sizeof(vfs), sb, sizeof(sb)));
+        ASSERT_TRUE(test_has_opt(vfs, "rw") && test_has_opt(sb, "rw"));
+        ASSERT_TRUE(test_has_opt(vfs, "noatime"));
+        ASSERT_TRUE(!test_has_opt(vfs, "noexec"));
 
         /* A bad filesystem option fails the reconfigure and changes nothing,
          * the per-mount attributes included. */
@@ -511,8 +432,8 @@ static void test_remount(void) {
         ASSERT_TRUE(fstab_remount(where, &o, 0, err, sizeof(err)) < 0);
         ASSERT_TRUE(strstr(err, "fsconfig(no_such_tmpfs_option)") != NULL);
         fstab_options_done(&o);
-        ASSERT_TRUE(mount_options(where, vfs, sizeof(vfs), sb, sizeof(sb)));
-        ASSERT_TRUE(has_opt(vfs, "rw") && has_opt(sb, "rw"));
+        ASSERT_TRUE(test_mount_options(where, vfs, sizeof(vfs), sb, sizeof(sb)));
+        ASSERT_TRUE(test_has_opt(vfs, "rw") && test_has_opt(sb, "rw"));
 
         path_in(where, sizeof(where), "not-a-mount-point-at-all");
         ASSERT_TRUE(fstab_remount(where, NULL, 0, err, sizeof(err)) < 0);
@@ -577,14 +498,14 @@ static void test_pass_real(void) {
 
         /* The API mount: fstab's filesystem option applied, and its request
          * to clear the hardening refused -- the floor stands. */
-        ASSERT_TRUE(mount_options(api, vfs, sizeof(vfs), sb, sizeof(sb)));
-        ASSERT_TRUE(has_opt(sb, "size=2048k"));
-        ASSERT_TRUE(has_opt(vfs, "nosuid") && has_opt(vfs, "nodev") && has_opt(vfs, "noexec"));
+        ASSERT_TRUE(test_mount_options(api, vfs, sizeof(vfs), sb, sizeof(sb)));
+        ASSERT_TRUE(test_has_opt(sb, "size=2048k"));
+        ASSERT_TRUE(test_has_opt(vfs, "nosuid") && test_has_opt(vfs, "nodev") && test_has_opt(vfs, "noexec"));
 
         /* Already mounted and not PID 1's own: left exactly as it was. */
-        ASSERT_TRUE(mount_options(plain, vfs, sizeof(vfs), sb, sizeof(sb)));
-        ASSERT_TRUE(has_opt(sb, "size=1024k"));
-        ASSERT_TRUE(!has_opt(vfs, "noexec"));
+        ASSERT_TRUE(test_mount_options(plain, vfs, sizeof(vfs), sb, sizeof(sb)));
+        ASSERT_TRUE(test_has_opt(sb, "size=1024k"));
+        ASSERT_TRUE(!test_has_opt(vfs, "noexec"));
 
         read_file(record, content, sizeof(content));
         ASSERT_TRUE(strstr(content, " mounted tmpfs size=1m\n") != NULL);
@@ -622,7 +543,7 @@ int main(void) {
         ASSERT_TRUE(dir != NULL);
         snprintf(scratch, sizeof(scratch), "%s", dir);
 
-        if (!enter_namespace()) {
+        if (!test_enter_mount_namespace()) {
                 test_rm_rf(dir);
                 free(dir);
                 printf("test-fstab-mount: no user namespace here, skipping the real-mount checks\n");

@@ -16,6 +16,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "fstab-mount.h"
 #include "gpt-scan.h"
 #include "util.h"
 
@@ -161,28 +162,48 @@ static int run_fsck(const char *node, int *ret_code) {
         return 0;
 }
 
-/* Clear MS_RDONLY on "/" and say so. Returns PICO_ROOT_CONTINUE or -errno. */
-static int remount_rw(void) {
-        /*
-         * MS_REMOUNT with no MS_RDONLY in the flags is what clears it. The
-         * other per-mount flags go with it, which is correct here and only
-         * here: this is the root the kernel itself mounted from the command
-         * line, so the only flag it carries is the read-only one being
-         * cleared. A root mounted by anything with an opinion about nosuid or
-         * nodev would need those flags passed back in.
-         */
-        if (mount(NULL, "/", NULL, MS_REMOUNT, NULL) < 0) {
-                int saved = errno; /* pico_log() is free to clobber it */
+int pico_root_remount(const char *where, FstabEntry *root_line) {
+        const FstabOptions *o = root_line ? &root_line->opts : NULL;
+        bool want_ro = o && (o->attr_set & MOUNT_ATTR_RDONLY);
+        char err[512];
+        int r;
 
-                pico_log(PICO_LOG_ERR, "could not remount the root filesystem read-write: %s", strerror(saved));
-                return -saved;
+        r = fstab_remount(where, o, 0, err, sizeof(err));
+        if (r < 0 && o && !want_ro) {
+                /* What the line asks for is not worth a read-only root. */
+                pico_log(PICO_LOG_WARNING,
+                         "cannot apply /etc/fstab's options (%s) to the root filesystem: %s -- "
+                         "remounting it read-write without them",
+                         root_line->options,
+                         err);
+                fstab_entry_set_outcome(root_line, FSTAB_FAILED, "options not applied: %s", err);
+
+                r = fstab_remount(where, NULL, 0, err, sizeof(err));
+                if (r == 0) {
+                        pico_log(PICO_LOG_INFO, "the root filesystem is now mounted read-write");
+                        return PICO_ROOT_CONTINUE;
+                }
         }
 
-        pico_log(PICO_LOG_INFO, "the root filesystem is now mounted read-write");
+        if (r < 0) {
+                pico_log(PICO_LOG_ERR,
+                         "could not remount the root filesystem %s: %s",
+                         want_ro ? "with its /etc/fstab options" : "read-write",
+                         err);
+                fstab_entry_set_outcome(root_line, FSTAB_FAILED, "%s", err);
+                return r;
+        }
+
+        if (want_ro)
+                pico_log(PICO_LOG_INFO, "the root filesystem stays read-only, as /etc/fstab asks");
+        else
+                pico_log(PICO_LOG_INFO, "the root filesystem is now mounted read-write");
+
+        fstab_entry_set_outcome(root_line, FSTAB_REMOUNTED, "%s", root_line ? root_line->options : "rw");
         return PICO_ROOT_CONTINUE;
 }
 
-int pico_root_check(void) {
+int pico_root_check(FstabEntry *root_line) {
         char part[PATH_MAX];
         PicoExtInfo fs;
         bool read_only = false;
@@ -195,7 +216,7 @@ int pico_root_check(void) {
          * The branch every image built today takes, because nothing has flipped
          * `rw` to `ro` on any of these kernel command lines yet. It has to be
          * correct and cheap on an ordinary boot, and it is: one file read, no
-         * device opened, no mount(2) attempted.
+         * device opened, and no remount unless fstab's "/" line asks for one.
          *
          * `read_only` is answered by the mountinfo line alone, so it is
          * trustworthy even when the call went on to fail for want of a block
@@ -203,6 +224,17 @@ int pico_root_check(void) {
          * the case the r < 0 arm below distinguishes.
          */
         if (!read_only) {
+                /* Nothing to check on a root already in use read-write, but
+                 * fstab may still ask for "ro" or an option it lacks. */
+                if (root_line && !fstab_options_trivial(&root_line->opts)) {
+                        pico_log(PICO_LOG_INFO,
+                                 "the root filesystem is read-write, applying /etc/fstab's options (%s)",
+                                 root_line->options);
+                        return pico_root_remount("/", root_line);
+                }
+
+                fstab_entry_set_outcome(root_line, FSTAB_PRESENT, "read-write, not checked");
+
                 if (r < 0)
                         pico_log(r == -ENOENT ? PICO_LOG_DEBUG : PICO_LOG_WARNING,
                                  "the root filesystem has no block device under it (%s), nothing to check",
@@ -216,7 +248,8 @@ int pico_root_check(void) {
 
         /*
          * From here root IS read-only, so this function owes the rest of the
-         * boot either a read-write root or a logged reason why not. An
+         * boot either the root fstab asks for -- read-write, unless its "/"
+         * line says "ro" -- or a logged reason why not. An
          * unidentifiable device is not such a reason -- a machine sitting at a
          * console with a writable root is worth more than one that is right
          * about which node it is on.
@@ -224,35 +257,35 @@ int pico_root_check(void) {
         if (r < 0) {
                 pico_log(PICO_LOG_WARNING,
                          "the root filesystem is read-only but its device could not be identified (%s), "
-                         "remounting it read-write unchecked",
+                         "remounting it unchecked",
                          strerror(-r));
-                return remount_rw();
+                return pico_root_remount("/", root_line);
         }
 
         r = ext_super_read(part, &fs);
         if (r < 0) {
                 pico_log(PICO_LOG_WARNING,
-                         "%s: cannot read the filesystem superblock: %s, remounting read-write unchecked",
+                         "%s: cannot read the filesystem superblock: %s, remounting it unchecked",
                          part,
                          strerror(-r));
-                return remount_rw();
+                return pico_root_remount("/", root_line);
         }
 
         if (r == 0) {
                 pico_log(PICO_LOG_INFO, "%s carries no ext filesystem, nothing here can check it", part);
-                return remount_rw();
+                return pico_root_remount("/", root_line);
         }
 
         switch (pico_root_verdict(&fs)) {
         case PICO_ROOT_CLEAN:
                 pico_log(PICO_LOG_DEBUG, "%s is marked clean, no check needed", part);
-                return remount_rw();
+                return pico_root_remount("/", root_line);
 
         case PICO_ROOT_REPLAY:
                 pico_log(PICO_LOG_INFO,
                          "%s has an unreplayed journal; the kernel will recover it on the remount",
                          part);
-                return remount_rw();
+                return pico_root_remount("/", root_line);
 
         case PICO_ROOT_CHECK:
                 break;
@@ -271,27 +304,24 @@ int pico_root_check(void) {
          * kernel was going to mount anyway.
          */
         if (access(PICO_FSCK_EXT4, X_OK) < 0) {
-                pico_log(PICO_LOG_WARNING,
-                         "%s is not installed, remounting %s read-write unchecked",
-                         PICO_FSCK_EXT4,
-                         part);
-                return remount_rw();
+                pico_log(PICO_LOG_WARNING, "%s is not installed, remounting %s unchecked", PICO_FSCK_EXT4, part);
+                return pico_root_remount("/", root_line);
         }
 
         r = run_fsck(part, &code);
         if (r < 0) {
                 pico_log(PICO_LOG_WARNING,
-                         "could not run %s on %s: %s, remounting read-write unchecked",
+                         "could not run %s on %s: %s, remounting unchecked",
                          PICO_FSCK_EXT4,
                          part,
                          strerror(-r));
-                return remount_rw();
+                return pico_root_remount("/", root_line);
         }
 
         switch (pico_fsck_verdict(code)) {
         case PICO_FSCK_OK:
                 pico_log(PICO_LOG_INFO, "%s checked%s", part, code ? " and repaired" : "");
-                return remount_rw();
+                return pico_root_remount("/", root_line);
 
         case PICO_FSCK_REBOOT:
                 /*
@@ -329,16 +359,21 @@ int pico_root_check(void) {
                          part,
                          PICO_FSCK_EXT4,
                          code);
+                fstab_entry_set_outcome(
+                                root_line,
+                                FSTAB_FAILED,
+                                "%s left errors uncorrected, kept read-only",
+                                PICO_FSCK_EXT4);
                 return PICO_ROOT_CONTINUE;
 
         case PICO_FSCK_FAILED:
         default:
                 pico_log(PICO_LOG_WARNING,
                          "%s failed on %s (exit %d), which says nothing about the filesystem -- "
-                         "remounting read-write anyway",
+                         "remounting anyway",
                          PICO_FSCK_EXT4,
                          part,
                          code);
-                return remount_rw();
+                return pico_root_remount("/", root_line);
         }
 }

@@ -13,6 +13,8 @@
 
 #pragma once
 
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -76,3 +78,22 @@ int test_symlink(const char *dir, const char *name, const char *target);
 
 /* Recursively remove `path` and free nothing; caller still owns the string. */
 void test_rm_rf(const char *path);
+
+/*
+ * Move this process into a private user + mount namespace, root inside it, with
+ * every mount private. An unprivileged process there owns its own mount table
+ * and may mount tmpfs, reconfigure it and change its per-mount attributes, so
+ * mount code can be tested against the real kernel without touching the host.
+ * False, with the reason on stderr, when the host refuses user namespaces --
+ * callers SKIP (exit 77) on that. Single-threaded processes only.
+ */
+bool test_enter_mount_namespace(void);
+
+/* The mount at exactly `where`, per /proc/self/mountinfo: its per-mount option
+ * field into `vfs` and its superblock option field into `sb`, each wrapped as
+ * ",a,b,c," for test_has_opt(). The last matching line, the mount a lookup
+ * lands on. False when nothing is mounted there. */
+bool test_mount_options(const char *where, char *vfs, size_t vfs_size, char *sb, size_t sb_size);
+
+/* Whole-token membership in a list test_mount_options() built. */
+bool test_has_opt(const char *list, const char *opt);

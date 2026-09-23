@@ -134,7 +134,7 @@ int main(void) {
          * the thing that must catch a reboot() that came back -- belongs to
          * this file. root-check.h has the decision table behind the verdict.
          */
-        r = pico_root_check();
+        r = pico_root_check(NULL);
         if (r < 0)
                 pico_log(PICO_LOG_WARNING, "pico_root_check: %s", strerror(-r));
         else if (r == PICO_ROOT_REBOOT) {
