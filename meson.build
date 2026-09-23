@@ -95,6 +95,9 @@ pico_init_core_sources = files(
   # The boot-time fstab pass main.c runs between the root check and swap
   # discovery, on the kernel's new mount API.
   'src/fstab-mount.c',
+  # UUID=/LABEL=/PARTUUID=/PARTLABEL= resolution by walking sysfs, and the
+  # bounded wait for a device that has not appeared yet.
+  'src/fstab-resolve.c',
   'src/unit.c',
   # Template/instance name parsing (G2), split out of unit.c because it
   # needs nothing from Unit itself -- unit.c calls into it, not vice versa.
@@ -228,6 +231,9 @@ pico_tests = [
   'test-fstab',
   # The pass against real mounts, inside a private user + mount namespace.
   'test-fstab-mount',
+  # Source resolution against a fixture sysfs tree and image files, and the
+  # device wait driven through its poll hook.
+  'test-fstab-resolve',
   # Manager-level regression test for the SIGCHLD-before-cgroup-empty
   # dispatch-order property (manager.h's EVENT_PRIORITY_* table): drives
   # m->event directly, one dispatch at a time, since manager_loop() itself

@@ -15,6 +15,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -97,3 +98,24 @@ bool test_mount_options(const char *where, char *vfs, size_t vfs_size, char *sb,
 
 /* Whole-token membership in a list test_mount_options() built. */
 bool test_has_opt(const char *list, const char *opt);
+
+/*
+ * A block device in a fixture sysfs tree under `sys_root`, the way the kernel
+ * lays one out: its directory under devices/ (inside `parent`'s when it is a
+ * partition, `partno` > 0), holding "size" and, for a partition, "partition";
+ * and class/block/<name> a symlink to it. Parents first. 0 or -errno.
+ */
+int test_block_device(
+                const char *sys_root,
+                const char *name,
+                const char *parent,
+                unsigned partno,
+                unsigned long long size);
+
+/* `size` bytes of `path` (created sparse), with `n` bytes of `data` at `at`.
+ * 0 or -errno. */
+int test_image_write(const char *path, unsigned long long size, const void *data, size_t n, unsigned long long at);
+
+/* An ext4 filesystem as far as any superblock reader can tell: the magic, a
+ * clean state, `uuid` and `label`, 1 KiB in. 0 or -errno. */
+int test_ext_image(const char *path, const uint8_t uuid[16], const char *label);

@@ -243,3 +243,92 @@ bool test_has_opt(const char *list, const char *opt) {
         snprintf(tok, sizeof(tok), ",%s,", opt);
         return strstr(list, tok) != NULL;
 }
+
+static int mkdir_p(const char *path) {
+        char buf[PATH_MAX];
+
+        if (snprintf(buf, sizeof(buf), "%s", path) >= (int) sizeof(buf))
+                return -ENAMETOOLONG;
+
+        for (char *p = buf + 1; *p; p++) {
+                if (*p != '/')
+                        continue;
+                *p = '\0';
+                if (mkdir(buf, 0755) < 0 && errno != EEXIST)
+                        return -errno;
+                *p = '/';
+        }
+
+        if (mkdir(buf, 0755) < 0 && errno != EEXIST)
+                return -errno;
+        return 0;
+}
+
+int test_block_device(
+                const char *sys_root,
+                const char *name,
+                const char *parent,
+                unsigned partno,
+                unsigned long long size) {
+        char dir[PATH_MAX], link[PATH_MAX], val[32];
+        int r;
+
+        if (partno > 0)
+                r = snprintf(dir, sizeof(dir), "%s/devices/virtual/block/%s/%s", sys_root, parent, name);
+        else
+                r = snprintf(dir, sizeof(dir), "%s/devices/virtual/block/%s", sys_root, name);
+        if (r < 0 || (size_t) r >= sizeof(dir))
+                return -ENAMETOOLONG;
+
+        r = mkdir_p(dir);
+        if (r < 0)
+                return r;
+
+        snprintf(val, sizeof(val), "%llu\n", size);
+        r = test_write_file(dir, "size", val);
+        if (r < 0)
+                return r;
+
+        if (partno > 0) {
+                snprintf(val, sizeof(val), "%u\n", partno);
+                r = test_write_file(dir, "partition", val);
+                if (r < 0)
+                        return r;
+        }
+
+        if (snprintf(link, sizeof(link), "%s/class/block", sys_root) >= (int) sizeof(link))
+                return -ENAMETOOLONG;
+        r = mkdir_p(link);
+        if (r < 0)
+                return r;
+
+        return test_symlink(link, name, dir);
+}
+
+int test_image_write(const char *path, unsigned long long size, const void *data, size_t n, unsigned long long at) {
+        int fd, r = 0;
+
+        fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+        if (fd < 0)
+                return -errno;
+
+        if (ftruncate(fd, (off_t) size) < 0 || (n > 0 && pwrite(fd, data, n, (off_t) at) != (ssize_t) n))
+                r = -errno ? -errno : -EIO;
+
+        close(fd);
+        return r;
+}
+
+int test_ext_image(const char *path, const uint8_t uuid[16], const char *label) {
+        uint8_t sb[1024] = { 0 };
+
+        sb[56] = 0x53; /* s_magic 0xef53 */
+        sb[57] = 0xef;
+        sb[58] = 0x01; /* s_state: cleanly unmounted */
+        sb[92] = 0x04; /* s_feature_compat: has_journal */
+        memcpy(sb + 104, uuid, 16);
+        if (label)
+                memcpy(sb + 120, label, strlen(label) > 16 ? 16 : strlen(label));
+
+        return test_image_write(path, 1 << 20, sb, sizeof(sb), 1024);
+}
