@@ -32,6 +32,7 @@ typedef enum UnitLoadState {
         UNIT_STUB,   /* created, fragment not read yet */
         UNIT_LOADED, /* fragment parsed successfully */
         UNIT_ERROR,  /* fragment missing or malformed */
+        UNIT_MASKED, /* fragment shadowed by a symlink to a device node, or is empty (v30 null_or_empty()) */
         _UNIT_LOAD_STATE_MAX,
 } UnitLoadState;
 

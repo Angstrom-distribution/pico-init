@@ -7,7 +7,7 @@
  * in src/load-fragment.c (tag v30, commit 501c92c, copyright 2010
  * Lennart Poettering, GPL-2.0-or-later) down to its essential
  * shape: search a path for "<id>", hand a found file to the INI parser,
- * resolve to UNIT_LOADED or UNIT_ERROR. The 2011 original searched
+ * resolve to UNIT_LOADED, UNIT_ERROR or UNIT_MASKED. The 2011 original searched
  * several directories (/etc, /run, /usr/lib) with per-directory drop-in
  * merging; this MVP searches the manager's own unit path, which defaults to
  * two entries -- PICO_UNIT_DIR (admin overrides) then PICO_PACKAGED_UNIT_DIR
@@ -60,13 +60,19 @@
 
 /*
  * Search every unit_path entry for "<dir>/<name>". 1 with *ret owned on a
- * hit, 0 on a clean miss, -ENOMEM. Split out of unit_load() so the fallback
- * below can run the exact same search twice, once for u->id and once for
- * its template -- the warning strings still name u->id as the subject
- * either time, since that is the unit actually being loaded regardless of
- * which filename was tried.
+ * hit, 0 on a clean miss or a mask, -ENOMEM. Split out of unit_load() so the
+ * fallback below can run the exact same search twice, once for u->id and
+ * once for its template -- the warning strings still name u->id as the
+ * subject either time, since that is the unit actually being loaded
+ * regardless of which filename was tried.
+ *
+ * The first candidate found, mask or not, is terminal (matches
+ * unit_find_fragment()'s own "first hit in the path decides" rule): a mask
+ * must shadow a lower-priority real fragment, not be skipped past. *ret_masked
+ * is only ever set to true, never reset, so a second call reusing it (the
+ * literal-then-template fallback in unit_load()) can't un-mask a unit.
  */
-static int unit_find_fragment(Unit *u, const char *name, char **ret) {
+static int unit_find_fragment(Unit *u, const char *name, char **ret, bool *ret_masked) {
         char * const *dir;
 
         for (dir = u->manager->unit_path; *dir; dir++) {
@@ -88,6 +94,16 @@ static int unit_find_fragment(Unit *u, const char *name, char **ret) {
                                          candidate,
                                          strerror(errno));
                         continue;
+                }
+
+                /* v30 null_or_empty() (util.c): a symlink to a device node
+                 * (conventionally /dev/null) or a zero-size regular file
+                 * masks the unit -- refuse it here rather than falling
+                 * through to a lower-priority real fragment. */
+                if (S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode) || (S_ISREG(st.st_mode) && st.st_size == 0)) {
+                        pico_log(PICO_LOG_INFO, "%s: '%s' masks the unit, refusing to load", u->id, candidate);
+                        *ret_masked = true;
+                        return 0;
                 }
 
                 if (!S_ISREG(st.st_mode)) {
@@ -208,6 +224,7 @@ int unit_resolve_alias(Manager *m, const char *name, char **ret) {
 
 int unit_load(Unit *u) {
         char *fragment_path = NULL;
+        bool masked = false;
         int r;
 
         if (!u)
@@ -221,7 +238,7 @@ int unit_load(Unit *u) {
         if (u->load_state != UNIT_STUB)
                 return 0; /* idempotent: already resolved by an earlier call */
 
-        r = unit_find_fragment(u, u->id, &fragment_path);
+        r = unit_find_fragment(u, u->id, &fragment_path, &masked);
         if (r < 0)
                 return r;
 
@@ -236,16 +253,22 @@ int unit_load(Unit *u) {
          * "optimization" would silently invert. See
          * test_literal_beats_template_across_dirs() in test-unit-load.c.
          */
-        if (r == 0 && u->instance) {
+        if (r == 0 && !masked && u->instance) {
                 char *tmpl = unit_name_template(u->id);
 
                 if (!tmpl)
                         return -ENOMEM;
 
-                r = unit_find_fragment(u, tmpl, &fragment_path);
+                r = unit_find_fragment(u, tmpl, &fragment_path, &masked);
                 free(tmpl);
                 if (r < 0)
                         return r;
+        }
+
+        if (masked) {
+                pico_log(PICO_LOG_DEBUG, "%s: masked, not loading", u->id);
+                u->load_state = UNIT_MASKED;
+                return 0;
         }
 
         if (r == 0) {

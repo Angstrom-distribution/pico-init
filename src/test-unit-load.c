@@ -432,6 +432,83 @@ static void test_non_alias_symlinks(void) {
         free(lib);
 }
 
+/*
+ * units-mask-inverted: /etc/foo.service -> /dev/null must shadow
+ * /usr/lib/foo.service, not skip past it to load the lower-priority copy
+ * (v30 load-fragment.c:2217-2218, null_or_empty()).
+ */
+static void test_mask_shadows_lower_priority_fragment(void) {
+        char *etc, *lib;
+        Manager *m;
+        Unit *u = NULL;
+
+        etc = test_tmpdir_new();
+        lib = test_tmpdir_new();
+        ASSERT_TRUE(etc != NULL && lib != NULL);
+
+        ASSERT_EQ_INT(test_write_file(lib, "foo.service", "[Service]\nExecStart=/bin/true\n"), 0);
+        ASSERT_EQ_INT(test_symlink(etc, "foo.service", "/dev/null"), 0);
+
+        m = manager_for2(etc, lib);
+        ASSERT_EQ_INT(manager_load_unit(m, "foo.service", &u), 0);
+
+        ASSERT_TRUE(u != NULL);
+        ASSERT_EQ_INT(u->load_state, UNIT_MASKED);
+        ASSERT_TRUE(u->fragment_path == NULL);
+
+        manager_free(m);
+        test_rm_rf(etc);
+        test_rm_rf(lib);
+        free(etc);
+        free(lib);
+}
+
+/* The same rule for an instance: a masked literal must not fall back to the
+ * template, the same way a real literal beats the template (G3(b)). */
+static void test_masked_instance_does_not_fall_back_to_template(void) {
+        char *dir;
+        Manager *m;
+        Unit *u = NULL;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir, "serial-getty@.service", "[Service]\nExecStart=/bin/true\n"), 0);
+        ASSERT_EQ_INT(test_symlink(dir, "serial-getty@ttyS0.service", "/dev/null"), 0);
+
+        m = manager_for(dir);
+        ASSERT_EQ_INT(manager_load_unit(m, "serial-getty@ttyS0.service", &u), 0);
+
+        ASSERT_TRUE(u != NULL);
+        ASSERT_EQ_INT(u->load_state, UNIT_MASKED);
+        ASSERT_TRUE(u->fragment_path == NULL);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* A zero-length regular file masks exactly like a symlink to /dev/null. */
+static void test_empty_file_masks(void) {
+        char *dir;
+        Manager *m;
+        Unit *u = NULL;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        ASSERT_EQ_INT(test_write_file(dir, "empty.service", ""), 0);
+
+        m = manager_for(dir);
+        ASSERT_EQ_INT(manager_load_unit(m, "empty.service", &u), 0);
+
+        ASSERT_TRUE(u != NULL);
+        ASSERT_EQ_INT(u->load_state, UNIT_MASKED);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
         test_symlink_alias_is_one_unit();
         test_non_alias_symlinks();
@@ -444,6 +521,9 @@ int main(void) {
         test_boot_scan_skips_templates();
         test_wants_symlink_instantiates_template();
         test_presets_never_see_a_template();
+        test_mask_shadows_lower_priority_fragment();
+        test_masked_instance_does_not_fall_back_to_template();
+        test_empty_file_masks();
 
         printf("test-unit-load: all checks passed\n");
         return 0;
