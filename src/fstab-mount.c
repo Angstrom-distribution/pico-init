@@ -645,10 +645,15 @@ static CheckAction check_filesystem(FstabEntry *e, const char *node, const Fstab
                 PicoExtInfo fs;
 
                 r = ext_super_read(node, &fs);
-                if (r <= 0) {
+                if (r < 0) {
                         pico_log(PICO_LOG_WARNING,
-                                 "fstab: %s: cannot read its ext superblock, not checking it",
-                                 node);
+                                 "fstab: %s: cannot read its superblock: %s, not checking it",
+                                 node,
+                                 strerror(-r));
+                        return CHECK_MOUNT;
+                }
+                if (r == 0) {
+                        pico_log(PICO_LOG_WARNING, "fstab: %s carries no ext filesystem, not checking it", node);
                         return CHECK_MOUNT;
                 }
                 if (pico_root_verdict(&fs) != PICO_ROOT_CHECK) {
