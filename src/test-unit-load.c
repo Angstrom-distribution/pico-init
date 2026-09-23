@@ -509,6 +509,130 @@ static void test_empty_file_masks(void) {
         free(dir);
 }
 
+/*
+ * Multi-hop alias chains and the two ways they can loop, none of it covered
+ * before this: test_non_alias_symlinks() and test_symlink_alias_is_one_unit()
+ * only ever exercise one hop.
+ */
+
+/* a -> b -> c (a real fragment): resolves straight through to c. */
+static void test_alias_chain_resolves_to_final_canonical(void) {
+        char *dir;
+        Manager *m;
+        char *canon = NULL;
+        char path[PATH_MAX];
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir, "c.service", "[Service]\nExecStart=/bin/true\n"), 0);
+        snprintf(path, sizeof(path), "%s/c.service", dir);
+        ASSERT_EQ_INT(test_symlink(dir, "b.service", path), 0);
+        snprintf(path, sizeof(path), "%s/b.service", dir);
+        ASSERT_EQ_INT(test_symlink(dir, "a.service", path), 0);
+
+        m = manager_for(dir);
+        ASSERT_EQ_INT(unit_resolve_alias(m, "a.service", &canon), 1);
+        ASSERT_STREQ(canon, "c.service");
+        free(canon);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* p -> q -> p: the cycle closes back on the name unit_resolve_alias() itself
+ * started from, caught by its own "cycle back to the start" check well
+ * before the hop bound. */
+static void test_alias_cycle_back_to_start_is_not_an_alias(void) {
+        char *dir;
+        Manager *m;
+        char *canon = NULL;
+        char path[PATH_MAX];
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        snprintf(path, sizeof(path), "%s/q.service", dir);
+        ASSERT_EQ_INT(test_symlink(dir, "p.service", path), 0);
+        snprintf(path, sizeof(path), "%s/p.service", dir);
+        ASSERT_EQ_INT(test_symlink(dir, "q.service", path), 0);
+
+        m = manager_for(dir);
+        ASSERT_EQ_INT(unit_resolve_alias(m, "p.service", &canon), 0);
+        ASSERT_TRUE(canon == NULL);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * A chain of nine hops (a0 -> a1 -> ... -> a8, a8 a real fragment) exceeds
+ * ALIAS_MAX_HOPS (8, unit-load.c) without ever revisiting a0 -- the bounded-
+ * hop safety net, not the cycle-back-to-start shortcut, is what has to catch
+ * this or unit_resolve_alias() would walk it forever on a sufficiently long
+ * (or maliciously crafted) symlink chain.
+ */
+static void test_alias_chain_longer_than_max_hops_is_not_an_alias(void) {
+        char *dir;
+        Manager *m;
+        char *canon = NULL;
+        char name[32], target[32], path[PATH_MAX];
+        int i;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir, "a8.service", "[Service]\nExecStart=/bin/true\n"), 0);
+        for (i = 7; i >= 0; i--) {
+                snprintf(name, sizeof(name), "a%d.service", i);
+                snprintf(target, sizeof(target), "a%d.service", i + 1);
+                snprintf(path, sizeof(path), "%s/%s", dir, target);
+                ASSERT_EQ_INT(test_symlink(dir, name, path), 0);
+        }
+
+        m = manager_for(dir);
+        ASSERT_EQ_INT(unit_resolve_alias(m, "a0.service", &canon), 0);
+        ASSERT_TRUE(canon == NULL);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * A dangling alias -- ghost.service names nothing real anywhere in the
+ * search path -- still resolves by name (aliasing is purely syntactic;
+ * whether the canonical has a fragment is unit_load()'s separate concern).
+ * manager_load_unit() must hand back a real, correctly-named UNIT_ERROR
+ * unit rather than failing the call outright.
+ */
+static void test_alias_to_nonexistent_canonical_loads_as_error(void) {
+        char *dir;
+        Manager *m;
+        Unit *u = NULL;
+        char path[PATH_MAX];
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        snprintf(path, sizeof(path), "%s/ghost.service", dir);
+        ASSERT_EQ_INT(test_symlink(dir, "alias.service", path), 0);
+
+        m = manager_for(dir);
+        ASSERT_EQ_INT(manager_load_unit(m, "alias.service", &u), 0);
+
+        ASSERT_TRUE(u != NULL);
+        ASSERT_STREQ(u->id, "ghost.service");
+        ASSERT_TRUE(unit_has_name(u, "alias.service"));
+        ASSERT_EQ_INT(u->load_state, UNIT_ERROR);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
         test_symlink_alias_is_one_unit();
         test_non_alias_symlinks();
@@ -524,6 +648,10 @@ int main(void) {
         test_mask_shadows_lower_priority_fragment();
         test_masked_instance_does_not_fall_back_to_template();
         test_empty_file_masks();
+        test_alias_chain_resolves_to_final_canonical();
+        test_alias_cycle_back_to_start_is_not_an_alias();
+        test_alias_chain_longer_than_max_hops_is_not_an_alias();
+        test_alias_to_nonexistent_canonical_loads_as_error();
 
         printf("test-unit-load: all checks passed\n");
         return 0;
