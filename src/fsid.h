@@ -43,6 +43,7 @@
 typedef enum PicoFsKind {
         PICO_FS_NONE = 0, /* nothing recognised; as a hint: try every reader */
         PICO_FS_EXT,
+        PICO_FS_SWAP,
         _PICO_FS_KIND_MAX, /* as a hint: a type none of the readers handles */
 } PicoFsKind;
 
@@ -92,6 +93,7 @@ int pico_fs_probe_fd(int fd, PicoFsKind hint, PicoFsId *ret);
  * on 1.
  */
 int pico_fs_probe_ext(int fd, PicoFsId *ret);
+int pico_fs_probe_swap(int fd, PicoFsId *ret);
 
 /* --- shared by the readers, and tested on their own --- */
 

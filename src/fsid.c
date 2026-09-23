@@ -19,6 +19,7 @@
 
 static const char * const kind_table[_PICO_FS_KIND_MAX] = {
         [PICO_FS_EXT] = "ext4",
+        [PICO_FS_SWAP] = "swap",
 };
 
 const char *pico_fs_kind_to_string(PicoFsKind k) {
@@ -33,10 +34,11 @@ static const struct {
         const char *type;
         PicoFsKind kind;
 } type_table[] = {
-        {    "ext2", PICO_FS_EXT },
-        {    "ext3", PICO_FS_EXT },
-        {    "ext4", PICO_FS_EXT },
-        { "ext4dev", PICO_FS_EXT },
+        {    "ext2",  PICO_FS_EXT },
+        {    "ext3",  PICO_FS_EXT },
+        {    "ext4",  PICO_FS_EXT },
+        { "ext4dev",  PICO_FS_EXT },
+        {    "swap", PICO_FS_SWAP },
 };
 
 PicoFsKind pico_fs_kind_from_type(const char *fstype) {
@@ -62,7 +64,8 @@ static const struct {
         PicoFsKind kind;
         int (*probe)(int fd, PicoFsId *ret);
 } probe_table[] = {
-        { PICO_FS_EXT, pico_fs_probe_ext },
+        {  PICO_FS_EXT,  pico_fs_probe_ext },
+        { PICO_FS_SWAP, pico_fs_probe_swap },
 };
 
 int pico_fs_probe_fd(int fd, PicoFsKind hint, PicoFsId *ret) {
