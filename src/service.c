@@ -1007,6 +1007,27 @@ void service_sigchld_event(Service *s, pid_t pid, int code, int status) {
                 f = SERVICE_FAILURE_RESOURCES;
         }
 
+        /*
+         * "-" prefix (ExecCommand.ignore, v30 service.c:2597-2598/2669-2670):
+         * a failing command this unit marked ignorable is success as far as
+         * the unit's own state is concerned, whatever its raw exit looked
+         * like. ExecStartPre= is always the control process; ExecStart= is
+         * the control process too under Type=forking (its child is the real
+         * daemon), main otherwise.
+         */
+        if (f != SERVICE_SUCCESS &&
+            ((is_control && s->state == SERVICE_START_PRE && s->exec_start_pre_ignore) ||
+             (is_control && s->state == SERVICE_EXEC_START && s->type == SERVICE_TYPE_FORKING &&
+              s->exec_start_ignore) ||
+             (is_main && s->exec_start_ignore))) {
+                pico_log(PICO_LOG_DEBUG,
+                         "%s: %s process failed, but its ExecStart%s= line is marked '-', ignoring",
+                         UNIT(s)->id,
+                         is_control ? "control" : "main",
+                         is_control && s->state == SERVICE_START_PRE ? "Pre" : "");
+                f = SERVICE_SUCCESS;
+        }
+
         /* B3/a0fef983ab: write-once -- the *first* failure wins, not the
          * last. A watchdog-style timeout that goes on to SIGABRT the
          * service must report the timeout, not the coredump it caused. */

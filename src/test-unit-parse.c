@@ -1330,6 +1330,46 @@ static void test_forking_directives(void) {
         free(dir);
 }
 
+/*
+ * units-exec-dash-prefix-ignored: the '-' modifier glued to the path was
+ * parsed and then thrown away -- nothing carried it onto the Service, so a
+ * failing "-" command still failed the unit (service.c).
+ */
+static void test_exec_dash_prefix_sets_ignore(void) {
+        Manager *m;
+        char *dir;
+        Unit *u;
+        Service *s;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "dash.service",
+                                      "[Service]\nExecStartPre=-/bin/false\nExecStart=/bin/true\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir, "nodash.service", "[Service]\nExecStart=/bin/true\n"), 0);
+
+        m = manager_for(dir);
+
+        u = load_one(m, "dash.service");
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        s = (Service *) u;
+        ASSERT_EQ_INT(s->exec_start_pre_ignore, true);
+        ASSERT_EQ_INT(s->exec_start_ignore, false);
+        ASSERT_STREQ(s->exec_start_pre[0], "/bin/false");
+
+        u = load_one(m, "nodash.service");
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        s = (Service *) u;
+        ASSERT_EQ_INT(s->exec_start_ignore, false);
+        ASSERT_EQ_INT(s->exec_start_pre_ignore, false);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
         test_service_fields();
         test_unknown_directives_are_tolerated();
@@ -1356,6 +1396,7 @@ int main(void) {
         test_shipped_ttygs0_unit_wins_over_template();
         test_type_values();
         test_forking_directives();
+        test_exec_dash_prefix_sets_ignore();
 
         printf("test-unit-parse: all checks passed\n");
         return 0;

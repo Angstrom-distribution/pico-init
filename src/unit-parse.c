@@ -113,13 +113,15 @@ typedef struct ConfigItem {
 
 /*
  * Parses one ExecStart=/ExecStartPre= value into a NULL-terminated argv.
- * Supports the "-" modifier (ignore exit status) only when it's not
- * separated from the path by whitespace; that's the exact shape
- * ("ExecStart=- /bin/true") that hit assert(skip < l) upstream (35b1078e1)
- * -- reject it with a warning instead of indexing past it. Other
- * modifiers (@ + ! :) aren't supported in this MVP and cause the whole
- * directive to be rejected, same as c853953658's validate-and-reject
- * rework rather than the original assert-on-bad-input.
+ * Supports the "-" modifier (ignore exit status), stored via *ret_ignore for
+ * the caller to keep on the command (v30 load-fragment.c:531-533 sets
+ * ExecCommand.ignore the same way), only when it's not separated from the
+ * path by whitespace; that's the exact shape ("ExecStart=- /bin/true") that
+ * hit assert(skip < l) upstream (35b1078e1) -- reject it with a warning
+ * instead of indexing past it. Other modifiers (@ + ! :) aren't supported in
+ * this MVP and cause the whole directive to be rejected, same as
+ * c853953658's validate-and-reject rework rather than the original
+ * assert-on-bad-input.
  */
 /*
  * Expand *word through the full table (%I included) and replace it in
@@ -135,17 +137,25 @@ static int expand_word(Unit *u, char **word) {
         return r;
 }
 
-static int parse_exec_line(
-                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue, char ***ret_argv) {
+static int
+                parse_exec_line(Unit *u,
+                                const char *path,
+                                unsigned line,
+                                const char *lvalue,
+                                const char *rvalue,
+                                char ***ret_argv,
+                                bool *ret_ignore) {
         const char *p = rvalue;
         char **argv = NULL;
         char *word;
         int r;
 
+        *ret_ignore = false;
         p += strspn(p, " \t");
 
         if (*p == '-' && p[1] != '\0' && p[1] != ' ' && p[1] != '\t') {
-                p++; /* modifier glued to the path: accepted, exit status just isn't tracked yet */
+                p++; /* modifier glued to the path */
+                *ret_ignore = true;
         } else if (*p == '-') {
                 pico_log(PICO_LOG_WARNING,
                          "%s:%u: ExecStart= modifier must not be "
@@ -726,6 +736,7 @@ static int config_parse_exec_start(
                 Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
         Service *s = unit_to_service(u, path, line);
         char **argv = NULL;
+        bool ignore = false;
         int r;
 
         if (!s)
@@ -738,7 +749,7 @@ static int config_parse_exec_start(
          * ExecStart= at all is a validation problem, not a parse error --
          * not yet enforced (no post-load validation pass exists), tracked in
          * plans/29-pico-init.md. */
-        r = parse_exec_line(u, path, line, lvalue, rvalue, &argv);
+        r = parse_exec_line(u, path, line, lvalue, rvalue, &argv, &ignore);
         if (r < 0)
                 return 0;
 
@@ -753,6 +764,7 @@ static int config_parse_exec_start(
 
         s->exec_start = pico_strv_free(s->exec_start);
         s->exec_start = argv;
+        s->exec_start_ignore = ignore;
         return 0;
 }
 
@@ -760,12 +772,13 @@ static int config_parse_exec_start_pre(
                 Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
         Service *s = unit_to_service(u, path, line);
         char **argv = NULL;
+        bool ignore = false;
         int r;
 
         if (!s)
                 return 0;
 
-        r = parse_exec_line(u, path, line, lvalue, rvalue, &argv);
+        r = parse_exec_line(u, path, line, lvalue, rvalue, &argv, &ignore);
         if (r < 0)
                 return 0;
 
@@ -780,6 +793,7 @@ static int config_parse_exec_start_pre(
 
         s->exec_start_pre = pico_strv_free(s->exec_start_pre);
         s->exec_start_pre = argv;
+        s->exec_start_pre_ignore = ignore;
         return 0;
 }
 

@@ -365,6 +365,44 @@ static void test_oneshot_completes_only_on_exit(void) {
         free(dir);
 }
 
+/*
+ * units-exec-dash-prefix-ignored: a "-"-prefixed ExecStartPre= that fails
+ * must not fail the unit or skip ExecStart= (v30 service.c:2669-2670 sets
+ * success=true when the exiting control_command->ignore is set).
+ */
+static void test_exec_start_pre_dash_ignores_failure(void) {
+        Manager *m;
+        Service *s;
+        char *dir;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        s = load_service(
+                        m,
+                        dir,
+                        "dash-pre.service",
+                        "[Unit]\nDescription=dash-pre\n"
+                        "[Service]\nType=oneshot\nExecStartPre=-/bin/false\nExecStart=/bin/true\n");
+
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        ASSERT_EQ_INT(s->state, SERVICE_START_PRE);
+        ASSERT_TRUE(s->control_pid > 0);
+
+        ASSERT_TRUE(drive_until(m, service_settled_done, s, 1000));
+
+        /* Reached DEAD (default RemainAfterExit=no), not FAILED: the '-' on
+         * ExecStartPre= means /bin/false's exit 1 never counted. */
+        ASSERT_EQ_INT(s->state, SERVICE_DEAD);
+        ASSERT_EQ_INT(s->result, SERVICE_SUCCESS);
+        ASSERT_EQ_INT(unit_active_state(UNIT(s)), UNIT_INACTIVE);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 static void test_remain_after_exit(void) {
         Manager *m;
         Service *s;
@@ -1888,6 +1926,7 @@ static void test_exec_type_with_expanded_argv(void) {
 int main(void) {
         test_lifecycle_simple();
         test_oneshot_completes_only_on_exit();
+        test_exec_start_pre_dash_ignores_failure();
         test_remain_after_exit();
         test_b2_signal_amnesty_differs_by_type();
         test_start_timeout();

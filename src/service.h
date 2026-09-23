@@ -112,6 +112,11 @@ typedef struct Service {
         char **exec_start_pre; /* may be NULL */
         char **exec_start;
 
+        /* "-" prefix on the ExecStart=/ExecStartPre= line above: a nonzero
+         * exit is not a failure (v30 ExecCommand.ignore, load-fragment.c). */
+        bool exec_start_pre_ignore;
+        bool exec_start_ignore;
+
         /*
          * Environment=/EnvironmentFile=: a "NAME=value" strv and a strv of
          * paths, each optionally '-'-prefixed (missing file is not an error)
