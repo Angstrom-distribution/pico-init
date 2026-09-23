@@ -531,6 +531,71 @@ static void test_pass_real(void) {
         api_path = NULL;
 }
 
+/* Two stand-ins for the table's /dev/pts and /run entries, by their scratch
+ * paths, with the table's own floors. */
+static char stock_pts[PATH_MAX], stock_run[PATH_MAX];
+
+static bool stock_api(const char *where, uint64_t *ret_floor) {
+        if (strcmp(where, stock_pts) == 0) {
+                *ret_floor = MOUNT_ATTR_NOSUID | MOUNT_ATTR_NOEXEC;
+                return true;
+        }
+        if (strcmp(where, stock_run) == 0) {
+                *ret_floor = MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV;
+                return true;
+        }
+        return false;
+}
+
+/*
+ * oe-core's stock fstab lines for /dev/pts and /run, against mounts made the
+ * way mount-setup.c makes them. The devpts line differs from the table
+ * (ptmxmode=), so it is really reapplied through a devpts reconfigure; gid=0
+ * rather than the stock gid=5 only because gid 5 has no mapping in this
+ * namespace.
+ */
+static void test_stock_api_lines(void) {
+        char vfs[1024], sb[1024], record[PATH_MAX], line[PATH_MAX * 2];
+        FstabPassConfig cfg = { 0 };
+        FstabTable t = { 0 };
+
+        path_in(stock_pts, sizeof(stock_pts), "stock/pts");
+        path_in(stock_run, sizeof(stock_run), "stock/run");
+        path_in(record, sizeof(record), "stock/fstab");
+        ASSERT_EQ_INT(fstab_mkdir_p(stock_pts, 0755), 0);
+        ASSERT_EQ_INT(fstab_mkdir_p(stock_run, 0755), 0);
+
+        ASSERT_TRUE(mount("devpts", stock_pts, "devpts", MS_NOSUID | MS_NOEXEC, "newinstance,gid=0,mode=620") ==
+                    0);
+        ASSERT_TRUE(mount("tmpfs", stock_run, "tmpfs", MS_NOSUID | MS_NODEV | MS_STRICTATIME, "mode=0755") ==
+                    0);
+
+        t.entries = calloc(2, sizeof(FstabEntry));
+        ASSERT_TRUE(t.entries != NULL);
+        snprintf(line, sizeof(line), "devpts %s devpts mode=0620,ptmxmode=0666,gid=0 0 0", stock_pts);
+        ASSERT_EQ_INT(fstab_parse_line(line, &t.entries[t.n++]), 1);
+        snprintf(line, sizeof(line), "tmpfs %s tmpfs mode=0755,nodev,nosuid,strictatime 0 0", stock_run);
+        ASSERT_EQ_INT(fstab_parse_line(line, &t.entries[t.n++]), 1);
+
+        cfg.api_floor = stock_api;
+        cfg.record = record;
+        ASSERT_EQ_INT(fstab_pass(&t, &cfg), 0);
+        ASSERT_EQ_INT(t.entries[0].outcome, FSTAB_REMOUNTED);
+        ASSERT_EQ_INT(t.entries[1].outcome, FSTAB_REMOUNTED);
+
+        ASSERT_TRUE(test_mount_options(stock_pts, vfs, sizeof(vfs), sb, sizeof(sb)));
+        ASSERT_TRUE(test_has_opt(sb, "ptmxmode=666"));
+        ASSERT_TRUE(test_has_opt(vfs, "nosuid") && test_has_opt(vfs, "noexec"));
+
+        /* strictatime shows in mountinfo as the absence of the other two. */
+        ASSERT_TRUE(test_mount_options(stock_run, vfs, sizeof(vfs), sb, sizeof(sb)));
+        ASSERT_TRUE(test_has_opt(vfs, "nosuid") && test_has_opt(vfs, "nodev"));
+        ASSERT_TRUE(!test_has_opt(vfs, "relatime") && !test_has_opt(vfs, "noatime"));
+        ASSERT_TRUE(test_has_opt(vfs, "rw"));
+
+        fstab_table_done(&t);
+}
+
 int main(void) {
         char *dir;
 
@@ -558,6 +623,7 @@ int main(void) {
         test_auto_and_bind();
         test_remount();
         test_pass_real();
+        test_stock_api_lines();
 
         ASSERT_TRUE(umount2(scratch, MNT_DETACH) == 0);
         test_rm_rf(dir);

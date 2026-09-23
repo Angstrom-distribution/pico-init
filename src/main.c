@@ -15,6 +15,8 @@
 #include <sys/reboot.h>
 #include <unistd.h>
 
+#include "fstab-mount.h"
+#include "fstab.h"
 #include "gpt-scan.h"
 #include "manager.h"
 #include "mount-setup.h"
@@ -38,6 +40,7 @@ static _Noreturn void freeze(const char *reason) {
 }
 
 int main(void) {
+        FstabTable fstab = { 0 };
         Manager *m = NULL;
         int objective;
         int r;
@@ -133,8 +136,15 @@ int main(void) {
          * where PID 1's one sync()/reboot() path lives, and because freeze() --
          * the thing that must catch a reboot() that came back -- belongs to
          * this file. root-check.h has the decision table behind the verdict.
+         *
+         * /etc/fstab is read first, from a root that may still be read-only,
+         * because its "/" line decides how the check's remount ends.
          */
-        r = pico_root_check(NULL);
+        r = fstab_load("/etc/fstab", &fstab);
+        if (r < 0 && r != -ENOENT)
+                pico_log(PICO_LOG_WARNING, "/etc/fstab: %s", strerror(-r));
+
+        r = pico_root_check(fstab_find(&fstab, "/"));
         if (r < 0)
                 pico_log(PICO_LOG_WARNING, "pico_root_check: %s", strerror(-r));
         else if (r == PICO_ROOT_REBOOT) {
@@ -143,6 +153,20 @@ int main(void) {
                 reboot(RB_AUTOBOOT);
                 freeze("reboot() returned");
         }
+
+        /*
+         * The rest of /etc/fstab. After the root check, because mount points
+         * may need creating on a root that has only now settled; before swap
+         * discovery and before the manager, so that no unit, whatever its
+         * ordering, can see an fstab path before it is mounted.
+         * fstab-mount.h has the rest of the reasoning.
+         */
+        r = fstab_pass(&fstab, NULL);
+        if (r < 0)
+                pico_log(PICO_LOG_WARNING, "fstab_pass: %s", strerror(-r));
+        else if (r > 0)
+                pico_log(PICO_LOG_WARNING, "%d /etc/fstab line(s) not mounted, see %s", r, PICO_FSTAB_RECORD);
+        fstab_table_done(&fstab);
 
         /*
          * Swap, off the partition table alone. Placed here for three separate
