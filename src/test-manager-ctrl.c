@@ -493,6 +493,46 @@ static void test_start_while_stopping_waits(void) {
         ctrl_fixture_teardown(&f);
 }
 
+/* Once a shutdown is pending, nothing new may be started behind its back;
+ * stop still works. */
+static void test_start_refused_while_shutting_down(void) {
+        struct ctrl_fixture f;
+        Unit *u, *hold;
+
+        ctrl_fixture_setup(&f);
+        ASSERT_EQ_INT(test_write_file(f.unitdir,
+                                      "demo.service",
+                                      "[Unit]\n[Service]\nType=simple\nExecStart=/bin/sleep 300\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(f.unitdir,
+                                      "hold.service",
+                                      "[Unit]\n[Service]\nType=oneshot\nExecStart=/bin/sleep 30\n"),
+                      0);
+        ctrl_fixture_boot(&f);
+
+        u = manager_get_unit(f.m, "demo.service");
+        hold = manager_get_unit(f.m, "hold.service");
+        ASSERT_TRUE(u != NULL && hold != NULL);
+
+        /* A start job that stays RUNNING, and a far deadline, keep the loop
+         * from adopting the pending objective while requests are sent. */
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 start hold.service --no-block", "ok queued\n", 100);
+        drive_until_service_state(f.m, hold, SERVICE_EXEC_START);
+        f.m->pending_objective = MANAGER_POWEROFF;
+        f.m->shutdown_deadline = now_monotonic() + 60 * USEC_PER_SEC;
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 start demo.service", "err shutting-down\n", 100);
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 restart demo.service", "err shutting-down\n", 100);
+        ASSERT_EQ_INT(unit_active_state(u), UNIT_INACTIVE);
+        ASSERT_TRUE(u->job == NULL);
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 stop demo.service", "ok done\n", 100);
+        ASSERT_EQ_INT(f.m->objective, MANAGER_EXIT); /* stopped by the driver, not adopted */
+
+        f.m->pending_objective = MANAGER_RUNNING;
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 stop hold.service", "ok done\n", 400);
+        ctrl_fixture_teardown(&f);
+}
+
 /* reset-failed: a FAILED unit returns to inactive; an already-non-FAILED
  * unit is a harmless no-op success (real systemctl's own behaviour); an
  * unknown unit is a real error, not a silent no-op. */
@@ -887,6 +927,7 @@ int main(void) {
         test_start_oneshot_replies_done();
         test_stop_and_restart_ending_failed_reply_done();
         test_start_while_stopping_waits();
+        test_start_refused_while_shutting_down();
         test_reset_failed();
         test_no_block_replies_immediately();
         test_early_disconnect_leaks_nothing();

@@ -32,7 +32,8 @@
  * than anything that allocates on lookup; the accepted-connection count is
  * capped at PICO_CTRL_MAX_CONNS, beyond which a new connection is accepted
  * (draining the listen backlog) and immediately rejected with
- * "err too-many-connections" rather than tracked.
+ * "err too-many-connections" rather than tracked. Once a shutdown is pending,
+ * start/restart are refused with "err shutting-down".
  */
 
 /* accept4()/SOCK_SEQPACKET/struct ucred/MSG_TRUNC-on-a-UNIX-socket are
@@ -392,6 +393,14 @@ static void ctrl_handle_request(struct ctrl_conn *conn, const char *buf, size_t 
         err = ctrl_parse_request(buf, len, &req);
         if (err) {
                 ctrl_send_err(conn->fd, err);
+                ctrl_conn_free(conn);
+                return;
+        }
+
+        /* manager_shutdown() cancelled every start; do not queue new ones. */
+        if (ctrl->manager->pending_objective != MANAGER_RUNNING &&
+            (req.verb == CTRL_VERB_START || req.verb == CTRL_VERB_RESTART)) {
+                ctrl_send_err(conn->fd, "shutting-down");
                 ctrl_conn_free(conn);
                 return;
         }

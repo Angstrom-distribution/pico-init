@@ -15,6 +15,7 @@
 #include <stddef.h>
 #include <string.h>
 
+#include "job.h"
 #include "manager.h"
 #include "util.h"
 
@@ -53,6 +54,20 @@ int manager_shutdown(Manager *m, ManagerObjective objective) {
         m->pending_objective = objective;
         m->shutdown_deadline = now_monotonic() + PICO_SHUTDOWN_TIMEOUT_USEC;
         manager_arm_shutdown_deadline(m);
+
+        /*
+         * Cancel every start and restart still queued. The stop sweep below
+         * skips inactive units, so a start job waiting there would otherwise
+         * run as soon as whatever it is ordered after has stopped. v30 gets
+         * the same effect by isolating to the shutdown target.
+         * Non-recursive: cancelling is not a failure of the unit.
+         */
+        for (i = 0; i < m->n_units; i++) {
+                Job *j = m->units[i]->job;
+
+                if (j && (j->type == JOB_START || j->type == JOB_RESTART))
+                        job_finish_full(j, JOB_CANCELED, false);
+        }
 
         /*
          * Queue a stop for everything still up. Ordering is the job engine's

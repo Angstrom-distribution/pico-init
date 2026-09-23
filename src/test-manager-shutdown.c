@@ -146,8 +146,64 @@ static void test_shutdown_waits_for_running_stop_job(void) {
         free(dir);
 }
 
+/*
+ * A shutdown arriving mid-boot: y's start job is still WAITING behind x. The
+ * stop sweep skipped y because it is inactive, so once x's stop finished y
+ * was started, during the shutdown, and left running at reboot.
+ */
+static void test_shutdown_cancels_waiting_start_jobs(void) {
+        char cgroup_root[PATH_MAX];
+        Manager *m;
+        char *dir;
+        Unit *t, *x, *y;
+        pid_t y_pid;
+        int objective;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir, "x.service", "[Service]\nType=oneshot\nExecStart=/bin/sleep 5\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "y.service",
+                                      "[Unit]\nAfter=x.service\n[Service]\nType=simple\nExecStart=/bin/sleep 300\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir, "t.target", "[Unit]\nWants=x.service y.service\n"), 0);
+
+        m = manager_for(dir, "cancel-starts", cgroup_root, sizeof(cgroup_root));
+        t = manager_get_unit(m, "t.target");
+        x = manager_get_unit(m, "x.service");
+        y = manager_get_unit(m, "y.service");
+        ASSERT_TRUE(t != NULL && x != NULL && y != NULL);
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, t, NULL), 0);
+        ASSERT_TRUE(manager_dispatch_run_queue(m) > 0);
+        ASSERT_EQ_INT(SERVICE(x)->state, SERVICE_EXEC_START);
+        ASSERT_TRUE(y->job != NULL);
+        ASSERT_EQ_INT(y->job->state, JOB_WAITING);
+
+        ASSERT_EQ_INT(manager_shutdown(m, MANAGER_POWEROFF), 0);
+        objective = loop_with_budget(m, 5 * USEC_PER_SEC);
+
+        y_pid = SERVICE(y)->main_pid;
+        if (y_pid > 0)
+                kill(y_pid, SIGKILL);
+
+        ASSERT_EQ_INT(objective, MANAGER_POWEROFF);
+        ASSERT_TRUE(y->job == NULL);
+        ASSERT_EQ_INT(y_pid, 0); /* never spawned */
+        ASSERT_EQ_INT(SERVICE(y)->state, SERVICE_DEAD);
+        ASSERT_TRUE(unit_active_state(x) == UNIT_INACTIVE || unit_active_state(x) == UNIT_FAILED);
+
+        manager_free(m);
+        free_private_cgroup_root(cgroup_root);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
         test_shutdown_waits_for_running_stop_job();
+        test_shutdown_cancels_waiting_start_jobs();
 
         printf("test-manager-shutdown: all checks passed\n");
         return 0;
