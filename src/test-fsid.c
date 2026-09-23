@@ -140,6 +140,14 @@ static void test_kinds(void) {
         ASSERT_EQ_INT(pico_fs_kind_from_type("EXT4"), _PICO_FS_KIND_MAX);
 
         ASSERT_STREQ(pico_fs_kind_to_string(PICO_FS_EXT), "ext4");
+
+        /* Every reader has a name, and every name maps back to its reader. */
+        for (int k = PICO_FS_NONE + 1; k < _PICO_FS_KIND_MAX; k++) {
+                const char *name = pico_fs_kind_to_string((PicoFsKind) k);
+
+                ASSERT_TRUE(name != NULL);
+                ASSERT_EQ_INT(pico_fs_kind_from_type(name), k);
+        }
         ASSERT_TRUE(pico_fs_kind_to_string(PICO_FS_NONE) == NULL);
         ASSERT_TRUE(pico_fs_kind_to_string(_PICO_FS_KIND_MAX) == NULL);
 }

@@ -83,6 +83,7 @@ pico_init_core_sources = files(
   'src/fsid-vfat.c',
   'src/fsid-exfat.c',
   'src/fsid-xfs.c',
+  'src/fsid-btrfs.c',
   # The root filesystem check and the remount that ends it (plan §10, R1).
   # Beside gpt-scan.c for the same reason: it is boot-path code main.c calls
   # once, and the two decision tables inside it are what the tests link.
@@ -214,6 +215,7 @@ pico_tests = [
   'test-fsid-vfat',
   'test-fsid-exfat',
   'test-fsid-xfs',
+  'test-fsid-btrfs',
   # The root check's two decision tables (plan §10, R1). The I/O half of it
   # remounts "/" and is proven by a boot instead.
   'test-root-check',

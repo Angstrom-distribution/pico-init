@@ -19,7 +19,7 @@
 
 static const char * const kind_table[_PICO_FS_KIND_MAX] = {
         [PICO_FS_EXT] = "ext4",    [PICO_FS_SWAP] = "swap", [PICO_FS_VFAT] = "vfat",
-        [PICO_FS_EXFAT] = "exfat", [PICO_FS_XFS] = "xfs",
+        [PICO_FS_EXFAT] = "exfat", [PICO_FS_XFS] = "xfs",   [PICO_FS_BTRFS] = "btrfs",
 };
 
 const char *pico_fs_kind_to_string(PicoFsKind k) {
@@ -43,6 +43,7 @@ static const struct {
         {   "msdos",  PICO_FS_VFAT },
         {   "exfat", PICO_FS_EXFAT },
         {     "xfs",   PICO_FS_XFS },
+        {   "btrfs", PICO_FS_BTRFS },
 };
 
 PicoFsKind pico_fs_kind_from_type(const char *fstype) {
@@ -70,6 +71,7 @@ static const struct {
 } probe_table[] = {
         {   PICO_FS_EXT,   pico_fs_probe_ext },
         {   PICO_FS_XFS,   pico_fs_probe_xfs },
+        { PICO_FS_BTRFS, pico_fs_probe_btrfs },
         { PICO_FS_EXFAT, pico_fs_probe_exfat },
         {  PICO_FS_VFAT,  pico_fs_probe_vfat },
         {  PICO_FS_SWAP,  pico_fs_probe_swap },
