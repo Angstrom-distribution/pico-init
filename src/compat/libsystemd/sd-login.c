@@ -149,7 +149,13 @@ int sd_uid_get_state(uid_t uid, char **ret_state) {
         if (!s)
                 return -ENOMEM;
 
-        *ret_state = s;
+        /* ret_state is optional, like every other output pointer here --
+         * upstream's own existence-only idiom (sd-login.c's
+         * `if (ret_state) *ret_state = TAKE_PTR(s);`). */
+        if (ret_state)
+                *ret_state = s;
+        else
+                free(s);
         return 0;
 }
 

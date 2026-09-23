@@ -32,6 +32,9 @@ static void test_uid_functions(void) {
         ASSERT_STREQ(state, "offline");
         free(state);
 
+        /* NULL argument (existence-only query): must not crash. */
+        ASSERT_EQ_INT(sd_uid_get_state(0, NULL), 0);
+
         ASSERT_EQ_INT(sd_uid_get_sessions(0, 0, &sessions), 0);
         ASSERT_TRUE(sessions == NULL);
         ASSERT_EQ_INT(sd_uid_get_seats(0, 0, &seats), 0);
