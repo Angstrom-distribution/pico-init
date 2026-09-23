@@ -218,6 +218,9 @@ pico_tests = [
   'test-fsid-xfs',
   'test-fsid-btrfs',
   'test-fsid-ntfs',
+  # The readers against real mkfs images, compared with blkid; SKIPs
+  # without blkid, and skips each format whose mkfs is not installed.
+  'test-fsid-real',
   # The root check's two decision tables (plan §10, R1). The I/O half of it
   # remounts "/" and is proven by a boot instead.
   'test-root-check',
