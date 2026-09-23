@@ -188,6 +188,75 @@ static void test_parent_and_all_parents(void) {
         teardown();
 }
 
+static bool is_grandparent_chain(const char *s) {
+        return strcmp(s, "dev3") == 0 || strcmp(s, "dev4") == 0 || strcmp(s, "parentY") == 0 ||
+                        strcmp(s, "grandparentG") == 0;
+}
+
+/* add_all_parents() over a two-level ancestor chain shared by two
+ * devices: the walk (device-enumerator.c's enumerator_scan_devices())
+ * must climb past the immediate parent to the grandparent, and the
+ * dedup-by-syspath check must keep the shared parent and grandparent
+ * to one entry each even though two children's walks both reach them. */
+static void test_multi_level_parent_chain(void) {
+        sd_device_enumerator *e = NULL;
+        char *tmp = test_tmpdir_new();
+        char sysroot[620];
+
+        ASSERT_TRUE(tmp != NULL);
+        snprintf(sysroot, sizeof(sysroot), "%s/sys", tmp);
+        device_set_sys_root_for_tests(sysroot);
+
+        ASSERT_EQ_INT(test_mkdir(tmp, "sys"), 0);
+        ASSERT_EQ_INT(test_mkdir(tmp, "sys/devices"), 0);
+        ASSERT_EQ_INT(test_mkdir(tmp, "sys/devices/platform"), 0);
+        ASSERT_EQ_INT(test_mkdir(tmp, "sys/devices/platform/grandparentG"), 0);
+        ASSERT_EQ_INT(test_write_file(tmp, "sys/devices/platform/grandparentG/uevent", ""), 0);
+        ASSERT_EQ_INT(test_mkdir(tmp, "sys/devices/platform/grandparentG/parentY"), 0);
+        ASSERT_EQ_INT(test_write_file(tmp, "sys/devices/platform/grandparentG/parentY/uevent", ""), 0);
+        ASSERT_EQ_INT(test_mkdir(tmp, "sys/devices/platform/grandparentG/parentY/dev3"), 0);
+        ASSERT_EQ_INT(test_write_file(tmp, "sys/devices/platform/grandparentG/parentY/dev3/uevent", ""), 0);
+        ASSERT_EQ_INT(test_mkdir(tmp, "sys/devices/platform/grandparentG/parentY/dev4"), 0);
+        ASSERT_EQ_INT(test_write_file(tmp, "sys/devices/platform/grandparentG/parentY/dev4/uevent", ""), 0);
+        ASSERT_EQ_INT(test_symlink(tmp,
+                                   "sys/devices/platform/grandparentG/parentY/dev3/subsystem",
+                                   "../../../../../bus/testbus2"),
+                      0);
+        ASSERT_EQ_INT(test_symlink(tmp,
+                                   "sys/devices/platform/grandparentG/parentY/dev4/subsystem",
+                                   "../../../../../bus/testbus2"),
+                      0);
+
+        /* Enumeration walks /sys/bus/<x>/devices symlinks, not
+         * /sys/devices directly (collect_device_candidates()), so dev3
+         * and dev4 need their own bus registration -- a second bus,
+         * kept separate from test_parent_and_all_parents()'s "testbus"
+         * so this fixture is self-contained. */
+        ASSERT_EQ_INT(test_mkdir(tmp, "sys/bus"), 0);
+        ASSERT_EQ_INT(test_mkdir(tmp, "sys/bus/testbus2"), 0);
+        ASSERT_EQ_INT(test_write_file(tmp, "sys/bus/testbus2/uevent", ""), 0);
+        ASSERT_EQ_INT(test_mkdir(tmp, "sys/bus/testbus2/devices"), 0);
+        ASSERT_EQ_INT(test_symlink(tmp,
+                                   "sys/bus/testbus2/devices/dev3",
+                                   "../../../devices/platform/grandparentG/parentY/dev3"),
+                      0);
+        ASSERT_EQ_INT(test_symlink(tmp,
+                                   "sys/bus/testbus2/devices/dev4",
+                                   "../../../devices/platform/grandparentG/parentY/dev4"),
+                      0);
+
+        ASSERT_EQ_INT(sd_device_enumerator_new(&e), 0);
+        ASSERT_EQ_INT(sd_device_enumerator_add_match_sysname(e, "dev3"), 0);
+        ASSERT_EQ_INT(sd_device_enumerator_add_match_sysname(e, "dev4"), 0);
+        ASSERT_EQ_INT(sd_device_enumerator_add_all_parents(e), 0);
+        /* dev3 + dev4 + one parentY + one grandparentG, not five or six */
+        ASSERT_EQ_INT(count_and_check(e, is_grandparent_chain), 4);
+        sd_device_enumerator_unref(e);
+
+        test_rm_rf(tmp);
+        free(tmp);
+}
+
 static void test_subsystem_enumeration(void) {
         sd_device_enumerator *e = NULL;
         sd_device *d;
@@ -230,6 +299,7 @@ int main(void) {
         test_sysname_and_property();
         test_sysattr_and_tag();
         test_parent_and_all_parents();
+        test_multi_level_parent_chain();
         test_subsystem_enumeration();
 
         printf("test-sd-device-enumerator: OK\n");
