@@ -76,6 +76,9 @@ pico_init_core_sources = files(
   # removable partition from it, and PID 1's root check gates a filesystem
   # checker on it.
   'src/ext-super.c',
+  # Filesystem identity (UUID/LABEL) the way blkid reports it, one narrow
+  # reader per on-disk format, for resolving fstab's UUID=/LABEL= sources.
+  'src/fsid.c',
   # The root filesystem check and the remount that ends it (plan §10, R1).
   # Beside gpt-scan.c for the same reason: it is boot-path code main.c calls
   # once, and the two decision tables inside it are what the tests link.
@@ -200,6 +203,8 @@ pico_tests = [
   # The ext superblock reader, moved here with the code it covers when that
   # code left src/devd/ to gain its second consumer (plan §10).
   'test-ext-super',
+  # The shared half of the identity readers, and the dispatcher.
+  'test-fsid',
   # The root check's two decision tables (plan §10, R1). The I/O half of it
   # remounts "/" and is proven by a boot instead.
   'test-root-check',
