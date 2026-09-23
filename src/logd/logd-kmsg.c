@@ -22,6 +22,7 @@
 #include <unistd.h>
 
 #include "../util.h"
+#include "logd-kmsg-internal.h"
 
 /* Generous over any real single kmsg record -- the kernel's own printk
  * ring caps a line well under this. */
@@ -68,37 +69,15 @@ int logd_kmsg_fd(LogdKmsg *k) {
         return k ? k->fd : -1;
 }
 
-int logd_kmsg_read(LogdKmsg *k, char **ret_line, size_t *ret_len, int *ret_priority) {
-        char buf[KMSG_READ_BUF_SIZE];
-        ssize_t n;
-        char *semi, *nl;
-        const char *msg_start;
+int logd_kmsg_parse_record(const char *buf, size_t n, char **ret_line, size_t *ret_len, int *ret_priority) {
+        const char *semi, *nl, *msg_start;
         size_t msg_len;
-        int priority = 6; /* LOG_INFO: the fallback if the header fails to parse at all */
+        int priority;
 
-        if (!k || !ret_line || !ret_len || !ret_priority)
+        if (!buf || !ret_line || !ret_len || !ret_priority)
                 return -EINVAL;
 
-        n = read(k->fd, buf, sizeof(buf) - 1);
-        if (n < 0) {
-                if (errno == EAGAIN)
-                        return 0;
-                if (errno == EPIPE) {
-                        /* We fell behind and the kernel dropped records to
-                         * make room; the next read() resumes right after
-                         * the gap on its own, nothing to seek or reopen. */
-                        pico_log(PICO_LOG_WARNING,
-                                 "logd: /dev/kmsg reader fell behind, some kernel messages were dropped");
-                        return 0;
-                }
-                return -errno;
-        }
-        if (n == 0)
-                return 0;
-
-        buf[n] = '\0';
-
-        semi = memchr(buf, ';', (size_t) n);
+        semi = memchr(buf, ';', n);
         if (!semi)
                 return 0; /* malformed record -- skip it rather than crash on it */
 
@@ -126,6 +105,35 @@ int logd_kmsg_read(LogdKmsg *k, char **ret_line, size_t *ret_len, int *ret_prior
         *ret_priority = priority;
 
         return 1;
+}
+
+int logd_kmsg_read(LogdKmsg *k, char **ret_line, size_t *ret_len, int *ret_priority) {
+        char buf[KMSG_READ_BUF_SIZE];
+        ssize_t n;
+
+        if (!k || !ret_line || !ret_len || !ret_priority)
+                return -EINVAL;
+
+        n = read(k->fd, buf, sizeof(buf) - 1);
+        if (n < 0) {
+                if (errno == EAGAIN)
+                        return 0;
+                if (errno == EPIPE) {
+                        /* We fell behind and the kernel dropped records to
+                         * make room; the next read() resumes right after
+                         * the gap on its own, nothing to seek or reopen. */
+                        pico_log(PICO_LOG_WARNING,
+                                 "logd: /dev/kmsg reader fell behind, some kernel messages were dropped");
+                        return 0;
+                }
+                return -errno;
+        }
+        if (n == 0)
+                return 0;
+
+        buf[n] = '\0';
+
+        return logd_kmsg_parse_record(buf, (size_t) n, ret_line, ret_len, ret_priority);
 }
 
 int logd_kmsg_drain(LogdKmsg *k, LogdWriter *writer) {

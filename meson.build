@@ -611,6 +611,7 @@ install_data(
 logd_tests = [
   'test-logd-write',
   'test-logd-recv',
+  'test-logd-kmsg',
   'test-picolog',
 ]
 
