@@ -667,6 +667,88 @@ static void test_start_limit_from_failed_finishes_job(void) {
         free(dir);
 }
 
+/* Alive and not a zombie. */
+static bool pid_is_running(pid_t pid) {
+        char path[64], buf[512];
+        char *rp;
+        ssize_t n;
+        int fd;
+
+        snprintf(path, sizeof(path), "/proc/%d/stat", (int) pid);
+        fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0)
+                return false;
+        n = read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+        if (n <= 0)
+                return false;
+        buf[n] = '\0';
+
+        rp = strrchr(buf, ')');
+        return rp && rp[1] == ' ' && rp[2] != 'Z' && rp[2] != 'X';
+}
+
+/*
+ * A stop covers the whole cgroup, not just the main pid (v30's default
+ * KillMode=control-group, service_enter_signal()). Here the main process is
+ * a shell that dies of SIGTERM and leaves its backgrounded child behind; the
+ * unit must not report inactive while that child still runs. SIGHUP is
+ * ignored so the shell's exit as session leader of the console cannot kill
+ * the child on the stop's behalf.
+ */
+static void test_stop_signals_whole_cgroup(void) {
+        Manager *m;
+        Service *s;
+        char *dir;
+        pid_t pids[8], child = 0;
+        size_t n = 0, i;
+        int tries;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        s = load_service(
+                        m,
+                        dir,
+                        "stop-tree.service",
+                        "[Service]\nType=simple\nExecStart=/bin/sh -c \"trap '' HUP; sleep 100 & wait\"\n");
+
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        ASSERT_EQ_INT(s->state, SERVICE_RUNNING);
+
+        if (!s->cgroup) {
+                printf("test-service: no cgroup, skipping the whole-cgroup stop check\n");
+                ASSERT_EQ_INT(unit_stop(UNIT(s)), 0);
+                ASSERT_TRUE(drive_until(m, service_settled_done, s, 400));
+                manager_free(m);
+                test_rm_rf(dir);
+                free(dir);
+                return;
+        }
+
+        for (tries = 0; tries < 1000 && child == 0; tries++) {
+                ASSERT_EQ_INT(cgroup_v2_get_pids(s->cgroup, pids, 8, &n), 0);
+                for (i = 0; i < n && i < 8; i++)
+                        if (pids[i] != s->main_pid)
+                                child = pids[i];
+                if (child == 0)
+                        test_sleep_ms(2);
+        }
+        ASSERT_TRUE(child > 0);
+
+        ASSERT_EQ_INT(unit_stop(UNIT(s)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, s, 600));
+
+        ASSERT_EQ_INT(s->state, SERVICE_DEAD);
+        ASSERT_EQ_INT(cgroup_v2_is_empty(s->cgroup), 1);
+        ASSERT_TRUE(!pid_is_running(child));
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 /*
  * Bug found during this milestone's own review, not upstream: every branch
  * of service_enter_running() leaves the start attempt behind for good, so
@@ -1983,6 +2065,7 @@ int main(void) {
         test_crash_restart();
         test_b7_start_limit_stops_the_loop();
         test_start_limit_from_failed_finishes_job();
+        test_stop_signals_whole_cgroup();
         test_bug_running_timer_not_cancelled();
         test_b9_service_verify_refuses_no_execstart();
         test_b1_zero_timeout_means_infinity();

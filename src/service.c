@@ -637,6 +637,29 @@ static void service_enter_dead(Service *s) {
         service_arm_timeout(s, s->restart_usec, service_timer_restart);
 }
 
+/*
+ * v30's default KillMode=control-group (service_enter_signal()): a stop
+ * signals every process in the unit's cgroup, main and control pids
+ * excluded so they are not signalled twice. More members than fit here
+ * get one cgroup-wide pass instead.
+ */
+static void service_signal_cgroup_rest(Service *s, int sig) {
+        pid_t pids[64];
+        size_t n = 0, i;
+
+        if (!s->cgroup || cgroup_v2_get_pids(s->cgroup, pids, sizeof(pids) / sizeof(pids[0]), &n) < 0)
+                return;
+
+        if (n > sizeof(pids) / sizeof(pids[0])) {
+                (void) cgroup_v2_signal(s->cgroup, sig);
+                return;
+        }
+
+        for (i = 0; i < n; i++)
+                if (pids[i] != s->main_pid && pids[i] != s->control_pid)
+                        (void) kill(pids[i], sig);
+}
+
 static void service_enter_stop(Service *s) {
         int mp = main_pid_good(s);
         int cp = control_pid_good(s);
@@ -668,6 +691,7 @@ static void service_enter_stop(Service *s) {
                 kill(s->main_pid, SIGTERM);
         if (cp > 0)
                 kill(s->control_pid, SIGTERM);
+        service_signal_cgroup_rest(s, SIGTERM);
 
         service_arm_timeout(s, s->timeout_stop_usec, service_timer_stop_timeout);
 }
@@ -1080,7 +1104,10 @@ void service_sigchld_event(Service *s, pid_t pid, int code, int status) {
                         service_enter_running(s); /* s->result routes the failure case */
                 } else if (s->state == SERVICE_STOP && main_pid_good(s) == 0) {
                         s->control_pid = 0;
-                        service_enter_dead(s);
+                        /* The rest of the cgroup was signalled too: its
+                         * cgroup-empty event, or the stop timeout, ends it. */
+                        if (service_cgroup_populated(s) == 0)
+                                service_enter_dead(s);
                 } else
                         s->control_pid = 0;
                 return;
@@ -1121,7 +1148,9 @@ void service_sigchld_event(Service *s, pid_t pid, int code, int status) {
                 break;
 
         case SERVICE_STOP:
-                if (control_pid_good(s) == 0)
+                /* Not dead while the rest of the cgroup is still exiting:
+                 * its cgroup-empty event, or the stop timeout, ends it. */
+                if (control_pid_good(s) == 0 && service_cgroup_populated(s) == 0)
                         service_enter_dead(s);
                 break;
 
