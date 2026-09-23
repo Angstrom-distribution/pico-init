@@ -516,13 +516,18 @@ static void process_entry(FstabEntry *e, const FstabPassConfig *cfg) {
         if (!realpath(e->where, where))
                 snprintf(where, sizeof(where), "%s", e->where);
 
+        /* Not knowing is not the same as not mounted: guessing wrong would
+         * stack a second mount on top of the first. */
         r = fstab_is_mounted(cfg->mountinfo, where);
-        if (r < 0)
+        if (r < 0) {
                 pico_log(PICO_LOG_WARNING,
-                         "fstab: cannot read %s: %s, assuming %s is not mounted",
+                         "fstab: cannot read %s: %s, not mounting %s",
                          cfg->mountinfo,
                          strerror(-r),
                          where);
+                fstab_entry_set_outcome(e, FSTAB_FAILED, "cannot tell whether it is mounted: %s", strerror(-r));
+                return;
+        }
 
         if (r > 0) {
                 if (!api) {

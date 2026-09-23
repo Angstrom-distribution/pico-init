@@ -225,6 +225,26 @@ static void test_pass_skips(void) {
 
         fstab_table_done(&t);
 
+        /* A line that would be mounted, when whether it already is cannot
+         * be read: failed, never a guess that could stack a second mount. */
+        {
+                char line[PATH_MAX + 64], mi[PATH_MAX + 16];
+
+                snprintf(line, sizeof(line), "tmpfs %s/m tmpfs defaults 0 0", dir);
+                ASSERT_TRUE((t.entries = calloc(1, sizeof(FstabEntry))) != NULL);
+                ASSERT_EQ_INT(fstab_parse_line(line, &t.entries[0]), 1);
+                t.n = 1;
+
+                snprintf(mi, sizeof(mi), "%s/no-mountinfo", dir);
+                cfg.mountinfo = mi;
+                ASSERT_EQ_INT(fstab_pass(&t, &cfg), 1);
+                ASSERT_EQ_INT(t.entries[0].outcome, FSTAB_FAILED);
+                ASSERT_STREQ(t.entries[0].reason,
+                             "cannot tell whether it is mounted: No such file or directory");
+                cfg.mountinfo = NULL;
+                fstab_table_done(&t);
+        }
+
         /* No fstab lines at all still leaves a record behind, empty. */
         ASSERT_EQ_INT(fstab_pass(&t, &cfg), 0);
         read_file(record, content, sizeof(content));
