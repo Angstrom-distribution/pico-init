@@ -513,7 +513,11 @@ static void test_notify_barrier_acked(void) {
                 close(result_pipe[0]);
                 setenv("NOTIFY_SOCKET", manager_notify_socket_path(f.m), 1);
                 ok = sd_notify_barrier(0, 2 * USEC_PER_SEC) >= 0 ? 'y' : 'n';
-                (void) write(result_pipe[1], &ok, 1);
+                /* Not `(void) write(...)`: a void cast does not suppress
+                 * warn_unused_result -- see pico_log_internal(). */
+                if (write(result_pipe[1], &ok, 1) < 0) {
+                        /* Parent's read() below will time out instead. */
+                }
                 _exit(0);
         }
         close(result_pipe[1]);
