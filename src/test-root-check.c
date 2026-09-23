@@ -326,11 +326,54 @@ static void test_root_check(void) {
         ASSERT_TRUE(is_rw(root));
 }
 
+/* A stand-in checker that records its arguments and exits 4. */
+static void test_fsck_run(void) {
+        char *dir, checker[PATH_MAX], args[PATH_MAX + 8], got[256];
+        int code = -1;
+        FILE *f;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        snprintf(args, sizeof(args), "%s/args", dir);
+
+        {
+                char script[PATH_MAX * 2];
+
+                snprintf(script, sizeof(script), "#!/bin/sh\necho \"$*\" > %s\nexit 4\n", args);
+                ASSERT_EQ_INT(test_write_file(dir, "fsck.vfat", script), 0);
+        }
+        snprintf(checker, sizeof(checker), "%s/fsck.vfat", dir);
+        ASSERT_EQ_INT(chmod(checker, 0755), 0);
+
+        ASSERT_EQ_INT(pico_fsck_run(checker, "/dev/sdz9", &code), 0);
+        ASSERT_EQ_INT(code, 4);
+        ASSERT_EQ_INT(pico_fsck_verdict(code), PICO_FSCK_UNCORRECTED);
+
+        /* Preen mode and the node, nothing else. */
+        f = fopen(args, "re");
+        ASSERT_TRUE(f != NULL);
+        ASSERT_TRUE(fgets(got, sizeof(got), f) != NULL);
+        fclose(f);
+        ASSERT_STREQ(got, "-a /dev/sdz9\n");
+
+        /* A checker that is not there is fsck's own operational error. */
+        snprintf(checker, sizeof(checker), "%s/fsck.missing", dir);
+        ASSERT_EQ_INT(pico_fsck_run(checker, "/dev/sdz9", &code), 0);
+        ASSERT_EQ_INT(code, 8);
+        ASSERT_EQ_INT(pico_fsck_verdict(code), PICO_FSCK_FAILED);
+
+        ASSERT_EQ_INT(pico_fsck_run(NULL, "/dev/sdz9", &code), -EINVAL);
+
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
         char *dir;
 
         test_root_verdict();
         test_fsck_verdict();
+        test_fsck_run();
 
         dir = test_tmpdir_new();
         ASSERT_TRUE(dir != NULL);

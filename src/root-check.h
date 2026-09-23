@@ -160,3 +160,15 @@ typedef enum PicoFsckVerdict {
  * urgent of the two things a combined status can be saying.
  */
 PicoFsckVerdict pico_fsck_verdict(int code);
+
+/*
+ * Run `checker` (an absolute path: PID 1 goes looking for no repair tool
+ * through $PATH) as `<checker> -a <node>` -- preen, never -y -- and wait for
+ * it. The root check runs fsck.ext4 through this; the fstab pass runs
+ * fsck.<type> for any line with a non-zero pass number.
+ *
+ * 0 with *ret_code set to the exit status (8, fsck's own "operational error",
+ * when the exec itself failed), or -errno when the checker could not be
+ * forked or did not exit normally.
+ */
+int pico_fsck_run(const char *checker, const char *node, int *ret_code);

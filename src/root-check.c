@@ -104,7 +104,7 @@ PicoFsckVerdict pico_fsck_verdict(int code) {
 }
 
 /*
- * Run the checker over `node` and hand back its exit code.
+ * Run `checker` over `node` and hand back its exit code.
  *
  * `-a` is preen mode: repair what can be repaired without asking, and give up
  * rather than guess at anything else. Never `-y` -- an appliance with no
@@ -126,16 +126,23 @@ PicoFsckVerdict pico_fsck_verdict(int code) {
  * Returns 0 with *ret_code set, or -errno when the checker could not be run or
  * did not exit normally at all.
  */
-static int run_fsck(const char *node, int *ret_code) {
+int pico_fsck_run(const char *checker, const char *node, int *ret_code) {
+        const char *name;
         pid_t pid;
         int status;
+
+        if (!checker || !node || !ret_code)
+                return -EINVAL;
+
+        name = strrchr(checker, '/');
+        name = name ? name + 1 : checker;
 
         pid = fork();
         if (pid < 0)
                 return -errno;
 
         if (pid == 0) {
-                execl(PICO_FSCK_EXT4, "fsck.ext4", "-a", node, (char *) NULL);
+                execl(checker, name, "-a", node, (char *) NULL);
 
                 /* An exec that did not happen is an operational error in
                  * fsck(8)'s own vocabulary, which is what the parent's mapping
@@ -152,7 +159,8 @@ static int run_fsck(const char *node, int *ret_code) {
 
         if (!WIFEXITED(status)) {
                 pico_log(PICO_LOG_WARNING,
-                         "fsck.ext4 on %s was killed by signal %d",
+                         "%s on %s was killed by signal %d",
+                         name,
                          node,
                          WIFSIGNALED(status) ? WTERMSIG(status) : 0);
                 return -EIO;
@@ -308,7 +316,7 @@ int pico_root_check(FstabEntry *root_line) {
                 return pico_root_remount("/", root_line);
         }
 
-        r = run_fsck(part, &code);
+        r = pico_fsck_run(PICO_FSCK_EXT4, part, &code);
         if (r < 0) {
                 pico_log(PICO_LOG_WARNING,
                          "could not run %s on %s: %s, remounting unchecked",
