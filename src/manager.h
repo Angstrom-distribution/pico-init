@@ -335,8 +335,8 @@ void manager_arm_shutdown_deadline(Manager *m);
 /* Queue stop jobs for everything and record where to go once they drain. 0 or -errno. */
 int manager_shutdown(Manager *m, ManagerObjective objective);
 
-/* True when a pending shutdown may now be acted on: the run queue has drained,
- * or the deadline passed and a wedged unit is not going to be waited for. */
+/* True when a pending shutdown may now be acted on: every installed job has
+ * finished, or the deadline passed and a wedged unit is not going to be waited for. */
 bool manager_shutdown_finished(Manager *m);
 
 const char *manager_objective_to_string(ManagerObjective o);

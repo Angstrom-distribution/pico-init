@@ -8,7 +8,7 @@
  * the event loop on its very next iteration -- before a single one of the stop
  * jobs this function just queued had a chance to run -- so "orderly shutdown"
  * would stop nothing at all. Instead a pending objective is recorded and the
- * loop adopts it once the run queue has drained, or once the deadline passes.
+ * loop adopts it once every job has finished, or once the deadline passes.
  */
 
 #include <errno.h>
@@ -82,7 +82,10 @@ bool manager_shutdown_finished(Manager *m) {
         if (!m || m->pending_objective == MANAGER_RUNNING)
                 return false;
 
-        if (!m->run_queue)
+        /* Installed jobs, not the run queue: a stop job that has sent
+         * SIGTERM is RUNNING and already off the queue, and is exactly
+         * what a shutdown has to wait for. */
+        if (m->n_jobs == 0)
                 return true;
 
         if (now_monotonic() >= m->shutdown_deadline) {

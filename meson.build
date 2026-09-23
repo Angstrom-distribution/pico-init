@@ -207,6 +207,9 @@ pico_tests = [
   # starved property. Real-device ioctl negotiation and reset-on-hang need
   # target hardware -- see manager-watchdog.h and this test's own header.
   'test-manager-watchdog',
+  # Orderly shutdown: waiting on running stop jobs, cancelling queued start
+  # jobs, the signal-to-objective mapping and the deadline.
+  'test-manager-shutdown',
 ]
 
 # manager.h now pulls in sd-event.h, so every test that reaches it

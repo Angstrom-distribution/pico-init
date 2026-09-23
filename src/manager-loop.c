@@ -429,7 +429,7 @@ int manager_loop(Manager *m) {
         /*
          * One pre-loop check for the enter-the-loop-with-a-pending-empty-
          * shutdown case: a post source only becomes pending after some other
-         * dispatch, so a shutdown requested with an already-empty run queue
+         * dispatch, so a shutdown requested with no job installed at all
          * (the direct API/test path, rather than one arriving through a
          * signal or ctrl request already inside the loop) would otherwise
          * never get adopted.
