@@ -80,6 +80,7 @@ pico_init_core_sources = files(
   # reader per on-disk format, for resolving fstab's UUID=/LABEL= sources.
   'src/fsid.c',
   'src/fsid-swap.c',
+  'src/fsid-vfat.c',
   # The root filesystem check and the remount that ends it (plan §10, R1).
   # Beside gpt-scan.c for the same reason: it is boot-path code main.c calls
   # once, and the two decision tables inside it are what the tests link.
@@ -208,6 +209,7 @@ pico_tests = [
   'test-fsid',
   # One test per format reader, against images built byte by byte.
   'test-fsid-swap',
+  'test-fsid-vfat',
   # The root check's two decision tables (plan §10, R1). The I/O half of it
   # remounts "/" and is proven by a boot instead.
   'test-root-check',
