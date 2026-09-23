@@ -749,6 +749,165 @@ static void test_stop_signals_whole_cgroup(void) {
         free(dir);
 }
 
+/* ExecStart=- on the main process, the '-' most shipped units use (oe-core
+ * sshd.service, psplash-systemd.service); a control case without it fails. */
+static void test_exec_start_dash_ignores_main_failure(void) {
+        Manager *m;
+        Service *s, *plain;
+        char *dir;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        s = load_service(
+                        m,
+                        dir,
+                        "dash-main.service",
+                        "[Service]\nType=oneshot\nRemainAfterExit=yes\n"
+                        "ExecStartPre=-/bin/false\nExecStart=-/bin/sh -c \"exit 7\"\n");
+        plain = load_service(
+                        m,
+                        dir,
+                        "nodash-main.service",
+                        "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/sh -c \"exit 7\"\n");
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, UNIT(s), NULL), 0);
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, UNIT(plain), NULL), 0);
+        ASSERT_TRUE(drive_until(m, jobs_idle_done, m, 600));
+
+        ASSERT_EQ_INT(s->state, SERVICE_EXITED);
+        ASSERT_EQ_INT(s->result, SERVICE_SUCCESS);
+        ASSERT_EQ_INT(unit_active_state(UNIT(s)), UNIT_ACTIVE);
+
+        ASSERT_EQ_INT(plain->state, SERVICE_FAILED);
+        ASSERT_EQ_INT(plain->result, SERVICE_FAILURE_EXIT_CODE);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* A oneshot that leaves a background child behind: the exit reaps the rest
+ * of the cgroup and the stop waits for it to empty, and the start job must
+ * still finish (ACTIVATING -> DEACTIVATING -> INACTIVE) so that whatever is
+ * ordered after it runs. */
+static void test_oneshot_with_leftover_child_finishes_job(void) {
+        Manager *m;
+        Service *a, *b;
+        char *dir;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        a = load_service(
+                        m,
+                        dir,
+                        "leftover-a.service",
+                        "[Service]\nType=oneshot\nExecStart=/bin/sh -c \"trap '' HUP; sleep 100 & exit 0\"\n");
+        b = load_service(
+                        m,
+                        dir,
+                        "leftover-b.service",
+                        "[Unit]\nAfter=leftover-a.service\nWants=leftover-a.service\n"
+                        "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n");
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, UNIT(b), NULL), 0);
+        ASSERT_TRUE(drive_until(m, jobs_idle_done, m, 600));
+
+        ASSERT_EQ_INT(a->state, SERVICE_DEAD);
+        ASSERT_EQ_INT(a->result, SERVICE_SUCCESS);
+        ASSERT_EQ_INT(b->state, SERVICE_EXITED);
+        ASSERT_EQ_INT(m->n_jobs, 0);
+        if (a->cgroup)
+                ASSERT_EQ_INT(cgroup_v2_is_empty(a->cgroup), 1);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* TimeoutStopSec= is the only bound on a wedged stop: a service ignoring
+ * SIGTERM is killed through its cgroup and ends FAILED with result=timeout. */
+static void test_stop_timeout_escalates_to_kill(void) {
+        Manager *m;
+        Service *s;
+        char *dir;
+        pid_t pid;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        s = load_service(
+                        m,
+                        dir,
+                        "stop-wedged.service",
+                        "[Service]\nType=simple\nTimeoutStopSec=200ms\n"
+                        "ExecStart=/bin/sh -c \"trap '' TERM HUP; while :; do sleep 0.05; done\"\n");
+
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        ASSERT_EQ_INT(s->state, SERVICE_RUNNING);
+        pid = s->main_pid;
+        test_sleep_ms(50); /* past the shell's trap */
+
+        ASSERT_EQ_INT(unit_stop(UNIT(s)), 0);
+        ASSERT_EQ_INT(s->state, SERVICE_STOP);
+        ASSERT_TRUE(drive_until(m, service_settled_done, s, 600));
+
+        ASSERT_EQ_INT(s->state, SERVICE_FAILED);
+        ASSERT_EQ_INT(s->result, SERVICE_FAILURE_TIMEOUT);
+        ASSERT_EQ_INT(s->main_pid, 0);
+        ASSERT_TRUE(!pid_is_running(pid));
+        ASSERT_TRUE(s->timer_event == NULL);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* A restart whose stop half ends FAILED (a daemon exiting non-zero on
+ * SIGTERM) is still a restart: the unit comes back under a new pid. */
+static void test_restart_of_daemon_failing_on_sigterm(void) {
+        Manager *m;
+        Service *s;
+        char *dir;
+        pid_t pid1;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        s = load_service(
+                        m,
+                        dir,
+                        "restart-exit3.service",
+                        "[Service]\nType=simple\n"
+                        "ExecStart=/bin/sh -c \"trap 'exit 3' TERM; while :; do sleep 0.05; done\"\n");
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, UNIT(s), NULL), 0);
+        ASSERT_TRUE(drive_until(m, jobs_idle_done, m, 400));
+        ASSERT_EQ_INT(s->state, SERVICE_RUNNING);
+        pid1 = s->main_pid;
+        test_sleep_ms(50); /* past the shell's trap */
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_RESTART, UNIT(s), NULL), 0);
+        ASSERT_TRUE(drive_until(m, jobs_idle_done, m, 600));
+
+        ASSERT_EQ_INT(s->state, SERVICE_RUNNING);
+        ASSERT_TRUE(s->main_pid > 0);
+        ASSERT_TRUE(s->main_pid != pid1);
+        ASSERT_EQ_INT(s->result, SERVICE_SUCCESS);
+
+        ASSERT_EQ_INT(unit_stop(UNIT(s)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, s, 600));
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 /*
  * Bug found during this milestone's own review, not upstream: every branch
  * of service_enter_running() leaves the start attempt behind for good, so
@@ -2114,6 +2273,10 @@ int main(void) {
         test_b7_start_limit_stops_the_loop();
         test_start_limit_from_failed_finishes_job();
         test_stop_signals_whole_cgroup();
+        test_exec_start_dash_ignores_main_failure();
+        test_oneshot_with_leftover_child_finishes_job();
+        test_stop_timeout_escalates_to_kill();
+        test_restart_of_daemon_failing_on_sigterm();
         test_bug_running_timer_not_cancelled();
         test_b9_service_verify_refuses_no_execstart();
         test_b1_zero_timeout_means_infinity();
