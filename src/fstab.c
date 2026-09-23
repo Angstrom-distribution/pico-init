@@ -19,7 +19,7 @@
 static const char * const outcome_table[_FSTAB_OUTCOME_MAX] = {
         [FSTAB_PENDING] = "pending", [FSTAB_MOUNTED] = "mounted", [FSTAB_REMOUNTED] = "remounted",
         [FSTAB_PRESENT] = "present", [FSTAB_NOAUTO] = "noauto",   [FSTAB_SKIPPED] = "skipped",
-        [FSTAB_FAILED] = "failed",
+        [FSTAB_FAILED] = "failed",   [FSTAB_ABSENT] = "absent",   [FSTAB_ACTIVE] = "active",
 };
 
 const char *fstab_outcome_to_string(FstabOutcome o) {
@@ -281,8 +281,10 @@ static int apply_option(FstabOptions *o, const char *name, const char *value, co
                         pico_log(PICO_LOG_WARNING,
                                  "fstab: ignoring unparsable x-systemd.device-timeout=%s",
                                  value);
-                else
+                else {
                         o->device_timeout = t;
+                        o->device_timeout_set = true;
+                }
                 return 0;
         }
 
@@ -636,6 +638,20 @@ int fstab_mount_order(FstabTable *t, FstabEntry ***ret_order) {
         return 0;
 }
 
+static bool is_swap(const FstabEntry *e) {
+        return e->type && strcmp(e->type, "swap") == 0;
+}
+
+bool fstab_has_swap(const FstabTable *t) {
+        size_t i;
+
+        for (i = 0; t && i < t->n; i++)
+                if (is_swap(&t->entries[i]))
+                        return true;
+
+        return false;
+}
+
 int fstab_record_write(const FstabTable *t, const char *path) {
         char tmp[PATH_MAX];
         FILE *f;
@@ -653,10 +669,11 @@ int fstab_record_write(const FstabTable *t, const char *path) {
         for (i = 0; t && i < t->n; i++) {
                 const FstabEntry *e = &t->entries[i];
                 char where[PATH_MAX * 4];
+                const char *name = is_swap(e) ? e->what : e->where;
                 char reason[512];
                 char *c;
 
-                if (fstab_escape(e->where ? e->where : "", where, sizeof(where)) < 0)
+                if (fstab_escape(name ? name : "", where, sizeof(where)) < 0)
                         snprintf(where, sizeof(where), "?");
 
                 /* One line per entry is the format's whole contract, so a

@@ -205,15 +205,16 @@ static void test_device_timeout(void) {
         static const struct {
                 const char *opt;
                 usec_t want;
+                bool set;
         } cases[] = {
-                {       "x-systemd.device-timeout=90",   90 * USEC_PER_SEC },
-                {    "x-systemd.device-timeout=500ms", 500 * USEC_PER_MSEC },
-                {     "x-systemd.device-timeout=2min",  120 * USEC_PER_SEC },
-                {        "x-systemd.device-timeout=0",                   0 },
-                { "x-systemd.device-timeout=infinity",       USEC_INFINITY },
-                {    "x-systemd.device-timeout=bogus",       USEC_INFINITY },
-                {      "x-systemd.device-timeout=5xs",       USEC_INFINITY },
-                {                            "nofail",       USEC_INFINITY },
+                {       "x-systemd.device-timeout=90",   90 * USEC_PER_SEC,  true },
+                {    "x-systemd.device-timeout=500ms", 500 * USEC_PER_MSEC,  true },
+                {     "x-systemd.device-timeout=2min",  120 * USEC_PER_SEC,  true },
+                {        "x-systemd.device-timeout=0",                   0,  true },
+                { "x-systemd.device-timeout=infinity",       USEC_INFINITY,  true },
+                {    "x-systemd.device-timeout=bogus",       USEC_INFINITY, false },
+                {      "x-systemd.device-timeout=5xs",       USEC_INFINITY, false },
+                {                            "nofail",       USEC_INFINITY, false },
         };
         size_t i;
 
@@ -225,6 +226,7 @@ static void test_device_timeout(void) {
                         fprintf(stderr, "%s: got %llu\n", cases[i].opt, (unsigned long long) o.device_timeout);
                         ASSERT_TRUE(o.device_timeout == cases[i].want);
                 }
+                ASSERT_EQ_INT(o.device_timeout_set, cases[i].set);
                 ASSERT_TRUE(o.data == NULL);
                 fstab_options_done(&o);
         }
@@ -419,6 +421,10 @@ static void test_outcome_strings(void) {
         ASSERT_TRUE(!fstab_outcome_is_degraded(FSTAB_PRESENT));
         ASSERT_TRUE(!fstab_outcome_is_degraded(FSTAB_NOAUTO));
         ASSERT_TRUE(!fstab_outcome_is_degraded(FSTAB_PENDING));
+        ASSERT_TRUE(!fstab_outcome_is_degraded(FSTAB_ABSENT));
+        ASSERT_TRUE(!fstab_outcome_is_degraded(FSTAB_ACTIVE));
+        ASSERT_STREQ(fstab_outcome_to_string(FSTAB_ABSENT), "absent");
+        ASSERT_STREQ(fstab_outcome_to_string(FSTAB_ACTIVE), "active");
 }
 
 static void test_record(void) {
@@ -431,18 +437,23 @@ static void test_record(void) {
         ASSERT_TRUE(dir != NULL);
         snprintf(path, sizeof(path), "%s/fstab", dir);
 
-        t.entries = calloc(4, sizeof(FstabEntry));
+        t.entries = calloc(6, sizeof(FstabEntry));
         ASSERT_TRUE(t.entries != NULL);
         ASSERT_EQ_INT(fstab_parse_line("tmpfs /var/volatile tmpfs defaults 0 0", &t.entries[0]), 1);
         ASSERT_EQ_INT(fstab_parse_line("/dev/sda1 /mnt/my\\040disk ext4 defaults 0 2", &t.entries[1]), 1);
         ASSERT_EQ_INT(fstab_parse_line("srv:/x /mnt/nfs nfs defaults 0 0", &t.entries[2]), 1);
         ASSERT_EQ_INT(fstab_parse_line("/dev/sdc1 /mnt/card auto noauto 0 0", &t.entries[3]), 1);
-        t.n = 4;
+        ASSERT_EQ_INT(fstab_parse_line("LABEL=swap\\040a none swap sw 0 0", &t.entries[4]), 1);
+        ASSERT_EQ_INT(fstab_parse_line("UUID=1234-ABCD /mnt/stick vfat nofail 0 0", &t.entries[5]), 1);
+        t.n = 6;
+        ASSERT_TRUE(fstab_has_swap(&t));
 
         fstab_entry_set_outcome(&t.entries[0], FSTAB_MOUNTED, "tmpfs");
         fstab_entry_set_outcome(&t.entries[1], FSTAB_FAILED, "fsconfig: %s\ne second line", "No such device");
         fstab_entry_set_outcome(&t.entries[2], FSTAB_SKIPPED, "network filesystem");
         fstab_entry_set_outcome(&t.entries[3], FSTAB_NOAUTO, NULL);
+        fstab_entry_set_outcome(&t.entries[4], FSTAB_ACTIVE, "/dev/sda3");
+        fstab_entry_set_outcome(&t.entries[5], FSTAB_ABSENT, "no device appeared");
 
         ASSERT_EQ_INT(fstab_record_write(&t, path), 0);
 
@@ -458,7 +469,9 @@ static void test_record(void) {
                      "/var/volatile mounted tmpfs\n"
                      "/mnt/my\\040disk failed fsconfig: No such device e second line\n"
                      "/mnt/nfs skipped network filesystem\n"
-                     "/mnt/card noauto -\n");
+                     "/mnt/card noauto -\n"
+                     "LABEL=swap\\040a active /dev/sda3\n"
+                     "/mnt/stick absent no device appeared\n");
         free(content);
 
         ASSERT_EQ_INT(fstab_record_count_degraded(path), 2);
@@ -477,6 +490,8 @@ static void test_record(void) {
 
         /* An empty table is an empty record, which is not an absent one. */
         fstab_table_done(&t);
+        ASSERT_TRUE(!fstab_has_swap(&t));
+        ASSERT_TRUE(!fstab_has_swap(NULL));
         ASSERT_EQ_INT(fstab_record_write(&t, path), 0);
         ASSERT_EQ_INT(fstab_record_count_degraded(path), 0);
 

@@ -45,6 +45,8 @@ typedef enum FstabOutcome {
         FSTAB_NOAUTO,    /* noauto: deliberately left alone */
         FSTAB_SKIPPED,   /* not something pico-init can mount */
         FSTAB_FAILED,    /* attempted, and the kernel said no */
+        FSTAB_ABSENT,    /* nofail, and its device never appeared */
+        FSTAB_ACTIVE,    /* a swap line, swapped on by pico-init */
         _FSTAB_OUTCOME_MAX,
 } FstabOutcome;
 
@@ -52,7 +54,9 @@ const char *fstab_outcome_to_string(FstabOutcome o);
 FstabOutcome fstab_outcome_from_string(const char *s); /* _FSTAB_OUTCOME_MAX if unknown */
 
 /* Whether an outcome means the machine is not what fstab describes: the two
- * that make `picoctl is-system-running` say "degraded". */
+ * that make `picoctl is-system-running` say "degraded". An absent nofail
+ * device is not one of them -- upstream's nofail mount whose device never
+ * shows up leaves an inactive unit, not a failed one. */
 bool fstab_outcome_is_degraded(FstabOutcome o);
 
 typedef struct FstabOptions {
@@ -83,8 +87,10 @@ typedef struct FstabOptions {
         bool propagation; /* shared/private/slave/unbindable and r* forms: ignored */
 
         /* x-systemd.device-timeout=, USEC_INFINITY when absent or unparsable
-         * as well as for an explicit "infinity". */
+         * as well as for an explicit "infinity"; device_timeout_set tells
+         * those apart, since only an absent one means "the default". */
         usec_t device_timeout;
+        bool device_timeout_set;
 } FstabOptions;
 
 typedef struct FstabEntry {
@@ -167,9 +173,14 @@ unsigned fstab_path_depth(const char *path);
  */
 int fstab_mount_order(FstabTable *t, FstabEntry ***ret_order);
 
+/* Whether any line is a swap line, noauto ones included: upstream's rule for
+ * standing DPS swap discovery down (systemd #6192). */
+bool fstab_has_swap(const FstabTable *t);
+
 /*
  * The visibility record: one line per entry, "<mount point> <outcome>
- * <reason>", mount point escaped per fstab_escape(). Written to a temporary
+ * <reason>", mount point escaped per fstab_escape(). A swap line has no mount
+ * point, so its source stands in the first field. Written to a temporary
  * file beside `path` and renamed into place, so a reader never sees half of
  * it. 0 or -errno.
  */

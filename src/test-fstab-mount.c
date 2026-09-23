@@ -178,7 +178,7 @@ static void test_pass_skips(void) {
         };
         static const char * const want[] = {
                 "/ present the root filesystem\n",
-                "none skipped swap lines are not activated by pico-init\n",
+                "/dev/sda2 skipped swap lines are not activated by pico-init\n",
                 "/mnt/nfs skipped network filesystem: nothing orders it after the network\n",
                 "/mnt/cifs skipped network filesystem: nothing orders it after the network\n",
                 "/mnt/net skipped network filesystem: nothing orders it after the network\n",
