@@ -455,6 +455,44 @@ static void test_stop_and_restart_ending_failed_reply_done(void) {
         ctrl_fixture_teardown(&f);
 }
 
+/*
+ * A start that arrives while the service is still stopping waits for the stop
+ * to finish and then starts it (v30 job_run_and_invalidate() on -EAGAIN),
+ * rather than failing because service_start() said "not yet".
+ */
+static void test_start_while_stopping_waits(void) {
+        struct ctrl_fixture f;
+        char unit[PATH_MAX + 64];
+        Unit *u;
+        pid_t old_pid;
+
+        ctrl_fixture_setup(&f);
+        ASSERT_EQ_INT(test_write_file(f.unitdir,
+                                      "slow-term.sh",
+                                      "trap 'sleep 0.3; exit 0' TERM\nwhile :; do sleep 0.1; done\n"),
+                      0);
+        snprintf(unit, sizeof(unit), "[Service]\nType=simple\nExecStart=/bin/sh %s/slow-term.sh\n", f.unitdir);
+        ASSERT_EQ_INT(test_write_file(f.unitdir, "slow.service", unit), 0);
+        ctrl_fixture_boot(&f);
+
+        u = manager_get_unit(f.m, "slow.service");
+        ASSERT_TRUE(u != NULL);
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 start slow.service", "ok done\n", 400);
+        old_pid = SERVICE(u)->main_pid;
+        usleep(200 * 1000); /* let the shell install its trap */
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 stop slow.service --no-block", "ok queued\n", 100);
+        drive_until_service_state(f.m, u, SERVICE_STOP);
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 start slow.service", "ok done\n", 400);
+        ASSERT_EQ_INT(unit_active_state(u), UNIT_ACTIVE);
+        ASSERT_TRUE(SERVICE(u)->main_pid > 0 && SERVICE(u)->main_pid != old_pid);
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 stop slow.service", "ok done\n", 400);
+        ctrl_fixture_teardown(&f);
+}
+
 /* reset-failed: a FAILED unit returns to inactive; an already-non-FAILED
  * unit is a harmless no-op success (real systemctl's own behaviour); an
  * unknown unit is a real error, not a silent no-op. */
@@ -848,6 +886,7 @@ int main(void) {
         test_start_failing_unit_replies_with_real_result();
         test_start_oneshot_replies_done();
         test_stop_and_restart_ending_failed_reply_done();
+        test_start_while_stopping_waits();
         test_reset_failed();
         test_no_block_replies_immediately();
         test_early_disconnect_leaks_nothing();

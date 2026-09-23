@@ -108,7 +108,7 @@ static void job_unlink_run_queue(Job *j) {
 
 /* Append, never prepend: the run queue is meant to read as "what happens, in
  * what order", and prepending onto a list fed by an enumeration reverses it. */
-static void job_add_to_run_queue(Job *j) {
+void job_add_to_run_queue(Job *j) {
         Job **cur;
 
         if (!j)
@@ -441,6 +441,14 @@ int job_run(Job *j) {
          */
         if (r == -EALREADY) {
                 job_finish_full(j, JOB_DONE, true);
+                return 0;
+        }
+
+        /* Not now, e.g. a start while the service is still stopping: wait,
+         * and unit_notify() re-queues the job on the unit's next state
+         * change (v30 job_run_and_invalidate()). */
+        if (r == -EAGAIN) {
+                j->state = JOB_WAITING;
                 return 0;
         }
 

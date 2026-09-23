@@ -365,6 +365,12 @@ void unit_notify(Unit *u, UnitActiveState old_state, UnitActiveState new_state) 
         manager_state_notify_unit(u);
 
         j = u->job;
+
+        /* A job that job_run() put back to WAITING on -EAGAIN may be able to
+         * run now (v30 src/unit.c unit_notify()). */
+        if (j && j->state == JOB_WAITING)
+                job_add_to_run_queue(j);
+
         if (!j || j->state != JOB_RUNNING)
                 return;
 

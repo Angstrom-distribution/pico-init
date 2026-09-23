@@ -118,6 +118,9 @@ int job_finish_full(Job *j, JobResult result, bool recursive);
 /* True when every job this one is ordered after has already finished. */
 bool job_is_runnable(Job *j);
 
+/* Queue a WAITING job to be tried again, and arm the run-queue dispatch. */
+void job_add_to_run_queue(Job *j);
+
 const char *job_type_to_string(JobType t);
 const char *job_state_to_string(JobState s);
 const char *job_result_to_string(JobResult r);
