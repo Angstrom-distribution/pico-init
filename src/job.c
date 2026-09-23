@@ -944,7 +944,11 @@ static void transaction_drop_redundant(Transaction *tx) {
         while (i < tx->n_jobs) {
                 Job *j = tx->jobs[i];
 
-                if (j != tx->anchor_job && job_type_is_redundant(j->type, unit_active_state(j->unit))) {
+                /* Not redundant while a conflicting job is installed: a unit
+                 * that is active now but has a stop queued is about to go
+                 * down (v30 transaction_drop_redundant()). */
+                if (j != tx->anchor_job && job_type_is_redundant(j->type, unit_active_state(j->unit)) &&
+                    !(j->unit->job && job_type_is_conflicting(j->type, j->unit->job->type))) {
                         pico_log(PICO_LOG_DEBUG,
                                  "%s: %s job is redundant, dropping",
                                  j->unit->id,

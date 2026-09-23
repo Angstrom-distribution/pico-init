@@ -1195,8 +1195,56 @@ static void test_requires_failure_propagates_transitively(void) {
         free(dir);
 }
 
+/*
+ * b is active but has a stop job installed, so it is about to go down. A start
+ * pulled in for it by a's Requires= is not redundant: dropping it let b's stop
+ * run and a start without its requirement. v30 transaction_drop_redundant()
+ * keeps a job that conflicts with the one installed.
+ */
+static void test_start_not_dropped_over_installed_stop(void) {
+        Manager *m;
+        char *dir;
+        Unit *a, *b;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir, "b.target", "[Unit]\nDescription=B\n"), 0);
+        ASSERT_EQ_INT(test_write_file(dir, "a.target", "[Unit]\nRequires=b.target\nAfter=b.target\n"), 0);
+
+        m = manager_for(dir);
+        ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+
+        a = manager_get_unit(m, "a.target");
+        b = manager_get_unit(m, "b.target");
+        ASSERT_TRUE(a != NULL && b != NULL);
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, a, NULL), 0);
+        manager_dispatch_run_queue(m);
+        ASSERT_EQ_INT(unit_active_state(a), UNIT_ACTIVE);
+        ASSERT_EQ_INT(unit_active_state(b), UNIT_ACTIVE);
+
+        /* not dispatched: b's stop stays installed and WAITING */
+        ASSERT_EQ_INT(manager_add_job(m, JOB_STOP, b, NULL), 0);
+        ASSERT_TRUE(b->job != NULL && b->job->type == JOB_STOP);
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, a, NULL), 0);
+        ASSERT_TRUE(b->job != NULL);
+        ASSERT_EQ_INT(b->job->type, JOB_START);
+
+        manager_dispatch_run_queue(m);
+        ASSERT_EQ_INT(unit_active_state(b), UNIT_ACTIVE);
+        ASSERT_EQ_INT(unit_active_state(a), UNIT_ACTIVE);
+        ASSERT_EQ_INT(m->n_jobs, 0);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
         test_oneshot_start_job_finishes();
+        test_start_not_dropped_over_installed_stop();
         test_requires_failure_propagates_transitively();
         test_restart_of_unit_that_stops_failed();
         test_ordering_c_b_a();
