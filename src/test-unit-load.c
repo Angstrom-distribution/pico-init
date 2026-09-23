@@ -174,6 +174,63 @@ static void test_literal_beats_template_across_dirs(void) {
         free(dirB);
 }
 
+/*
+ * The basic /etc > /usr/lib rule for an ordinary (non-instance) unit --
+ * only the instance/template precedence case above had a test. The two
+ * dirs' .wants/ directories are unioned, not just-the-winner's: that part
+ * is scan_wants_requires_for()'s own per-directory loop, exercised here
+ * against the same precedence fixture rather than assumed to follow from it.
+ */
+static void test_etc_overrides_lib_for_an_ordinary_unit(void) {
+        Manager *m;
+        char *etc, *lib;
+        Unit *foo, *from_etc, *from_lib;
+
+        etc = test_tmpdir_new();
+        lib = test_tmpdir_new();
+        ASSERT_TRUE(etc != NULL && lib != NULL);
+
+        ASSERT_EQ_INT(test_write_file(etc,
+                                      "foo.service",
+                                      "[Unit]\nDescription=Override\n\n[Service]\nExecStart=/bin/true\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(lib,
+                                      "foo.service",
+                                      "[Unit]\nDescription=Packaged\n\n[Service]\nExecStart=/bin/true\n"),
+                      0);
+
+        ASSERT_EQ_INT(test_write_file(lib, "from-etc.service", "[Service]\nExecStart=/bin/true\n"), 0);
+        ASSERT_EQ_INT(test_write_file(lib, "from-lib.service", "[Service]\nExecStart=/bin/true\n"), 0);
+
+        ASSERT_EQ_INT(test_mkdir(etc, "foo.service.wants"), 0);
+        ASSERT_EQ_INT(test_symlink(etc, "foo.service.wants/from-etc.service", "../from-etc.service"), 0);
+
+        ASSERT_EQ_INT(test_mkdir(lib, "foo.service.wants"), 0);
+        ASSERT_EQ_INT(test_symlink(lib, "foo.service.wants/from-lib.service", "../from-lib.service"), 0);
+
+        m = manager_for2(etc, lib);
+        ASSERT_EQ_INT(manager_load_unit(m, "foo.service", &foo), 0);
+
+        ASSERT_TRUE(foo != NULL);
+        ASSERT_EQ_INT(foo->load_state, UNIT_LOADED);
+        ASSERT_STREQ(foo->description, "Override");
+        ASSERT_STREQ(basename_of(foo->fragment_path), "foo.service");
+
+        ASSERT_EQ_INT(unit_add_wants_requires_dirs(foo), 0);
+        from_etc = manager_get_unit(m, "from-etc.service");
+        from_lib = manager_get_unit(m, "from-lib.service");
+        ASSERT_TRUE(from_etc != NULL && from_lib != NULL);
+        ASSERT_TRUE(unit_has_dependency(foo, UNIT_WANTS, from_etc));
+        ASSERT_TRUE(unit_has_dependency(foo, UNIT_WANTS, from_lib));
+        ASSERT_EQ_INT(foo->n_dependencies[UNIT_WANTS], 2);
+
+        manager_free(m);
+        test_rm_rf(etc);
+        test_rm_rf(lib);
+        free(etc);
+        free(lib);
+}
+
 static void test_non_instance_miss_does_not_try_template(void) {
         Manager *m;
         char *dir;
@@ -640,6 +697,7 @@ int main(void) {
         test_template_fallback();
         test_literal_beats_template_same_dir();
         test_literal_beats_template_across_dirs();
+        test_etc_overrides_lib_for_an_ordinary_unit();
         test_non_instance_miss_does_not_try_template();
         test_template_id_rejected();
         test_boot_scan_skips_templates();
