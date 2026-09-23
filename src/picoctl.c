@@ -47,6 +47,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "fstab.h"
 #include "logd-read.h"
 #include "logd.h"
 #include "manager.h"
@@ -341,6 +342,11 @@ static int cmd_list_units(int argc, char *argv[]) {
  * mid-boot may still resolve). "offline" covers PID 1 not running at all
  * (no manager file), the same not-a-unit-problem case read_unit_state()'s
  * own not-found default already models for a single unit.
+ *
+ * An /etc/fstab line PID 1 skipped or failed to mount degrades the system
+ * too, as a failed .mount unit does upstream. Those lines never become units
+ * here -- the pass runs before the manager exists -- so they are read from the
+ * pass's own record rather than from units/.
  */
 static int cmd_is_system_running(int argc, char *argv[]) {
         char rt[PATH_MAX];
@@ -393,6 +399,14 @@ static int cmd_is_system_running(int argc, char *argv[]) {
                                 any_failed = true;
                 }
                 closedir(d);
+        }
+
+        if (!any_failed) {
+                char record[PATH_MAX];
+
+                if (path_join(record, sizeof(record), PICO_FSTAB_RECORD) == 0 &&
+                    fstab_record_count_degraded(record) > 0)
+                        any_failed = true;
         }
 
         if (any_failed) {

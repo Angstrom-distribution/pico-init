@@ -899,12 +899,65 @@ static void test_status_log_tail(void) {
         free(root);
 }
 
+/*
+ * is-system-running and the fstab pass's record: a skipped or failed fstab line
+ * degrades the system even with every unit healthy; noauto and mounted lines,
+ * and no record at all, do not.
+ */
+static void test_is_system_running_fstab(void) {
+        char *root;
+        char rtdir[PATH_MAX], unitsdir[PATH_MAX + 16];
+        struct run_result res;
+
+        root = test_tmpdir_new();
+        ASSERT_TRUE(root != NULL);
+
+        snprintf(rtdir, sizeof(rtdir), "%s%s", root, PICO_RUNTIME_DIR);
+        snprintf(unitsdir, sizeof(unitsdir), "%s/units", rtdir);
+        ASSERT_EQ_INT(fixture_mkdir_p(unitsdir), 0);
+        ASSERT_EQ_INT(test_write_file(rtdir, "manager", "Objective=running\nNJobs=0\n"), 0);
+        ASSERT_EQ_INT(test_write_file(unitsdir, "demo.service", "ActiveState=active\nSubState=running\n"), 0);
+
+        RUN_PICOCTL(&res, "--root", root, "is-system-running");
+        ASSERT_STREQ(res.out, "running\n");
+        ASSERT_EQ_INT(res.exit_code, 0);
+
+        ASSERT_EQ_INT(test_write_file(rtdir,
+                                      "fstab",
+                                      "/ present read-write, not checked\n"
+                                      "/var/volatile mounted tmpfs defaults\n"
+                                      "/media/card noauto -\n"),
+                      0);
+        RUN_PICOCTL(&res, "--root", root, "is-system-running");
+        ASSERT_STREQ(res.out, "running\n");
+        ASSERT_EQ_INT(res.exit_code, 0);
+
+        ASSERT_EQ_INT(test_write_file(rtdir,
+                                      "fstab",
+                                      "/var/volatile mounted tmpfs defaults\n"
+                                      "/mnt/nfs skipped network filesystem: nothing orders it after the network\n"),
+                      0);
+        RUN_PICOCTL(&res, "--root", root, "is-system-running");
+        ASSERT_STREQ(res.out, "degraded\n");
+        ASSERT_EQ_INT(res.exit_code, 1);
+
+        /* Jobs still running outrank it, exactly as they outrank a failed
+         * unit. */
+        ASSERT_EQ_INT(test_write_file(rtdir, "manager", "Objective=running\nNJobs=2\n"), 0);
+        RUN_PICOCTL(&res, "--root", root, "is-system-running");
+        ASSERT_STREQ(res.out, "starting\n");
+
+        test_rm_rf(root);
+        free(root);
+}
+
 int main(void) {
         test_enable_disable_is_enabled();
         test_preset();
         test_preset_default_enable();
         test_read_verbs_against_real_boot();
         test_status_log_tail();
+        test_is_system_running_fstab();
         /* Last: it exit(77)s on a host without systemctl, and a SKIP must not
          * hide the in-process checks above. */
         test_oracle_symlinks_byte_identical();
