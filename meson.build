@@ -461,6 +461,7 @@ devd_tests = [
   'test-devd-rules',
   'test-devd-match',
   'test-devd-run',
+  'test-devd-media',
 ]
 
 # PICO_SOURCE_DIR lets test-devd-match.c parse the very file meson installs
