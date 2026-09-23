@@ -19,6 +19,7 @@
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/swap.h>
 #include <sys/sysmacros.h>
 #include <unistd.h>
 
@@ -32,6 +33,14 @@
 
 #ifndef AT_RECURSIVE
 #        define AT_RECURSIVE 0x8000
+#endif
+
+/* The kernel's (linux/swap.h); older glibc <sys/swap.h> stops at DISCARD. */
+#ifndef SWAP_FLAG_DISCARD_ONCE
+#        define SWAP_FLAG_DISCARD_ONCE 0x20000
+#endif
+#ifndef SWAP_FLAG_DISCARD_PAGES
+#        define SWAP_FLAG_DISCARD_PAGES 0x40000
 #endif
 
 /* The attributes a mount(8) remount resets unless the options name them.
@@ -511,8 +520,6 @@ static bool type_is_network(const char *type) {
 /* The lines the pass does not attempt, each with the reason it gives. NULL
  * when the line is one to mount. */
 static const char *skip_reason(const FstabEntry *e) {
-        if (strcmp(e->type, "swap") == 0)
-                return "swap lines are not activated by pico-init";
         if (type_is_network(e->type) || e->opts.netdev)
                 return "network filesystem: nothing orders it after the network";
         if (e->opts.automount)
@@ -542,8 +549,7 @@ static bool resolve_source(FstabEntry *e, PicoFsKind hint, const FstabPassConfig
         timeout = fstab_device_timeout(&e->opts, cfg->device_timeout, &clamped);
         if (clamped)
                 pico_log(PICO_LOG_WARNING,
-                         "fstab: %s: waiting at most %llus for %s, not forever",
-                         e->where,
+                         "fstab: waiting at most %llus for %s, not forever",
                          (unsigned long long) (timeout / USEC_PER_SEC),
                          e->what);
 
@@ -556,8 +562,8 @@ static bool resolve_source(FstabEntry *e, PicoFsKind hint, const FstabPassConfig
 
         if (r == -EOPNOTSUPP) {
                 pico_log(PICO_LOG_WARNING,
-                         "fstab: not mounting %s: pico-init cannot read a %s filesystem's UUID or label",
-                         e->where,
+                         "fstab: cannot resolve %s: pico-init cannot read a %s filesystem's UUID or label",
+                         e->what,
                          e->type);
                 fstab_entry_set_outcome(e, FSTAB_FAILED, "no UUID/LABEL reader for %s", e->type);
                 return false;
@@ -571,10 +577,9 @@ static bool resolve_source(FstabEntry *e, PicoFsKind hint, const FstabPassConfig
 
         if (e->opts.nofail) {
                 pico_log(PICO_LOG_INFO,
-                         "fstab: %s did not appear within %llums, and %s is nofail",
+                         "fstab: %s did not appear within %llums, and its line is nofail",
                          e->what,
-                         (unsigned long long) (timeout / USEC_PER_MSEC),
-                         e->where);
+                         (unsigned long long) (timeout / USEC_PER_MSEC));
                 fstab_entry_set_outcome(
                                 e,
                                 FSTAB_ABSENT,
@@ -584,10 +589,9 @@ static bool resolve_source(FstabEntry *e, PicoFsKind hint, const FstabPassConfig
         }
 
         pico_log(PICO_LOG_WARNING,
-                 "fstab: %s did not appear within %llums, not mounting %s",
+                 "fstab: %s did not appear within %llums, skipping its line",
                  e->what,
-                 (unsigned long long) (timeout / USEC_PER_MSEC),
-                 e->where);
+                 (unsigned long long) (timeout / USEC_PER_MSEC));
         fstab_entry_set_outcome(
                         e,
                         FSTAB_SKIPPED,
@@ -828,6 +832,96 @@ static void process_entry(FstabEntry *e, const FstabPassConfig *cfg) {
                 fstab_entry_set_outcome(e, FSTAB_MOUNTED, "%s %s", e->type, e->options);
 }
 
+int fstab_swap_flags(const FstabOptions *o, int *ret_flags) {
+        int flags = 0;
+        char **d;
+
+        for (d = o ? o->data : NULL; d && *d; d++) {
+                if (strncmp(*d, "pri=", 4) == 0) {
+                        char *end;
+                        long pri;
+
+                        errno = 0;
+                        pri = strtol(*d + 4, &end, 10);
+                        if (errno != 0 || end == *d + 4 || *end != '\0' || pri < 0 || pri > SWAP_FLAG_PRIO_MASK)
+                                return -EINVAL;
+                        flags = (flags & ~(SWAP_FLAG_PREFER | SWAP_FLAG_PRIO_MASK)) | SWAP_FLAG_PREFER |
+                                        (((int) pri << SWAP_FLAG_PRIO_SHIFT) & SWAP_FLAG_PRIO_MASK);
+                } else if (strcmp(*d, "discard") == 0)
+                        flags = (flags & ~(SWAP_FLAG_DISCARD_ONCE | SWAP_FLAG_DISCARD_PAGES)) |
+                                        SWAP_FLAG_DISCARD;
+                else if (strcmp(*d, "discard=once") == 0)
+                        flags = (flags & ~SWAP_FLAG_DISCARD_PAGES) | SWAP_FLAG_DISCARD |
+                                        SWAP_FLAG_DISCARD_ONCE;
+                else if (strcmp(*d, "discard=pages") == 0)
+                        flags = (flags & ~SWAP_FLAG_DISCARD_ONCE) | SWAP_FLAG_DISCARD |
+                                        SWAP_FLAG_DISCARD_PAGES;
+                else
+                        pico_log(PICO_LOG_DEBUG, "fstab: ignoring swap option %s", *d);
+        }
+
+        *ret_flags = flags;
+        return 0;
+}
+
+/*
+ * A swap line: its device resolved and waited for exactly as a mount line's
+ * is (a swap file, not being a device, is looked for once), then swapon()
+ * with the line's priority and discard policy. An area already active is
+ * the outcome asked for, not a failure.
+ */
+static void process_swap(FstabEntry *e, const FstabPassConfig *cfg) {
+        char node[PATH_MAX];
+        struct stat st;
+        int flags, r;
+
+        if (e->opts.noauto) {
+                pico_log(PICO_LOG_DEBUG, "fstab: swap %s is noauto, leaving it alone", e->what);
+                fstab_entry_set_outcome(e, FSTAB_NOAUTO, NULL);
+                return;
+        }
+
+        if (fstab_swap_flags(&e->opts, &flags) < 0) {
+                pico_log(PICO_LOG_WARNING, "fstab: swap %s: bad priority in %s", e->what, e->options);
+                fstab_entry_set_outcome(e, FSTAB_FAILED, "bad pri= in %s", e->options);
+                return;
+        }
+
+        if (fstab_source_needs_device(e->what)) {
+                if (!resolve_source(e, PICO_FS_SWAP, cfg, node, sizeof(node)))
+                        return;
+        } else {
+                if (stat(e->what, &st) < 0) {
+                        r = -errno;
+                        pico_log(PICO_LOG_WARNING, "fstab: swap file %s: %s", e->what, strerror(-r));
+                        fstab_entry_set_outcome(e, FSTAB_FAILED, "%s", strerror(-r));
+                        return;
+                }
+                snprintf(node, sizeof(node), "%s", e->what);
+        }
+
+        if (cfg->swapon(node, flags) < 0) {
+                r = -errno;
+
+                if (r == -EBUSY) {
+                        pico_log(PICO_LOG_DEBUG, "fstab: swap on %s is already active", node);
+                        fstab_entry_set_outcome(e, FSTAB_PRESENT, "already active");
+                        return;
+                }
+
+                pico_log(PICO_LOG_WARNING, "fstab: swapon %s: %s", node, strerror(-r));
+                fstab_entry_set_outcome(e, FSTAB_FAILED, "swapon: %s", strerror(-r));
+                return;
+        }
+
+        pico_log(PICO_LOG_INFO, "fstab: swap on %s activated", node);
+        fstab_entry_set_outcome(e, FSTAB_ACTIVE, "%s", node);
+}
+
+static bool is_swap_line(const FstabEntry *e) {
+        return strcmp(e->type, "swap") == 0;
+}
+
 /* mkdir -p of the directory `path` lives in. */
 static int ensure_parent(const char *path) {
         char dir[PATH_MAX];
@@ -855,6 +949,7 @@ int fstab_pass(FstabTable *t, const FstabPassConfig *cfg) {
                 .dev_root = "/dev",
                 .fsck_dir = "/usr/sbin",
                 .device_timeout = FSTAB_DEVICE_TIMEOUT_DEFAULT,
+                .swapon = swapon,
         };
         FstabEntry **order = NULL;
         int degraded = 0;
@@ -878,6 +973,8 @@ int fstab_pass(FstabTable *t, const FstabPassConfig *cfg) {
                         c.fsck_dir = cfg->fsck_dir;
                 if (cfg->device_timeout)
                         c.device_timeout = cfg->device_timeout;
+                if (cfg->swapon)
+                        c.swapon = cfg->swapon;
                 c.poll_hook = cfg->poll_hook;
                 c.poll_userdata = cfg->poll_userdata;
         }
@@ -887,8 +984,14 @@ int fstab_pass(FstabTable *t, const FstabPassConfig *cfg) {
                 return r;
 
         for (i = 0; i < t->n; i++)
-                if (order[i]->outcome == FSTAB_PENDING)
+                if (order[i]->outcome == FSTAB_PENDING && !is_swap_line(order[i]))
                         process_entry(order[i], &c);
+
+        /* Swap last, in file order: a swap file lives on a filesystem the
+         * loop above may just have mounted. */
+        for (i = 0; i < t->n; i++)
+                if (t->entries[i].outcome == FSTAB_PENDING && is_swap_line(&t->entries[i]))
+                        process_swap(&t->entries[i], &c);
 
         free(order);
 

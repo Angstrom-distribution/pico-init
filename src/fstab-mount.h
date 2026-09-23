@@ -27,6 +27,10 @@
  * What the pass does with each line, in mount order (fstab_mount_order()):
  *
  *  - "/" is the root check's (root-check.h), which consults the same line.
+ *  - Swap lines are activated after every mount line, since a swap file may
+ *    live on a filesystem the pass mounts: the device resolved and waited for
+ *    like any other, then swapon() with pri= and discard. Any swap line at all
+ *    stands DPS swap discovery down, which is upstream's rule (main.c).
  *  - noauto lines are left alone and recorded as such.
  *  - Lines for PID 1's own API mounts (mount-setup.c's table; oe-core's stock
  *    fstab names /proc, /dev/pts and /run) are never mounted twice. The line's
@@ -46,8 +50,7 @@
  *
  * Out of scope, recorded as "skipped" with a WARNING rather than attempted:
  * network filesystems and _netdev (they need ordering after the network, which
- * nothing pre-manager has), x-systemd.automount, loop mounts, swap lines, and
- * ID= sources.
+ * nothing pre-manager has), x-systemd.automount, loop mounts, and ID= sources.
  *
  * Nothing here can stop a boot. Every failure is one line in the log and one
  * line in the record, and the record makes `picoctl is-system-running` report
@@ -80,6 +83,10 @@ typedef struct FstabPassConfig {
         /* The wait for a line's device without x-systemd.device-timeout=;
          * 0 means FSTAB_DEVICE_TIMEOUT_DEFAULT. */
         usec_t device_timeout;
+
+        /* swapon(2); tests substitute their own, having no CAP_SYS_ADMIN
+         * in the initial namespace, which swap needs. */
+        int (*swapon)(const char *path, int flags);
 
         /* Called before every re-look while waiting for a device; tests. */
         void (*poll_hook)(void *userdata, unsigned attempt);
@@ -135,6 +142,15 @@ int fstab_mount_from(
  * 0, or -errno with a description in `err`.
  */
 int fstab_remount(const char *where, const FstabOptions *o, uint64_t floor, char *err, size_t err_size);
+
+/*
+ * swapon(2) flags for a swap line's options, as swapon(8) maps them: pri=N
+ * (0-32767) as SWAP_FLAG_PREFER plus the priority, "discard" as
+ * SWAP_FLAG_DISCARD, "discard=once" and "discard=pages" adding the flag that
+ * limits it to one or the other. Anything else is ignored. 0, or -EINVAL for a
+ * priority that is not one.
+ */
+int fstab_swap_flags(const FstabOptions *o, int *ret_flags);
 
 /* The mount_setattr()/fsmount() masks for a fresh mount and for a remount.
  * Split out so the remount-reset and floor rules can be tested as values. */

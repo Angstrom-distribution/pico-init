@@ -28,6 +28,7 @@
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/swap.h>
 #include <sys/sysmacros.h>
 #include <unistd.h>
 
@@ -211,7 +212,6 @@ static void read_file(const char *path, char *buf, size_t size) {
 static void test_pass_skips(void) {
         static const char * const lines[] = {
                 "/dev/root / auto defaults 1 1",
-                "/dev/sda2 none swap sw 0 0",
                 "srv:/export /mnt/nfs nfs4 defaults 0 0",
                 "//srv/share /mnt/cifs cifs defaults 0 0",
                 "/dev/sdb1 /mnt/net ext4 _netdev 0 0",
@@ -223,7 +223,6 @@ static void test_pass_skips(void) {
         };
         static const char * const want[] = {
                 "/ present the root filesystem\n",
-                "/dev/sda2 skipped swap lines are not activated by pico-init\n",
                 "/mnt/nfs skipped network filesystem: nothing orders it after the network\n",
                 "/mnt/cifs skipped network filesystem: nothing orders it after the network\n",
                 "/mnt/net skipped network filesystem: nothing orders it after the network\n",
@@ -253,17 +252,17 @@ static void test_pass_skips(void) {
         cfg.record = record;
         cfg.api_floor = never_api;
 
-        /* 7 skipped + 1 failed; noauto and the root line do not count. The
+        /* 6 skipped + 1 failed; noauto and the root line do not count. The
          * record's directory is created on the way. */
-        ASSERT_EQ_INT(fstab_pass(&t, &cfg), 8);
+        ASSERT_EQ_INT(fstab_pass(&t, &cfg), 7);
         read_file(record, content, sizeof(content));
         ASSERT_STREQ(content, expect);
-        ASSERT_EQ_INT(fstab_record_count_degraded(record), 8);
+        ASSERT_EQ_INT(fstab_record_count_degraded(record), 7);
 
         /* An outcome already recorded -- the root check's -- is kept. */
         fstab_entry_set_outcome(&t.entries[0], FSTAB_REMOUNTED, "rw by the root check");
         t.entries[1].outcome = FSTAB_PENDING;
-        ASSERT_EQ_INT(fstab_pass(&t, &cfg), 8);
+        ASSERT_EQ_INT(fstab_pass(&t, &cfg), 7);
         read_file(record, content, sizeof(content));
         ASSERT_TRUE(strncmp(content, "/ remounted rw by the root check\n", 33) == 0);
 
@@ -294,6 +293,169 @@ static void test_pass_skips(void) {
         read_file(record, content, sizeof(content));
         ASSERT_STREQ(content, "");
 
+        test_rm_rf(dir);
+        free(dir);
+}
+
+static void test_swap_flags(void) {
+        static const struct {
+                const char *options;
+                int ret;
+                int flags;
+        } cases[] = {
+                {                   "sw",       0,                                                  0 },
+                {                "pri=5",       0,                               SWAP_FLAG_PREFER | 5 },
+                {            "pri=32767",       0,                           SWAP_FLAG_PREFER | 32767 },
+                {            "pri=32768", -EINVAL,                                                  0 },
+                {               "pri=-1", -EINVAL,                                                  0 },
+                {                "pri=x", -EINVAL,                                                  0 },
+                {                 "pri=", -EINVAL,                                                  0 },
+                {              "discard",       0,                                  SWAP_FLAG_DISCARD },
+                {         "discard=once",       0,                        SWAP_FLAG_DISCARD | 0x20000 },
+                {        "discard=pages",       0,                        SWAP_FLAG_DISCARD | 0x40000 },
+                {  "pri=3,discard=pages",       0, SWAP_FLAG_PREFER | 3 | SWAP_FLAG_DISCARD | 0x40000 },
+                /* The last discard wins, as the last pri= does. */
+                { "discard=once,discard",       0,                                  SWAP_FLAG_DISCARD },
+                {   "pri=1,pri=2,nofail",       0,                               SWAP_FLAG_PREFER | 2 },
+                /* Nothing for the kernel in these; ignored. */
+                {   "defaults,x-foo=bar",       0,                                                  0 },
+        };
+
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+                FstabOptions o;
+                int flags = -1, r;
+
+                ASSERT_EQ_INT(fstab_options_parse(cases[i].options, &o), 0);
+                r = fstab_swap_flags(&o, &flags);
+                if (r != cases[i].ret || (r == 0 && flags != cases[i].flags)) {
+                        fprintf(stderr, "%s: got %d/0x%x\n", cases[i].options, r, (unsigned) flags);
+                        ASSERT_TRUE(false);
+                }
+                fstab_options_done(&o);
+        }
+}
+
+/* What the pass asked for, in order: "m" for a mount line reaching the API
+ * floor lookup, "<path> <flags>" for a swapon(). */
+static char calls[4096];
+
+static int fake_swapon(const char *path, int flags) {
+        char one[PATH_MAX + 32];
+
+        snprintf(one, sizeof(one), "%s %d;", path, flags);
+        strncat(calls, one, sizeof(calls) - strlen(calls) - 1);
+
+        if (strstr(path, "busy")) {
+                errno = EBUSY;
+                return -1;
+        }
+        if (strstr(path, "bad")) {
+                errno = EINVAL;
+                return -1;
+        }
+        return 0;
+}
+
+static bool recording_api(const char *where, uint64_t *ret_floor) {
+        (void) where;
+        (void) ret_floor;
+        strncat(calls, "m;", sizeof(calls) - strlen(calls) - 1);
+        return false;
+}
+
+static void test_pass_swap(void) {
+        char *dir, sys[PATH_MAX], dev[PATH_MAX], record[PATH_MAX], want[PATH_MAX * 5], content[4096];
+        char lines[10][PATH_MAX + 64];
+        FstabPassConfig cfg = { 0 };
+        FstabTable t = { 0 };
+        size_t i;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        snprintf(sys, sizeof(sys), "%s/sys", dir);
+        snprintf(dev, sizeof(dev), "%s/dev", dir);
+        snprintf(record, sizeof(record), "%s/record", dir);
+        ASSERT_EQ_INT(test_mkdir(dir, "dev"), 0);
+
+        /* A card that is swap from end to end, and three swap files. */
+        {
+                uint8_t page[4096] = { 0 };
+                char path[PATH_MAX + 16];
+
+                page[1024] = 1;
+                page[1028] = 255;
+                memcpy(page + 1052, "picoswap", 8);
+                memcpy(page + 4086, "SWAPSPACE2", 10);
+                ASSERT_EQ_INT(test_block_device(sys, "mmcblk0", NULL, 0, 2048), 0);
+                snprintf(path, sizeof(path), "%s/mmcblk0", dev);
+                ASSERT_EQ_INT(test_image_write(path, 1 << 20, page, sizeof(page), 0), 0);
+        }
+        ASSERT_EQ_INT(test_write_file(dir, "swapfile", ""), 0);
+        ASSERT_EQ_INT(test_write_file(dir, "busyswap", ""), 0);
+        ASSERT_EQ_INT(test_write_file(dir, "badswap", ""), 0);
+
+        /* Swap lines first in the file, a mount line last: the mount line
+         * still goes first. */
+        snprintf(lines[0], sizeof(lines[0]), "%s/swapfile none swap pri=7 0 0", dir);
+        snprintf(lines[1], sizeof(lines[1]), "LABEL=picoswap none swap discard 0 0");
+        snprintf(lines[2], sizeof(lines[2]), "%s/busyswap none swap sw 0 0", dir);
+        snprintf(lines[3], sizeof(lines[3]), "%s/badswap none swap sw 0 0", dir);
+        snprintf(lines[4], sizeof(lines[4]), "%s/missing none swap sw 0 0", dir);
+        snprintf(lines[5], sizeof(lines[5]), "LABEL=noswap none swap sw 0 0");
+        snprintf(lines[6], sizeof(lines[6]), "LABEL=noswap2 none swap nofail 0 0");
+        snprintf(lines[7], sizeof(lines[7]), "%s/swapfile none swap noauto 0 0", dir);
+        snprintf(lines[8], sizeof(lines[8]), "LABEL=picoswap swap swap pri=99999 0 0");
+        snprintf(lines[9], sizeof(lines[9]), "tmpfs %s/mnt tmpfs no_such_tmpfs_option 0 0", dir);
+
+        t.entries = calloc(10, sizeof(FstabEntry));
+        ASSERT_TRUE(t.entries != NULL);
+        for (i = 0; i < 10; i++)
+                ASSERT_EQ_INT(fstab_parse_line(lines[i], &t.entries[t.n++]), 1);
+        ASSERT_TRUE(fstab_has_swap(&t));
+
+        cfg.record = record;
+        cfg.api_floor = recording_api;
+        cfg.sys_root = sys;
+        cfg.dev_root = dev;
+        cfg.device_timeout = 100 * USEC_PER_MSEC;
+        cfg.swapon = fake_swapon;
+        calls[0] = '\0';
+
+        /* badswap, missing, noswap, the bad priority, and the mount line
+         * (no namespace here, so the mount itself is refused). */
+        ASSERT_EQ_INT(fstab_pass(&t, &cfg), 5);
+
+        snprintf(want,
+                 sizeof(want),
+                 "m;%s/swapfile %d;%s/mmcblk0 %d;%s/busyswap 0;%s/badswap 0;",
+                 dir,
+                 SWAP_FLAG_PREFER | 7,
+                 dev,
+                 SWAP_FLAG_DISCARD,
+                 dir,
+                 dir);
+        ASSERT_STREQ(calls, want);
+
+        ASSERT_EQ_INT(t.entries[0].outcome, FSTAB_ACTIVE);
+        ASSERT_EQ_INT(t.entries[1].outcome, FSTAB_ACTIVE);
+        ASSERT_EQ_INT(t.entries[2].outcome, FSTAB_PRESENT);
+        ASSERT_EQ_INT(t.entries[3].outcome, FSTAB_FAILED);
+        ASSERT_EQ_INT(t.entries[4].outcome, FSTAB_FAILED);
+        ASSERT_EQ_INT(t.entries[5].outcome, FSTAB_SKIPPED);
+        ASSERT_EQ_INT(t.entries[6].outcome, FSTAB_ABSENT);
+        ASSERT_EQ_INT(t.entries[7].outcome, FSTAB_NOAUTO);
+        ASSERT_EQ_INT(t.entries[8].outcome, FSTAB_FAILED);
+        ASSERT_EQ_INT(t.entries[9].outcome, FSTAB_FAILED);
+
+        /* The record names swap by its source. */
+        read_file(record, content, sizeof(content));
+        snprintf(want, sizeof(want), "LABEL=picoswap active %s/mmcblk0\n", dev);
+        ASSERT_TRUE(strstr(content, want) != NULL);
+        ASSERT_TRUE(strstr(content, "LABEL=picoswap failed bad pri= in pri=99999\n") != NULL);
+        snprintf(want, sizeof(want), "%s/badswap failed swapon: Invalid argument\n", dir);
+        ASSERT_TRUE(strstr(content, want) != NULL);
+
+        fstab_table_done(&t);
         test_rm_rf(dir);
         free(dir);
 }
@@ -886,6 +1048,8 @@ int main(void) {
         test_is_mounted_and_mkdir();
         test_device_mounted();
         test_pass_skips();
+        test_swap_flags();
+        test_pass_swap();
 
         dir = test_tmpdir_new();
         ASSERT_TRUE(dir != NULL);
