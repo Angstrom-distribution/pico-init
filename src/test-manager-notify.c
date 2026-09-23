@@ -17,6 +17,8 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <poll.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -444,11 +446,126 @@ static void test_notify_setup_failure_not_fatal(void) {
         free(blockdir);
 }
 
+/* MAINPID= moves main_pid (what a stop signals) for a root sender; ERRNO=
+ * is stored. Malformed values of either change nothing. */
+static bool notify_errno_is_5_done(void *userdata) {
+        return ((Service *) userdata)->status_errno == 5;
+}
+
+static void test_notify_mainpid_and_errno(void) {
+        struct notify_fixture f;
+        Service *s;
+        pid_t other;
+        char msg[128];
+
+        notify_fixture_setup(&f);
+        s = load_service(f.m, f.unitdir, "demo.service", "[Unit]\n[Service]\nType=simple\nExecStart=/bin/true\n");
+        s->main_pid = getpid();
+
+        other = fork();
+        ASSERT_TRUE(other >= 0);
+        if (other == 0) {
+                pause();
+                _exit(0);
+        }
+
+        /* malformed first: nothing may change */
+        notify_send_str(f.rtdir, "MAINPID=0\nMAINPID=12x\nERRNO=-1\nERRNO=abc");
+        snprintf(msg, sizeof(msg), "MAINPID=%d\nERRNO=5", (int) other);
+        notify_send_str(f.rtdir, msg);
+
+        ASSERT_TRUE(drive_until(f.m, notify_errno_is_5_done, s, 200));
+        ASSERT_EQ_INT(s->status_errno, 5);
+        if (getuid() == 0)
+                ASSERT_EQ_INT(s->main_pid, other);
+        else
+                ASSERT_EQ_INT(s->main_pid, getpid()); /* uid-gated */
+
+        s->main_pid = 0; /* not ours to reap through the service */
+        kill(other, SIGKILL);
+        waitpid(other, NULL, 0);
+        notify_fixture_teardown(&f);
+}
+
+/* BARRIER=1: the fd sent along is closed by the manager, which is the ack
+ * sd_notify_barrier() waits for -- attributed or not. The barrier call
+ * blocks, so it runs in a child that reports its return value on a pipe. */
+static bool fd_readable_done(void *userdata) {
+        struct pollfd pfd = { .fd = *(int *) userdata, .events = POLLIN };
+
+        return poll(&pfd, 1, 0) == 1;
+}
+
+static void test_notify_barrier_acked(void) {
+        struct notify_fixture f;
+        int result_pipe[2];
+        pid_t child;
+        char r = 0;
+
+        notify_fixture_setup(&f);
+        ASSERT_EQ_INT(pipe(result_pipe), 0);
+
+        child = fork();
+        ASSERT_TRUE(child >= 0);
+        if (child == 0) {
+                char ok;
+
+                close(result_pipe[0]);
+                setenv("NOTIFY_SOCKET", manager_notify_socket_path(f.m), 1);
+                ok = sd_notify_barrier(0, 2 * USEC_PER_SEC) >= 0 ? 'y' : 'n';
+                (void) write(result_pipe[1], &ok, 1);
+                _exit(0);
+        }
+        close(result_pipe[1]);
+
+        ASSERT_TRUE(drive_until(f.m, fd_readable_done, &result_pipe[0], 400));
+        ASSERT_EQ_INT((int) read(result_pipe[0], &r, 1), 1);
+        ASSERT_EQ_INT(r, 'y');
+
+        close(result_pipe[0]);
+        waitpid(child, NULL, 0);
+        notify_fixture_teardown(&f);
+}
+
+static bool notify_errno_is_7_done(void *userdata) {
+        return ((Service *) userdata)->status_errno == 7;
+}
+
+/* A datagram larger than the receive buffer arrives MSG_TRUNC: dropped
+ * whole, never applied as its truncated head. */
+static void test_notify_oversized_dropped(void) {
+        struct notify_fixture f;
+        Service *s;
+        size_t len = 8192;
+        char *big;
+
+        notify_fixture_setup(&f);
+        s = load_service(f.m, f.unitdir, "demo.service", "[Unit]\n[Service]\nType=simple\nExecStart=/bin/true\n");
+        s->main_pid = getpid();
+
+        big = malloc(len);
+        ASSERT_TRUE(big != NULL);
+        memset(big, 'x', len);
+        memcpy(big, "READY=1\nSTATUS=", 15);
+        notify_send(f.rtdir, big, len);
+        free(big);
+        notify_send_str(f.rtdir, "ERRNO=7");
+
+        ASSERT_TRUE(drive_until(f.m, notify_errno_is_7_done, s, 200));
+        ASSERT_EQ_INT(s->notify_ready, false);
+        ASSERT_TRUE(s->status_text == NULL);
+
+        notify_fixture_teardown(&f);
+}
+
 int main(void) {
         test_notify_end_to_end_attributed();
         test_notify_unattributed_harmless();
         test_notify_unknown_key_harmless();
         test_notify_malformed_dropped();
+        test_notify_mainpid_and_errno();
+        test_notify_barrier_acked();
+        test_notify_oversized_dropped();
         test_notify_env_injection_and_scrub();
         test_notify_teardown_clean();
         test_notify_setup_failure_not_fatal();
