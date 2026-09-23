@@ -132,6 +132,13 @@ void socket_notify_service_starting(Unit *service);
  * won't act as tarpits"). No-op for a socket not currently RUNNING. */
 void socket_notify_service_dead(Unit *service);
 
+/* A job on the paired service has finished. A start that ended without the
+ * service ever running (unmet condition, failed requirement) never reaches
+ * socket_notify_service_dead(); re-arm here once the service is down with
+ * no job left (upstream calls unit_trigger_notify() from job completion,
+ * 3ecaa09bcc). */
+void socket_notify_service_job_finished(Unit *service);
+
 /*
  * Called by unit-parse.c once a [Socket] fragment has finished parsing
  * (never on a stub/unloaded unit -- see 75193d4128 in socket.c's header).

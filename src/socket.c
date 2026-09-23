@@ -946,6 +946,17 @@ void socket_notify_service_dead(Unit *service) {
         }
 }
 
+void socket_notify_service_job_finished(Unit *service) {
+        UnitActiveState st;
+
+        if (!service || service->type != UNIT_SERVICE || service->job)
+                return;
+
+        st = unit_active_state(service);
+        if (st == UNIT_INACTIVE || st == UNIT_FAILED)
+                socket_notify_service_dead(service);
+}
+
 /* --- load-time verification and pairing --- */
 
 int socket_verify_and_pair(Socket *s) {
@@ -1032,16 +1043,10 @@ int socket_verify_and_pair(Socket *s) {
          * After= back in the same call -- see unit-dependency.c's
          * dependency_inverse()).
          *
-         * Known gap, not silently missed: if the paired service's OWN
-         * fragment later fails to load (a syntax error in its file, as
-         * opposed to a fork/exec failure at start time), socket_trigger()'s
-         * manager_add_job() installs a job that will fail asynchronously via
-         * the run queue -- but nothing in this reduced state machine ever
-         * calls service_enter_dead() for a unit that never reached
-         * SERVICE_START_PRE/EXEC_START in the first place, so
-         * socket_notify_service_dead() never fires and the socket is stuck
-         * in RUNNING. Out of scope for S0-S2 (not among the review's 40
-         * carried-logic findings); flagged here rather than left invisible.
+         * A start job that ends without the service ever running (its own
+         * load failure, an unmet condition, a failed requirement) never
+         * reaches service_enter_dead(); job.c re-arms the socket through
+         * socket_notify_service_job_finished() instead.
          */
         return unit_add_dependency(SOCKET_UNIT(s), UNIT_BEFORE, svc);
 }

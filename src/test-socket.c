@@ -1320,6 +1320,89 @@ static void test_datagram_livelock_terminates_failed(void) {
         free(dir);
 }
 
+/*
+ * A trigger whose start job ends without the service ever starting -- an
+ * unmet Condition*=, or a Requires= dependency failing -- must re-arm the
+ * socket rather than leave it RUNNING with its fds unwatched. No
+ * socket_notify_service_dead() simulation here (NULL service to
+ * drive_until()): service_enter_dead() is never reached, so only the job
+ * ending can re-arm it. The datagram is never consumed, so the socket keeps
+ * re-triggering until its own trigger limit fails it; stuck RUNNING, it
+ * never gets that far.
+ */
+static void run_skipped_start_case(const char *tag, const char *svc_extra, const char *dep_unit) {
+        Manager *m;
+        Unit *sock_u, *svc_u;
+        Socket *s;
+        char *dir = test_tmpdir_new();
+        char sockpath[PATH_MAX], name[64];
+        int cfd;
+        struct sockaddr_un addr;
+
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+        snprintf(sockpath, sizeof(sockpath), "%s/%s.sock", dir, tag);
+
+        {
+                char content[PATH_MAX + 256];
+
+                snprintf(content, sizeof(content), "[Socket]\nListenDatagram=%s\n", sockpath);
+                snprintf(name, sizeof(name), "%s.socket", tag);
+                ASSERT_EQ_INT(test_write_file(dir, name, content), 0);
+
+                snprintf(content,
+                         sizeof(content),
+                         "[Unit]\n%s[Service]\nType=simple\nExecStart=/bin/sleep 100\n",
+                         svc_extra);
+                snprintf(name, sizeof(name), "%s.service", tag);
+                ASSERT_EQ_INT(test_write_file(dir, name, content), 0);
+        }
+        if (dep_unit)
+                ASSERT_EQ_INT(test_write_file(dir, "skipdep.service", dep_unit), 0);
+        ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+
+        snprintf(name, sizeof(name), "%s.socket", tag);
+        sock_u = manager_get_unit(m, name);
+        snprintf(name, sizeof(name), "%s.service", tag);
+        svc_u = manager_get_unit(m, name);
+        ASSERT_TRUE(sock_u != NULL && svc_u != NULL);
+        s = SOCKET(sock_u);
+
+        ASSERT_EQ_INT(unit_start(sock_u), 0);
+        ASSERT_EQ_INT(s->state, SOCKET_LISTENING);
+
+        cfd = socket(AF_UNIX, SOCK_DGRAM, 0);
+        ASSERT_TRUE(cfd >= 0);
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        strncpy(addr.sun_path, sockpath, sizeof(addr.sun_path) - 1);
+        ASSERT_EQ_INT((int) sendto(cfd, "q", 1, 0, (struct sockaddr *) &addr, sizeof(addr)), 1);
+        close(cfd);
+
+        {
+                DriveWait wait = { .kind = DRIVE_WAIT_SOCKET_STATE, .sock = s, .want_state = SOCKET_FAILED };
+
+                ASSERT_TRUE(drive_until(m, NULL, &wait, 800));
+        }
+
+        ASSERT_EQ_INT(s->state, SOCKET_FAILED);
+        ASSERT_TRUE(svc_u->job == NULL);
+        ASSERT_EQ_INT(SERVICE(svc_u)->main_pid, 0); /* never started */
+        ASSERT_EQ_INT(m->n_jobs, 0);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+static void test_skipped_start_rearms_socket(void) {
+        run_skipped_start_case("skipcond", "ConditionPathExists=/nonexistent/skipcond\n", NULL);
+        run_skipped_start_case(
+                        "skipreq",
+                        "Requires=skipdep.service\nAfter=skipdep.service\n",
+                        "[Service]\nType=oneshot\nExecStart=/bin/false\n");
+}
+
 int main(int argc, char **argv) {
         if (argc >= 2 && argv[1][0] == '-' && argv[1][1] == '-')
                 return run_as_helper(argc, argv);
@@ -1344,6 +1427,7 @@ int main(int argc, char **argv) {
         test_service_start_limit_yields_socket_failed();
         test_connect_flood_bounded_by_socket_trigger_limit();
         test_datagram_livelock_terminates_failed();
+        test_skipped_start_rearms_socket();
 
         free(g_self_exe);
 

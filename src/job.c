@@ -77,6 +77,7 @@
 #include "manager-ctrl.h"
 #include "manager-state.h"
 #include "manager.h"
+#include "socket.h"
 #include "status.h"
 #include "unit.h"
 #include "util.h"
@@ -626,6 +627,9 @@ int job_finish_full(Job *j, JobResult result, bool recursive) {
 
         /* j is gone; republish from the unit so Job= clears. */
         manager_state_notify_unit(u);
+
+        /* A paired socket may be waiting on this job to re-arm. */
+        socket_notify_service_job_finished(u);
 
         /*
          * Propagation is gated on `recursive` so a job completing inside
