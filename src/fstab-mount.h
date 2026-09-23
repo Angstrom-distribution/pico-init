@@ -48,6 +48,15 @@
  * pass number then gets the root check's filesystem check before the mount:
  * the ext superblock gate, fsck.<type> -a, and the same verdicts.
  *
+ * ubifs lines name a UBI volume (ubi0:rootfs, ubi0_1, /dev/ubi0_1), which only
+ * exists once its MTD device is attached. Before any line is mounted, the pass
+ * attaches every MTD device the kernel command line's ubi.mtd= names
+ * (ubi-attach.h), within the device wait's default bound. A ubifs line then
+ * waits for its volume as a device line waits for its device, and fails at
+ * once when its UBI device is attached without it or an attach for that
+ * device number failed. Its source goes to the kernel as written, and it gets
+ * no filesystem check: there is no fsck.ubifs, UBIFS recovers on mount.
+ *
  * Out of scope, recorded as "skipped" with a WARNING rather than attempted:
  * network filesystems and _netdev (they need ordering after the network, which
  * nothing pre-manager has), x-systemd.automount, loop mounts, and ID= sources.
@@ -66,6 +75,8 @@
 
 #include "fstab.h"
 #include "util.h"
+
+struct ubi_attach_req;
 
 typedef struct FstabPassConfig {
         const char *mountinfo;   /* default "/proc/self/mountinfo" */
@@ -91,6 +102,13 @@ typedef struct FstabPassConfig {
         /* Called before every re-look while waiting for a device; tests. */
         void (*poll_hook)(void *userdata, unsigned attempt);
         void *poll_userdata;
+
+        /* Where ubi.mtd= is read from; default "/proc/cmdline". */
+        const char *cmdline;
+
+        /* UBI_IOCATT (ubi-attach.h); tests substitute a fake kernel. */
+        int (*ubi_attach)(const char *ctrl, struct ubi_attach_req *req, void *userdata);
+        void *ubi_attach_userdata;
 } FstabPassConfig;
 
 /*

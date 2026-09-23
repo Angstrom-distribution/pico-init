@@ -21,6 +21,7 @@
 #include <sys/stat.h>
 #include <sys/swap.h>
 #include <sys/sysmacros.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "ext-super.h"
@@ -29,6 +30,7 @@
 #include "manager.h"
 #include "mount-setup.h"
 #include "root-check.h"
+#include "ubi-attach.h"
 #include "util.h"
 
 #ifndef AT_RECURSIVE
@@ -600,6 +602,118 @@ static bool resolve_source(FstabEntry *e, PicoFsKind hint, const FstabPassConfig
         return false;
 }
 
+static void sleep_usec(usec_t u) {
+        struct timespec ts = {
+                .tv_sec = (time_t) (u / USEC_PER_SEC),
+                .tv_nsec = (long) ((u % USEC_PER_SEC) * 1000),
+        };
+
+        while (nanosleep(&ts, &ts) < 0 && errno == EINTR)
+                ;
+}
+
+/*
+ * A ubifs line's volume. Failed at once when the attach for its UBI device
+ * number failed, or when that device is attached without the volume -- its
+ * volumes are all there the moment it is attached. Otherwise waited for
+ * within the line's device timeout, as a device is, since the kernel may have
+ * attached it rather than PID 1. True when it is there to mount.
+ */
+static bool
+                resolve_ubi(FstabEntry *e,
+                            const UbiSource *s,
+                            const FstabPassConfig *cfg,
+                            const UbiAttach *ubi,
+                            size_t n_ubi) {
+
+        const UbiAttach *failed = NULL;
+        char vol[UBI_MAX_VOLUME_NAME + 32], dev[32];
+        usec_t timeout, deadline;
+        unsigned attempt;
+        struct stat st;
+        bool clamped;
+        int r;
+
+        ubi_source_describe(s, vol, sizeof(vol));
+        snprintf(dev, sizeof(dev), "ubi%d", s->ubi_num);
+
+        for (size_t i = 0; i < n_ubi; i++)
+                if (ubi[i].state != UBI_ATTACH_DONE && ubi[i].param.ubi_num == s->ubi_num)
+                        failed = &ubi[i];
+
+        if (failed && ubi_volume_present(cfg->sys_root, s) == -ENODEV) {
+                pico_log(PICO_LOG_WARNING,
+                         "fstab: not mounting %s: %s is not attached: %s",
+                         e->where,
+                         dev,
+                         failed->reason);
+                if (failed->state == UBI_ATTACH_TIMEOUT && e->opts.nofail)
+                        fstab_entry_set_outcome(e, FSTAB_ABSENT, "%s not attached: %s", dev, failed->reason);
+                else
+                        fstab_entry_set_outcome(
+                                        e,
+                                        failed->state == UBI_ATTACH_TIMEOUT ? FSTAB_SKIPPED : FSTAB_FAILED,
+                                        "%s not attached: %s",
+                                        dev,
+                                        failed->reason);
+                return false;
+        }
+
+        timeout = fstab_device_timeout(&e->opts, cfg->device_timeout, &clamped);
+        if (clamped)
+                pico_log(PICO_LOG_WARNING,
+                         "fstab: waiting at most %llus for %s, not forever",
+                         (unsigned long long) (timeout / USEC_PER_SEC),
+                         vol);
+        deadline = usec_add(now_monotonic(), timeout);
+
+        for (attempt = 0;; attempt++) {
+                usec_t now;
+
+                if (attempt > 0 && cfg->poll_hook)
+                        cfg->poll_hook(cfg->poll_userdata, attempt);
+
+                r = ubi_volume_present(cfg->sys_root, s);
+                if (r == 0) {
+                        pico_log(PICO_LOG_WARNING, "fstab: not mounting %s: there is no %s", e->where, vol);
+                        fstab_entry_set_outcome(e, FSTAB_FAILED, "%s is attached without that volume", dev);
+                        return false;
+                }
+                if (r < 0 && r != -ENODEV) {
+                        pico_log(PICO_LOG_WARNING, "fstab: cannot look for %s: %s", vol, strerror(-r));
+                        fstab_entry_set_outcome(
+                                        e, FSTAB_FAILED, "cannot look for the volume: %s", strerror(-r));
+                        return false;
+                }
+                if (r > 0 && (!s->path || stat(e->what, &st) == 0))
+                        return true;
+
+                now = now_monotonic();
+                if (now >= deadline)
+                        break;
+                sleep_usec(deadline - now < FSTAB_DEVICE_POLL ? deadline - now : FSTAB_DEVICE_POLL);
+        }
+
+        /* Attached, but its volume's node never appeared; or never attached. */
+        if (r > 0)
+                snprintf(vol, sizeof(vol), "no %s", e->what);
+        else
+                snprintf(vol, sizeof(vol), "%s not attached", dev);
+
+        pico_log(e->opts.nofail ? PICO_LOG_INFO : PICO_LOG_WARNING,
+                 "fstab: %s after %llums, not mounting %s",
+                 vol,
+                 (unsigned long long) (timeout / USEC_PER_MSEC),
+                 e->where);
+        fstab_entry_set_outcome(
+                        e,
+                        e->opts.nofail ? FSTAB_ABSENT : FSTAB_SKIPPED,
+                        "%s after %llums",
+                        vol,
+                        (unsigned long long) (timeout / USEC_PER_MSEC));
+        return false;
+}
+
 typedef enum CheckAction {
         CHECK_MOUNT,
         CHECK_MOUNT_RO,
@@ -708,11 +822,12 @@ static CheckAction check_filesystem(FstabEntry *e, const char *node, const Fstab
         }
 }
 
-static void process_entry(FstabEntry *e, const FstabPassConfig *cfg) {
+static void process_entry(FstabEntry *e, const FstabPassConfig *cfg, const UbiAttach *ubi, size_t n_ubi) {
         char where[PATH_MAX], err[512], node[PATH_MAX];
         const char *reason, *source = e->what;
         CheckAction check = CHECK_MOUNT;
         FstabEntry ro;
+        UbiSource us;
         uint64_t floor = 0;
         bool api;
         int r;
@@ -802,7 +917,10 @@ static void process_entry(FstabEntry *e, const FstabPassConfig *cfg) {
                 return;
         }
 
-        if (!e->opts.bind && !e->opts.rbind && fstab_source_needs_device(e->what)) {
+        if (strcmp(e->type, "ubifs") == 0 && ubi_source_parse(e->what, &us)) {
+                if (!resolve_ubi(e, &us, cfg, ubi, n_ubi))
+                        return;
+        } else if (!e->opts.bind && !e->opts.rbind && fstab_source_needs_device(e->what)) {
                 if (!resolve_source(e, pico_fs_kind_from_type(e->type), cfg, node, sizeof(node)))
                         return;
                 source = node;
@@ -955,10 +1073,13 @@ int fstab_pass(FstabTable *t, const FstabPassConfig *cfg) {
                 .fsck_dir = "/usr/sbin",
                 .device_timeout = FSTAB_DEVICE_TIMEOUT_DEFAULT,
                 .swapon = swapon,
+                .cmdline = "/proc/cmdline",
         };
+        UbiMtdParam params[UBI_ATTACH_MAX];
         FstabEntry **order = NULL;
+        UbiAttach *ubi = NULL;
+        size_t i, n_ubi = 0;
         int degraded = 0;
-        size_t i;
         int r;
 
         if (cfg) {
@@ -982,15 +1103,42 @@ int fstab_pass(FstabTable *t, const FstabPassConfig *cfg) {
                         c.swapon = cfg->swapon;
                 c.poll_hook = cfg->poll_hook;
                 c.poll_userdata = cfg->poll_userdata;
+                if (cfg->cmdline)
+                        c.cmdline = cfg->cmdline;
+                c.ubi_attach = cfg->ubi_attach;
+                c.ubi_attach_userdata = cfg->ubi_attach_userdata;
         }
 
         r = fstab_mount_order(t, &order);
         if (r < 0)
                 return r;
 
+        /* UBI before any line: the kernel would have attached it before PID
+         * 1 ran, had UBI been built in. */
+        r = ubi_cmdline_load(c.cmdline, params, UBI_ATTACH_MAX);
+        if (r < 0 && r != -ENOENT)
+                pico_log(PICO_LOG_WARNING, "fstab: cannot read %s: %s", c.cmdline, strerror(-r));
+        if (r > 0 && !(ubi = calloc((size_t) r, sizeof(*ubi))))
+                pico_log(PICO_LOG_WARNING, "fstab: out of memory, not attaching UBI");
+        if (ubi) {
+                UbiEnv env = {
+                        .sys_root = c.sys_root,
+                        .dev_root = c.dev_root,
+                        .attach = c.ubi_attach,
+                        .attach_userdata = c.ubi_attach_userdata,
+                        .poll_hook = c.poll_hook,
+                        .poll_userdata = c.poll_userdata,
+                };
+
+                n_ubi = (size_t) r;
+                for (i = 0; i < n_ubi; i++)
+                        ubi_attach_init(&ubi[i], &params[i]);
+                (void) ubi_attach_run(ubi, n_ubi, &env, c.device_timeout);
+        }
+
         for (i = 0; i < t->n; i++)
                 if (order[i]->outcome == FSTAB_PENDING && !is_swap_line(order[i]))
-                        process_entry(order[i], &c);
+                        process_entry(order[i], &c, ubi, n_ubi);
 
         /* Swap last, in file order: a swap file lives on a filesystem the
          * loop above may just have mounted. */
@@ -999,6 +1147,7 @@ int fstab_pass(FstabTable *t, const FstabPassConfig *cfg) {
                         process_swap(&t->entries[i], &c);
 
         free(order);
+        free(ubi);
 
         for (i = 0; i < t->n; i++)
                 if (fstab_outcome_is_degraded(t->entries[i].outcome))

@@ -36,6 +36,7 @@
 #include "fstab.h"
 #include "mount-setup.h"
 #include "test-util.h"
+#include "ubi-attach.h"
 
 static void test_attr_masks(void) {
         FstabOptions o;
@@ -975,6 +976,201 @@ static void test_pass_devices(void) {
         ASSERT_EQ_INT(fstab_is_mounted("/proc/self/mountinfo", where), 1);
 }
 
+/* --- ubifs lines: the UBI attach ahead of the pass, and the volume wait --- */
+
+static char ubi_sys[PATH_MAX], ubi_dev[PATH_MAX];
+
+static void ubi_attr(const char *fmt, int a, int b, const char *name, const char *content) {
+        char rel[64], dir[PATH_MAX + 64];
+
+        snprintf(rel, sizeof(rel), fmt, a, b);
+        snprintf(dir, sizeof(dir), "%s/%s", ubi_sys, rel);
+        ASSERT_EQ_INT(fstab_mkdir_p(dir, 0755), 0);
+        ASSERT_EQ_INT(test_write_file(dir, name, content), 0);
+}
+
+/* UBI device `ubi` on MTD device `mtd`, with a volume 0 named "rootfs". */
+static void ubi_attached(int ubi, int mtd) {
+        char n[16];
+
+        snprintf(n, sizeof(n), "%d\n", mtd);
+        ubi_attr("class/ubi/ubi%d", ubi, 0, "mtd_num", n);
+        ubi_attr("class/ubi/ubi%d_%d", ubi, 0, "name", "rootfs\n");
+}
+
+typedef struct UbiKernel {
+        unsigned calls;
+        int fail;
+} UbiKernel;
+
+/* UBI_IOCATT as the kernel answers it, minus the flash. */
+static int ubi_fake_attach(const char *ctrl, struct ubi_attach_req *req, void *userdata) {
+        UbiKernel *k = userdata;
+        char path[PATH_MAX + 32];
+        struct stat st;
+        int num = req->ubi_num;
+
+        (void) ctrl;
+        k->calls++;
+        if (k->fail)
+                return -k->fail;
+
+        if (num == UBI_DEV_NUM_AUTO)
+                for (num = 0;; num++) {
+                        snprintf(path, sizeof(path), "%s/class/ubi/ubi%d", ubi_sys, num);
+                        if (stat(path, &st) < 0)
+                                break;
+                }
+        ubi_attached(num, req->mtd_num);
+        req->ubi_num = num;
+        return 0;
+}
+
+static void ubi_late(void *userdata, unsigned attempt) {
+        unsigned *seen = userdata;
+
+        *seen = attempt;
+        if (attempt == 2)
+                ubi_attached(6, 7);
+}
+
+/*
+ * A fresh fixture: MTD device 3 named "flash", /dev/ubi_ctrl, and `cmdline`
+ * as the kernel command line.
+ */
+static void ubi_fixture(FstabPassConfig *cfg, UbiKernel *k, const char *cmdline) {
+        char dir[PATH_MAX + 16];
+
+        test_rm_rf(ubi_sys);
+        test_rm_rf(ubi_dev);
+        ubi_attr("class/mtd/mtd%d", 3, 0, "name", "flash\n");
+        ASSERT_EQ_INT(fstab_mkdir_p(ubi_dev, 0755), 0);
+        ASSERT_EQ_INT(test_write_file(ubi_dev, "ubi_ctrl", ""), 0);
+        path_in(dir, sizeof(dir), "ubi");
+        ASSERT_EQ_INT(test_write_file(dir, "cmdline", cmdline), 0);
+
+        *k = (UbiKernel){ 0 };
+        *cfg = (FstabPassConfig){
+                .api_floor = never_api,
+                .sys_root = ubi_sys,
+                .dev_root = ubi_dev,
+                .device_timeout = 150 * USEC_PER_MSEC,
+                .ubi_attach = ubi_fake_attach,
+                .ubi_attach_userdata = k,
+        };
+}
+
+/* The mount itself cannot succeed here -- there is no flash behind any of
+ * this -- so a line that got past every UBI step fails at the mount API,
+ * whose step names all start "fs". */
+static bool reached_mount(const char *reason) {
+        return strncmp(reason, "fs", 2) == 0;
+}
+
+static void test_pass_ubi(void) {
+        char cmdline[PATH_MAX + 16], reason[1024], line[PATH_MAX * 2], record[PATH_MAX], want[PATH_MAX + 32];
+        FstabPassConfig cfg;
+        FstabTable t = { 0 };
+        UbiKernel k;
+        unsigned seen = 0;
+
+        path_in(ubi_sys, sizeof(ubi_sys), "ubi/sys");
+        path_in(ubi_dev, sizeof(ubi_dev), "ubi/dev");
+        path_in(cmdline, sizeof(cmdline), "ubi/cmdline");
+
+        /* ubi.mtd= is carried out whatever fstab says, as the kernel would. */
+        ubi_fixture(&cfg, &k, "root=/dev/mmcblk0p2 ubi.mtd=flash\n");
+        cfg.cmdline = cmdline;
+        path_in(record, sizeof(record), "ubi/record");
+        cfg.record = record;
+        ASSERT_EQ_INT(fstab_pass(&t, &cfg), 0);
+        ASSERT_EQ_INT(k.calls, 1);
+
+        /* Attached by PID 1, then mounted from the source as written. */
+        ubi_fixture(&cfg, &k, "ubi.mtd=flash\n");
+        cfg.cmdline = cmdline;
+        ASSERT_EQ_INT(run_line("ubi0:rootfs %s/m/ubi ubifs defaults 0 1", &cfg, reason, sizeof(reason)),
+                      FSTAB_FAILED);
+        ASSERT_EQ_INT(k.calls, 1);
+        ASSERT_TRUE(reached_mount(reason));
+        ASSERT_TRUE(strstr(reason, "ubifs") != NULL);
+
+        /* Attached already, by the kernel: no ioctl; and a volume it does
+         * not have fails at once rather than after a wait. */
+        ubi_fixture(&cfg, &k, "ubi.mtd=flash\n");
+        cfg.cmdline = cmdline;
+        cfg.device_timeout = 5 * USEC_PER_SEC;
+        ubi_attached(0, 3);
+        {
+                usec_t t0 = now_monotonic();
+
+                ASSERT_EQ_INT(run_line("ubi0:nosuch %s/m/ubi ubifs defaults 0 0", &cfg, reason, sizeof(reason)),
+                              FSTAB_FAILED);
+                ASSERT_TRUE(now_monotonic() - t0 < 1 * USEC_PER_SEC);
+        }
+        ASSERT_STREQ(reason, "ubi0 is attached without that volume");
+        ASSERT_EQ_INT(k.calls, 0);
+        ASSERT_EQ_INT(run_line("ubi0_0 %s/m/ubi ubifs defaults 0 0", &cfg, reason, sizeof(reason)),
+                      FSTAB_FAILED);
+        ASSERT_TRUE(reached_mount(reason));
+        ASSERT_EQ_INT(run_line("ubi0_1 %s/m/ubi ubifs defaults 0 0", &cfg, reason, sizeof(reason)),
+                      FSTAB_FAILED);
+        ASSERT_STREQ(reason, "ubi0 is attached without that volume");
+
+        /* The attach for the line's device number failed: the line says why. */
+        ubi_fixture(&cfg, &k, "ubi.mtd=flash,0,0,2\n");
+        cfg.cmdline = cmdline;
+        k.fail = EINVAL;
+        ASSERT_EQ_INT(run_line("ubi2_0 %s/m/ubi ubifs defaults 0 0", &cfg, reason, sizeof(reason)),
+                      FSTAB_FAILED);
+        ASSERT_STREQ(reason, "ubi2 not attached: UBI_IOCATT on mtd3: Invalid argument");
+        ASSERT_EQ_INT(k.calls, 1);
+
+        /* Its flash never appeared: skipped, or absent for nofail. */
+        ubi_fixture(&cfg, &k, "ubi.mtd=nowhere,0,0,1\n");
+        cfg.cmdline = cmdline;
+        ASSERT_EQ_INT(run_line("ubi1:rootfs %s/m/ubi ubifs defaults 0 0", &cfg, reason, sizeof(reason)),
+                      FSTAB_SKIPPED);
+        ASSERT_STREQ(reason, "ubi1 not attached: MTD device nowhere never appeared");
+        ASSERT_EQ_INT(run_line("ubi1:rootfs %s/m/ubi ubifs nofail 0 0", &cfg, reason, sizeof(reason)),
+                      FSTAB_ABSENT);
+        ASSERT_EQ_INT(k.calls, 0);
+
+        /* Nothing names the device: waited for, then skipped or absent. */
+        ubi_fixture(&cfg, &k, "quiet\n");
+        cfg.cmdline = cmdline;
+        ASSERT_EQ_INT(run_line("ubi5_0 %s/m/ubi ubifs defaults 0 0", &cfg, reason, sizeof(reason)),
+                      FSTAB_SKIPPED);
+        ASSERT_STREQ(reason, "ubi5 not attached after 150ms");
+        ASSERT_EQ_INT(run_line("ubi5_0 %s/m/ubi ubifs nofail 0 0", &cfg, reason, sizeof(reason)),
+                      FSTAB_ABSENT);
+
+        /* ... and found when it turns up during the wait. */
+        cfg.device_timeout = 5 * USEC_PER_SEC;
+        cfg.poll_hook = ubi_late;
+        cfg.poll_userdata = &seen;
+        ASSERT_EQ_INT(run_line("ubi6!rootfs %s/m/ubi ubifs defaults 0 0", &cfg, reason, sizeof(reason)),
+                      FSTAB_FAILED);
+        ASSERT_EQ_INT(seen, 2);
+        ASSERT_TRUE(reached_mount(reason));
+        cfg.poll_hook = NULL;
+
+        /* A node path needs the node as well as the volume. */
+        cfg.device_timeout = 150 * USEC_PER_MSEC;
+        ubi_attached(0, 3);
+        snprintf(line, sizeof(line), "%s/ubi0_0 %%s/m/ubi ubifs defaults 0 0", ubi_dev);
+        ASSERT_EQ_INT(run_line(line, &cfg, reason, sizeof(reason)), FSTAB_SKIPPED);
+        snprintf(want, sizeof(want), "no %s/ubi0_0 after 150ms", ubi_dev);
+        ASSERT_STREQ(reason, want);
+        ASSERT_EQ_INT(test_write_file(ubi_dev, "ubi0_0", ""), 0);
+        ASSERT_EQ_INT(run_line(line, &cfg, reason, sizeof(reason)), FSTAB_FAILED);
+        ASSERT_TRUE(reached_mount(reason));
+
+        /* Not ubifs: none of this applies. */
+        ASSERT_EQ_INT(run_line("ubi9_9 %s/m/ubi tmpfs size=1m 0 0", &cfg, reason, sizeof(reason)),
+                      FSTAB_MOUNTED);
+}
+
 /* Two stand-ins for the table's /dev/pts and /run entries, by their scratch
  * paths, with the table's own floors. */
 static char stock_pts[PATH_MAX], stock_run[PATH_MAX];
@@ -1071,6 +1267,7 @@ int main(void) {
         test_remount();
         test_pass_real();
         test_pass_devices();
+        test_pass_ubi();
         test_stock_api_lines();
 
         ASSERT_TRUE(umount2(scratch, MNT_DETACH) == 0);
