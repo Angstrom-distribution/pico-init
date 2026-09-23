@@ -479,24 +479,45 @@ int job_run(Job *j) {
         return 0;
 }
 
-/* Fail the start jobs of every unit that hard-requires `failed`. */
+/* Fail the start job of every unit that hard-requires `failed`, directly or
+ * through a chain of Requires= (v30 job_finish_and_invalidate() recurses per
+ * requirer). A worklist rather than recursion, since this runs in PID 1. */
 static void job_propagate_failure(Manager *m, Unit *failed, JobResult result) {
+        Unit **work;
+        size_t n_work = 0;
         size_t i;
 
-        for (i = 0; i < m->n_units; i++) {
-                Unit *w = m->units[i];
+        /* Each unit is pushed at most once: pushing it finishes its only job. */
+        work = malloc((m->n_units + 1) * sizeof(Unit *));
+        if (!work) {
+                pico_log(PICO_LOG_ERR, "%s: out of memory propagating its failure", failed->id);
+                return;
+        }
 
-                if (w == failed || !w->job || w->job->type != JOB_START)
-                        continue;
+        work[n_work++] = failed;
 
-                if (unit_has_dependency(w, UNIT_REQUIRES, failed)) {
+        while (n_work > 0) {
+                Unit *f = work[--n_work];
+
+                for (i = 0; i < m->n_units; i++) {
+                        Unit *w = m->units[i];
+
+                        if (w == f || !w->job || w->job->type != JOB_START)
+                                continue;
+
+                        if (!unit_has_dependency(w, UNIT_REQUIRES, f))
+                                continue;
+
                         pico_log(PICO_LOG_WARNING,
                                  "%s: required unit %s failed, failing its job too",
                                  w->id,
-                                 failed->id);
+                                 f->id);
                         job_finish_full(w->job, result, false);
+                        work[n_work++] = w;
                 }
         }
+
+        free(work);
 }
 
 int job_finish_full(Job *j, JobResult result, bool recursive) {

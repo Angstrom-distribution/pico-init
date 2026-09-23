@@ -1151,8 +1151,53 @@ static void test_restart_of_unit_that_stops_failed(void) {
         free(dir);
 }
 
+/*
+ * A Requires= failure fails the whole requirement chain, not just the direct
+ * requirer: c fails, so b (Requires=c) never starts, so a (Requires=b) must
+ * not start either. v30's job_finish_and_invalidate() re-enters propagation
+ * for every requirer it fails.
+ */
+static void test_requires_failure_propagates_transitively(void) {
+        char cgroup_root[PATH_MAX];
+        Manager *m;
+        char *dir;
+        Unit *a, *b, *c;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "c.service",
+                                      "[Service]\nType=oneshot\nExecStart=/nonexistent/pico-init-test\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir, "b.target", "[Unit]\nRequires=c.service\nAfter=c.service\n"), 0);
+        ASSERT_EQ_INT(test_write_file(dir, "a.target", "[Unit]\nRequires=b.target\nAfter=b.target\n"), 0);
+
+        m = manager_for(dir);
+        use_private_cgroup_root(m, "propagate", cgroup_root, sizeof(cgroup_root));
+        ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+
+        a = manager_get_unit(m, "a.target");
+        b = manager_get_unit(m, "b.target");
+        c = manager_get_unit(m, "c.service");
+        ASSERT_TRUE(a != NULL && b != NULL && c != NULL);
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, a, NULL), 0);
+        ASSERT_TRUE(drive_until_idle(m, 300));
+
+        ASSERT_EQ_INT(unit_active_state(c), UNIT_FAILED);
+        ASSERT_EQ_INT(unit_active_state(b), UNIT_INACTIVE);
+        ASSERT_EQ_INT(unit_active_state(a), UNIT_INACTIVE);
+
+        manager_free(m);
+        free_private_cgroup_root(cgroup_root);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
         test_oneshot_start_job_finishes();
+        test_requires_failure_propagates_transitively();
         test_restart_of_unit_that_stops_failed();
         test_ordering_c_b_a();
         test_unit_free_cancels_its_job();
