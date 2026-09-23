@@ -216,8 +216,7 @@ static void test_pass_skips(void) {
                 "//srv/share /mnt/cifs cifs defaults 0 0",
                 "/dev/sdb1 /mnt/net ext4 _netdev 0 0",
                 "/dev/sdc1 /mnt/auto ext4 x-systemd.automount 0 0",
-                "UUID=0123-4567 /mnt/uuid vfat defaults 0 0",
-                "PARTLABEL=data /mnt/plabel ext4 defaults 0 0",
+                "ID=usb-Card_Reader-0:0 /mnt/id vfat defaults 0 0",
                 "/img /mnt/loop ext4 loop 0 0",
                 "/dev/sdd1 /mnt/card auto noauto 0 0",
                 "tmpfs relative tmpfs defaults 0 0",
@@ -229,8 +228,7 @@ static void test_pass_skips(void) {
                 "/mnt/cifs skipped network filesystem: nothing orders it after the network\n",
                 "/mnt/net skipped network filesystem: nothing orders it after the network\n",
                 "/mnt/auto skipped x-systemd.automount is not supported\n",
-                "/mnt/uuid skipped UUID= sources are not resolved by pico-init yet\n",
-                "/mnt/plabel skipped PARTLABEL= sources are not resolved by pico-init yet\n",
+                "/mnt/id skipped ID= sources are not supported\n",
                 "/mnt/loop skipped loop mounts are not supported\n",
                 "/mnt/card noauto -\n",
                 "relative failed the mount point is not an absolute path\n",
@@ -255,17 +253,17 @@ static void test_pass_skips(void) {
         cfg.record = record;
         cfg.api_floor = never_api;
 
-        /* 8 skipped + 1 failed; noauto and the root line do not count. The
+        /* 7 skipped + 1 failed; noauto and the root line do not count. The
          * record's directory is created on the way. */
-        ASSERT_EQ_INT(fstab_pass(&t, &cfg), 9);
+        ASSERT_EQ_INT(fstab_pass(&t, &cfg), 8);
         read_file(record, content, sizeof(content));
         ASSERT_STREQ(content, expect);
-        ASSERT_EQ_INT(fstab_record_count_degraded(record), 9);
+        ASSERT_EQ_INT(fstab_record_count_degraded(record), 8);
 
         /* An outcome already recorded -- the root check's -- is kept. */
         fstab_entry_set_outcome(&t.entries[0], FSTAB_REMOUNTED, "rw by the root check");
         t.entries[1].outcome = FSTAB_PENDING;
-        ASSERT_EQ_INT(fstab_pass(&t, &cfg), 9);
+        ASSERT_EQ_INT(fstab_pass(&t, &cfg), 8);
         read_file(record, content, sizeof(content));
         ASSERT_TRUE(strncmp(content, "/ remounted rw by the root check\n", 33) == 0);
 
@@ -597,6 +595,224 @@ static void test_pass_real(void) {
         api_path = NULL;
 }
 
+/* --- device-backed lines: resolution, the wait, the filesystem check --- */
+
+static char fx_sys[PATH_MAX], fx_dev[PATH_MAX], fx_fsck[PATH_MAX], fx_log[PATH_MAX];
+
+static const uint8_t uuid_stick[16] = { 0x5e, 0x5e, 0x5e, 0x5e, 0x11, 0x11, 0x22, 0x22,
+                                        0x33, 0x33, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44 };
+#define UUID_STICK "5e5e5e5e-1111-2222-3333-444444444444"
+
+/* An ext image on a whole unpartitioned disk `name`, with s_state `state`. */
+static void fx_disk(const char *name, const char *label, uint8_t state) {
+        char path[PATH_MAX * 2];
+
+        ASSERT_EQ_INT(test_block_device(fx_sys, name, NULL, 0, 2048), 0);
+        snprintf(path, sizeof(path), "%s/%s", fx_dev, name);
+        ASSERT_EQ_INT(test_ext_image(path, uuid_stick, label), 0);
+        ASSERT_EQ_INT(test_image_write(path, 1 << 20, &state, 1, 1024 + 58), 0);
+}
+
+/* fsck.ext4 as a script: logs its arguments, exits with `code`. */
+static void fx_checker(int code) {
+        char script[PATH_MAX * 3];
+
+        snprintf(script, sizeof(script), "#!/bin/sh\necho \"$*\" >> %s\nexit %d\n", fx_log, code);
+        ASSERT_EQ_INT(test_write_file(fx_fsck, "fsck.ext4", script), 0);
+        {
+                char path[PATH_MAX * 2];
+
+                snprintf(path, sizeof(path), "%s/fsck.ext4", fx_fsck);
+                ASSERT_EQ_INT(chmod(path, 0755), 0);
+        }
+        (void) unlink(fx_log);
+}
+
+static bool fx_checked(char *args, size_t size) {
+        FILE *f = fopen(fx_log, "re");
+        bool ran;
+
+        if (!f)
+                return false;
+        ran = fgets(args, (int) size, f) != NULL;
+        fclose(f);
+        return ran;
+}
+
+static void fx_late_card(void *userdata, unsigned attempt) {
+        unsigned *seen = userdata;
+
+        *seen = attempt;
+        if (attempt == 1)
+                fx_disk("sdl", "late", 0x01);
+}
+
+/* Run the pass over one line (with `%s` standing for the scratch dir) and
+ * hand back its outcome, keeping its reason in `reason`. */
+static FstabOutcome run_line(const char *fmt, FstabPassConfig *cfg, char *reason, size_t size) {
+        char line[PATH_MAX * 3], record[PATH_MAX];
+        FstabTable t = { 0 };
+        FstabOutcome o;
+
+        snprintf(line, sizeof(line), fmt, scratch, scratch);
+        path_in(record, sizeof(record), "fx/record");
+        cfg->record = record;
+
+        ASSERT_TRUE((t.entries = calloc(1, sizeof(FstabEntry))) != NULL);
+        ASSERT_EQ_INT(fstab_parse_line(line, &t.entries[0]), 1);
+        t.n = 1;
+
+        (void) fstab_pass(&t, cfg);
+        o = t.entries[0].outcome;
+        snprintf(reason, size, "%s", t.entries[0].reason ? t.entries[0].reason : "");
+        fstab_table_done(&t);
+        return o;
+}
+
+static void test_pass_devices(void) {
+        char fs[PATH_MAX], where[PATH_MAX], node[PATH_MAX * 2], reason[1024], args[PATH_MAX];
+        char vfs[1024], sb[1024], mi_line[PATH_MAX * 3];
+        FstabPassConfig cfg = { 0 };
+        unsigned seen = 0;
+
+        path_in(fx_sys, sizeof(fx_sys), "fx/sys");
+        path_in(fx_dev, sizeof(fx_dev), "fx/dev");
+        path_in(fx_fsck, sizeof(fx_fsck), "fx/sbin");
+        path_in(fx_log, sizeof(fx_log), "fx/fsck.log");
+        ASSERT_EQ_INT(fstab_mkdir_p(fx_dev, 0755), 0);
+        ASSERT_EQ_INT(fstab_mkdir_p(fx_fsck, 0755), 0);
+
+        /* "auto" mounts through a type list holding only tmpfs, which takes
+         * any string as its source: what is under test is which source. */
+        path_in(fs, sizeof(fs), "fx/filesystems");
+        {
+                FILE *f = fopen(fs, "we");
+
+                ASSERT_TRUE(f != NULL);
+                fputs("\ttmpfs\n", f);
+                fclose(f);
+        }
+
+        fx_disk("sdb", "stick", 0x01);
+        fx_disk("sdc", "dirty", 0x02); /* ERROR_FS: the gate sends it to fsck */
+        fx_disk("sdd", "clean", 0x01);
+
+        cfg.api_floor = never_api;
+        cfg.filesystems = fs;
+        cfg.sys_root = fx_sys;
+        cfg.dev_root = fx_dev;
+        cfg.fsck_dir = fx_fsck;
+        cfg.device_timeout = 150 * USEC_PER_MSEC;
+        fx_checker(0);
+
+        /* UUID= resolved to the whole-disk ext on sdb, mounted from it. */
+        snprintf(node, sizeof(node), "%s/sdb", fx_dev);
+        ASSERT_EQ_INT(run_line("UUID=" UUID_STICK " %s/m/uuid auto size=1m 0 0", &cfg, reason, sizeof(reason)),
+                      FSTAB_MOUNTED);
+        path_in(where, sizeof(where), "m/uuid");
+        ASSERT_EQ_INT(fstab_device_mounted("/proc/self/mountinfo", node, NULL, 0), 1);
+        snprintf(mi_line, sizeof(mi_line), "auto size=1m from %s", node);
+        ASSERT_STREQ(reason, mi_line);
+
+        /* A device mounted already is never checked: the errored sdc, once
+         * without a pass number and then again with one, under a checker
+         * that would refuse the mount. */
+        fx_checker(2);
+        ASSERT_EQ_INT(run_line("LABEL=dirty %s/m/first auto size=1m 0 0", &cfg, reason, sizeof(reason)),
+                      FSTAB_MOUNTED);
+        ASSERT_EQ_INT(run_line("LABEL=dirty %s/m/again auto size=1m 0 2", &cfg, reason, sizeof(reason)),
+                      FSTAB_MOUNTED);
+        ASSERT_TRUE(!fx_checked(args, sizeof(args)));
+        path_in(where, sizeof(where), "m/first");
+        ASSERT_TRUE(umount2(where, MNT_DETACH) == 0);
+        path_in(where, sizeof(where), "m/again");
+        ASSERT_TRUE(umount2(where, MNT_DETACH) == 0);
+
+        /* A clean ext filesystem passes the gate without a checker. */
+        ASSERT_EQ_INT(run_line("LABEL=clean %s/m/clean auto size=1m 0 2", &cfg, reason, sizeof(reason)),
+                      FSTAB_MOUNTED);
+        ASSERT_TRUE(!fx_checked(args, sizeof(args)));
+
+        /* An errored one gets fsck.ext4 -a on its node, and each verdict
+         * its own ending. Unmounted between runs, or the next would find it
+         * mounted and skip the check. */
+        snprintf(node, sizeof(node), "%s/sdc", fx_dev);
+        snprintf(mi_line, sizeof(mi_line), "-a %s\n", node);
+        path_in(where, sizeof(where), "m/dirty");
+
+        fx_checker(1);
+        ASSERT_EQ_INT(run_line("LABEL=dirty %s/m/dirty auto size=1m 0 2", &cfg, reason, sizeof(reason)),
+                      FSTAB_MOUNTED);
+        ASSERT_TRUE(fx_checked(args, sizeof(args)));
+        ASSERT_STREQ(args, mi_line);
+        ASSERT_TRUE(test_mount_options(where, vfs, sizeof(vfs), sb, sizeof(sb)) && test_has_opt(vfs, "rw"));
+        ASSERT_TRUE(umount2(where, MNT_DETACH) == 0);
+
+        fx_checker(4);
+        ASSERT_EQ_INT(run_line("LABEL=dirty %s/m/dirty auto size=1m 0 2", &cfg, reason, sizeof(reason)),
+                      FSTAB_FAILED);
+        ASSERT_STREQ(reason, "fsck left errors uncorrected, mounted read-only");
+        ASSERT_TRUE(test_mount_options(where, vfs, sizeof(vfs), sb, sizeof(sb)));
+        ASSERT_TRUE(test_has_opt(vfs, "ro") && test_has_opt(sb, "ro"));
+        ASSERT_TRUE(umount2(where, MNT_DETACH) == 0);
+
+        fx_checker(2);
+        ASSERT_EQ_INT(run_line("LABEL=dirty %s/m/dirty auto size=1m 0 2", &cfg, reason, sizeof(reason)),
+                      FSTAB_FAILED);
+        ASSERT_STREQ(reason, "fsck.ext4 asks for a reboot (exit 2)");
+        ASSERT_TRUE(!test_mount_options(where, vfs, sizeof(vfs), sb, sizeof(sb)));
+
+        fx_checker(8);
+        ASSERT_EQ_INT(run_line("LABEL=dirty %s/m/dirty auto size=1m 0 2", &cfg, reason, sizeof(reason)),
+                      FSTAB_MOUNTED);
+        ASSERT_TRUE(fx_checked(args, sizeof(args)));
+        ASSERT_TRUE(umount2(where, MNT_DETACH) == 0);
+
+        /* No checker installed: mounted unchecked. */
+        {
+                char path[PATH_MAX * 2];
+
+                snprintf(path, sizeof(path), "%s/fsck.ext4", fx_fsck);
+                ASSERT_EQ_INT(unlink(path), 0);
+        }
+        ASSERT_EQ_INT(run_line("LABEL=dirty %s/m/dirty auto size=1m 0 2", &cfg, reason, sizeof(reason)),
+                      FSTAB_MOUNTED);
+        ASSERT_TRUE(umount2(where, MNT_DETACH) == 0);
+
+        /* A plain /dev path that exists is mounted from as written. */
+        snprintf(node, sizeof(node), "%s/sdd", fx_dev);
+        snprintf(mi_line, sizeof(mi_line), "%s %%s/m/plain auto size=1m 0 0", node);
+        ASSERT_EQ_INT(run_line(mi_line, &cfg, reason, sizeof(reason)), FSTAB_MOUNTED);
+        ASSERT_STREQ(reason, "auto size=1m");
+
+        /* Never appears: skipped (degrading), or absent for nofail (not). */
+        ASSERT_EQ_INT(run_line("LABEL=nowhere %s/m/gone auto defaults 0 0", &cfg, reason, sizeof(reason)),
+                      FSTAB_SKIPPED);
+        ASSERT_STREQ(reason, "no device after 150ms");
+        ASSERT_EQ_INT(run_line("LABEL=nowhere %s/m/gone auto nofail 0 0", &cfg, reason, sizeof(reason)),
+                      FSTAB_ABSENT);
+        ASSERT_EQ_INT(run_line("/dev/pico-init-test-no-such-node %s/m/gone2 auto nofail 0 0",
+                               &cfg,
+                               reason,
+                               sizeof(reason)),
+                      FSTAB_ABSENT);
+
+        /* A type with no UUID reader fails at once rather than waiting. */
+        ASSERT_EQ_INT(run_line("UUID=" UUID_STICK " %s/m/f2 f2fs defaults 0 0", &cfg, reason, sizeof(reason)),
+                      FSTAB_FAILED);
+        ASSERT_STREQ(reason, "no UUID/LABEL reader for f2fs");
+
+        /* A card that turns up while PID 1 waits. */
+        cfg.device_timeout = 5 * USEC_PER_SEC;
+        cfg.poll_hook = fx_late_card;
+        cfg.poll_userdata = &seen;
+        ASSERT_EQ_INT(run_line("LABEL=late %s/m/late auto size=1m 0 0", &cfg, reason, sizeof(reason)),
+                      FSTAB_MOUNTED);
+        ASSERT_EQ_INT(seen, 1);
+        path_in(where, sizeof(where), "m/late");
+        ASSERT_EQ_INT(fstab_is_mounted("/proc/self/mountinfo", where), 1);
+}
+
 /* Two stand-ins for the table's /dev/pts and /run entries, by their scratch
  * paths, with the table's own floors. */
 static char stock_pts[PATH_MAX], stock_run[PATH_MAX];
@@ -690,6 +906,7 @@ int main(void) {
         test_auto_and_bind();
         test_remount();
         test_pass_real();
+        test_pass_devices();
         test_stock_api_lines();
 
         ASSERT_TRUE(umount2(scratch, MNT_DETACH) == 0);

@@ -36,12 +36,18 @@
  *  - Anything already mounted is left as it is.
  *  - Everything else gets its mount point created (mkdir -p) and is mounted.
  *
+ * A line whose source is a device -- a /dev path, or a UUID=/LABEL=/PARTUUID=/
+ * PARTLABEL= tag, which fstab-resolve.h turns into one -- first waits for that
+ * device, boundedly (fstab-resolve.h has the bounds). One that never appears is
+ * skipped with a WARNING, or recorded as absent for a nofail line; the boot
+ * goes on either way, where upstream would drop to emergency mode. A non-zero
+ * pass number then gets the root check's filesystem check before the mount:
+ * the ext superblock gate, fsck.<type> -a, and the same verdicts.
+ *
  * Out of scope, recorded as "skipped" with a WARNING rather than attempted:
  * network filesystems and _netdev (they need ordering after the network, which
  * nothing pre-manager has), x-systemd.automount, loop mounts, swap lines, and
- * UUID=/LABEL=/PARTUUID=/PARTLABEL= sources, which need an identifier resolver
- * this pass does not have yet. A plain device path is mounted as-is, without
- * waiting for it to appear and without a filesystem check.
+ * ID= sources.
  *
  * Nothing here can stop a boot. Every failure is one line in the log and one
  * line in the record, and the record makes `picoctl is-system-running` report
@@ -56,6 +62,7 @@
 #include <sys/types.h>
 
 #include "fstab.h"
+#include "util.h"
 
 typedef struct FstabPassConfig {
         const char *mountinfo;   /* default "/proc/self/mountinfo" */
@@ -65,6 +72,18 @@ typedef struct FstabPassConfig {
         /* Which mount points are PID 1's own API mounts, and their floor.
          * Default mount_setup_api_floor(). */
         bool (*api_floor)(const char *where, uint64_t *ret_floor);
+
+        const char *sys_root; /* default "/sys", where block devices are listed */
+        const char *dev_root; /* default "/dev", where their nodes are */
+        const char *fsck_dir; /* default "/usr/sbin", where fsck.<type> lives */
+
+        /* The wait for a line's device without x-systemd.device-timeout=;
+         * 0 means FSTAB_DEVICE_TIMEOUT_DEFAULT. */
+        usec_t device_timeout;
+
+        /* Called before every re-look while waiting for a device; tests. */
+        void (*poll_hook)(void *userdata, unsigned attempt);
+        void *poll_userdata;
 } FstabPassConfig;
 
 /*
@@ -86,6 +105,17 @@ int fstab_pass(FstabTable *t, const FstabPassConfig *cfg);
  * the filesystem's own message when it left one -- in `err`.
  */
 int fstab_mount(const FstabEntry *e,
+                const char *where,
+                uint64_t floor,
+                const char *filesystems,
+                char *err,
+                size_t err_size);
+
+/* The same with `source` in place of e->what: the device a tag resolved to.
+ * NULL means e->what. */
+int fstab_mount_from(
+                const FstabEntry *e,
+                const char *source,
                 const char *where,
                 uint64_t floor,
                 const char *filesystems,

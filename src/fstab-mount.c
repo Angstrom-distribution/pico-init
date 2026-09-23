@@ -22,8 +22,12 @@
 #include <sys/sysmacros.h>
 #include <unistd.h>
 
+#include "ext-super.h"
+#include "fsid.h"
+#include "fstab-resolve.h"
 #include "manager.h"
 #include "mount-setup.h"
+#include "root-check.h"
 #include "util.h"
 
 #ifndef AT_RECURSIVE
@@ -148,6 +152,7 @@ static int configure_superblock(int fsfd, const FstabOptions *o, bool rwro, char
 
 static int
                 mount_one_type(const FstabEntry *e,
+                               const char *source,
                                const char *type,
                                const char *where,
                                uint64_t floor,
@@ -165,7 +170,7 @@ static int
                 return describe_failure(-1, step, err, err_size);
         }
 
-        if (fsconfig(fsfd, FSCONFIG_SET_STRING, "source", e->what, 0) < 0) {
+        if (fsconfig(fsfd, FSCONFIG_SET_STRING, "source", source, 0) < 0) {
                 r = describe_failure(fsfd, "fsconfig(source)", err, err_size);
                 close(fsfd);
                 return r;
@@ -240,6 +245,7 @@ static int mount_bind(const FstabEntry *e, const char *where, uint64_t floor, ch
  * needs a device, in the order the kernel lists them, first success wins. */
 static int
                 mount_auto(const FstabEntry *e,
+                           const char *source,
                            const char *where,
                            uint64_t floor,
                            const char *filesystems,
@@ -268,7 +274,7 @@ static int
                         continue;
                 type[len] = '\0';
 
-                r = mount_one_type(e, type, where, floor, last, sizeof(last));
+                r = mount_one_type(e, source, type, where, floor, last, sizeof(last));
                 if (r == 0)
                         break;
         }
@@ -282,7 +288,9 @@ static int
         return r;
 }
 
-int fstab_mount(const FstabEntry *e,
+int fstab_mount_from(
+                const FstabEntry *e,
+                const char *source,
                 const char *where,
                 uint64_t floor,
                 const char *filesystems,
@@ -292,10 +300,30 @@ int fstab_mount(const FstabEntry *e,
         if (e->opts.bind || e->opts.rbind)
                 return mount_bind(e, where, floor, err, err_size);
 
-        if (strcmp(e->type, "auto") == 0)
-                return mount_auto(e, where, floor, filesystems ? filesystems : "/proc/filesystems", err, err_size);
+        if (!source)
+                source = e->what;
 
-        return mount_one_type(e, e->type, where, floor, err, err_size);
+        if (strcmp(e->type, "auto") == 0)
+                return mount_auto(
+                                e,
+                                source,
+                                where,
+                                floor,
+                                filesystems ? filesystems : "/proc/filesystems",
+                                err,
+                                err_size);
+
+        return mount_one_type(e, source, e->type, where, floor, err, err_size);
+}
+
+int fstab_mount(const FstabEntry *e,
+                const char *where,
+                uint64_t floor,
+                const char *filesystems,
+                char *err,
+                size_t err_size) {
+
+        return fstab_mount_from(e, NULL, where, floor, filesystems, err, err_size);
 }
 
 int fstab_remount(const char *where, const FstabOptions *o, uint64_t floor, char *err, size_t err_size) {
@@ -480,26 +508,9 @@ static bool type_is_network(const char *type) {
         return false;
 }
 
-/* A source that names a device by an identifier rather than a path. The
- * name before '=' goes into the record. */
-static bool source_is_tag(const char *what, char *tag, size_t size) {
-        static const char * const tags[] = { "UUID=", "LABEL=", "PARTUUID=", "PARTLABEL=", "ID=" };
-        size_t i;
-
-        for (i = 0; i < sizeof(tags) / sizeof(tags[0]); i++)
-                if (strncmp(what, tags[i], strlen(tags[i])) == 0) {
-                        snprintf(tag, size, "%s", tags[i]);
-                        return true;
-                }
-
-        return false;
-}
-
 /* The lines the pass does not attempt, each with the reason it gives. NULL
  * when the line is one to mount. */
-static const char *skip_reason(const FstabEntry *e, char *buf, size_t size) {
-        char tag[16];
-
+static const char *skip_reason(const FstabEntry *e) {
         if (strcmp(e->type, "swap") == 0)
                 return "swap lines are not activated by pico-init";
         if (type_is_network(e->type) || e->opts.netdev)
@@ -508,17 +519,191 @@ static const char *skip_reason(const FstabEntry *e, char *buf, size_t size) {
                 return "x-systemd.automount is not supported";
         if (e->opts.loop)
                 return "loop mounts are not supported";
-        if (source_is_tag(e->what, tag, sizeof(tag))) {
-                snprintf(buf, size, "%s sources are not resolved by pico-init yet", tag);
-                return buf;
-        }
+        /* systemd's by-id tag: a device's bus identity, which nothing
+         * pre-manager can read. */
+        if (strncmp(e->what, "ID=", 3) == 0)
+                return "ID= sources are not supported";
 
         return NULL;
 }
 
+/*
+ * The device behind a line: its tag resolved, or its /dev path waited for,
+ * within the line's device timeout. True with the node in `node`; false with
+ * the line's outcome recorded -- absent for a nofail line whose device never
+ * appeared, skipped for any other, failed when no amount of waiting helps.
+ */
+static bool resolve_source(FstabEntry *e, PicoFsKind hint, const FstabPassConfig *cfg, char *node, size_t size) {
+        FstabResolver res = { .sys_root = cfg->sys_root, .dev_root = cfg->dev_root };
+        bool clamped;
+        usec_t timeout;
+        int r;
+
+        timeout = fstab_device_timeout(&e->opts, cfg->device_timeout, &clamped);
+        if (clamped)
+                pico_log(PICO_LOG_WARNING,
+                         "fstab: %s: waiting at most %llus for %s, not forever",
+                         e->where,
+                         (unsigned long long) (timeout / USEC_PER_SEC),
+                         e->what);
+
+        r = fstab_wait_device(&res, e->what, hint, timeout, cfg->poll_hook, cfg->poll_userdata, node, size);
+        if (r > 0) {
+                if (strcmp(node, e->what) != 0)
+                        pico_log(PICO_LOG_DEBUG, "fstab: %s is %s", e->what, node);
+                return true;
+        }
+
+        if (r == -EOPNOTSUPP) {
+                pico_log(PICO_LOG_WARNING,
+                         "fstab: not mounting %s: pico-init cannot read a %s filesystem's UUID or label",
+                         e->where,
+                         e->type);
+                fstab_entry_set_outcome(e, FSTAB_FAILED, "no UUID/LABEL reader for %s", e->type);
+                return false;
+        }
+
+        if (r < 0) {
+                pico_log(PICO_LOG_WARNING, "fstab: cannot look for %s: %s", e->what, strerror(-r));
+                fstab_entry_set_outcome(e, FSTAB_FAILED, "cannot look for the device: %s", strerror(-r));
+                return false;
+        }
+
+        if (e->opts.nofail) {
+                pico_log(PICO_LOG_INFO,
+                         "fstab: %s did not appear within %llums, and %s is nofail",
+                         e->what,
+                         (unsigned long long) (timeout / USEC_PER_MSEC),
+                         e->where);
+                fstab_entry_set_outcome(
+                                e,
+                                FSTAB_ABSENT,
+                                "no device after %llums",
+                                (unsigned long long) (timeout / USEC_PER_MSEC));
+                return false;
+        }
+
+        pico_log(PICO_LOG_WARNING,
+                 "fstab: %s did not appear within %llums, not mounting %s",
+                 e->what,
+                 (unsigned long long) (timeout / USEC_PER_MSEC),
+                 e->where);
+        fstab_entry_set_outcome(
+                        e,
+                        FSTAB_SKIPPED,
+                        "no device after %llums",
+                        (unsigned long long) (timeout / USEC_PER_MSEC));
+        return false;
+}
+
+typedef enum CheckAction {
+        CHECK_MOUNT,
+        CHECK_MOUNT_RO,
+        CHECK_DONT_MOUNT,
+} CheckAction;
+
+/*
+ * fs_passno > 0: the root check's gate and verdicts, applied to a line's
+ * device before it is mounted. An ext filesystem is only handed to its
+ * checker when its own superblock says something is wrong; any other type
+ * gets fsck.<type> -a whenever it is installed, as upstream's systemd-fsck
+ * runs it. A device already mounted somewhere is never checked.
+ *
+ * The verdicts follow the root check's, divergence included: a checker that
+ * could not correct the damage leaves the filesystem mounted read-only rather
+ * than not at all, and a checker that itself failed does not stop the mount.
+ * "Reboot" -- which for a filesystem not in use should not happen -- leaves it
+ * unmounted rather than rebooting a machine over a data partition.
+ */
+static CheckAction check_filesystem(FstabEntry *e, const char *node, const FstabPassConfig *cfg) {
+        char checker[PATH_MAX], elsewhere[PATH_MAX];
+        const char *type = e->type;
+        PicoFsId id;
+        int code = 0, r;
+
+        if (e->passno <= 0)
+                return CHECK_MOUNT;
+
+        if (fstab_device_mounted(cfg->mountinfo, node, elsewhere, sizeof(elsewhere)) > 0) {
+                pico_log(PICO_LOG_DEBUG, "fstab: %s is mounted on %s already, not checking it", node, elsewhere);
+                return CHECK_MOUNT;
+        }
+
+        if (strcmp(type, "auto") == 0) {
+                if (pico_fs_probe(node, PICO_FS_NONE, &id) <= 0) {
+                        pico_log(PICO_LOG_INFO, "fstab: %s: unknown filesystem, not checking it", node);
+                        return CHECK_MOUNT;
+                }
+                type = pico_fs_kind_to_string(id.kind);
+        }
+
+        if (pico_fs_kind_from_type(type) == PICO_FS_EXT) {
+                PicoExtInfo fs;
+
+                r = ext_super_read(node, &fs);
+                if (r <= 0) {
+                        pico_log(PICO_LOG_WARNING,
+                                 "fstab: %s: cannot read its ext superblock, not checking it",
+                                 node);
+                        return CHECK_MOUNT;
+                }
+                if (pico_root_verdict(&fs) != PICO_ROOT_CHECK) {
+                        pico_log(PICO_LOG_DEBUG, "fstab: %s is clean or only needs its journal, no check", node);
+                        return CHECK_MOUNT;
+                }
+                pico_log(PICO_LOG_WARNING, "fstab: %s is not clean (state 0x%04x), checking it", node, fs.state);
+        }
+
+        if ((size_t) snprintf(checker, sizeof(checker), "%s/fsck.%s", cfg->fsck_dir, type) >= sizeof(checker) ||
+            access(checker, X_OK) < 0) {
+                pico_log(PICO_LOG_INFO, "fstab: %s is not installed, not checking %s", checker, node);
+                return CHECK_MOUNT;
+        }
+
+        r = pico_fsck_run(checker, node, &code);
+        if (r < 0) {
+                pico_log(PICO_LOG_WARNING, "fstab: could not run %s on %s: %s", checker, node, strerror(-r));
+                return CHECK_MOUNT;
+        }
+
+        switch (pico_fsck_verdict(code)) {
+        case PICO_FSCK_OK:
+                pico_log(PICO_LOG_INFO, "fstab: %s checked%s", node, code ? " and repaired" : "");
+                return CHECK_MOUNT;
+
+        case PICO_FSCK_REBOOT:
+                pico_log(PICO_LOG_WARNING,
+                         "fstab: %s asks for a reboot after repairing %s (exit %d), not mounting it",
+                         checker,
+                         node,
+                         code);
+                fstab_entry_set_outcome(e, FSTAB_FAILED, "fsck.%s asks for a reboot (exit %d)", type, code);
+                return CHECK_DONT_MOUNT;
+
+        case PICO_FSCK_UNCORRECTED:
+                pico_log(PICO_LOG_ERR,
+                         "fstab: %s left errors on %s uncorrected (exit %d), mounting it read-only",
+                         checker,
+                         node,
+                         code);
+                return CHECK_MOUNT_RO;
+
+        case PICO_FSCK_FAILED:
+        default:
+                pico_log(PICO_LOG_WARNING,
+                         "fstab: %s failed on %s (exit %d), which says nothing about it -- mounting anyway",
+                         checker,
+                         node,
+                         code);
+                return CHECK_MOUNT;
+        }
+}
+
 static void process_entry(FstabEntry *e, const FstabPassConfig *cfg) {
-        char where[PATH_MAX], err[512], buf[128];
-        const char *reason;
+        char where[PATH_MAX], err[512], node[PATH_MAX];
+        const char *reason, *source = e->what;
+        CheckAction check = CHECK_MOUNT;
+        FstabEntry ro;
         uint64_t floor = 0;
         bool api;
         int r;
@@ -536,7 +721,7 @@ static void process_entry(FstabEntry *e, const FstabPassConfig *cfg) {
                 return;
         }
 
-        reason = skip_reason(e, buf, sizeof(buf));
+        reason = skip_reason(e);
         if (reason) {
                 pico_log(PICO_LOG_WARNING, "fstab: not mounting %s: %s", e->where, reason);
                 fstab_entry_set_outcome(e, FSTAB_SKIPPED, "%s", reason);
@@ -608,15 +793,39 @@ static void process_entry(FstabEntry *e, const FstabPassConfig *cfg) {
                 return;
         }
 
-        r = fstab_mount(e, where, floor, cfg->filesystems, err, sizeof(err));
+        if (!e->opts.bind && !e->opts.rbind && fstab_source_needs_device(e->what)) {
+                if (!resolve_source(e, pico_fs_kind_from_type(e->type), cfg, node, sizeof(node)))
+                        return;
+                source = node;
+
+                check = check_filesystem(e, node, cfg);
+                if (check == CHECK_DONT_MOUNT)
+                        return;
+        }
+
+        /* A shallow copy whose options say read-only: the arrays inside are
+         * still e's, and are neither changed nor freed through it. */
+        ro = *e;
+        if (check == CHECK_MOUNT_RO) {
+                ro.opts.attr_set |= MOUNT_ATTR_RDONLY;
+                ro.opts.attr_clr &= ~(uint64_t) MOUNT_ATTR_RDONLY;
+        }
+
+        r = fstab_mount_from(&ro, source, where, floor, cfg->filesystems, err, sizeof(err));
         if (r < 0) {
-                pico_log(PICO_LOG_WARNING, "fstab: cannot mount %s on %s: %s", e->what, where, err);
+                pico_log(PICO_LOG_WARNING, "fstab: cannot mount %s on %s: %s", source, where, err);
                 fstab_entry_set_outcome(e, FSTAB_FAILED, "%s", err);
                 return;
         }
 
-        pico_log(PICO_LOG_INFO, "fstab: mounted %s on %s (%s)", e->what, where, e->type);
-        fstab_entry_set_outcome(e, FSTAB_MOUNTED, "%s %s", e->type, e->options);
+        pico_log(PICO_LOG_INFO, "fstab: mounted %s on %s (%s)", source, where, e->type);
+
+        if (check == CHECK_MOUNT_RO)
+                fstab_entry_set_outcome(e, FSTAB_FAILED, "fsck left errors uncorrected, mounted read-only");
+        else if (source != e->what)
+                fstab_entry_set_outcome(e, FSTAB_MOUNTED, "%s %s from %s", e->type, e->options, source);
+        else
+                fstab_entry_set_outcome(e, FSTAB_MOUNTED, "%s %s", e->type, e->options);
 }
 
 /* mkdir -p of the directory `path` lives in. */
@@ -642,6 +851,10 @@ int fstab_pass(FstabTable *t, const FstabPassConfig *cfg) {
                 .filesystems = "/proc/filesystems",
                 .record = PICO_FSTAB_RECORD,
                 .api_floor = mount_setup_api_floor,
+                .sys_root = "/sys",
+                .dev_root = "/dev",
+                .fsck_dir = "/usr/sbin",
+                .device_timeout = FSTAB_DEVICE_TIMEOUT_DEFAULT,
         };
         FstabEntry **order = NULL;
         int degraded = 0;
@@ -657,6 +870,16 @@ int fstab_pass(FstabTable *t, const FstabPassConfig *cfg) {
                         c.record = cfg->record;
                 if (cfg->api_floor)
                         c.api_floor = cfg->api_floor;
+                if (cfg->sys_root)
+                        c.sys_root = cfg->sys_root;
+                if (cfg->dev_root)
+                        c.dev_root = cfg->dev_root;
+                if (cfg->fsck_dir)
+                        c.fsck_dir = cfg->fsck_dir;
+                if (cfg->device_timeout)
+                        c.device_timeout = cfg->device_timeout;
+                c.poll_hook = cfg->poll_hook;
+                c.poll_userdata = cfg->poll_userdata;
         }
 
         r = fstab_mount_order(t, &order);
