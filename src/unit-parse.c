@@ -558,16 +558,46 @@ static int config_parse_type(Unit *u, const char *path, unsigned line, const cha
                          path,
                          line);
                 return unit_add_degradation(u, "Type=notify-reload");
+        } else if (strcmp(rvalue, "dbus") == 0) {
+                /*
+                 * plans/38-pico-init-drop-in-systemd-compat.md SS7.2: readiness
+                 * ("the name appeared on the system bus") is unobtainable in
+                 * principle here, pico-init runs no bus at all -- so this is
+                 * a permanent degrade, not a stopgap. Running as simple is
+                 * how avahi-daemon/bluetooth behaved for years before
+                 * Type=dbus existed; refusing the unit guarantees they never
+                 * start. BusName= itself still falls through to the generic
+                 * unknown-directive degradation below.
+                 */
+                s->type = SERVICE_TYPE_SIMPLE;
+                pico_log(PICO_LOG_WARNING,
+                         "%s:%u: Type=dbus: no system bus, running as Type=simple (BusName= readiness never "
+                         "waited for)",
+                         path,
+                         line);
+                return unit_add_degradation(u, "Type=dbus");
+        } else if (strcmp(rvalue, "idle") == 0) {
+                /* plans/38 SS7.2: idle is simple with the start delayed until
+                 * the job queue drains -- degrade to simple now, the delay
+                 * itself is a later refinement (every in-image Type=idle
+                 * consumer is a getty pico-init's own units already replace). */
+                s->type = SERVICE_TYPE_SIMPLE;
+                pico_log(PICO_LOG_WARNING,
+                         "%s:%u: Type=idle: start-delay not implemented, running as Type=simple",
+                         path,
+                         line);
+                return unit_add_degradation(u, "Type=idle");
         } else {
                 /*
-                 * Still a hard failure rather than a dropped directive:
-                 * dbus/idle each change *when* a service counts as started,
-                 * so silently running one as simple would report the unit
-                 * up before it actually is, and everything ordered After=
-                 * it would then start too early. Refusing is safer.
+                 * Still a hard failure rather than a dropped directive: any
+                 * OTHER type changes *when* a service counts as started, so
+                 * silently running one as simple would report the unit up
+                 * before it actually is, and everything ordered After= it
+                 * would then start too early. Refusing is safer.
                  */
                 pico_log(PICO_LOG_ERR,
-                         "%s:%u: Type=%s is not supported (simple, oneshot, exec, notify, notify-reload, forking are), failing unit",
+                         "%s:%u: Type=%s is not supported (simple, oneshot, exec, notify, notify-reload, forking, "
+                         "dbus, idle are), failing unit",
                          path,
                          line,
                          rvalue);

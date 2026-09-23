@@ -1276,6 +1276,48 @@ static void test_type_values(void) {
 }
 
 /*
+ * units-type-dbus-idle-refused: plans/38-pico-init-drop-in-systemd-compat.md
+ * SS7.2 decided dbus/idle degrade to simple, permanently -- not the hard
+ * refusal every other unrecognized Type= still gets.
+ */
+static void test_type_dbus_and_idle_degrade_to_simple(void) {
+        Manager *m;
+        char *dir;
+        Unit *u;
+        char *degraded;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "dbus.service",
+                                      "[Service]\nType=dbus\nBusName=org.example.Thing\n"
+                                      "ExecStart=/bin/true\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir, "idle.service", "[Service]\nType=idle\nExecStart=/bin/true\n"), 0);
+
+        m = manager_for(dir);
+
+        u = load_one(m, "dbus.service");
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        ASSERT_EQ_INT(((Service *) u)->type, SERVICE_TYPE_SIMPLE);
+        degraded = unit_degraded_directives_string(u);
+        ASSERT_TRUE(strstr(degraded, "Type=dbus") != NULL);
+        free(degraded);
+
+        u = load_one(m, "idle.service");
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        ASSERT_EQ_INT(((Service *) u)->type, SERVICE_TYPE_SIMPLE);
+        degraded = unit_degraded_directives_string(u);
+        ASSERT_STREQ(degraded, "Type=idle");
+        free(degraded);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
  * Type=forking's own directives: PIDFile= takes the full specifier table
  * and a relative path lands under /run/ (systemd since v237); an empty
  * value resets it. GuessMainPID= defaults to yes.
@@ -1395,6 +1437,7 @@ int main(void) {
         test_shipped_ttygs0_unit_is_unchanged();
         test_shipped_ttygs0_unit_wins_over_template();
         test_type_values();
+        test_type_dbus_and_idle_degrade_to_simple();
         test_forking_directives();
         test_exec_dash_prefix_sets_ignore();
 
