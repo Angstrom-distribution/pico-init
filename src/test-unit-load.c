@@ -339,7 +339,102 @@ static void test_presets_never_see_a_template(void) {
         free(presetdir);
 }
 
+/*
+ * oe-core's set_systemd_default_target leaves exactly this on every image:
+ * /etc/systemd/system/default.target -> /usr/lib/systemd/system/multi-user.target,
+ * shadowing the packaged default.target. Before alias support pico parsed
+ * multi-user.target's body under the id "default.target", never loaded
+ * multi-user.target itself, and so never scanned multi-user.target.wants/ --
+ * every WantedBy=multi-user.target unit silently never started.
+ */
+static void test_symlink_alias_is_one_unit(void) {
+        Manager *m;
+        char *etc, *lib;
+        Unit *def, *multi, *wanted_a, *wanted_b;
+        char path[PATH_MAX];
+
+        etc = test_tmpdir_new();
+        lib = test_tmpdir_new();
+        ASSERT_TRUE(etc != NULL && lib != NULL);
+
+        ASSERT_EQ_INT(test_write_file(lib, "default.target", "[Unit]\nDescription=Packaged default\n"), 0);
+        ASSERT_EQ_INT(test_write_file(lib, "multi-user.target", "[Unit]\nDescription=Multi-User System\n"), 0);
+        ASSERT_EQ_INT(test_write_file(lib, "a.service", "[Service]\nExecStart=/bin/true\n"), 0);
+        ASSERT_EQ_INT(test_write_file(lib, "b.service", "[Service]\nExecStart=/bin/true\n"), 0);
+
+        snprintf(path, sizeof(path), "%s/multi-user.target", lib);
+        ASSERT_EQ_INT(test_symlink(etc, "default.target", path), 0);
+
+        /* one enablement under each name */
+        ASSERT_EQ_INT(test_mkdir(etc, "multi-user.target.wants"), 0);
+        snprintf(path, sizeof(path), "%s/multi-user.target.wants", etc);
+        ASSERT_EQ_INT(test_symlink(path, "a.service", "../a.service"), 0);
+        ASSERT_EQ_INT(test_mkdir(lib, "default.target.wants"), 0);
+        snprintf(path, sizeof(path), "%s/default.target.wants", lib);
+        ASSERT_EQ_INT(test_symlink(path, "b.service", "../b.service"), 0);
+
+        m = manager_for2(etc, lib);
+        ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+
+        def = manager_get_unit(m, "default.target");
+        multi = manager_get_unit(m, "multi-user.target");
+        ASSERT_TRUE(def != NULL);
+        ASSERT_TRUE(def == multi);
+        ASSERT_STREQ(def->id, "multi-user.target");
+        ASSERT_TRUE(unit_has_name(def, "default.target"));
+        ASSERT_EQ_INT(def->load_state, UNIT_LOADED);
+        ASSERT_STREQ(def->description, "Multi-User System");
+
+        ASSERT_EQ_INT(unit_add_wants_requires_dirs(def), 0);
+        wanted_a = manager_get_unit(m, "a.service");
+        wanted_b = manager_get_unit(m, "b.service");
+        ASSERT_TRUE(wanted_a != NULL && wanted_b != NULL);
+        ASSERT_TRUE(unit_has_dependency(def, UNIT_WANTS, wanted_a));
+        ASSERT_TRUE(unit_has_dependency(def, UNIT_WANTS, wanted_b));
+
+        manager_free(m);
+        test_rm_rf(etc);
+        test_rm_rf(lib);
+        free(etc);
+        free(lib);
+}
+
+/* A mask (-> /dev/null), a same-name link and a cross-type link are not aliases. */
+static void test_non_alias_symlinks(void) {
+        char *etc, *lib;
+        Manager *m;
+        char *canon = NULL;
+        char path[PATH_MAX];
+
+        etc = test_tmpdir_new();
+        lib = test_tmpdir_new();
+        ASSERT_TRUE(etc != NULL && lib != NULL);
+
+        ASSERT_EQ_INT(test_write_file(lib, "same.service", "[Service]\nExecStart=/bin/true\n"), 0);
+        ASSERT_EQ_INT(test_write_file(lib, "other.target", "[Unit]\n"), 0);
+        snprintf(path, sizeof(path), "%s/same.service", lib);
+        ASSERT_EQ_INT(test_symlink(etc, "same.service", path), 0);
+        ASSERT_EQ_INT(test_symlink(etc, "masked.service", "/dev/null"), 0);
+        snprintf(path, sizeof(path), "%s/other.target", lib);
+        ASSERT_EQ_INT(test_symlink(etc, "cross.service", path), 0);
+
+        m = manager_for2(etc, lib);
+        ASSERT_EQ_INT(unit_resolve_alias(m, "same.service", &canon), 0);
+        ASSERT_TRUE(canon == NULL);
+        ASSERT_EQ_INT(unit_resolve_alias(m, "masked.service", &canon), 0);
+        ASSERT_EQ_INT(unit_resolve_alias(m, "cross.service", &canon), 0);
+        ASSERT_EQ_INT(unit_resolve_alias(m, "absent.service", &canon), 0);
+
+        manager_free(m);
+        test_rm_rf(etc);
+        test_rm_rf(lib);
+        free(etc);
+        free(lib);
+}
+
 int main(void) {
+        test_symlink_alias_is_one_unit();
+        test_non_alias_symlinks();
         test_literal_instance_loads();
         test_template_fallback();
         test_literal_beats_template_same_dir();

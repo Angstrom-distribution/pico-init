@@ -201,6 +201,30 @@ static const char *unit_file_state(Unit *u) {
         return u->enabled ? "enabled" : "disabled";
 }
 
+/* Each alias gets a relative symlink to the unit's own file, so reading
+ * units/default.target answers for the unit it is an alias of -- what
+ * `systemctl show default.target` does. Created once; EEXIST is the common
+ * case on every later republish. */
+static void publish_unit_aliases(Unit *u, struct pico_manager_state *st) {
+        char **a;
+
+        for (a = u->aliases; a && *a; a++) {
+                char link[PATH_MAX];
+                int n;
+
+                n = snprintf(link, sizeof(link), "%s/%s", st->units_dir, *a);
+                if (n < 0 || (size_t) n >= sizeof(link))
+                        continue;
+
+                if (symlink(u->id, link) < 0 && errno != EEXIST)
+                        pico_log(PICO_LOG_DEBUG,
+                                 "%s: could not publish alias %s: %s",
+                                 u->id,
+                                 *a,
+                                 strerror(errno));
+        }
+}
+
 /* Write u's file to a fixed tmp name under units_dir, then rename() it into
  * place. Every failure is logged at DEBUG and swallowed -- see the file
  * header for why this must never propagate. */
@@ -315,7 +339,10 @@ static void publish_unit_file(Unit *u) {
         if (rename(tmp, final) < 0) {
                 pico_log(PICO_LOG_DEBUG, "%s: could not publish state file: %s", u->id, strerror(errno));
                 unlink(tmp);
+                return;
         }
+
+        publish_unit_aliases(u, st);
 }
 
 void manager_state_notify_unit(Unit *u) {
@@ -345,6 +372,7 @@ void manager_state_notify_job(Job *j) {
 void manager_state_forget_unit(Unit *u) {
         struct pico_manager_state *st;
         char path[PATH_MAX];
+        char **a;
         int n;
 
         if (!u || !u->manager || !u->manager->state || !u->id)
@@ -357,6 +385,12 @@ void manager_state_forget_unit(Unit *u) {
                 return;
 
         unlink(path);
+
+        for (a = u->aliases; a && *a; a++) {
+                n = snprintf(path, sizeof(path), "%s/%s", st->units_dir, *a);
+                if (n > 0 && (size_t) n < sizeof(path))
+                        unlink(path);
+        }
 }
 
 void manager_state_notify_manager(Manager *m) {

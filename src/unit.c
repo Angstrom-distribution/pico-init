@@ -171,6 +171,7 @@ Unit *unit_free(Unit *u) {
                 u->n_dependencies[i] = 0;
         }
 
+        u->aliases = pico_strv_free(u->aliases);
         u->wanted_by = pico_strv_free(u->wanted_by);
         u->required_by = pico_strv_free(u->required_by);
 
@@ -185,6 +186,32 @@ Unit *unit_free(Unit *u) {
         free(u);
 
         return NULL;
+}
+
+bool unit_has_name(const Unit *u, const char *name) {
+        char **p;
+
+        if (!u || !name)
+                return false;
+
+        if (u->id && strcmp(u->id, name) == 0)
+                return true;
+
+        for (p = u->aliases; p && *p; p++)
+                if (strcmp(*p, name) == 0)
+                        return true;
+
+        return false;
+}
+
+int unit_add_alias(Unit *u, const char *name) {
+        if (!u || !name || !*name)
+                return -EINVAL;
+
+        if (unit_has_name(u, name))
+                return 0;
+
+        return pico_strv_extend(&u->aliases, name);
 }
 
 int unit_add_degradation(Unit *u, const char *what) {

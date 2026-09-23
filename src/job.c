@@ -576,7 +576,7 @@ int job_finish_full(Job *j, JobResult result, bool recursive) {
         /* The default target's start job ending, either way, is when the boot
          * has settled: everything it pulled in has been loaded and tried, so
          * the degradation count is final. */
-        if (j->type == JOB_START && m->default_target && strcmp(u->id, m->default_target) == 0)
+        if (j->type == JOB_START && m->default_target && unit_has_name(u, m->default_target))
                 manager_log_degradation_summary(m);
 
         /*

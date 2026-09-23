@@ -33,7 +33,15 @@
  * template's path, matching v30's own behaviour (load-fragment.c:2228-2230)
  * -- that is what picoctl status is meant to show. Not carried: v30's alias
  * retry (load-fragment.c:2302-2319) and its fragment_path-as-hint retry
- * (:2274-2287) -- pico has no Alias= and no linked-path hint.
+ * (:2274-2287).
+ *
+ * Symlink aliases (default.target -> multi-user.target, the shape oe-core's
+ * set_systemd_default_target and every Alias= enablement produce) are
+ * resolved before a unit exists at all: manager_load_unit() asks
+ * unit_resolve_alias() below and hands back the canonical unit, with the
+ * alias recorded as one of its names. v30 instead merged two already-loaded
+ * units (unit_merge()); resolving by name up front makes merging unnecessary,
+ * because an alias never gets a Unit of its own to merge.
  */
 
 #include "unit.h"
@@ -44,6 +52,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "manager.h"
 #include "unit-name.h"
@@ -93,6 +102,108 @@ static int unit_find_fragment(Unit *u, const char *name, char **ret) {
         }
 
         return 0;
+}
+
+/*
+ * One hop of alias resolution. The first entry named `name` anywhere in the
+ * search path decides, the same precedence unit_find_fragment() uses: a
+ * symlink there whose target's basename is a different, valid unit name of the
+ * same type makes `name` an alias of that unit -- v30 collected the same names
+ * while following the fragment's symlinks (load-fragment.c open_follow()).
+ * Not an alias: a regular file, a symlink to a file of the same name, a mask
+ * (-> /dev/null), anything instance- or template-shaped (plan 32's own
+ * fallback owns those). 1 with *ret owned, 0, -ENOMEM.
+ */
+static int alias_one_hop(Manager *m, const char *name, char **ret) {
+        char * const *dir;
+
+        for (dir = m->unit_path; *dir; dir++) {
+                char path[PATH_MAX], target[PATH_MAX];
+                const char *base;
+                struct stat st;
+                ssize_t k;
+                int n;
+
+                n = snprintf(path, sizeof(path), "%s/%s", *dir, name);
+                if (n < 0 || (size_t) n >= sizeof(path))
+                        continue;
+
+                if (lstat(path, &st) < 0)
+                        continue;
+
+                if (!S_ISLNK(st.st_mode))
+                        return 0;
+
+                k = readlink(path, target, sizeof(target) - 1);
+                if (k <= 0)
+                        return 0;
+                target[k] = '\0';
+
+                base = strrchr(target, '/');
+                base = base ? base + 1 : target;
+
+                if (strcmp(base, name) == 0 || !unit_name_is_valid(base) || strchr(base, '@') ||
+                    unit_type_from_name(base) != unit_type_from_name(name))
+                        return 0;
+
+                *ret = pico_strdup(base);
+                return *ret ? 1 : -ENOMEM;
+        }
+
+        return 0;
+}
+
+/* Bounded, so a symlink cycle degrades to "no alias" (and the literal load
+ * then fails on ELOOP) instead of recursing forever. */
+#define ALIAS_MAX_HOPS 8
+
+int unit_resolve_alias(Manager *m, const char *name, char **ret) {
+        char *cur = NULL;
+        int hops, r;
+
+        if (!m || !m->unit_path || !name || !ret)
+                return -EINVAL;
+
+        *ret = NULL;
+
+        if (strchr(name, '@'))
+                return 0;
+
+        for (hops = 0; hops < ALIAS_MAX_HOPS; hops++) {
+                char *next = NULL;
+
+                r = alias_one_hop(m, cur ? cur : name, &next);
+                if (r < 0) {
+                        free(cur);
+                        return r;
+                }
+                if (r == 0)
+                        break;
+
+                if (strcmp(next, name) == 0) { /* cycle back to the start */
+                        free(next);
+                        free(cur);
+                        return 0;
+                }
+
+                free(cur);
+                cur = next;
+        }
+
+        if (hops == ALIAS_MAX_HOPS) {
+                pico_log(PICO_LOG_WARNING,
+                         "%s: alias chain longer than %d links, treating as its own unit",
+                         name,
+                         ALIAS_MAX_HOPS);
+                free(cur);
+                return 0;
+        }
+
+        if (!cur)
+                return 0;
+
+        *ret = cur;
+        return 1;
 }
 
 int unit_load(Unit *u) {

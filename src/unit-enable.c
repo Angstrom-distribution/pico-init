@@ -60,18 +60,15 @@ static int scan_enable_dir(Unit *u, const char *dirpath, UnitDependency dep) {
         return ret;
 }
 
-int unit_add_wants_requires_dirs(Unit *u) {
+static int scan_wants_requires_for(Unit *u, const char *name) {
         char * const *dir;
         int ret = 0;
-
-        if (!u || !u->manager)
-                return -EINVAL;
 
         for (dir = u->manager->unit_path; dir && *dir; dir++) {
                 char path[PATH_MAX];
                 int n, r;
 
-                n = snprintf(path, sizeof(path), "%s/%s.wants", *dir, u->id);
+                n = snprintf(path, sizeof(path), "%s/%s.wants", *dir, name);
                 if (n < 0 || (size_t) n >= sizeof(path)) {
                         if (ret == 0)
                                 ret = -ENAMETOOLONG;
@@ -81,7 +78,7 @@ int unit_add_wants_requires_dirs(Unit *u) {
                                 ret = r;
                 }
 
-                n = snprintf(path, sizeof(path), "%s/%s.requires", *dir, u->id);
+                n = snprintf(path, sizeof(path), "%s/%s.requires", *dir, name);
                 if (n < 0 || (size_t) n >= sizeof(path)) {
                         if (ret == 0)
                                 ret = -ENAMETOOLONG;
@@ -90,6 +87,29 @@ int unit_add_wants_requires_dirs(Unit *u) {
                         if (r < 0 && ret == 0)
                                 ret = r;
                 }
+        }
+
+        return ret;
+}
+
+/* Every name the unit answers to, not just its id: with default.target an
+ * alias of multi-user.target, both default.target.wants/ and
+ * multi-user.target.wants/ belong to the one unit (v30 walked u->names the
+ * same way). By index, re-reading u->aliases each time: a scan can load a
+ * unit, and a newly found alias of u would realloc the vector. */
+int unit_add_wants_requires_dirs(Unit *u) {
+        size_t i;
+        int ret, r;
+
+        if (!u || !u->manager)
+                return -EINVAL;
+
+        ret = scan_wants_requires_for(u, u->id);
+
+        for (i = 0; u->aliases && u->aliases[i]; i++) {
+                r = scan_wants_requires_for(u, u->aliases[i]);
+                if (r < 0 && ret == 0)
+                        ret = r;
         }
 
         return ret;

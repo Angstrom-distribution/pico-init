@@ -94,6 +94,11 @@ struct Unit {
         const UnitVTable *vtable;
 
         char *id;            /* "foo.service" */
+        char **aliases;      /* other names this unit answers to, owned strv, may be NULL.
+                              * Set by manager_load_unit() when a name's fragment is a
+                              * symlink to a differently named unit file -- the shape
+                              * oe-core's default.target -> multi-user.target and every
+                              * Alias= enablement produce. */
         char *instance;      /* the part between the first '@' and the last '.', owned;
                               * NULL unless this is an instance. Set once at unit_new()
                               * time from u->id and never changes afterwards, so every
@@ -115,9 +120,9 @@ struct Unit {
          * drops a value using it rather than mistaking it for a literal path
          * that can never exist.
          */
-        char **condition_path_exists;       /* ConditionPathExists=, owned, may be NULL */
-        bool *condition_path_exists_negated;       /* parallel to condition_path_exists, owned, may be NULL */
-        char **condition_path_is_directory; /* ConditionPathIsDirectory=, owned, may be NULL */
+        char **condition_path_exists;        /* ConditionPathExists=, owned, may be NULL */
+        bool *condition_path_exists_negated; /* parallel to condition_path_exists, owned, may be NULL */
+        char **condition_path_is_directory;  /* ConditionPathIsDirectory=, owned, may be NULL */
         bool *condition_path_is_directory_negated; /* parallel to condition_path_is_directory, owned, may be NULL */
 
         /* Result of the last unit_start() condition check. False means the
@@ -228,10 +233,22 @@ int unit_add_degradation(Unit *u, const char *what);
  * NULL on -ENOMEM. */
 char *unit_degraded_directives_string(Unit *u);
 
+/* True if name is u->id or one of u->aliases. */
+bool unit_has_name(const Unit *u, const char *name);
+
+/* Record name as another name of u; a no-op if u already answers to it.
+ * 0 or -ENOMEM. */
+int unit_add_alias(Unit *u, const char *name);
+
 /* --- unit-load.c --- */
 /* Find u->id's fragment in the manager's unit search path, parse it, resolve to
  * LOADED/ERROR. Idempotent once the unit has left UNIT_STUB. 0 or -errno. */
 int unit_load(Unit *u);
+
+/* If name's first entry in the search path is a symlink to a differently
+ * named unit file of the same type, follow the chain and hand back the final
+ * name (owned) with 1. 0 when name is its own unit, -ENOMEM. */
+int unit_resolve_alias(Manager *m, const char *name, char **ret);
 
 /* --- unit-parse.c --- */
 /* Parse one INI fragment (sections, escapes, line continuations) into u. 0 or -errno. */

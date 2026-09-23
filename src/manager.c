@@ -476,6 +476,11 @@ Unit *manager_get_unit(Manager *m, const char *id) {
                 if (strcmp(m->units[i]->id, id) == 0)
                         return m->units[i];
 
+        /* A second pass, so a canonical id always wins over an alias. */
+        for (i = 0; i < m->n_units; i++)
+                if (unit_has_name(m->units[i], id))
+                        return m->units[i];
+
         return NULL;
 }
 
@@ -528,7 +533,38 @@ int manager_load_unit(Manager *m, const char *id, Unit **ret) {
 
         u = manager_get_unit(m, id);
         if (!u) {
-                UnitType type = unit_type_from_name(id);
+                UnitType type;
+                char *canonical = NULL;
+
+                /*
+                 * An alias never becomes a Unit of its own: load the unit it
+                 * names and record `id` as another of that unit's names, so
+                 * every route in -- a Wants= line, a .wants symlink, the boot
+                 * target, picoctl -- lands on the same node (see unit-load.c).
+                 */
+                r = unit_resolve_alias(m, id, &canonical);
+                if (r < 0)
+                        return r;
+                if (r > 0) {
+                        Unit *c = NULL;
+
+                        r = manager_load_unit(m, canonical, &c);
+                        free(canonical);
+                        if (r < 0)
+                                return r;
+                        if (!c)
+                                return -ENOENT;
+
+                        r = unit_add_alias(c, id);
+                        if (r < 0)
+                                return r;
+
+                        if (ret)
+                                *ret = c;
+                        return 0;
+                }
+
+                type = unit_type_from_name(id);
 
                 r = unit_new(m, type, id, &u);
                 if (r < 0)

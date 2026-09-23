@@ -34,6 +34,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -271,7 +272,13 @@ static int cmd_list_units(int argc, char *argv[]) {
         }
 
         while ((de = readdir(d))) {
+                struct stat lst;
+
                 if (de->d_name[0] == '.')
+                        continue;
+                /* an alias's file is a symlink to its unit's; list the unit once, as
+                 * systemctl list-units does */
+                if (fstatat(dirfd(d), de->d_name, &lst, AT_SYMLINK_NOFOLLOW) == 0 && S_ISLNK(lst.st_mode))
                         continue;
                 if (n == cap) {
                         char **grown;
