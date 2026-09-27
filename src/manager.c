@@ -298,15 +298,16 @@ int manager_add_unit(Manager *m, Unit *u) {
 }
 
 /*
- * Drop u from the table and free it. ONLY for a unit that failed to load and
- * therefore has no fragment, no edges and nothing pointing at it -- unit_
- * free()'s own header comment explains why a unit with live edges must
- * never be dropped this way. manager-ctrl.c's start-fallback is the one
- * caller: a "picoctl start nonexistent.service" creates a UNIT_ERROR node
- * with no fragment and no edges (nothing else could have referenced a name
- * that had never been seen before), and without this it would sit in
- * m->units forever, walked by every future manager_apply_presets() and
- * manager_dispatch_run_queue() pass.
+ * Drop u from the table and free it. ONLY for a unit with no edges and
+ * nothing pointing at it -- unit_free()'s own header comment explains why a
+ * unit with live edges must never be dropped this way. Two callers.
+ * manager-ctrl.c's start-fallback: a "picoctl start nonexistent.service"
+ * creates a UNIT_ERROR node with no fragment and no edges (nothing else
+ * could have referenced a name that had never been seen before), and
+ * without this it would sit in m->units forever, walked by every future
+ * manager_apply_presets() and manager_dispatch_run_queue() pass. And
+ * socket.c's reaping of a finished Accept=yes instance, which clears the
+ * instance's edges with unit_dependency_unlink() first.
  */
 int manager_remove_unit(Manager *m, Unit *u) {
         size_t i;

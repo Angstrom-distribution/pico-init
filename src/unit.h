@@ -261,6 +261,16 @@ int unit_resolve_alias(Manager *m, const char *name, char **ret);
 /* Parse one INI fragment (sections, escapes, line continuations) into u. 0 or -errno. */
 int unit_parse_file(Unit *u, const char *path);
 
+/* --- unit-reload.c --- */
+/*
+ * Re-parse a loaded unit's fragment and replace its directive values in
+ * place, all or nothing; nothing is started, stopped or signalled. 1 when
+ * reloaded, 0 when not applicable (not loaded, or a socket unit), -EBUSY
+ * with a job or control process in flight, else -errno with the unit left
+ * exactly as it was.
+ */
+int unit_reload(Unit *u);
+
 /* --- unit-dependency.c --- */
 /* Record "u has dependency d on other", deduplicating. Also records the inverse
  * relation where one exists in this model (Before <-> After); Requires/Wants

@@ -49,6 +49,7 @@ enum {
         EVENT_PRIORITY_PICO_TIMER = SD_EVENT_PRIORITY_NORMAL,
         EVENT_PRIORITY_RUN_QUEUE = SD_EVENT_PRIORITY_IDLE + 1,
         EVENT_PRIORITY_SHUTDOWN_CHECK = SD_EVENT_PRIORITY_IDLE + 2,
+        EVENT_PRIORITY_SOCKET_REAP = SD_EVENT_PRIORITY_IDLE + 3, /* last: frees units other sources name */
 };
 
 /* angstrom-pico-init adopts usrmerge (see plans/29-pico-init.md §4), so
@@ -258,6 +259,10 @@ void manager_enqueue_load(Manager *m, Unit *u);
 
 /* Drain the load queue, calling unit_load() on each entry. Number loaded, or -errno. */
 int manager_dispatch_load_queue(Manager *m);
+
+/* SIGHUP: unit_reload() every unit in the table (unit-reload.c). Number
+ * reloaded, or -EINVAL. */
+int manager_reload(Manager *m);
 
 /*
  * Queue u as having a confirmed-empty cgroup, or take it back off again.

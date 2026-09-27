@@ -143,8 +143,9 @@ int manager_dispatch_signal(Manager *m, int signo) {
                 return manager_dispatch_sigchld(m);
 
         if (signo == SIGHUP) {
-                /* TODO (post-M5): reload unit fragments. */
-                pico_log(PICO_LOG_INFO, "SIGHUP received, reload not implemented yet");
+                /* A unit that failed to reload keeps its old values and
+                 * has already said so; not a signal-handling error. */
+                (void) manager_reload(m);
                 return 0;
         }
 

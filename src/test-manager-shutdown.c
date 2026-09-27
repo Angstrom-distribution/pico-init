@@ -204,9 +204,9 @@ static void test_shutdown_cancels_waiting_start_jobs(void) {
 
 /*
  * The signals PID 1 answers: SIGINT (ctrl-alt-del) reboots, SIGRTMIN+3/+4
- * power off, SIGHUP is a no-op for now, and SIGTERM is ignored by a system
- * manager. A second request only changes where the shutdown ends up; it does
- * not restart the deadline.
+ * power off, SIGHUP reloads unit files without touching the objective, and
+ * SIGTERM is ignored by a system manager. A second request only changes
+ * where the shutdown ends up; it does not restart the deadline.
  */
 static void test_signal_to_objective_mapping(void) {
         Manager *m = NULL;

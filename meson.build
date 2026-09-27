@@ -111,6 +111,9 @@ pico_init_core_sources = files(
   'src/unit-load.c',
   'src/conf-scan.c',
   'src/unit-parse.c',
+  # SIGHUP's daemon-reload: re-parse each loaded fragment into a scratch
+  # unit, swap the directive values in only if it parsed cleanly.
+  'src/unit-reload.c',
   'src/unit-dependency.c',
   'src/unit-enable.c',
   'src/service.c',
@@ -206,6 +209,9 @@ pico_tests = [
   # parser test the §7 unit-test item asks for.
   'test-dev-setup',
   'test-unit-parse',
+  # SIGHUP reload: new directive values land, a bad or vanished file and a
+  # busy unit change nothing, and a running process is left alone.
+  'test-unit-reload',
   # The boot console channel: the os-release parser behind the greeting, and
   # the byte-level shape of what lands on the console.
   'test-status',
