@@ -529,11 +529,12 @@ foreach t : devd_tests
 endforeach
 
 # ---------------------------------------------------------------------------
-# pico-tmpfiles -- the creation half of systemd-tmpfiles over tmpfiles.d
-# (plans/38 §9.4). A fifth binary out of the same tree, a oneshot rather than
-# a daemon, and the thing that makes the tmpfiles.d snippets oe-core packages
-# already ship do something under pico-init. tmpfiles.h lists exactly which
-# line types are real and which are an explicit, logged skip.
+# pico-tmpfiles -- systemd-tmpfiles' --create, --clean and --remove over
+# tmpfiles.d (plans/38 §9.4). A fifth binary out of the same tree, a oneshot
+# rather than a daemon, and the thing that makes the tmpfiles.d snippets
+# oe-core packages already ship do something under pico-init. tmpfiles.h
+# lists exactly which line types are real and which are an explicit, logged
+# skip.
 #
 # It links pico-init-core for util.c's logging and os-release.c's reader
 # (behind the %o/%w/%A specifiers) and nothing else of PID 1. bindir, like
@@ -546,6 +547,7 @@ tmpfiles_core = static_library(
   files(
     'src/tmpfiles/tmpfiles-conf.c',
     'src/tmpfiles/tmpfiles-create.c',
+    'src/tmpfiles/tmpfiles-clean.c',
   ),
   include_directories: tmpfiles_includes,
 )
@@ -568,10 +570,13 @@ install_data(
 # test-tmpfiles-conf covers the grammar and the file-precedence rule against
 # fixture trees under a --root; test-tmpfiles-create applies real fixtures
 # and reads the inodes back, then runs the installed binary end to end (found
-# next to the test via /proc/self/exe, test-picoctl.c's idiom).
+# next to the test via /proc/self/exe, test-picoctl.c's idiom);
+# test-tmpfiles-clean does the same for --clean/--remove over inodes whose
+# ages it sets itself.
 tmpfiles_tests = [
   'test-tmpfiles-conf',
   'test-tmpfiles-create',
+  'test-tmpfiles-clean',
 ]
 
 foreach t : tmpfiles_tests

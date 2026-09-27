@@ -8,10 +8,9 @@
  * into the binary alone, and tmpfiles-core into every test, so anything a
  * test needs has to be defined in the core.
  *
- * --clean and --remove are refused rather than silently accepted: the
- * age-based cleanup is deferred with no consumer in these images, and a
- * flag that "works" by doing nothing is exactly the silent degradation the
- * rest of pico-init exists to avoid.
+ * --purge is refused rather than silently accepted: it has no consumer in
+ * these images, and a flag that "works" by doing nothing is exactly the
+ * silent degradation the rest of pico-init exists to avoid.
  */
 
 #include "tmpfiles.h"
@@ -27,10 +26,13 @@
 static void help(void) {
         printf("Usage: pico-tmpfiles [OPTIONS...] [CONFIGURATION FILE...]\n"
                "\n"
-               "Create files and directories from tmpfiles.d(5) configuration.\n"
+               "Create, delete, and clean up files and directories from tmpfiles.d(5)\n"
+               "configuration.\n"
                "\n"
                "Commands:\n"
                "     --create               Create and adjust files and directories\n"
+               "     --clean                Clean up files and directories\n"
+               "     --remove               Remove files and directories marked for removal\n"
                "  -h --help                 Show this help\n"
                "     --version              Show package version\n"
                "\n"
@@ -42,7 +44,7 @@ static void help(void) {
                "  -E                        Ignore rules prefixed with /dev, /proc, /run, /sys\n"
                "     --root=PATH            Operate on an alternate filesystem root\n"
                "\n"
-               "--clean and --remove are not implemented.\n");
+               "--purge is not implemented.\n");
 }
 
 int main(int argc, char *argv[]) {
@@ -74,7 +76,8 @@ int main(int argc, char *argv[]) {
         };
         PicoTmpfiles *t = NULL;
         bool create = false;
-        int c, r, ret = EXIT_FAILURE;
+        unsigned cleanup = 0;
+        int c, r, q, ret = EXIT_FAILURE;
 
         r = pico_tmpfiles_new(&t);
         if (r < 0) {
@@ -99,11 +102,15 @@ int main(int argc, char *argv[]) {
                         break;
 
                 case ARG_CLEAN:
+                        cleanup |= PICO_TMPFILES_CLEAN;
+                        break;
+
                 case ARG_REMOVE:
+                        cleanup |= PICO_TMPFILES_REMOVE;
+                        break;
+
                 case ARG_PURGE:
-                        pico_log(PICO_LOG_ERR,
-                                 "pico-tmpfiles: --%s is not implemented",
-                                 options[c - ARG_VERSION + 1].name);
+                        pico_log(PICO_LOG_ERR, "pico-tmpfiles: --purge is not implemented");
                         goto finish;
 
                 case ARG_BOOT:
@@ -157,8 +164,9 @@ int main(int argc, char *argv[]) {
                 }
         }
 
-        if (!create) {
-                pico_log(PICO_LOG_ERR, "pico-tmpfiles: you need to specify --create");
+        if (!create && cleanup == 0) {
+                pico_log(PICO_LOG_ERR,
+                         "pico-tmpfiles: you need to specify at least one of --clean, --create, --remove");
                 goto finish;
         }
 
@@ -212,7 +220,13 @@ int main(int argc, char *argv[]) {
                         goto oom;
         }
 
-        r = pico_tmpfiles_create(t);
+        /* upstream's phase order: clear the ground first, then build on it */
+        r = pico_tmpfiles_remove_and_clean(t, cleanup);
+        if (create) {
+                q = pico_tmpfiles_create(t);
+                if (r >= 0)
+                        r = q;
+        }
         if (r == -ENOMEM)
                 goto oom;
 

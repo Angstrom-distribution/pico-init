@@ -353,6 +353,39 @@ static int path_set_perms_recursively(const PicoTmpfilesItem *i, const char *pat
         return set_perms_recursively(i, fd, path);
 }
 
+/* empty_directory(): 'e' only adjusts directories that already exist. */
+static int path_set_perms_directory(const PicoTmpfilesItem *i, const char *path) {
+        struct stat st;
+        int fd, r;
+
+        fd = open(path, O_PATH | O_NOFOLLOW | O_CLOEXEC);
+        if (fd < 0) {
+                if (errno == ENOENT) {
+                        pico_log(PICO_LOG_DEBUG, "skipping missing directory: %s", path);
+                        return 0;
+                }
+                r = -errno;
+                pico_log(PICO_LOG_ERR, "failed to open directory '%s': %s", path, strerror(-r));
+                return r;
+        }
+
+        if (fstat(fd, &st) < 0) {
+                r = -errno;
+                pico_log(PICO_LOG_ERR, "failed to fstat(%s): %s", path, strerror(-r));
+                close(fd);
+                return r;
+        }
+        if (!S_ISDIR(st.st_mode)) {
+                pico_log(PICO_LOG_WARNING, "'%s' already exists and is not a directory", path);
+                close(fd);
+                return 0;
+        }
+
+        r = set_perms(i, fd, path, &st, CREATION_EXISTING);
+        close(fd);
+        return r;
+}
+
 /* glob_item(): every match, or nothing at all when there is none. */
 static int glob_item(const PicoTmpfilesItem *i, bool recursive) {
         glob_t g = { 0 };
@@ -369,8 +402,12 @@ static int glob_item(const PicoTmpfilesItem *i, bool recursive) {
         }
 
         for (k = 0; k < g.gl_pathc; k++) {
-                q = recursive ? path_set_perms_recursively(i, g.gl_pathv[k]) :
-                                path_set_perms(i, g.gl_pathv[k], CREATION_EXISTING);
+                if (i->type == 'e')
+                        q = path_set_perms_directory(i, g.gl_pathv[k]);
+                else if (recursive)
+                        q = path_set_perms_recursively(i, g.gl_pathv[k]);
+                else
+                        q = path_set_perms(i, g.gl_pathv[k], CREATION_EXISTING);
                 if (r >= 0)
                         r = q;
         }
@@ -1144,6 +1181,7 @@ static int create_item(const PicoTmpfiles *t, PicoTmpfilesItem *i) {
                 mkdir_parents(i->path);
                 return create_symlink(t, i);
 
+        case 'e':
         case 'z':
                 return glob_item(i, false);
         case 'Z':
@@ -1215,6 +1253,15 @@ static void link_parent(PicoTmpfiles *t, PicoTmpfilesArray *a) {
         }
 }
 
+void pico_tmpfiles_link_parents(PicoTmpfiles *t) {
+        size_t k;
+
+        for (k = 0; k < t->n_items; k++)
+                link_parent(t, t->items[k]);
+        for (k = 0; k < t->n_globs; k++)
+                link_parent(t, t->globs[k]);
+}
+
 int pico_tmpfiles_create(PicoTmpfiles *t) {
         mode_t saved;
         size_t k;
@@ -1223,10 +1270,7 @@ int pico_tmpfiles_create(PicoTmpfiles *t) {
         if (!t)
                 return -EINVAL;
 
-        for (k = 0; k < t->n_items; k++)
-                link_parent(t, t->items[k]);
-        for (k = 0; k < t->n_globs; k++)
-                link_parent(t, t->globs[k]);
+        pico_tmpfiles_link_parents(t);
 
         saved = umask(0);
 

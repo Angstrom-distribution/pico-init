@@ -113,13 +113,102 @@ static void test_basic_fields(void) {
         i = only_item(t, "/run/dash");
         ASSERT_TRUE(i->argument == NULL);
 
-        /* age is kept verbatim for a later --clean and nothing else */
+        /* age is kept verbatim and parsed, with upstream's default age-by */
         ASSERT_EQ_INT(pico_tmpfiles_parse_line(t, "a.conf", 6, "d /run/aged 1777 root root 10d"), 0);
         i = only_item(t, "/run/aged");
         ASSERT_STREQ(i->age, "10d");
+        ASSERT_TRUE(i->age_set);
+        ASSERT_EQ_INT(i->age_usec, 10ULL * 86400 * 1000000);
+        ASSERT_TRUE(!i->keep_first_level);
+        ASSERT_EQ_INT(i->age_by_file, PICO_TMPFILES_AGE_BY_DEFAULT_FILE);
+        ASSERT_EQ_INT(i->age_by_dir, PICO_TMPFILES_AGE_BY_DEFAULT_DIR);
         ASSERT_EQ_INT(i->mode, 01777);
+        i = only_item(t, "/run/named");
+        ASSERT_TRUE(!i->age_set);
 
         ASSERT_TRUE(!t->invalid_config);
+        pico_tmpfiles_free(t);
+}
+
+/* systemd's time-span syntax, which is what every age field is written in */
+static void test_time_spans(void) {
+        uint64_t v;
+
+        ASSERT_EQ_INT(pico_tmpfiles_parse_sec("30", &v), 0);
+        ASSERT_EQ_INT(v, 30ULL * 1000000);
+        ASSERT_EQ_INT(pico_tmpfiles_parse_sec("10d", &v), 0);
+        ASSERT_EQ_INT(v, 10ULL * 86400 * 1000000);
+        ASSERT_EQ_INT(pico_tmpfiles_parse_sec("1h 30min", &v), 0);
+        ASSERT_EQ_INT(v, 5400ULL * 1000000);
+        ASSERT_EQ_INT(pico_tmpfiles_parse_sec("1h30m", &v), 0);
+        ASSERT_EQ_INT(v, 5400ULL * 1000000);
+        ASSERT_EQ_INT(pico_tmpfiles_parse_sec("2w", &v), 0);
+        ASSERT_EQ_INT(v, 14ULL * 86400 * 1000000);
+        ASSERT_EQ_INT(pico_tmpfiles_parse_sec("1.5h", &v), 0);
+        ASSERT_EQ_INT(v, 5400ULL * 1000000);
+        ASSERT_EQ_INT(pico_tmpfiles_parse_sec("500ms", &v), 0);
+        ASSERT_EQ_INT(v, 500000);
+        ASSERT_EQ_INT(pico_tmpfiles_parse_sec("1M", &v), 0);
+        ASSERT_EQ_INT(v, 2629800ULL * 1000000);
+        ASSERT_EQ_INT(pico_tmpfiles_parse_sec("1y", &v), 0);
+        ASSERT_EQ_INT(v, 31557600ULL * 1000000);
+        ASSERT_EQ_INT(pico_tmpfiles_parse_sec("5 minutes", &v), 0);
+        ASSERT_EQ_INT(v, 300ULL * 1000000);
+        ASSERT_EQ_INT(pico_tmpfiles_parse_sec("infinity", &v), 0);
+        ASSERT_TRUE(v == UINT64_MAX);
+
+        ASSERT_EQ_INT(pico_tmpfiles_parse_sec("", &v), -EINVAL);
+        ASSERT_EQ_INT(pico_tmpfiles_parse_sec("-1d", &v), -EINVAL);
+        ASSERT_EQ_INT(pico_tmpfiles_parse_sec("10x", &v), -EINVAL);
+        ASSERT_EQ_INT(pico_tmpfiles_parse_sec("1mins", &v), -EINVAL);
+        ASSERT_EQ_INT(pico_tmpfiles_parse_sec(".", &v), -EINVAL);
+        ASSERT_EQ_INT(pico_tmpfiles_parse_sec("99999999999999y", &v), -ERANGE);
+}
+
+/* "[~][age-by:]span": the prefix and the age-by letters */
+static void test_age_field(void) {
+        PicoTmpfiles *t = fresh();
+        PicoTmpfilesItem *i;
+
+        ASSERT_EQ_INT(pico_tmpfiles_parse_line(t, "g.conf", 1, "d /run/g1 - - - ~1h"), 0);
+        i = only_item(t, "/run/g1");
+        ASSERT_TRUE(i->keep_first_level);
+        ASSERT_EQ_INT(i->age_usec, 3600ULL * 1000000);
+
+        /* only file letters: directories keep their default, and vice versa */
+        ASSERT_EQ_INT(pico_tmpfiles_parse_line(t, "g.conf", 2, "d /run/g2 - - - am:2d"), 0);
+        i = only_item(t, "/run/g2");
+        ASSERT_EQ_INT(i->age_by_file, PICO_TMPFILES_AGE_BY_ATIME | PICO_TMPFILES_AGE_BY_MTIME);
+        ASSERT_EQ_INT(i->age_by_dir, PICO_TMPFILES_AGE_BY_DEFAULT_DIR);
+        ASSERT_EQ_INT(i->age_usec, 2ULL * 86400 * 1000000);
+
+        ASSERT_EQ_INT(pico_tmpfiles_parse_line(t, "g.conf", 3, "D /run/g3 - - - ~C:10m"), 0);
+        i = only_item(t, "/run/g3");
+        ASSERT_TRUE(i->keep_first_level);
+        ASSERT_EQ_INT(i->age_by_file, PICO_TMPFILES_AGE_BY_DEFAULT_FILE);
+        ASSERT_EQ_INT(i->age_by_dir, PICO_TMPFILES_AGE_BY_CTIME);
+
+        ASSERT_EQ_INT(pico_tmpfiles_parse_line(t, "g.conf", 4, "R /run/g4 - - - mM:1w"), 0);
+        i = only_item(t, "/run/g4");
+        ASSERT_EQ_INT(i->age_by_file, PICO_TMPFILES_AGE_BY_MTIME);
+        ASSERT_EQ_INT(i->age_by_dir, PICO_TMPFILES_AGE_BY_MTIME);
+        ASSERT_TRUE(!t->invalid_config);
+
+        /* each of these is invalid configuration, and the line is dropped */
+        ASSERT_TRUE(pico_tmpfiles_parse_line(t, "g.conf", 5, "d /run/bad1 - - - 10q") < 0);
+        ASSERT_TRUE(t->invalid_config);
+        absent(t, "/run/bad1");
+        t->invalid_config = false;
+        ASSERT_TRUE(pico_tmpfiles_parse_line(t, "g.conf", 6, "d /run/bad2 - - - xz:1d") < 0);
+        ASSERT_TRUE(t->invalid_config);
+        t->invalid_config = false;
+        ASSERT_TRUE(pico_tmpfiles_parse_line(t, "g.conf", 7, "d /run/bad3 - - - :1d") < 0);
+        ASSERT_TRUE(t->invalid_config);
+        t->invalid_config = false;
+        ASSERT_TRUE(pico_tmpfiles_parse_line(t, "g.conf", 8, "r /run/bad4 - - - ~1d") < 0);
+        ASSERT_TRUE(t->invalid_config);
+        absent(t, "/run/bad4");
+
         pico_tmpfiles_free(t);
 }
 
@@ -220,7 +309,6 @@ static void test_types(void) {
         /* every letter tmpfiles.d(5) defines parses; the unimplemented ones
          * are skipped without becoming invalid configuration */
         ASSERT_EQ_INT(pico_tmpfiles_parse_line(t, "t.conf", 1, "w /run/w - - - - x"), 0);
-        ASSERT_EQ_INT(pico_tmpfiles_parse_line(t, "t.conf", 2, "e /run/e - - - 1d"), 0);
         ASSERT_EQ_INT(pico_tmpfiles_parse_line(t, "t.conf", 3, "p /run/p"), 0);
         ASSERT_EQ_INT(pico_tmpfiles_parse_line(t, "t.conf", 4, "c /run/c - - - - 1:3"), 0);
         ASSERT_EQ_INT(pico_tmpfiles_parse_line(t, "t.conf", 5, "b /run/b - - - - 8:0"), 0);
@@ -230,16 +318,20 @@ static void test_types(void) {
         ASSERT_EQ_INT(t->n_items + t->n_globs, 0);
         ASSERT_TRUE(!t->invalid_config);
 
-        /* the no-op-on-create ones are kept, in the glob set */
+        /* the cleanup-only ones are kept, in the glob set, and so is e */
         ASSERT_EQ_INT(pico_tmpfiles_parse_line(t, "t.conf", 9, "x /run/keep/*"), 0);
         ASSERT_EQ_INT(pico_tmpfiles_parse_line(t, "t.conf", 10, "r /run/gone"), 0);
-        ASSERT_EQ_INT(t->n_globs, 2);
+        ASSERT_EQ_INT(pico_tmpfiles_parse_line(t, "t.conf", 2, "e /run/e - - - 1d"), 0);
+        ASSERT_EQ_INT(t->n_globs, 3);
         ASSERT_EQ_INT(t->n_items, 0);
+        i = only_item(t, "/run/e");
+        ASSERT_EQ_INT(i->type, 'e');
+        ASSERT_TRUE(i->age_set);
 
         /* z/Z are globs; d/f/L/C are not */
         ASSERT_EQ_INT(pico_tmpfiles_parse_line(t, "t.conf", 11, "z /run/z* 0600 - -"), 0);
         ASSERT_EQ_INT(pico_tmpfiles_parse_line(t, "t.conf", 12, "d /run/d"), 0);
-        ASSERT_EQ_INT(t->n_globs, 3);
+        ASSERT_EQ_INT(t->n_globs, 4);
         ASSERT_EQ_INT(t->n_items, 1);
 
         /* z with no mode leaves the mode alone (mode_set false), unlike d */
@@ -513,6 +605,8 @@ int main(void) {
 
         test_path_helpers();
         test_basic_fields();
+        test_time_spans();
+        test_age_field();
         test_quoting_and_escapes();
         test_modifiers();
         test_types();

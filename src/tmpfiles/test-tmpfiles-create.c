@@ -309,6 +309,33 @@ static void test_existing_inodes(void) {
         assert_dir("/run/child-first/leaf", 0700);
 }
 
+/* e adjusts directories that exist and nothing else: never creates, never touches a file. */
+static void test_e_lines(void) {
+        char p[PATH_MAX];
+        struct stat st;
+
+        test_rm_rf(root);
+        ASSERT_EQ_INT(mkdir(root, 0755), 0);
+        setup_tree();
+
+        ASSERT_EQ_INT(test_mkdir(root, "run/edir"), 0);
+        fullpath("/run/edir", p, sizeof(p));
+        ASSERT_EQ_INT(chmod(p, 0755), 0);
+        write_conf("run/efile", "x");
+        fullpath("/run/efile", p, sizeof(p));
+        ASSERT_EQ_INT(chmod(p, 0644), 0);
+        write_conf("usr/lib/tmpfiles.d/e.conf",
+                   "e /run/e* 0700 - - 1d\n"
+                   "e /run/emissing 0700 - -\n");
+
+        ASSERT_EQ_INT(apply(true), 0);
+
+        assert_dir("/run/edir", 0700);
+        ASSERT_EQ_INT(lstat_rel("/run/efile", &st), 0);
+        ASSERT_EQ_INT(st.st_mode & 07777, 0644);
+        assert_absent("/run/emissing");
+}
+
 /* A path that cannot be honoured fails the run unless the line says '-'. */
 static void test_failure_reporting(void) {
         test_rm_rf(root);
@@ -425,9 +452,9 @@ static void test_cli(void) {
                 ASSERT_EQ_INT(run_binary(args), PICO_TMPFILES_EX_CANTCREAT);
         }
 
-        /* the deferred half is refused, not silently accepted */
+        /* --purge is refused, not silently accepted */
         {
-                char *args[] = { bin, "--clean", rootarg, NULL };
+                char *args[] = { bin, "--purge", rootarg, NULL };
 
                 ASSERT_EQ_INT(run_binary(args), EXIT_FAILURE);
         }
@@ -450,6 +477,7 @@ int main(void) {
         test_etc_overrides_usr_lib();
         test_dev_null_mask();
         test_existing_inodes();
+        test_e_lines();
         test_failure_reporting();
         test_cli();
 

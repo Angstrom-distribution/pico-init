@@ -7,10 +7,11 @@
 # read-write and mounts /run before it starts a single unit (root-check.h,
 # mount-setup.c), and there are no separate .mount units to wait for.
 #
-# --remove is absent because it is not implemented (tmpfiles.h); every line
-# type with a consumer in these images is a --create one. Enablement follows
-# the preset flow like every other unit: this ships WantedBy=sysinit.target,
-# upstream's own hook, and the preset alone decides.
+# --remove as upstream passes it, so r/R lines and D directories are cleared
+# at boot before creation runs. The age-based --clean belongs to a periodic
+# job (upstream's systemd-tmpfiles-clean.timer), not to boot. Enablement
+# follows the preset flow like every other unit: this ships
+# WantedBy=sysinit.target, upstream's own hook, and the preset alone decides.
 
 [Unit]
 Description=Create System Files and Directories
@@ -19,7 +20,7 @@ Before=sysinit.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/bin/pico-tmpfiles --create --boot
+ExecStart=/usr/bin/pico-tmpfiles --create --remove --boot
 
 [Install]
 WantedBy=sysinit.target

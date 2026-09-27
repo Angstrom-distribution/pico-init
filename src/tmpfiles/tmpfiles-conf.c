@@ -818,6 +818,207 @@ static int find_gid(const char *name, gid_t *ret) {
         return 0;
 }
 
+/* --- age ------------------------------------------------------------------ */
+
+/*
+ * time-util.c's unit table, in its order: the first prefix that matches
+ * wins, which is why "minutes"/"msec" precede "m". Nanoseconds are left out,
+ * the one unit finer than the microseconds everything here counts in.
+ */
+static const struct {
+        const char *suffix;
+        uint64_t usec;
+} time_units[] = {
+        {   "seconds",        1000000ULL },
+        {    "second",        1000000ULL },
+        {       "sec",        1000000ULL },
+        {         "s",        1000000ULL },
+        {   "minutes",       60000000ULL },
+        {    "minute",       60000000ULL },
+        {       "min",       60000000ULL },
+        {    "months",  2629800000000ULL },
+        {     "month",  2629800000000ULL },
+        {         "M",  2629800000000ULL },
+        {      "msec",           1000ULL },
+        {        "ms",           1000ULL },
+        {         "m",       60000000ULL },
+        {     "hours",     3600000000ULL },
+        {      "hour",     3600000000ULL },
+        {        "hr",     3600000000ULL },
+        {         "h",     3600000000ULL },
+        {      "days",    86400000000ULL },
+        {       "day",    86400000000ULL },
+        {         "d",    86400000000ULL },
+        {     "weeks",   604800000000ULL },
+        {      "week",   604800000000ULL },
+        {         "w",   604800000000ULL },
+        {     "years", 31557600000000ULL },
+        {      "year", 31557600000000ULL },
+        {         "y", 31557600000000ULL },
+        {      "usec",              1ULL },
+        {        "us",              1ULL },
+        { "\xce\xbcs",              1ULL },
+        { "\xc2\xb5s",              1ULL },
+};
+
+int pico_tmpfiles_parse_sec(const char *s, uint64_t *ret) {
+        uint64_t total = 0;
+        bool any = false;
+
+        if (!s || !ret)
+                return -EINVAL;
+
+        while (*s == ' ' || *s == '\t')
+                s++;
+        if (strcmp(s, "infinity") == 0) {
+                *ret = UINT64_MAX;
+                return 0;
+        }
+
+        for (;;) {
+                unsigned long long whole = 0;
+                uint64_t mult = 1000000ULL, frac = 0, frac_div = 1, v;
+                const char *start;
+                char *end;
+                size_t k;
+
+                while (*s == ' ' || *s == '\t')
+                        s++;
+                if (!*s)
+                        break;
+
+                /* strtoull() would take a sign and leading blanks; neither is valid here */
+                if (*s != '.' && (*s < '0' || *s > '9'))
+                        return -EINVAL;
+
+                start = s;
+                if (*s != '.') {
+                        errno = 0;
+                        whole = strtoull(s, &end, 10);
+                        if (errno != 0)
+                                return -ERANGE;
+                        s = end;
+                }
+                if (*s == '.') {
+                        s++;
+                        for (; *s >= '0' && *s <= '9'; s++)
+                                if (frac_div < 1000000ULL) {
+                                        frac = frac * 10 + (uint64_t) (*s - '0');
+                                        frac_div *= 10;
+                                }
+                }
+                if (s == start || (s == start + 1 && *start == '.'))
+                        return -EINVAL;
+
+                while (*s == ' ' || *s == '\t')
+                        s++;
+                for (k = 0; k < sizeof(time_units) / sizeof(time_units[0]); k++) {
+                        size_t l = strlen(time_units[k].suffix);
+
+                        if (strncmp(s, time_units[k].suffix, l) == 0) {
+                                mult = time_units[k].usec;
+                                s += l;
+                                break;
+                        }
+                }
+
+                if (whole > (UINT64_MAX - 1) / mult)
+                        return -ERANGE;
+                v = (uint64_t) whole * mult;
+                /* frac * mult can overflow; frac < frac_div <= 1e6 keeps both halves in range */
+                v += frac * (mult / frac_div) + (frac * (mult % frac_div)) / frac_div;
+                if (v >= UINT64_MAX - total)
+                        return -ERANGE;
+                total += v;
+                any = true;
+        }
+
+        if (!any)
+                return -EINVAL;
+
+        *ret = total;
+        return 0;
+}
+
+/* parse_age_by_from_arg(): lower case for files, upper case for directories. */
+static int parse_age_by(const char *s, PicoTmpfilesItem *i) {
+        static const char letters[] = "abcm";
+        static const unsigned flags[] = {
+                PICO_TMPFILES_AGE_BY_ATIME,
+                PICO_TMPFILES_AGE_BY_BTIME,
+                PICO_TMPFILES_AGE_BY_CTIME,
+                PICO_TMPFILES_AGE_BY_MTIME,
+        };
+        unsigned f = 0, d = 0;
+
+        if (!*s)
+                return -EINVAL;
+
+        for (; *s; s++) {
+                const char *hit;
+
+                if (*s == ' ' || *s == '\t')
+                        continue;
+
+                hit = strchr(letters, *s);
+                if (hit)
+                        f |= flags[hit - letters];
+                else if (*s >= 'A' && *s <= 'Z' && (hit = strchr(letters, *s - 'A' + 'a')))
+                        d |= flags[hit - letters];
+                else
+                        return -EINVAL;
+        }
+
+        if (f == 0 && d == 0)
+                return -EINVAL;
+
+        i->age_by_file = f ? f : PICO_TMPFILES_AGE_BY_DEFAULT_FILE;
+        i->age_by_dir = d ? d : PICO_TMPFILES_AGE_BY_DEFAULT_DIR;
+        return 0;
+}
+
+/* "[~][age-by:]span". 0, or -EINVAL with *what naming the part that failed. */
+static int parse_age(PicoTmpfilesItem *i, const char *age, const char **what) {
+        const char *a = age, *colon;
+        int r;
+
+        i->age_by_file = PICO_TMPFILES_AGE_BY_DEFAULT_FILE;
+        i->age_by_dir = PICO_TMPFILES_AGE_BY_DEFAULT_DIR;
+
+        if (*a == '~') {
+                if (i->type == 'r') {
+                        *what = "age modifier '~' is not supported for r lines";
+                        return -EINVAL;
+                }
+                i->keep_first_level = true;
+                a++;
+        }
+
+        colon = strchr(a, ':');
+        if (colon) {
+                char *by = strndup(a, (size_t) (colon - a));
+
+                if (!by)
+                        return -ENOMEM;
+                r = parse_age_by(by, i);
+                free(by);
+                if (r < 0) {
+                        *what = "invalid age-by";
+                        return r;
+                }
+                a = colon + 1;
+        }
+
+        r = pico_tmpfiles_parse_sec(a, &i->age_usec);
+        if (r < 0) {
+                *what = "invalid age";
+                return -EINVAL;
+        }
+
+        i->age_set = true;
+        return 0;
+}
+
 /* --- item bookkeeping ------------------------------------------------- */
 
 static bool needs_glob(char type) {
@@ -1145,7 +1346,7 @@ int pico_tmpfiles_parse_line(PicoTmpfiles *t, const char *fname, unsigned line, 
 
         /* Syntax this implementation reads correctly but cannot honour. One
          * warning each, so the gap shows in the boot log. */
-        if (strchr("wepcbtThHaA", i.type)) {
+        if (strchr("wpcbtThHaA", i.type)) {
                 log_line(PICO_LOG_WARNING,
                          fname,
                          line,
@@ -1199,6 +1400,7 @@ int pico_tmpfiles_parse_line(PicoTmpfiles *t, const char *fname, unsigned line, 
         case 'v':
         case 'q':
         case 'Q':
+        case 'e':
         case 'x':
         case 'X':
         case 'r':
@@ -1384,6 +1586,21 @@ int pico_tmpfiles_parse_line(PicoTmpfiles *t, const char *fname, unsigned line, 
                 i.mode &= 0777;
 
         if (!empty_or_dash(age)) {
+                const char *what = NULL;
+
+                r = parse_age(&i, age, &what);
+                if (r == -ENOMEM) {
+                        ret = r;
+                        goto finish;
+                }
+                if (r < 0) {
+                        char msg[128];
+
+                        (void) snprintf(msg, sizeof(msg), "%s: '%.64s'", what, age);
+                        ret = invalid(t, fname, line, msg);
+                        goto finish;
+                }
+
                 i.age = strdup(age);
                 if (!i.age) {
                         ret = -ENOMEM;
