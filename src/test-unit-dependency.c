@@ -299,6 +299,53 @@ static void test_target_loads(void) {
         free(dir);
 }
 
+/*
+ * unit_dependency_unlink(): a is "Wants=b, After=c". Unlinking b is refused
+ * (a's Wants= names it) with nothing changed; unlinking a clears c's inverse
+ * Before= as well as a's own edges, leaving b and c free of any pointer to a.
+ */
+static void test_dependency_unlink(void) {
+        Unit *a, *b, *c;
+        Manager *m;
+        char *dir;
+        int d;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir, "a.service", unit_a), 0);
+        ASSERT_EQ_INT(test_write_file(dir, "b.service", unit_b), 0);
+        ASSERT_EQ_INT(test_write_file(dir, "c.service", unit_c), 0);
+
+        m = manager_for(dir);
+        ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+
+        a = manager_get_unit(m, "a.service");
+        b = manager_get_unit(m, "b.service");
+        c = manager_get_unit(m, "c.service");
+        ASSERT_TRUE(a != NULL && b != NULL && c != NULL);
+        ASSERT_TRUE(unit_has_dependency(c, UNIT_BEFORE, a));
+
+        ASSERT_EQ_INT(unit_dependency_unlink(b), -EBUSY);
+        ASSERT_TRUE(unit_has_dependency(a, UNIT_WANTS, b));
+
+        ASSERT_EQ_INT(unit_dependency_unlink(a), 0);
+        for (d = 0; d < _UNIT_DEPENDENCY_MAX; d++) {
+                ASSERT_EQ_INT((int) a->n_dependencies[d], 0);
+                ASSERT_TRUE(!unit_has_dependency(b, d, a));
+                ASSERT_TRUE(!unit_has_dependency(c, d, a));
+        }
+        ASSERT_EQ_INT((int) c->n_dependencies[UNIT_BEFORE], 0);
+        ASSERT_TRUE(c->dependencies[UNIT_BEFORE] == NULL || c->dependencies[UNIT_BEFORE][0] == NULL);
+
+        ASSERT_EQ_INT(manager_remove_unit(m, a), 0);
+        ASSERT_TRUE(manager_get_unit(m, "a.service") == NULL);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
         test_unit_name_validation();
         test_three_unit_ordering();
@@ -306,6 +353,7 @@ int main(void) {
         test_cycle_detection();
         test_dependency_name_cannot_escape();
         test_target_loads();
+        test_dependency_unlink();
 
         printf("test-unit-dependency: all checks passed\n");
         return 0;

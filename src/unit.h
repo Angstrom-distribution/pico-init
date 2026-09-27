@@ -285,4 +285,12 @@ bool unit_has_dependency(Unit *u, UnitDependency d, Unit *other);
 /* Walk every loaded unit's ordering edges; -ELOOP if a cycle exists, else 0. */
 int unit_dependency_detect_cycles(Manager *m);
 
+/*
+ * Drop every edge between u and the rest of its manager's table, both
+ * directions, so u can then be freed without a peer keeping a dangling
+ * Before=/After= back to it. -EBUSY with nothing changed when another unit
+ * Requires=/Wants= u.
+ */
+int unit_dependency_unlink(Unit *u);
+
 const char *unit_dependency_to_string(UnitDependency d);

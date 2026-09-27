@@ -5,12 +5,23 @@
 /*
  * Socket units, quarried from systemd's ~2011-era src/socket.c and
  * src/socket-util.c (tag v30, commit 501c92c, copyright 2010 Lennart
- * Poettering, GPL-2.0-or-later), trimmed to Accept=no, ListenStream=/
- * ListenDatagram= (unix path or bare port) and DEAD/LISTENING/RUNNING/FAILED
- * -- no socket-side Exec*=, no Accept=yes instantiation, no Symlinks=/
- * PassCredentials=/ListenFIFO=/ListenSpecial=/ListenMessageQueue=/
- * ListenNetlink=/ListenSequentialPacket=. See plans/29-pico-init.md §1.6 for
- * the full scope decision.
+ * Poettering, GPL-2.0-or-later), trimmed to ListenStream=/ListenDatagram=
+ * (unix path or bare port), Accept=, MaxConnections= and DEAD/LISTENING/
+ * RUNNING/FAILED -- no socket-side Exec*=, no Symlinks=/PassCredentials=/
+ * ListenFIFO=/ListenSpecial=/ListenMessageQueue=/ListenNetlink=/
+ * ListenSequentialPacket=. See plans/29-pico-init.md §1.6 for the full scope
+ * decision.
+ *
+ * Accept=yes is v30's socket_enter_running() cfd branch: one accept() per
+ * wakeup, a prefix@<instance>.service loaded for it (through unit-load.c's
+ * template fallback, so %i expands to the instance), the connection handed
+ * over as that instance's only LISTEN_FDS fd, and the socket itself never
+ * leaving LISTENING. What v30 got from its general unit GC is done here
+ * directly: once an instance is down with no job left, socket_reap_
+ * connections() closes PID 1's copy of the fd and drops the instance from
+ * the unit table, so a long-lived listener does not grow the table by one
+ * unit per connection. Upstream's later StandardInput=socket is not
+ * carried; see socket_instance_refused().
  *
  * Quarry-history review: 591 commits touch this file between 501c92c and
  * upstream main (git rev-list --count 501c92c..main -- src/core/socket.c
@@ -27,7 +38,13 @@
  *    Upstream's parseable directives are not carried; the values are
  *    hardcoded at 20 tokens / 2s (NOT the 2500/5s the plan's §1.6 draft
  *    implied from the commit titles alone -- verified against the actual
- *    diff, corrected here).
+ *    diff, corrected here). 1f15ce2846's separate Accept=yes default of 200
+ *    is taken too: there every trigger is one accept(), not one start of a
+ *    shared service.
+ *  - 77b088c211 "socket: make sure that the name for per-connection services
+ *    are unique" -- socket_instance_name() prefixes every instance with the
+ *    n_accepted counter, which v30's inet names lacked; 2b061f5a4b's
+ *    IPv4-in-IPv6 formatting is already in v30 and kept.
  *  - c2f3480897 "fail socket unit when service has reached the start limit,
  *    so sockets won't act as tarpits" -- socket_notify_service_dead(): a
  *    paired service dying with SERVICE_FAILURE_START_LIMIT is terminal for
@@ -100,7 +117,7 @@
  *    supposed to be up" (#4708) -- socket_notify_service_dead() re-arms
  *    unconditionally on a genuinely terminal service death; nothing here
  *    gates on the SOCKET unit's own load state the way the reload-era bug
- *    did, since pico has no daemon-reload at all yet.
+ *    did, since pico's reload never re-reads a socket unit (unit-reload.c).
  *  - 4c523d62d2 "core: unify how we determine if a unit is "active"" (the
  *    inactive-state-list rewritten three times upstream) -- rather than
  *    hardcoding a list of "the service is down" states at each call site,
@@ -193,6 +210,7 @@
 #include "sd-event.h"
 #include "service.h"
 #include "socket.h"
+#include "unit-name.h"
 #include "unit.h"
 #include "util.h"
 
@@ -202,6 +220,10 @@
  * exists to override it. */
 #define PICO_SOCKET_TRIGGER_LIMIT_INTERVAL_USEC (2 * USEC_PER_SEC)
 #define PICO_SOCKET_TRIGGER_LIMIT_BURST 20
+#define PICO_SOCKET_TRIGGER_LIMIT_BURST_ACCEPT 200
+
+/* v30 socket_init(): MaxConnections= default. */
+#define PICO_SOCKET_MAX_CONNECTIONS_DEFAULT 64
 
 /* --- string table --- */
 
@@ -652,6 +674,7 @@ static void socket_init(Unit *u) {
         s->state = SOCKET_DEAD;
         s->socket_mode = 0666;
         s->backlog = INT_MAX; /* 768fcd779f: let the kernel clamp against the real sysctl */
+        s->max_connections = PICO_SOCKET_MAX_CONNECTIONS_DEFAULT;
 }
 
 static void socket_done(Unit *u) {
@@ -672,6 +695,19 @@ static void socket_done(Unit *u) {
 
         s->service_name = pico_mfree(s->service_name);
         /* s->service is borrowed: never freed here. */
+
+        /* Only PID 1's fd copies: an instance may already be gone
+         * (manager_free() frees in table order), so none is touched. */
+        while (s->connections) {
+                SocketConnection *c = s->connections;
+
+                s->connections = c->next;
+                close(c->fd);
+                free(c);
+        }
+        s->n_connections = 0;
+
+        s->reap_source = sd_event_source_disable_unref(s->reap_source);
 }
 
 const UnitVTable socket_vtable = {
@@ -690,6 +726,10 @@ const UnitVTable socket_vtable = {
 /* Same token-bucket shape as service.c's service_start_limit_check(); see
  * this file's header for why the numbers are hardcoded rather than
  * parseable. */
+static unsigned socket_trigger_limit_burst(const Socket *s) {
+        return s->accept ? PICO_SOCKET_TRIGGER_LIMIT_BURST_ACCEPT : PICO_SOCKET_TRIGGER_LIMIT_BURST;
+}
+
 static bool socket_trigger_ratelimit_check(Socket *s) {
         usec_t now = now_monotonic();
 
@@ -700,7 +740,7 @@ static bool socket_trigger_ratelimit_check(Socket *s) {
                 return true;
         }
 
-        return ++s->trigger_ratelimit_num <= PICO_SOCKET_TRIGGER_LIMIT_BURST;
+        return ++s->trigger_ratelimit_num <= socket_trigger_limit_burst(s);
 }
 
 /* H1/16ac401407..60d9771c59: what v30's broken close-and-reopen was trying
@@ -777,6 +817,328 @@ static int socket_trigger(Socket *s) {
         return 0;
 }
 
+/* --- Accept=yes: one instance per connection --- */
+
+/*
+ * v30 instance_from_socket(), plus 77b088c211's leading connection number:
+ * "<nr>-<local>-<remote>" for IP, "<nr>-<pid>-<uid>" of the peer for
+ * AF_UNIX, written into `ret` as the full prefix@<instance>.service name.
+ * 0 or -errno.
+ */
+static int socket_instance_name(Socket *s, int cfd, char *ret, size_t size) {
+        union {
+                struct sockaddr sa;
+                struct sockaddr_in in;
+                struct sockaddr_in6 in6;
+                struct sockaddr_storage storage;
+        } local, remote;
+        static const uint8_t ipv4_prefix[12] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF };
+        char instance[UNIT_NAME_MAX + 1];
+        unsigned nr = s->n_accepted;
+        socklen_t l;
+        char *prefix;
+        int n;
+
+        l = sizeof(local);
+        if (getsockname(cfd, &local.sa, &l) < 0)
+                return -errno;
+
+        l = sizeof(remote);
+        if (getpeername(cfd, &remote.sa, &l) < 0)
+                return -errno;
+
+        switch (local.sa.sa_family) {
+        case AF_INET: {
+                uint32_t a = ntohl(local.in.sin_addr.s_addr), b = ntohl(remote.in.sin_addr.s_addr);
+
+                n = snprintf(instance,
+                             sizeof(instance),
+                             "%u-%u.%u.%u.%u:%u-%u.%u.%u.%u:%u",
+                             nr,
+                             a >> 24,
+                             (a >> 16) & 0xFF,
+                             (a >> 8) & 0xFF,
+                             a & 0xFF,
+                             ntohs(local.in.sin_port),
+                             b >> 24,
+                             (b >> 16) & 0xFF,
+                             (b >> 8) & 0xFF,
+                             b & 0xFF,
+                             ntohs(remote.in.sin_port));
+                break;
+        }
+        case AF_INET6:
+                /* 2b061f5a4b: a dual-stack listener sees IPv4 peers as
+                 * ::ffff:a.b.c.d -- name them the way AF_INET would. */
+                if (memcmp(local.in6.sin6_addr.s6_addr, ipv4_prefix, sizeof(ipv4_prefix)) == 0 &&
+                    memcmp(remote.in6.sin6_addr.s6_addr, ipv4_prefix, sizeof(ipv4_prefix)) == 0) {
+                        const uint8_t *a = local.in6.sin6_addr.s6_addr + 12,
+                                      *b = remote.in6.sin6_addr.s6_addr + 12;
+
+                        n = snprintf(instance,
+                                     sizeof(instance),
+                                     "%u-%u.%u.%u.%u:%u-%u.%u.%u.%u:%u",
+                                     nr,
+                                     a[0],
+                                     a[1],
+                                     a[2],
+                                     a[3],
+                                     ntohs(local.in6.sin6_port),
+                                     b[0],
+                                     b[1],
+                                     b[2],
+                                     b[3],
+                                     ntohs(remote.in6.sin6_port));
+                } else {
+                        char a[INET6_ADDRSTRLEN], b[INET6_ADDRSTRLEN];
+
+                        if (!inet_ntop(AF_INET6, &local.in6.sin6_addr, a, sizeof(a)) ||
+                            !inet_ntop(AF_INET6, &remote.in6.sin6_addr, b, sizeof(b)))
+                                return -errno;
+
+                        n = snprintf(instance,
+                                     sizeof(instance),
+                                     "%u-%s:%u-%s:%u",
+                                     nr,
+                                     a,
+                                     ntohs(local.in6.sin6_port),
+                                     b,
+                                     ntohs(remote.in6.sin6_port));
+                }
+                break;
+        case AF_UNIX: {
+                struct ucred ucred;
+
+                l = sizeof(ucred);
+                if (getsockopt(cfd, SOL_SOCKET, SO_PEERCRED, &ucred, &l) < 0)
+                        return -errno;
+
+                n = snprintf(instance,
+                             sizeof(instance),
+                             "%u-%lu-%lu",
+                             nr,
+                             (unsigned long) ucred.pid,
+                             (unsigned long) ucred.uid);
+                break;
+        }
+        default:
+                return -EAFNOSUPPORT;
+        }
+
+        if (n < 0 || (size_t) n >= sizeof(instance))
+                return -ENAMETOOLONG;
+
+        prefix = unit_name_to_prefix(SOCKET_UNIT(s)->id);
+        if (!prefix)
+                return -ENOMEM;
+
+        n = snprintf(ret, size, "%s@%s.service", prefix, instance);
+        free(prefix);
+        if (n < 0 || (size_t) n >= size)
+                return -ENAMETOOLONG;
+
+        return 0;
+}
+
+/*
+ * The connection reaches an instance only as its one LISTEN_FDS fd.
+ * StandardInput= is not parsed, so it lands in the degradation record, and
+ * an inetd-style template asking for the connection on stdin (oe-core's
+ * dropbear@.service, StandardInput=socket) would run with the console there
+ * instead -- the silently wrong per-connection behaviour Accept=yes used to
+ * be refused outright to prevent. Refuse that connection loudly instead.
+ */
+static bool socket_instance_refused(Unit *svc) {
+        char **p;
+
+        for (p = svc->degraded_directives; p && *p; p++)
+                if (strcmp(*p, "StandardInput") == 0)
+                        return true;
+
+        return false;
+}
+
+/* Drop an instance from the unit table: finished, or never startable. Kept,
+ * harmlessly, while another unit Requires=/Wants= it by name. */
+static void socket_drop_instance(Manager *m, Unit *u) {
+        int r;
+
+        if (u->job)
+                return;
+
+        r = unit_dependency_unlink(u);
+        if (r < 0) {
+                pico_log(PICO_LOG_DEBUG, "%s: still referenced, keeping it: %s", u->id, strerror(-r));
+                return;
+        }
+
+        manager_dequeue_cgroup_empty(m, u);
+        (void) manager_remove_unit(m, u);
+}
+
+/*
+ * Deferred, never called from socket_notify_service_dead() itself: that runs
+ * inside service.c's and job.c's own handling of the very unit this frees,
+ * which both keep using it after the notify returns. At
+ * EVENT_PRIORITY_SOCKET_REAP every other source is done with it. An
+ * instance still running, restarting or holding a job is left for the next
+ * notify.
+ */
+static int socket_reap_connections(sd_event_source *es, void *userdata) {
+        Socket *s = userdata;
+        SocketConnection **c = &s->connections;
+
+        (void) es;
+
+        while (*c) {
+                SocketConnection *conn = *c;
+                UnitActiveState st = unit_active_state(conn->service);
+
+                if (conn->service->job || (st != UNIT_INACTIVE && st != UNIT_FAILED)) {
+                        c = &conn->next;
+                        continue;
+                }
+
+                *c = conn->next;
+                s->n_connections--;
+                close(conn->fd);
+                socket_drop_instance(SOCKET_UNIT(s)->manager, conn->service);
+                free(conn);
+        }
+
+        return 0;
+}
+
+static void socket_schedule_reap(Socket *s) {
+        Manager *m = SOCKET_UNIT(s)->manager;
+        int r;
+
+        if (!m || !m->event)
+                return;
+
+        if (!s->reap_source) {
+                r = sd_event_add_defer(m->event, &s->reap_source, socket_reap_connections, s);
+                if (r < 0) {
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s: cannot schedule connection cleanup: %s",
+                                 SOCKET_UNIT(s)->id,
+                                 strerror(-r));
+                        return;
+                }
+                sd_event_source_set_priority(s->reap_source, EVENT_PRIORITY_SOCKET_REAP);
+        }
+
+        sd_event_source_set_enabled(s->reap_source, SD_EVENT_ONESHOT);
+}
+
+static bool socket_has_connection(Socket *s, Unit *service) {
+        SocketConnection *c;
+
+        for (c = s->connections; c; c = c->next)
+                if (c->service == service)
+                        return true;
+
+        return false;
+}
+
+/*
+ * v30 socket_enter_running()'s cfd branch. Any failure closes this one
+ * connection and leaves the socket LISTENING: one bad connection is not a
+ * reason to stop serving the next.
+ */
+static void socket_accept_one(Socket *s, SocketPort *p) {
+        Manager *m = SOCKET_UNIT(s)->manager;
+        char name[UNIT_NAME_MAX + 1];
+        SocketConnection *c;
+        Unit *svc = NULL;
+        bool existed;
+        int cfd, r;
+
+        cfd = accept4(p->fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if (cfd < 0) {
+                if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR && errno != ECONNABORTED)
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s: accept() failed: %s",
+                                 SOCKET_UNIT(s)->id,
+                                 strerror(errno));
+                return;
+        }
+
+        if (s->n_connections >= s->max_connections) {
+                pico_log(PICO_LOG_WARNING,
+                         "%s: too many incoming connections (%u), refusing",
+                         SOCKET_UNIT(s)->id,
+                         s->n_connections);
+                close(cfd);
+                return;
+        }
+
+        r = socket_instance_name(s, cfd, name, sizeof(name));
+        s->n_accepted++;
+        if (r < 0) {
+                pico_log(PICO_LOG_WARNING,
+                         "%s: cannot name an instance for a connection: %s",
+                         SOCKET_UNIT(s)->id,
+                         strerror(-r));
+                close(cfd);
+                return;
+        }
+
+        existed = manager_get_unit(m, name) != NULL;
+        r = manager_load_unit(m, name, &svc);
+        if (r < 0 || !svc || svc->type != UNIT_SERVICE || svc->load_state != UNIT_LOADED) {
+                pico_log(PICO_LOG_ERR,
+                         "%s: could not load %s for a connection, closing it",
+                         SOCKET_UNIT(s)->id,
+                         name);
+                goto fail;
+        }
+
+        if (existed) {
+                /* only after n_accepted wraps; never share a live instance */
+                pico_log(PICO_LOG_ERR, "%s: %s already exists, closing the connection", SOCKET_UNIT(s)->id, name);
+                goto fail;
+        }
+
+        if (socket_instance_refused(svc)) {
+                pico_log(PICO_LOG_ERR,
+                         "%s: %s wants the connection on stdin (StandardInput=), which is not supported, closing it",
+                         SOCKET_UNIT(s)->id,
+                         name);
+                goto fail;
+        }
+
+        c = calloc(1, sizeof(*c));
+        if (!c)
+                goto fail;
+
+        c->service = svc;
+        c->fd = cfd;
+        c->next = s->connections;
+        s->connections = c;
+        s->n_connections++;
+
+        r = manager_add_job(m, JOB_START, svc, NULL);
+        if (r < 0) {
+                pico_log(PICO_LOG_WARNING,
+                         "%s: failed to queue start of %s: %s",
+                         SOCKET_UNIT(s)->id,
+                         name,
+                         strerror(-r));
+                s->connections = c->next;
+                s->n_connections--;
+                free(c);
+                goto fail;
+        }
+
+        return;
+
+fail:
+        close(cfd);
+        if (svc && !existed)
+                socket_drop_instance(m, svc);
+}
+
 /*
  * The events_source io callback (EVENT_PRIORITY_SOCKET). Manager is reached
  * via p->socket's unit, never through a passed-in parameter -- this IS the
@@ -824,9 +1186,14 @@ int socket_dispatch_io(sd_event_source *es, int fd, uint32_t revents, void *user
                 pico_log(PICO_LOG_WARNING,
                          "%s: triggered too quickly (limit %u per %llu us), failing",
                          SOCKET_UNIT(s)->id,
-                         (unsigned) PICO_SOCKET_TRIGGER_LIMIT_BURST,
+                         socket_trigger_limit_burst(s),
                          (unsigned long long) PICO_SOCKET_TRIGGER_LIMIT_INTERVAL_USEC);
                 socket_enter_failed(s);
+                return 0;
+        }
+
+        if (s->accept) {
+                socket_accept_one(s, p);
                 return 0;
         }
 
@@ -859,6 +1226,19 @@ int socket_collect_fds(Unit *service, int *fds, size_t n_fds) {
                         continue;
 
                 s = SOCKET(u);
+                if (s->accept) {
+                        SocketConnection *c;
+
+                        for (c = s->connections; c; c = c->next) {
+                                if (c->service != service)
+                                        continue;
+                                if (n >= n_fds)
+                                        return -ENOBUFS;
+                                fds[n++] = c->fd;
+                        }
+                        continue;
+                }
+
                 if (s->service != service)
                         continue;
 
@@ -920,6 +1300,12 @@ void socket_notify_service_dead(Unit *service) {
                         continue;
 
                 s = SOCKET(u);
+                if (s->accept) {
+                        if (socket_has_connection(s, service))
+                                socket_schedule_reap(s);
+                        continue;
+                }
+
                 if (s->service != service)
                         continue;
 
@@ -972,20 +1358,31 @@ int socket_verify_and_pair(Socket *s) {
         }
 
         /*
-         * Accept=yes needs per-connection instantiation (prefix@N.service),
-         * which needs template/%i machinery this project does not have --
-         * unit_load() stats a literal filename, no specifier expansion
-         * exists anywhere. Rather than silently running the shared service
-         * once and losing per-connection semantics, this is the one
-         * directive where the drop-in tolerance rule would do the wrong
-         * thing, so it is a deliberate, documented exception: fail the
-         * load loudly instead.
+         * v30 socket_verify(). Accept=yes pairs with no service here: each
+         * connection loads its own prefix@<instance>.service at accept time
+         * (socket_accept_one()), so there is no one unit for Service= to
+         * name, and only a stream port has connections to accept. Whether
+         * the template exists is found out per connection, as in v30.
          */
         if (s->accept) {
-                pico_log(PICO_LOG_ERR,
-                         "%s: Accept=yes is not supported (no template/instantiation support), refusing to load",
-                         SOCKET_UNIT(s)->id);
-                return -ENOTSUP;
+                SocketPort *p;
+
+                if (s->service_name) {
+                        pico_log(PICO_LOG_ERR,
+                                 "%s: Service= is not supported with Accept=yes, refusing to load",
+                                 SOCKET_UNIT(s)->id);
+                        return -EINVAL;
+                }
+
+                for (p = s->ports; p; p = p->next)
+                        if (p->type != SOCK_STREAM) {
+                                pico_log(PICO_LOG_ERR,
+                                         "%s: Accept=yes needs ListenStream= ports only, refusing to load",
+                                         SOCKET_UNIT(s)->id);
+                                return -EINVAL;
+                        }
+
+                return 0;
         }
 
         if (s->service_name) {

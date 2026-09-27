@@ -58,15 +58,34 @@ typedef struct SocketPort {
         uint16_t port; /* AF_INET/AF_INET6 only, host byte order */
 } SocketPort;
 
+/*
+ * One accepted connection under Accept=yes: the prefix@<instance>.service
+ * started for it and PID 1's own copy of the connection fd, which that
+ * instance inherits as its one LISTEN_FDS fd. Closed, and the instance
+ * dropped from the unit table, once the instance is down with no job left.
+ */
+typedef struct SocketConnection {
+        struct SocketConnection *next;
+        Unit *service; /* the per-connection instance, borrowed */
+        int fd;
+} SocketConnection;
+
 typedef struct Socket {
         Unit unit; /* must be first: a Socket* is a Unit* */
 
         SocketState state;
         SocketPort *ports; /* singly linked, declaration order; NULL means "no Listen* yet" */
 
-        bool accept;        /* Accept=; must stay false, socket_verify_and_pair() fails the load otherwise */
-        Unit *service;      /* the paired service, borrowed; resolved at parse time */
+        bool accept;        /* Accept=; yes instantiates prefix@<instance>.service per connection */
+        Unit *service;      /* the paired service, borrowed; resolved at parse time; NULL under Accept=yes */
         char *service_name; /* Service= override value, owned; consumed once paired */
+
+        /* Accept=yes only. The socket itself stays LISTENING throughout. */
+        SocketConnection *connections;
+        unsigned n_connections;
+        unsigned max_connections;     /* MaxConnections=; default 64 */
+        unsigned n_accepted;          /* numbers each instance, so every name is unique (77b088c211) */
+        sd_event_source *reap_source; /* defer, ONESHOT-armed when an instance may be done */
 
         mode_t socket_mode; /* SocketMode=; default 0666 */
         int backlog;        /* Backlog=; default INT_MAX (768fcd779f) -- let the kernel clamp it */
@@ -97,7 +116,8 @@ const char *socket_state_to_string(SocketState s);
  * EPOLLIN on a .socket unit's listening fd. Under Accept=no PID 1 never
  * accept()s -- the connection stays queued in the backlog and is handed to
  * the paired service, which is what makes the socket survive a service
- * restart. The sd_event_io_handler_t shape itself, registered directly by
+ * restart. Under Accept=yes it accept()s one connection per wakeup and
+ * starts a fresh instance for it. The sd_event_io_handler_t shape itself, registered directly by
  * socket_watch_port(); userdata is the SocketPort*. Always returns 0 -- see
  * the definition's own callback-contract comment.
  */
@@ -108,7 +128,8 @@ int socket_dispatch_io(sd_event_source *es, int fd, uint32_t revents, void *user
  * .socket unit(s), if any. Called on ANY service start, not just a
  * socket-triggered one: a service started at boot with its socket already
  * listening must get the same fds the same way (the journald arrangement,
- * and the one logd relies on).
+ * and the one logd relies on). An Accept=yes instance gets exactly one: its
+ * own connection.
  *
  * Returns the number of fds written to `fds` (0 when the service has no
  * paired socket), or -errno. `fds` is caller-owned, `n_fds` its capacity.
@@ -129,7 +150,8 @@ void socket_notify_service_starting(Unit *service);
  * connection triggers it again -- unless the service's own start-limit is
  * what killed it, in which case the socket goes FAILED instead, so it does
  * not immediately re-trigger the same crash loop (c2f3480897, "so sockets
- * won't act as tarpits"). No-op for a socket not currently RUNNING. */
+ * won't act as tarpits"). No-op for a socket not currently RUNNING. For an
+ * Accept=yes instance, arms the deferred reap of its connection instead. */
 void socket_notify_service_dead(Unit *service);
 
 /* A job on the paired service has finished. A start that ended without the
@@ -142,10 +164,12 @@ void socket_notify_service_job_finished(Unit *service);
 /*
  * Called by unit-parse.c once a [Socket] fragment has finished parsing
  * (never on a stub/unloaded unit -- see 75193d4128 in socket.c's header).
- * Validates the section (at least one Listen*, Accept=no) and resolves
- * service pairing: the explicit Service= override if given, else the
- * same-basename suffix swap. Also records the auto-Before= edge onto the
- * paired service (and, via unit_add_dependency()'s inverse, its After= back).
- * 0 or -errno; -errno fails the whole unit's load.
+ * Validates the section (at least one Listen*; under Accept=yes, stream
+ * ports only and no Service=) and, for Accept=no, resolves service pairing:
+ * the explicit Service= override if given, else the same-basename suffix
+ * swap. Also records the auto-Before= edge onto the paired service (and, via
+ * unit_add_dependency()'s inverse, its After= back). Accept=yes pairs with
+ * nothing here: each connection loads its own instance of the prefix@
+ * template. 0 or -errno; -errno fails the whole unit's load.
  */
 int socket_verify_and_pair(Socket *s);

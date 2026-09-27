@@ -134,6 +134,52 @@ int unit_add_dependency_by_name(Unit *u, UnitDependency d, const char *name) {
         return unit_add_dependency(u, d, other);
 }
 
+/* Remove every occurrence of `other` from one of u's arrays, keeping the
+ * NULL terminator. */
+static void unit_drop_dependency_one(Unit *u, UnitDependency d, Unit *other) {
+        size_t i, n = 0;
+
+        for (i = 0; i < u->n_dependencies[d]; i++)
+                if (u->dependencies[d][i] != other)
+                        u->dependencies[d][n++] = u->dependencies[d][i];
+
+        if (u->dependencies[d])
+                u->dependencies[d][n] = NULL;
+        u->n_dependencies[d] = n;
+}
+
+int unit_dependency_unlink(Unit *u) {
+        Manager *m;
+        size_t i;
+        int d;
+
+        if (!u || !u->manager)
+                return -EINVAL;
+
+        m = u->manager;
+
+        /* Requires=/Wants= have no inverse slot, so a peer holding one was
+         * declared by a file that names u: dropping it would rewrite that
+         * unit's graph behind its back. */
+        for (i = 0; i < m->n_units; i++)
+                if (m->units[i] != u &&
+                    (unit_has_dependency(m->units[i], UNIT_REQUIRES, u) ||
+                     unit_has_dependency(m->units[i], UNIT_WANTS, u)))
+                        return -EBUSY;
+
+        for (i = 0; i < m->n_units; i++)
+                if (m->units[i] != u)
+                        for (d = 0; d < _UNIT_DEPENDENCY_MAX; d++)
+                                unit_drop_dependency_one(m->units[i], d, u);
+
+        for (d = 0; d < _UNIT_DEPENDENCY_MAX; d++) {
+                u->dependencies[d] = pico_mfree(u->dependencies[d]);
+                u->n_dependencies[d] = 0;
+        }
+
+        return 0;
+}
+
 /* One frame of the explicit DFS stack. */
 typedef struct DepFrame {
         Unit *u;

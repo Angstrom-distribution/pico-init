@@ -335,8 +335,74 @@ finish:
         return rename(tmp_path, result_path) < 0 ? 92 : ret;
 }
 
+/*
+ * --accept-conn <%i>: an Accept=yes instance. fd 3 must already be the
+ * connection (connected, not listening), so it is read directly, never
+ * accept()ed. Writes "OK <data> <%i>" to $TEST_RESULT_PATH.<%i> (write-
+ * aside-and-rename) and acks the client, proving which instance got which
+ * connection.
+ */
+static int helper_accept_conn(int argc, char **argv) {
+        const char *result_path = getenv("TEST_RESULT_PATH");
+        char buf[64], path[PATH_MAX], tmp_path[PATH_MAX + 8];
+        int ret = 1, listening = 1;
+        socklen_t sl = sizeof(listening);
+        ssize_t n;
+        FILE *f;
+
+        if (!result_path || argc < 3)
+                return 90;
+        snprintf(path, sizeof(path), "%s.%s", result_path, argv[2]);
+        snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+        f = fopen(tmp_path, "we");
+        if (!f)
+                return 91;
+
+        if (!check_listen_env(f))
+                goto finish;
+
+        if (getsockopt(3, SOL_SOCKET, SO_ACCEPTCONN, &listening, &sl) < 0 || listening) {
+                fprintf(f, "FAIL fd 3 is not an accepted connection\n");
+                goto finish;
+        }
+
+        n = read(3, buf, sizeof(buf) - 1);
+        if (n <= 0) {
+                fprintf(f, "FAIL read\n");
+                goto finish;
+        }
+        buf[n] = '\0';
+
+        if (write(3, "ack", 3) != 3) {
+                fprintf(f, "FAIL write\n");
+                goto finish;
+        }
+
+        fprintf(f, "OK %s %s\n", buf, argv[2]);
+        ret = 0;
+
+finish:
+        fclose(f);
+        return rename(tmp_path, path) < 0 ? 92 : ret;
+}
+
+/* --accept-hold: keeps its connection until the client closes it. */
+static int helper_accept_hold(void) {
+        char buf[64];
+
+        while (read(3, buf, sizeof(buf)) > 0)
+                ;
+
+        return 0;
+}
+
 static int run_as_helper(int argc, char **argv) {
         const char *mode = argv[1];
+
+        if (strcmp(mode, "--accept-conn") == 0)
+                return helper_accept_conn(argc, argv);
+        if (strcmp(mode, "--accept-hold") == 0)
+                return helper_accept_hold();
 
         if (strcmp(mode, "--accept-echo") == 0)
                 return helper_accept_echo();
@@ -553,9 +619,12 @@ static void test_ignored_directives_tolerated(void) {
         free(dir);
 }
 
-static void test_accept_yes_fails_loudly(void) {
+/* Loads one "acc.socket" with `extra` appended to a ListenStream= line and
+ * returns its load state. */
+static UnitLoadState accept_socket_load_state(const char *extra, unsigned *ret_max_connections) {
         Manager *m;
         Unit *sock;
+        UnitLoadState st;
         char *dir = test_tmpdir_new();
         char sockpath[PATH_MAX];
 
@@ -565,18 +634,41 @@ static void test_accept_yes_fails_loudly(void) {
 
         {
                 char content[PATH_MAX + 256];
-                snprintf(content, sizeof(content), "[Socket]\nListenStream=%s\nAccept=yes\n", sockpath);
+                snprintf(content, sizeof(content), "[Socket]\nListenStream=%s\n%s", sockpath, extra);
                 ASSERT_EQ_INT(test_write_file(dir, "acc.socket", content), 0);
         }
+        ASSERT_EQ_INT(test_write_file(dir, "acc@.service", "[Service]\nType=simple\nExecStart=/bin/true\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir, "other.service", "[Service]\nType=simple\nExecStart=/bin/true\n"),
+                      0);
         ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
 
         sock = manager_get_unit(m, "acc.socket");
         ASSERT_TRUE(sock != NULL);
-        ASSERT_EQ_INT(sock->load_state, UNIT_ERROR); /* refused, not silently accepted */
+        st = sock->load_state;
+        if (ret_max_connections)
+                *ret_max_connections = SOCKET(sock)->max_connections;
 
         manager_free(m);
         test_rm_rf(dir);
         free(dir);
+        return st;
+}
+
+/* v30 socket_verify()'s Accept=yes rules: a stream-only socket with no
+ * Service= loads (pairing with nothing up front); a datagram port or an
+ * explicit Service= fails the load. */
+static void test_accept_yes_verify(void) {
+        unsigned max = 0;
+
+        ASSERT_EQ_INT(accept_socket_load_state("Accept=yes\n", &max), UNIT_LOADED);
+        ASSERT_EQ_INT((int) max, 64);
+        ASSERT_EQ_INT(accept_socket_load_state("Accept=yes\nMaxConnections=3\n", &max), UNIT_LOADED);
+        ASSERT_EQ_INT((int) max, 3);
+        ASSERT_EQ_INT(accept_socket_load_state("Accept=yes\nMaxConnections=0\n", &max), UNIT_LOADED);
+        ASSERT_EQ_INT((int) max, 64);
+        ASSERT_EQ_INT(accept_socket_load_state("Accept=yes\nService=other.service\n", NULL), UNIT_ERROR);
+        ASSERT_EQ_INT(accept_socket_load_state("Accept=yes\nListenDatagram=12345\n", NULL), UNIT_ERROR);
 }
 
 static void test_no_listen_fails(void) {
@@ -717,6 +809,8 @@ typedef enum DriveWaitKind {
         DRIVE_WAIT_SOCKET_STATE,
         DRIVE_WAIT_SERVICE_RESULT,
         DRIVE_WAIT_SERVICE_STATE,
+        DRIVE_WAIT_CONNECTIONS, /* Accept=yes: sock->n_connections == want_connections */
+        DRIVE_WAIT_PEER_CLOSED, /* client end `fd` reads EOF */
 } DriveWaitKind;
 
 typedef struct DriveWait {
@@ -727,7 +821,15 @@ typedef struct DriveWait {
         Service *svc;
         ServiceResult want_result;
         ServiceState want_svc_state;
+        unsigned want_connections;
+        int fd;
 } DriveWait;
+
+static bool peer_closed(int fd) {
+        char c;
+
+        return recv(fd, &c, 1, MSG_DONTWAIT | MSG_PEEK) == 0;
+}
 
 static bool drive_wait_done(const DriveWait *w) {
         switch (w->kind) {
@@ -739,6 +841,10 @@ static bool drive_wait_done(const DriveWait *w) {
                 return w->svc->result == w->want_result;
         case DRIVE_WAIT_SERVICE_STATE:
                 return w->svc->state == w->want_svc_state;
+        case DRIVE_WAIT_CONNECTIONS:
+                return w->sock->n_connections == w->want_connections;
+        case DRIVE_WAIT_PEER_CLOSED:
+                return peer_closed(w->fd);
         default:
                 return false;
         }
@@ -1552,6 +1658,234 @@ static void test_exec_type_with_socket_fds(void) {
         free(dir);
 }
 
+/* --- Accept=yes: one instance per connection --- */
+
+static int connect_unix(const char *path) {
+        struct sockaddr_un addr;
+        int fd;
+
+        fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        ASSERT_TRUE(fd >= 0);
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+        ASSERT_EQ_INT(connect(fd, (struct sockaddr *) &addr, sizeof(addr)), 0);
+
+        return fd;
+}
+
+/* Writes acc.socket (Accept=yes, `extra` appended) and, unless NULL, the
+ * acc@.service template; loads everything and starts the socket. */
+static Manager *accept_setup(
+                const char *dir, const char *sockpath, const char *extra, const char *tmpl, Socket **ret) {
+        Manager *m = manager_for(dir);
+        Unit *sock_u;
+
+        {
+                char content[PATH_MAX + 256];
+                snprintf(content, sizeof(content), "[Socket]\nListenStream=%s\nAccept=yes\n%s", sockpath, extra);
+                ASSERT_EQ_INT(test_write_file(dir, "acc.socket", content), 0);
+        }
+        if (tmpl)
+                ASSERT_EQ_INT(test_write_file(dir, "acc@.service", tmpl), 0);
+        ASSERT_EQ_INT(test_write_file(dir, "anchor.service", "[Service]\nType=simple\nExecStart=/bin/true\n"),
+                      0);
+        ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+
+        sock_u = manager_get_unit(m, "acc.socket");
+        ASSERT_TRUE(sock_u != NULL);
+        ASSERT_EQ_INT(sock_u->load_state, UNIT_LOADED);
+        ASSERT_EQ_INT(unit_start(sock_u), 0);
+        ASSERT_EQ_INT(SOCKET(sock_u)->state, SOCKET_LISTENING);
+
+        *ret = SOCKET(sock_u);
+        return m;
+}
+
+static void read_line(const char *path, char *buf, size_t size) {
+        FILE *f = fopen(path, "re");
+
+        ASSERT_TRUE(f != NULL);
+        ASSERT_TRUE(fgets(buf, (int) size, f) != NULL);
+        fclose(f);
+}
+
+/*
+ * Two connections held open at once get two independent instances of
+ * acc@.service, each with %i naming its own connection ("<nr>-<pid>-<uid>"
+ * for AF_UNIX) and each handed only its own connection on fd 3. Once both
+ * exit, both are dropped from the unit table -- the template's After= edge
+ * with them -- and the socket is still LISTENING.
+ */
+static void test_accept_yes_instance_per_connection(void) {
+        Manager *m;
+        Socket *s;
+        Unit *anchor;
+        char *dir = test_tmpdir_new();
+        char sockpath[PATH_MAX], resultpath[PATH_MAX], tmpl[PATH_MAX + 256];
+        char inst[2][64], name[2][128], file[2][PATH_MAX + 64], line[160], expect[160], ack[8];
+        int c[2], i;
+
+        ASSERT_TRUE(dir != NULL);
+        snprintf(sockpath, sizeof(sockpath), "%s/acc.sock", dir);
+        snprintf(resultpath, sizeof(resultpath), "%s/result", dir);
+        setenv("TEST_RESULT_PATH", resultpath, 1);
+        snprintf(tmpl,
+                 sizeof(tmpl),
+                 "[Unit]\nAfter=anchor.service\n[Service]\nType=simple\nExecStart=%s --accept-conn %%i\n",
+                 g_self_exe);
+        m = accept_setup(dir, sockpath, "", tmpl, &s);
+
+        anchor = manager_get_unit(m, "anchor.service");
+        ASSERT_TRUE(anchor != NULL);
+
+        for (i = 0; i < 2; i++) {
+                snprintf(inst[i],
+                         sizeof(inst[i]),
+                         "%d-%lu-%lu",
+                         i,
+                         (unsigned long) getpid(),
+                         (unsigned long) getuid());
+                snprintf(name[i], sizeof(name[i]), "acc@%s.service", inst[i]);
+                snprintf(file[i], sizeof(file[i]), "%s.%s", resultpath, inst[i]);
+        }
+
+        /* both connected before the manager runs at all: two queued
+         * connections, accepted in order */
+        c[0] = connect_unix(sockpath);
+        c[1] = connect_unix(sockpath);
+        ASSERT_EQ_INT((int) write(c[0], "one", 3), 3);
+        ASSERT_EQ_INT((int) write(c[1], "two", 3), 3);
+
+        for (i = 0; i < 2; i++) {
+                DriveWait wait = { .kind = DRIVE_WAIT_FILE, .path = file[i] };
+
+                ASSERT_TRUE(drive_until(m, NULL, &wait, 4000));
+        }
+        ASSERT_EQ_INT((int) s->n_accepted, 2);
+
+        read_line(file[0], line, sizeof(line));
+        snprintf(expect, sizeof(expect), "OK one %s\n", inst[0]);
+        ASSERT_EQ_INT(strcmp(line, expect), 0);
+        read_line(file[1], line, sizeof(line));
+        snprintf(expect, sizeof(expect), "OK two %s\n", inst[1]);
+        ASSERT_EQ_INT(strcmp(line, expect), 0);
+
+        for (i = 0; i < 2; i++) {
+                ASSERT_EQ_INT((int) read(c[i], ack, sizeof(ack)), 3);
+                close(c[i]);
+        }
+
+        {
+                DriveWait wait = { .kind = DRIVE_WAIT_CONNECTIONS, .sock = s, .want_connections = 0 };
+
+                ASSERT_TRUE(drive_until(m, NULL, &wait, 4000));
+        }
+        ASSERT_TRUE(manager_get_unit(m, name[0]) == NULL);
+        ASSERT_TRUE(manager_get_unit(m, name[1]) == NULL);
+        ASSERT_EQ_INT((int) anchor->n_dependencies[UNIT_BEFORE], 0);
+        ASSERT_EQ_INT(s->state, SOCKET_LISTENING);
+
+        unsetenv("TEST_RESULT_PATH");
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* MaxConnections=1: a second connection while the first instance is still
+ * up is closed at once without ever naming or loading an instance; after
+ * the first closes, its instance is reaped and the count is back at 0. */
+static void test_accept_yes_max_connections(void) {
+        Manager *m;
+        Socket *s;
+        char *dir = test_tmpdir_new();
+        char sockpath[PATH_MAX], tmpl[PATH_MAX + 256];
+        int c1, c2;
+
+        ASSERT_TRUE(dir != NULL);
+        snprintf(sockpath, sizeof(sockpath), "%s/acc.sock", dir);
+        snprintf(tmpl, sizeof(tmpl), "[Service]\nType=simple\nExecStart=%s --accept-hold\n", g_self_exe);
+        m = accept_setup(dir, sockpath, "MaxConnections=1\n", tmpl, &s);
+
+        c1 = connect_unix(sockpath);
+        {
+                DriveWait wait = { .kind = DRIVE_WAIT_CONNECTIONS, .sock = s, .want_connections = 1 };
+
+                ASSERT_TRUE(drive_until(m, NULL, &wait, 4000));
+        }
+
+        c2 = connect_unix(sockpath);
+        {
+                DriveWait wait = { .kind = DRIVE_WAIT_PEER_CLOSED, .fd = c2 };
+
+                ASSERT_TRUE(drive_until(m, NULL, &wait, 4000));
+        }
+        ASSERT_EQ_INT((int) s->n_accepted, 1);
+        ASSERT_EQ_INT((int) s->n_connections, 1);
+        close(c2);
+
+        close(c1);
+        {
+                DriveWait wait = { .kind = DRIVE_WAIT_CONNECTIONS, .sock = s, .want_connections = 0 };
+
+                ASSERT_TRUE(drive_until(m, NULL, &wait, 4000));
+        }
+        ASSERT_EQ_INT(s->state, SOCKET_LISTENING);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* A connection whose instance cannot run correctly is closed and its
+ * instance never kept: no template at all, or a template that wants the
+ * connection on stdin (StandardInput=, not supported). */
+static void run_accept_refused_case(const char *tmpl) {
+        Manager *m;
+        Socket *s;
+        char *dir = test_tmpdir_new();
+        char sockpath[PATH_MAX], name[128];
+        size_t n_units;
+        int c;
+
+        ASSERT_TRUE(dir != NULL);
+        snprintf(sockpath, sizeof(sockpath), "%s/acc.sock", dir);
+        m = accept_setup(dir, sockpath, "", tmpl, &s);
+        n_units = m->n_units;
+        snprintf(name, sizeof(name), "acc@0-%lu-%lu.service", (unsigned long) getpid(), (unsigned long) getuid());
+
+        c = connect_unix(sockpath);
+        {
+                DriveWait wait = { .kind = DRIVE_WAIT_PEER_CLOSED, .fd = c };
+
+                ASSERT_TRUE(drive_until(m, NULL, &wait, 4000));
+        }
+        close(c);
+
+        ASSERT_EQ_INT((int) s->n_accepted, 1);
+        ASSERT_EQ_INT((int) s->n_connections, 0);
+        ASSERT_TRUE(manager_get_unit(m, name) == NULL);
+        ASSERT_EQ_INT((int) m->n_units, (int) n_units);
+        ASSERT_EQ_INT(s->state, SOCKET_LISTENING);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+static void test_accept_yes_refused_instances(void) {
+        char tmpl[PATH_MAX + 256];
+
+        run_accept_refused_case(NULL);
+
+        snprintf(tmpl,
+                 sizeof(tmpl),
+                 "[Unit]\nAfter=anchor.service\n[Service]\nType=simple\nExecStart=%s --accept-hold\n"
+                 "StandardInput=socket\n",
+                 g_self_exe);
+        run_accept_refused_case(tmpl);
+}
+
 int main(int argc, char **argv) {
         if (argc >= 2 && argv[1][0] == '-' && argv[1][1] == '-')
                 return run_as_helper(argc, argv);
@@ -1563,7 +1897,7 @@ int main(int argc, char **argv) {
         test_pairing_explicit_service();
         test_repeated_listen_lines();
         test_ignored_directives_tolerated();
-        test_accept_yes_fails_loudly();
+        test_accept_yes_verify();
         test_no_listen_fails();
         test_datagram_passcred_set_before_bind();
 
@@ -1578,6 +1912,10 @@ int main(int argc, char **argv) {
         test_connect_flood_bounded_by_socket_trigger_limit();
         test_datagram_livelock_terminates_failed();
         test_skipped_start_rearms_socket();
+
+        test_accept_yes_instance_per_connection();
+        test_accept_yes_max_connections();
+        test_accept_yes_refused_instances();
 
         free(g_self_exe);
 
