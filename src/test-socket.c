@@ -1723,7 +1723,12 @@ static void test_accept_yes_instance_per_connection(void) {
         Unit *anchor;
         char *dir = test_tmpdir_new();
         char sockpath[PATH_MAX], resultpath[PATH_MAX], tmpl[PATH_MAX + 256];
-        char inst[2][64], name[2][128], file[2][PATH_MAX + 64], line[160], expect[160], ack[8];
+        /* name[]/file[] sized well past what inst[]'s real content (a
+         * short "%d-%lu-%lu") ever produces -- GCC's format-truncation
+         * analysis can't trace inst[i]'s actual runtime bound through the
+         * loop and conservatively assumes up to inst[]'s full declared
+         * size, so the destination has to out-size that worst case too. */
+        char inst[2][64], name[2][192], file[2][PATH_MAX + 256], line[160], expect[160], ack[8];
         int c[2], i;
 
         ASSERT_TRUE(dir != NULL);
