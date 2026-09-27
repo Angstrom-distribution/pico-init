@@ -71,13 +71,16 @@ typedef enum ServiceType {
 
 typedef enum ServiceState {
         SERVICE_DEAD,
+        SERVICE_CONDITION,    /* ExecCondition= running as the control process */
         SERVICE_START_PRE,    /* ExecStartPre= running */
         SERVICE_EXEC_START,   /* ExecStart= forked; oneshot: still running, exec: execve()
                                * not yet confirmed, notify: READY=1 not yet received,
                                * forking: the parent (control_pid) has not exited yet */
         SERVICE_RUNNING,      /* simple: main process up */
         SERVICE_EXITED,       /* main process gone, cgroup empty, clean exit */
+        SERVICE_EXEC_STOP,    /* ExecStop= running as the control process, nothing signalled yet */
         SERVICE_STOP,         /* SIGTERM sent, waiting for exit or TimeoutStopSec */
+        SERVICE_STOP_POST,    /* ExecStopPost= running, every other process already gone */
         SERVICE_AUTO_RESTART, /* waiting out RestartSec before starting again */
         SERVICE_FAILED,
         _SERVICE_STATE_MAX,
@@ -98,8 +101,16 @@ typedef enum ServiceResult {
         SERVICE_FAILURE_SIGNAL,      /* killed by a signal */
         SERVICE_FAILURE_START_LIMIT, /* B7: restarted too many times too fast, refusing */
         SERVICE_FAILURE_PROTOCOL,    /* Type=notify main process exited cleanly before READY=1 */
+        SERVICE_SKIP_CONDITION,      /* ExecCondition= exited 1-254: skipped, not failed */
         _SERVICE_RESULT_MAX,
 } ServiceResult;
+
+/* One ExecCondition=/ExecStop=/ExecStopPost=/ExecReload= line: its argv
+ * (owned) and its "-" prefix. */
+typedef struct ServiceExecCommand {
+        char **argv;
+        bool ignore;
+} ServiceExecCommand;
 
 typedef struct Service {
         Unit unit; /* must be first: a Service* is a Unit* */
@@ -116,6 +127,34 @@ typedef struct Service {
          * exit is not a failure (v30 ExecCommand.ignore, load-fragment.c). */
         bool exec_start_pre_ignore;
         bool exec_start_ignore;
+
+        /*
+         * ExecStop=, every line in file order: upstream appends each one and
+         * an empty ExecStop= resets the list. Run one after another as the
+         * control process on a stop from RUNNING/EXITED, before anything is
+         * signalled; exec_stop_idx is the line currently running. NULL/0
+         * when unset.
+         */
+        ServiceExecCommand *exec_stop;
+        unsigned n_exec_stop;
+        unsigned exec_stop_idx;
+
+        /*
+         * The same list shape and reset rule for three more directives.
+         * ExecCondition= runs before ExecStartPre=, and an exit of 1-254
+         * skips the start instead of failing it. ExecStopPost= runs once
+         * every other process of the unit is gone, after a stop and after a
+         * failed start alike. ExecReload= is parsed and kept, but nothing
+         * runs it: pico-init has no per-unit reload request yet.
+         */
+        ServiceExecCommand *exec_condition;
+        unsigned n_exec_condition;
+        unsigned exec_condition_idx;
+        ServiceExecCommand *exec_stop_post;
+        unsigned n_exec_stop_post;
+        unsigned exec_stop_post_idx;
+        ServiceExecCommand *exec_reload;
+        unsigned n_exec_reload;
 
         /*
          * Environment=/EnvironmentFile=: a "NAME=value" strv and a strv of
@@ -137,7 +176,8 @@ typedef struct Service {
         char *group;
 
         pid_t main_pid;    /* ExecStart= process, 0 when none; forking: the daemon left behind */
-        pid_t control_pid; /* ExecStartPre= process, or forking's ExecStart= parent; 0 when none */
+        pid_t control_pid; /* ExecCondition=/ExecStartPre=/ExecStop=/ExecStopPost= process, or
+                            * forking's ExecStart= parent; 0 when none */
 
         /*
          * Type=forking's main-pid discovery. pid_file is PIDFile= as
@@ -238,14 +278,21 @@ typedef struct Service {
 #define UNIT(s) (&(s)->unit)
 
 /* --- service.c --- */
-int service_start(Service *s); /* DEAD -> START_PRE/EXEC_START */
-int service_stop(Service *s);  /* SIGTERM, then cgroup_v2_kill on timeout */
+int service_start(Service *s); /* DEAD -> CONDITION/START_PRE/EXEC_START */
+int service_stop(Service *s);  /* ExecStop= if any, SIGTERM, cgroup_v2_kill on timeout, ExecStopPost= */
+
+/* Frees every ExecStop= line; unit-parse.c's reset on an empty ExecStop=. */
+void service_exec_stop_clear(Service *s);
+
+/* Frees every line of one command list and zeroes its count; the reset on
+ * an empty ExecCondition=/ExecStopPost=/ExecReload=. */
+void service_exec_commands_free(ServiceExecCommand **cmds, unsigned *n);
 
 /*
  * B9/CVE-2021-4034-class load-time validation: refuse a unit whose
- * ExecStart=/ExecStartPre= would reach execve() with a NULL or empty argv[0]
- * (the PwnKit primitive -- no PAM/seccomp/namespaces stand between pico-init
- * and it) or a non-absolute path. Called by unit_parse_file() once a
+ * ExecStart= or any other Exec*= line would reach execve() with a NULL or
+ * empty argv[0] (the PwnKit primitive -- no PAM/seccomp/namespaces stand
+ * between pico-init and it) or a non-absolute path. Called by unit_parse_file() once a
  * [Service] fragment has finished parsing. 0 or -ENOEXEC.
  */
 int service_verify(Service *s);

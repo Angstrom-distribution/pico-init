@@ -112,7 +112,7 @@ typedef struct ConfigItem {
 } ConfigItem;
 
 /*
- * Parses one ExecStart=/ExecStartPre= value into a NULL-terminated argv.
+ * Parses one Exec*= value (ExecStart=, ExecStop=, ...) into a NULL-terminated argv.
  * Supports the "-" modifier (ignore exit status), stored via *ret_ignore for
  * the caller to keep on the command (v30 load-fragment.c:531-533 sets
  * ExecCommand.ignore the same way), only when it's not separated from the
@@ -158,10 +158,11 @@ static int
                 *ret_ignore = true;
         } else if (*p == '-') {
                 pico_log(PICO_LOG_WARNING,
-                         "%s:%u: ExecStart= modifier must not be "
+                         "%s:%u: %s= modifier must not be "
                          "separated from the path by whitespace, ignoring",
                          path,
-                         line);
+                         line,
+                         lvalue);
                 return -EINVAL;
         } else if (*p == '@' || *p == '+' || *p == '!' || *p == ':') {
                 char what[64];
@@ -180,10 +181,11 @@ static int
         r = pico_extract_first_word(&p, &word);
         if (r <= 0) {
                 pico_log(PICO_LOG_WARNING,
-                         "%s:%u: %s in ExecStart=, ignoring",
+                         "%s:%u: %s in %s=, ignoring",
                          path,
                          line,
-                         r < 0 ? "malformed quoting" : "empty command line");
+                         r < 0 ? "malformed quoting" : "empty command line",
+                         lvalue);
                 return r < 0 ? r : -EINVAL;
         }
 
@@ -206,18 +208,20 @@ static int
 
         if (word[0] != '/') {
                 pico_log(PICO_LOG_WARNING,
-                         "%s:%u: ExecStart= path '%s' is not absolute, ignoring",
+                         "%s:%u: %s= path '%s' is not absolute, ignoring",
                          path,
                          line,
+                         lvalue,
                          word);
                 free(word);
                 return -EINVAL;
         }
         if (word[strlen(word) - 1] == '/') {
                 pico_log(PICO_LOG_WARNING,
-                         "%s:%u: ExecStart= path '%s' is a directory, ignoring",
+                         "%s:%u: %s= path '%s' is a directory, ignoring",
                          path,
                          line,
+                         lvalue,
                          word);
                 free(word);
                 return -EINVAL;
@@ -232,9 +236,10 @@ static int
                 r = pico_extract_first_word(&p, &word);
                 if (r < 0) {
                         pico_log(PICO_LOG_WARNING,
-                                 "%s:%u: malformed quoting in ExecStart=, ignoring",
+                                 "%s:%u: malformed quoting in %s=, ignoring",
                                  path,
-                                 line);
+                                 line,
+                                 lvalue);
                         argv = pico_strv_free(argv);
                         return r;
                 }
@@ -847,6 +852,118 @@ static int config_parse_exec_start_pre(
         return 0;
 }
 
+/* Upstream's list semantics, unlike the two above: every ExecStop= line
+ * appends, and an empty one resets whatever came before it. */
+static int config_parse_exec_stop(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        Service *s = unit_to_service(u, path, line);
+        ServiceExecCommand *cmds;
+        char **argv = NULL;
+        bool ignore = false;
+        int r;
+
+        if (!s)
+                return 0;
+
+        if (rvalue[strspn(rvalue, " \t")] == '\0') {
+                service_exec_stop_clear(s);
+                return 0;
+        }
+
+        r = parse_exec_line(u, path, line, lvalue, rvalue, &argv, &ignore);
+        if (r < 0)
+                return 0;
+
+        cmds = realloc(s->exec_stop, (s->n_exec_stop + 1) * sizeof(*cmds));
+        if (!cmds) {
+                pico_strv_free(argv);
+                return -ENOMEM;
+        }
+
+        cmds[s->n_exec_stop].argv = argv;
+        cmds[s->n_exec_stop].ignore = ignore;
+        s->exec_stop = cmds;
+        s->n_exec_stop++;
+        return 0;
+}
+
+/* ExecStop='s list semantics for any other command list: each line appends,
+ * an empty value resets the list. */
+static int
+                parse_exec_list(Unit *u,
+                                const char *path,
+                                unsigned line,
+                                const char *lvalue,
+                                const char *rvalue,
+                                ServiceExecCommand **list,
+                                unsigned *n) {
+        ServiceExecCommand *cmds;
+        char **argv = NULL;
+        bool ignore = false;
+        int r;
+
+        if (rvalue[strspn(rvalue, " \t")] == '\0') {
+                service_exec_commands_free(list, n);
+                return 0;
+        }
+
+        r = parse_exec_line(u, path, line, lvalue, rvalue, &argv, &ignore);
+        if (r < 0)
+                return 0;
+
+        cmds = realloc(*list, (*n + 1) * sizeof(*cmds));
+        if (!cmds) {
+                pico_strv_free(argv);
+                return -ENOMEM;
+        }
+
+        cmds[*n].argv = argv;
+        cmds[*n].ignore = ignore;
+        *list = cmds;
+        (*n)++;
+        return 0;
+}
+
+static int config_parse_exec_condition(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        Service *s = unit_to_service(u, path, line);
+
+        if (!s)
+                return 0;
+
+        return parse_exec_list(u, path, line, lvalue, rvalue, &s->exec_condition, &s->n_exec_condition);
+}
+
+static int config_parse_exec_stop_post(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        Service *s = unit_to_service(u, path, line);
+
+        if (!s)
+                return 0;
+
+        return parse_exec_list(u, path, line, lvalue, rvalue, &s->exec_stop_post, &s->n_exec_stop_post);
+}
+
+/* Stored for whatever later asks one unit to reload, and a degradation until
+ * then: nothing in pico-init runs it, and picoctl show and pico-unit-lint
+ * must keep saying so. */
+static int config_parse_exec_reload(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        Service *s = unit_to_service(u, path, line);
+        int r;
+
+        if (!s)
+                return 0;
+
+        r = parse_exec_list(u, path, line, lvalue, rvalue, &s->exec_reload, &s->n_exec_reload);
+        if (r < 0)
+                return r;
+
+        if (s->n_exec_reload > 0)
+                (void) unit_add_degradation(u, "ExecReload");
+        return 0;
+}
+
 /*
  * Environment=. Tokenized with the same pico_extract_first_word() ExecStart=
  * uses, so quoting is identical: Environment="FOO=a b" is one word. Each word
@@ -1311,6 +1428,33 @@ static int config_parse_socket_backlog(
         return 0;
 }
 
+/* Only consulted under Accept=yes. v30 refuses a unit with a zero value at
+ * verify time; rejecting it here keeps the default instead. */
+static int config_parse_socket_max_connections(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        Socket *s = unit_to_socket(u, path, line);
+        char *end;
+        long v;
+        (void) lvalue;
+
+        if (!s)
+                return 0;
+
+        errno = 0;
+        v = strtol(rvalue, &end, 10);
+        if (end == rvalue || *end != '\0' || errno == ERANGE || v <= 0 || (long) (unsigned) v != v) {
+                pico_log(PICO_LOG_WARNING,
+                         "%s:%u: invalid MaxConnections= value '%s', ignoring",
+                         path,
+                         line,
+                         rvalue);
+                return 0;
+        }
+
+        s->max_connections = (unsigned) v;
+        return 0;
+}
+
 /* --- [Install] handlers --- */
 
 /*
@@ -1390,6 +1534,10 @@ static const ConfigItem config_items[] = {
         { SECTION_SERVICE,                     "Type",                        config_parse_type },
         { SECTION_SERVICE,                "ExecStart",                  config_parse_exec_start },
         { SECTION_SERVICE,             "ExecStartPre",              config_parse_exec_start_pre },
+        { SECTION_SERVICE,                 "ExecStop",                   config_parse_exec_stop },
+        { SECTION_SERVICE,             "ExecStopPost",              config_parse_exec_stop_post },
+        { SECTION_SERVICE,            "ExecCondition",              config_parse_exec_condition },
+        { SECTION_SERVICE,               "ExecReload",                 config_parse_exec_reload },
         { SECTION_SERVICE,              "Environment",                 config_parse_environment },
         { SECTION_SERVICE,          "EnvironmentFile",            config_parse_environment_file },
         { SECTION_SERVICE,                  "Restart",                     config_parse_restart },
@@ -1407,6 +1555,7 @@ static const ConfigItem config_items[] = {
         {  SECTION_SOCKET,                   "Accept",               config_parse_socket_accept },
         {  SECTION_SOCKET,               "SocketMode",                 config_parse_socket_mode },
         {  SECTION_SOCKET,                  "Backlog",              config_parse_socket_backlog },
+        {  SECTION_SOCKET,           "MaxConnections",      config_parse_socket_max_connections },
         { SECTION_INSTALL,                 "WantedBy",                   config_parse_wanted_by },
         { SECTION_INSTALL,               "RequiredBy",                 config_parse_required_by },
 };

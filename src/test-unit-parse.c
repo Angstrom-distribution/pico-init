@@ -288,24 +288,27 @@ static void test_degradation_record(void) {
         ASSERT_STREQ(((Service *) u)->environment[1], "B=2");
         ASSERT_TRUE(((Service *) u)->environment[2] == NULL);
 
-        ASSERT_EQ_INT(u->n_degraded_directives, 6);
+        /* ExecStop= is implemented, not dropped (test_exec_stop_lines()). */
+        ASSERT_EQ_INT(((Service *) u)->n_exec_stop, 1);
+        ASSERT_STREQ(((Service *) u)->exec_stop[0].argv[1], "--stop");
+
+        ASSERT_EQ_INT(u->n_degraded_directives, 5);
         ASSERT_STREQ(u->degraded_directives[0], "ConditionPathExists=|");
         ASSERT_STREQ(u->degraded_directives[1], "ExecStartPre=multiple");
         ASSERT_STREQ(u->degraded_directives[2], "ExecStart=@");
-        ASSERT_STREQ(u->degraded_directives[3], "ExecStop");
-        ASSERT_STREQ(u->degraded_directives[4], "ExecReload");
-        ASSERT_STREQ(u->degraded_directives[5], "Alias");
-        ASSERT_TRUE(u->degraded_directives[6] == NULL);
+        ASSERT_STREQ(u->degraded_directives[3], "ExecReload");
+        ASSERT_STREQ(u->degraded_directives[4], "Alias");
+        ASSERT_TRUE(u->degraded_directives[5] == NULL);
 
         joined = unit_degraded_directives_string(u);
         ASSERT_STREQ(joined,
                      "ConditionPathExists=| ExecStartPre=multiple "
-                     "ExecStart=@ ExecStop ExecReload Alias");
+                     "ExecStart=@ ExecReload Alias");
         free(joined);
 
         /* a second identical drop is not a second entry */
         ASSERT_EQ_INT(unit_add_degradation(u, "Alias"), 0);
-        ASSERT_EQ_INT(u->n_degraded_directives, 6);
+        ASSERT_EQ_INT(u->n_degraded_directives, 5);
 
         ASSERT_EQ_INT(clean->load_state, UNIT_LOADED);
         ASSERT_EQ_INT(clean->n_degraded_directives, 0);
@@ -1512,6 +1515,166 @@ static void test_exec_dash_prefix_sets_ignore(void) {
         free(dir);
 }
 
+/*
+ * ExecStop= goes through ExecStart='s own parse_exec_line(), so the prefix
+ * rules are the same ones: '-' glued to the path is kept per line, '-'
+ * separated from it by whitespace is refused, and the modifiers pico-init
+ * does not implement (@ + ! !!) refuse the line and are recorded under
+ * ExecStop='s own name. Unlike ExecStart=, every accepted line appends, and
+ * an empty ExecStop= resets the list.
+ */
+static void test_exec_stop_lines(void) {
+        Manager *m;
+        char *dir;
+        Unit *u;
+        Service *s;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "stops.service",
+                                      "[Service]\n"
+                                      "ExecStart=/bin/true\n"
+                                      "ExecStop=-/bin/false one\n"
+                                      "ExecStop=@/bin/true at\n"
+                                      "ExecStop=- /bin/true spaced\n"
+                                      "ExecStop=+/bin/true plus\n"
+                                      "ExecStop=!!/bin/true bangbang\n"
+                                      "ExecStop=bin/true relative\n"
+                                      "ExecStop=/bin/true two\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "reset.service",
+                                      "[Service]\n"
+                                      "ExecStart=/bin/true\n"
+                                      "ExecStop=/bin/true dropped\n"
+                                      "ExecStop=\n"
+                                      "ExecStop=/bin/true kept\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir, "nostop.service", "[Service]\nExecStart=/bin/true\n"), 0);
+
+        m = manager_for(dir);
+
+        u = load_one(m, "stops.service");
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        s = (Service *) u;
+        ASSERT_EQ_INT(s->n_exec_stop, 2);
+        ASSERT_STREQ(s->exec_stop[0].argv[0], "/bin/false");
+        ASSERT_STREQ(s->exec_stop[0].argv[1], "one");
+        ASSERT_TRUE(s->exec_stop[0].argv[2] == NULL);
+        ASSERT_EQ_INT(s->exec_stop[0].ignore, true);
+        ASSERT_STREQ(s->exec_stop[1].argv[0], "/bin/true");
+        ASSERT_STREQ(s->exec_stop[1].argv[1], "two");
+        ASSERT_EQ_INT(s->exec_stop[1].ignore, false);
+
+        /* "- /bin/true" and the relative path are refused with a warning,
+         * not recorded: they are malformed, not unimplemented. */
+        ASSERT_EQ_INT(u->n_degraded_directives, 3);
+        ASSERT_STREQ(u->degraded_directives[0], "ExecStop=@");
+        ASSERT_STREQ(u->degraded_directives[1], "ExecStop=+");
+        ASSERT_STREQ(u->degraded_directives[2], "ExecStop=!");
+
+        u = load_one(m, "reset.service");
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        s = (Service *) u;
+        ASSERT_EQ_INT(s->n_exec_stop, 1);
+        ASSERT_STREQ(s->exec_stop[0].argv[1], "kept");
+        ASSERT_EQ_INT(u->n_degraded_directives, 0);
+
+        u = load_one(m, "nostop.service");
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        s = (Service *) u;
+        ASSERT_EQ_INT(s->n_exec_stop, 0);
+        ASSERT_TRUE(s->exec_stop == NULL);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * ExecCondition=, ExecStopPost= and ExecReload= share ExecStop='s list
+ * semantics: each line appends with its own '-' flag, an empty value
+ * resets, a malformed line is refused alone. The first two are honoured and
+ * leave no degradation; ExecReload= is stored but, with nothing to run it,
+ * is recorded exactly once however many lines it has.
+ */
+static void test_exec_condition_stop_post_reload_lines(void) {
+        Manager *m;
+        char *dir;
+        Unit *u;
+        Service *s;
+        char *joined;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "lists.service",
+                                      "[Service]\n"
+                                      "ExecStart=/bin/true\n"
+                                      "ExecCondition=/bin/true dropped\n"
+                                      "ExecCondition=\n"
+                                      "ExecCondition=-/bin/false one\n"
+                                      "ExecCondition=/bin/true two\n"
+                                      "ExecStopPost=/bin/true first\n"
+                                      "ExecStopPost=bin/true relative\n"
+                                      "ExecStopPost=-/bin/false second\n"
+                                      "ExecReload=/bin/kill -HUP $MAINPID\n"
+                                      "ExecReload=/bin/true again\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "reload-reset.service",
+                                      "[Service]\n"
+                                      "ExecStart=/bin/true\n"
+                                      "ExecStopPost=/bin/true gone\n"
+                                      "ExecStopPost=\n"
+                                      "ExecReload=\n"),
+                      0);
+
+        m = manager_for(dir);
+
+        u = load_one(m, "lists.service");
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        s = (Service *) u;
+
+        ASSERT_EQ_INT(s->n_exec_condition, 2);
+        ASSERT_STREQ(s->exec_condition[0].argv[0], "/bin/false");
+        ASSERT_STREQ(s->exec_condition[0].argv[1], "one");
+        ASSERT_EQ_INT(s->exec_condition[0].ignore, true);
+        ASSERT_STREQ(s->exec_condition[1].argv[1], "two");
+        ASSERT_EQ_INT(s->exec_condition[1].ignore, false);
+
+        ASSERT_EQ_INT(s->n_exec_stop_post, 2);
+        ASSERT_STREQ(s->exec_stop_post[0].argv[1], "first");
+        ASSERT_EQ_INT(s->exec_stop_post[0].ignore, false);
+        ASSERT_STREQ(s->exec_stop_post[1].argv[0], "/bin/false");
+        ASSERT_EQ_INT(s->exec_stop_post[1].ignore, true);
+
+        ASSERT_EQ_INT(s->n_exec_reload, 2);
+        ASSERT_STREQ(s->exec_reload[0].argv[0], "/bin/kill");
+        ASSERT_STREQ(s->exec_reload[0].argv[2], "$MAINPID"); /* expanded at spawn, not here */
+        ASSERT_STREQ(s->exec_reload[1].argv[1], "again");
+
+        joined = unit_degraded_directives_string(u);
+        ASSERT_STREQ(joined, "ExecReload");
+        free(joined);
+
+        u = load_one(m, "reload-reset.service");
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        s = (Service *) u;
+        ASSERT_EQ_INT(s->n_exec_stop_post, 0);
+        ASSERT_TRUE(s->exec_stop_post == NULL);
+        ASSERT_EQ_INT(s->n_exec_reload, 0);
+        ASSERT_EQ_INT(s->n_exec_condition, 0);
+        ASSERT_EQ_INT(u->n_degraded_directives, 0);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
         test_service_fields();
         test_unknown_directives_are_tolerated();
@@ -1542,6 +1705,8 @@ int main(void) {
         test_type_dbus_and_idle_degrade_to_simple();
         test_forking_directives();
         test_exec_dash_prefix_sets_ignore();
+        test_exec_stop_lines();
+        test_exec_condition_stop_post_reload_lines();
 
         printf("test-unit-parse: all checks passed\n");
         return 0;

@@ -7,7 +7,7 @@
  * cgroup child-side setup. Quarried from systemd's ~2011-era src/service.c
  * (tag v30, commit 501c92c, copyright 2010 Lennart Poettering,
  * GPL-2.0-or-later), reduced to the two-state-machine shape pico-init needs
- * (Type=simple/oneshot at first, no ExecStop=/ExecStopPost=/watchdog/D-Bus),
+ * (Type=simple/oneshot at first, no watchdog/D-Bus),
  * with a full history review (v30 -> 2026, ~2299 commits enumerated, ~300
  * read in full) applied on top so the reduction does not re-ship bugs
  * upstream has since fixed. No CVE has ever been assigned against
@@ -75,11 +75,33 @@
  *    PIDFile= naming the control process itself (a daemon writing its pid
  *    *before* forking) is refused rather than adopting a zombie.
  *
- * Not backported: ExecStop=/ExecStopPost=/ExecReload=, ExecCondition=,
- * Type=dbus/idle, the watchdog, cgroup accounting/resource-control
- * directives, D-Bus property change signals -- none of it has a field in
- * service.h, and pico-init's stop path (SIGTERM, then cgroup_v2_kill() on
- * timeout) makes an ExecStop= directive redundant for this MVP's scope.
+ *  - ExecStop=, v30's SERVICE_STOP state under pico-init's own name
+ *    (SERVICE_EXEC_STOP; pico's SERVICE_STOP is upstream's STOP_SIGTERM):
+ *    a stop from RUNNING/EXITED runs every ExecStop= line in turn as the
+ *    control process before anything is signalled, a clean main-process
+ *    exit without RemainAfterExit= does too (service_enter_exited_or_stop()
+ *    upstream), and a stop mid-start skips it and signals at once. A failed
+ *    line ends the chain and fails the unit, but the stop still proceeds --
+ *    a stop command can never keep a unit up. TimeoutStopSec= bounds the
+ *    whole chain, then again the signal phase after it.
+ *
+ *  - ExecStopPost= and ExecCondition=, modern upstream rather than v30,
+ *    shaped like ExecStop=. ExecStopPost= (SERVICE_STOP_POST) runs once
+ *    every other process of the unit is gone, on every path to DEAD/FAILED
+ *    that started something: a stop, a crash, a failed start, a skipped
+ *    condition. A failed line fails the unit and ends the chain, anything
+ *    it leaves in the cgroup is SIGKILLed (upstream's FINAL_SIGTERM,
+ *    without the SIGTERM step), and TimeoutStopSec= bounds it.
+ *    ExecCondition= (SERVICE_CONDITION) runs before ExecStartPre=; an exit
+ *    status of 1-254 is SERVICE_SKIP_CONDITION, which ends the start
+ *    cleanly in DEAD, completes the start job, and never triggers
+ *    Restart=. 255, a signal or one of pico-init's own setup exit codes
+ *    fails it as ExecStartPre= would.
+ *
+ * Not backported: running ExecReload= (it is parsed and stored, but
+ * nothing asks a single unit to reload yet), Type=dbus/idle, the watchdog,
+ * cgroup accounting/resource-control directives, D-Bus property change
+ * signals -- none of it has a field in service.h.
  *
  * Type=exec and Type=notify are modern upstream, not v30: exec follows
  * exec-invoke.c's exec_fd protocol (service_exec_fd_cb() below), notify
@@ -195,6 +217,12 @@ static bool pico_exit_status_is_internal(int status) {
         }
 }
 
+/* Everything but success and a skipped ExecCondition=: the one non-success
+ * result that still ends in DEAD rather than FAILED. */
+static bool service_result_is_failure(ServiceResult r) {
+        return r != SERVICE_SUCCESS && r != SERVICE_SKIP_CONDITION;
+}
+
 /* --- timers --- */
 
 static void service_timer_reset(Service *s) {
@@ -205,7 +233,9 @@ static void service_timer_reset(Service *s) {
 }
 
 static void service_timer_start_timeout(void *userdata, usec_t now);
+static void service_timer_exec_stop_timeout(void *userdata, usec_t now);
 static void service_timer_stop_timeout(void *userdata, usec_t now);
+static void service_timer_stop_post_timeout(void *userdata, usec_t now);
 static void service_timer_restart(void *userdata, usec_t now);
 
 /* B1: timer.h's own rule -- a caller with an infinite timeout skips
@@ -519,7 +549,7 @@ static bool service_shall_restart(Service *s, const char **reason) {
         case SERVICE_RESTART_NO:
                 return false;
         case SERVICE_RESTART_ON_FAILURE:
-                return s->result != SERVICE_SUCCESS;
+                return service_result_is_failure(s->result); /* a skip would only skip again */
         default:
                 return false;
         }
@@ -611,7 +641,7 @@ static void service_enter_dead(Service *s) {
         /* B8/a509f0e631: always the real DEAD/FAILED state first, then --
          * and only then -- AUTO_RESTART is even considered. Skipping this
          * made "start" never return in the systemd bug this fixed. */
-        service_set_state(s, s->result != SERVICE_SUCCESS ? SERVICE_FAILED : SERVICE_DEAD);
+        service_set_state(s, service_result_is_failure(s->result) ? SERVICE_FAILED : SERVICE_DEAD);
 
         /* Terminal, so a paired .socket unit may go back to listening and
          * re-trigger on the next connection. No-op when nothing pairs. */
@@ -660,6 +690,38 @@ static void service_signal_cgroup_rest(Service *s, int sig) {
                         (void) kill(pids[i], sig);
 }
 
+/* Spawns ExecStopPost= line exec_stop_post_idx as the control process. A
+ * spawn failure ends the chain the way a failed line does. */
+static void service_run_exec_stop_post(Service *s) {
+        int r;
+
+        r = service_spawn(s, s->exec_stop_post[s->exec_stop_post_idx].argv, &s->control_pid);
+        if (r < 0) {
+                pico_log(PICO_LOG_ERR, "%s: failed to spawn ExecStopPost=: %s", UNIT(s)->id, strerror(-r));
+                if (s->result == SERVICE_SUCCESS)
+                        s->result = SERVICE_FAILURE_RESOURCES;
+                service_enter_dead(s);
+        }
+}
+
+/* Upstream's service_enter_stop_post(): the last step before DEAD/FAILED,
+ * reached only once the main process, any control process and the rest of
+ * the cgroup are gone. */
+static void service_enter_stop_post(Service *s) {
+        if (s->n_exec_stop_post == 0) {
+                service_enter_dead(s);
+                return;
+        }
+
+        service_timer_reset(s);
+        service_exec_fd_close(s);
+
+        s->exec_stop_post_idx = 0;
+        service_set_state(s, SERVICE_STOP_POST);
+        service_arm_timeout(s, s->timeout_stop_usec, service_timer_stop_post_timeout);
+        service_run_exec_stop_post(s);
+}
+
 static void service_enter_stop(Service *s) {
         int mp = main_pid_good(s);
         int cp = control_pid_good(s);
@@ -675,7 +737,7 @@ static void service_enter_stop(Service *s) {
                  * rather than arm a timeout for a death that already
                  * happened (or never started at all: a failed fork). */
                 if (service_cgroup_populated(s) == 0) {
-                        service_enter_dead(s);
+                        service_enter_stop_post(s);
                         return;
                 }
 
@@ -694,6 +756,39 @@ static void service_enter_stop(Service *s) {
         service_signal_cgroup_rest(s, SIGTERM);
 
         service_arm_timeout(s, s->timeout_stop_usec, service_timer_stop_timeout);
+}
+
+/* Spawns ExecStop= line exec_stop_idx as the control process. A spawn
+ * failure goes straight on to the signal phase, as upstream: a stop command
+ * that cannot even run must never keep the unit up. */
+static void service_run_exec_stop(Service *s) {
+        int r;
+
+        r = service_spawn(s, s->exec_stop[s->exec_stop_idx].argv, &s->control_pid);
+        if (r < 0) {
+                pico_log(PICO_LOG_ERR, "%s: failed to spawn ExecStop=: %s", UNIT(s)->id, strerror(-r));
+                if (s->result == SERVICE_SUCCESS)
+                        s->result = SERVICE_FAILURE_RESOURCES;
+                service_enter_stop(s);
+        }
+}
+
+/* v30's service_enter_stop(): the ExecStop= chain first, when there is one,
+ * then service_enter_stop()'s signalling. One TimeoutStopSec= covers the
+ * whole chain, as upstream's per-state timer does. */
+static void service_enter_exec_stop(Service *s) {
+        if (s->n_exec_stop == 0) {
+                service_enter_stop(s);
+                return;
+        }
+
+        service_timer_reset(s);
+        service_exec_fd_close(s);
+
+        s->exec_stop_idx = 0;
+        service_set_state(s, SERVICE_EXEC_STOP);
+        service_arm_timeout(s, s->timeout_stop_usec, service_timer_exec_stop_timeout);
+        service_run_exec_stop(s);
 }
 
 /* B4/ec5b1452ac: result checked before service_good() before
@@ -741,7 +836,9 @@ static void service_enter_running(Service *s) {
                 return;
         }
 
-        service_enter_stop(s);
+        /* A clean exit is a completed run, and upstream stops it the full
+         * way, ExecStop= included (service_enter_exited_or_stop()). */
+        service_enter_exec_stop(s);
 }
 
 static void service_enter_start(Service *s) {
@@ -819,6 +916,39 @@ static void service_enter_start_pre(Service *s) {
         }
 }
 
+static void service_enter_start_pre_or_start(Service *s) {
+        if (s->exec_start_pre)
+                service_enter_start_pre(s);
+        else
+                service_enter_start(s);
+}
+
+/* Spawns ExecCondition= line exec_condition_idx as the control process; a
+ * condition that cannot even run fails the start rather than skipping it. */
+static void service_run_exec_condition(Service *s) {
+        int r;
+
+        r = service_spawn(s, s->exec_condition[s->exec_condition_idx].argv, &s->control_pid);
+        if (r < 0) {
+                pico_log(PICO_LOG_ERR, "%s: failed to spawn ExecCondition=: %s", UNIT(s)->id, strerror(-r));
+                if (s->result == SERVICE_SUCCESS)
+                        s->result = SERVICE_FAILURE_RESOURCES;
+                service_enter_stop(s);
+        }
+}
+
+/* Upstream's service_enter_condition(): START_PRE's shape, one state
+ * earlier, under the same TimeoutStartSec=. */
+static void service_enter_condition(Service *s) {
+        service_timer_reset(s);
+        service_kill_stale_cgroup_members(s); /* B11: before the first thing this start spawns */
+
+        s->exec_condition_idx = 0;
+        service_set_state(s, SERVICE_CONDITION);
+        service_arm_timeout(s, s->timeout_start_usec, service_timer_start_timeout);
+        service_run_exec_condition(s);
+}
+
 /* --- the public entry points --- */
 
 /* Shared by service_start() (after its own state-legality checks) and the
@@ -873,10 +1003,10 @@ static int service_do_start(Service *s) {
                          UNIT(s)->id,
                          strerror(-r));
 
-        if (s->exec_start_pre)
-                service_enter_start_pre(s);
+        if (s->n_exec_condition > 0)
+                service_enter_condition(s);
         else
-                service_enter_start(s);
+                service_enter_start_pre_or_start(s);
 
         return 0;
 }
@@ -886,13 +1016,16 @@ int service_start(Service *s) {
                 return -EINVAL;
 
         switch (s->state) {
+        case SERVICE_CONDITION:
         case SERVICE_START_PRE:
         case SERVICE_EXEC_START:
         case SERVICE_RUNNING:
         case SERVICE_EXITED:
                 return 0; /* already starting or started */
 
+        case SERVICE_EXEC_STOP:
         case SERVICE_STOP:
+        case SERVICE_STOP_POST:
                 return -EAGAIN; /* mid-shutdown; let it finish first */
 
         case SERVICE_AUTO_RESTART:
@@ -921,7 +1054,9 @@ int service_stop(Service *s) {
         switch (s->state) {
         case SERVICE_DEAD:
         case SERVICE_FAILED:
+        case SERVICE_EXEC_STOP:
         case SERVICE_STOP:
+        case SERVICE_STOP_POST:
                 return 0; /* already stopped or stopping */
 
         case SERVICE_AUTO_RESTART:
@@ -934,12 +1069,20 @@ int service_stop(Service *s) {
                 service_enter_dead(s);
                 return 0;
 
+        case SERVICE_CONDITION:
         case SERVICE_START_PRE:
         case SERVICE_EXEC_START:
+                /* Something is still starting: signal it at once, no
+                 * ExecStop= for a run that never completed (upstream's
+                 * service_stop() does the same). */
+                s->forbid_restart = true;
+                service_enter_stop(s);
+                return 0;
+
         case SERVICE_RUNNING:
         case SERVICE_EXITED:
                 s->forbid_restart = true;
-                service_enter_stop(s);
+                service_enter_exec_stop(s);
                 return 0;
 
         default:
@@ -971,6 +1114,31 @@ static const char *sigchld_code_to_string(int code) {
         default:
                 return "unknown";
         }
+}
+
+/* The directive the exiting process was spawned from, for the log. */
+static const char *service_command_name(Service *s, bool is_control) {
+        if (!is_control)
+                return "ExecStart";
+        if (s->state == SERVICE_CONDITION)
+                return "ExecCondition";
+        if (s->state == SERVICE_START_PRE)
+                return "ExecStartPre";
+        if (s->state == SERVICE_EXEC_STOP)
+                return "ExecStop";
+        if (s->state == SERVICE_STOP_POST)
+                return "ExecStopPost";
+        return "ExecStart"; /* Type=forking's parent */
+}
+
+/* The "-" flag of the ExecCondition=/ExecStopPost= line now running as the
+ * control process. */
+static bool service_list_command_ignore(Service *s) {
+        if (s->state == SERVICE_CONDITION)
+                return s->exec_condition[s->exec_condition_idx].ignore;
+        if (s->state == SERVICE_STOP_POST && s->exec_stop_post_idx < s->n_exec_stop_post)
+                return s->exec_stop_post[s->exec_stop_post_idx].ignore;
+        return false;
 }
 
 static void format_exit_status(char *buf, size_t size, int code, int status) {
@@ -1048,14 +1216,23 @@ void service_sigchld_event(Service *s, pid_t pid, int code, int status) {
             ((is_control && s->state == SERVICE_START_PRE && s->exec_start_pre_ignore) ||
              (is_control && s->state == SERVICE_EXEC_START && s->type == SERVICE_TYPE_FORKING &&
               s->exec_start_ignore) ||
-             (is_main && s->exec_start_ignore))) {
+             (is_control && s->state == SERVICE_EXEC_STOP && s->exec_stop[s->exec_stop_idx].ignore) ||
+             (is_control && service_list_command_ignore(s)) || (is_main && s->exec_start_ignore))) {
                 pico_log(PICO_LOG_DEBUG,
-                         "%s: %s process failed, but its ExecStart%s= line is marked '-', ignoring",
+                         "%s: %s process failed, but its %s= line is marked '-', ignoring",
                          UNIT(s)->id,
                          is_control ? "control" : "main",
-                         is_control && s->state == SERVICE_START_PRE ? "Pre" : "");
+                         service_command_name(s, is_control));
                 f = SERVICE_SUCCESS;
         }
+
+        /* ExecCondition='s own exit space, after the '-' rule as upstream
+         * orders it: 1-254 means "condition not met". 255, a signal, and
+         * pico-init's setup codes (already SERVICE_FAILURE_RESOURCES above)
+         * stay failures -- a condition that could not run must not pass for
+         * one that said no. */
+        if (is_control && s->state == SERVICE_CONDITION && f == SERVICE_FAILURE_EXIT_CODE && status < 255)
+                f = SERVICE_SKIP_CONDITION;
 
         /* B3/a0fef983ab: write-once -- the *first* failure wins, not the
          * last. A watchdog-style timeout that goes on to SIGABRT the
@@ -1073,7 +1250,7 @@ void service_sigchld_event(Service *s, pid_t pid, int code, int status) {
          * rule an earlier failure survives a later clean exit, and logging
          * "result=timeout" at debug would hide exactly the case that matters. */
         format_exit_status(statusbuf, sizeof statusbuf, code, status);
-        pico_log(s->result == SERVICE_SUCCESS ? PICO_LOG_DEBUG : PICO_LOG_WARNING,
+        pico_log(service_result_is_failure(s->result) ? PICO_LOG_WARNING : PICO_LOG_DEBUG,
                  "%s: %s process exited, code=%s, status=%s, result=%s",
                  UNIT(s)->id,
                  is_control ? "control" : "main",
@@ -1082,7 +1259,33 @@ void service_sigchld_event(Service *s, pid_t pid, int code, int status) {
                  service_result_to_string(s->result));
 
         if (is_control) {
-                if (s->state == SERVICE_START_PRE) {
+                if (s->state == SERVICE_CONDITION) {
+                        /* Every line must pass; the first that does not
+                         * ends the chain, a skip and a failure alike, and
+                         * the start unwinds through ExecStopPost=. */
+                        s->control_pid = 0;
+                        if (f == SERVICE_SUCCESS && s->exec_condition_idx + 1 < s->n_exec_condition) {
+                                s->exec_condition_idx++;
+                                service_run_exec_condition(s);
+                                return;
+                        }
+
+                        if (f == SERVICE_SUCCESS)
+                                service_enter_start_pre_or_start(s);
+                        else {
+                                /* Upstream's condition_result = false: the
+                                 * start job completes, with no "Started"
+                                 * line for a unit that never started. */
+                                if (f == SERVICE_SKIP_CONDITION) {
+                                        UNIT(s)->condition_result = false;
+                                        pico_log(PICO_LOG_INFO,
+                                                 "%s: ExecCondition= %s not met, skipping start",
+                                                 UNIT(s)->id,
+                                                 s->exec_condition[s->exec_condition_idx].argv[0]);
+                                }
+                                service_enter_stop(s);
+                        }
+                } else if (s->state == SERVICE_START_PRE) {
                         s->control_pid = 0;
                         if (f == SERVICE_SUCCESS)
                                 service_enter_start(s);
@@ -1102,12 +1305,49 @@ void service_sigchld_event(Service *s, pid_t pid, int code, int status) {
                                 service_forking_locate_main_pid(s);
                         s->control_pid = 0;
                         service_enter_running(s); /* s->result routes the failure case */
+                } else if (s->state == SERVICE_EXEC_STOP) {
+                        /* The next line only after a success, as with v30's
+                         * control_command_next; a failure (already logged
+                         * above, already in s->result) skips the rest and
+                         * the stop carries on to the signal phase. */
+                        s->control_pid = 0;
+                        if (f == SERVICE_SUCCESS && s->exec_stop_idx + 1 < s->n_exec_stop) {
+                                s->exec_stop_idx++;
+                                service_run_exec_stop(s);
+                                return;
+                        }
+
+                        if (f != SERVICE_SUCCESS)
+                                pico_log(PICO_LOG_WARNING,
+                                         "%s: ExecStop= command %s failed, stopping anyway",
+                                         UNIT(s)->id,
+                                         s->exec_stop[s->exec_stop_idx].argv[0]);
+                        service_enter_stop(s);
+                } else if (s->state == SERVICE_STOP_POST) {
+                        /* ExecStop='s chain rule. Whatever the chain left in
+                         * the cgroup is killed outright, the just-exited
+                         * control pid excluded by number while still set. */
+                        if (f == SERVICE_SUCCESS && s->exec_stop_post_idx + 1 < s->n_exec_stop_post) {
+                                s->control_pid = 0;
+                                s->exec_stop_post_idx++;
+                                service_run_exec_stop_post(s);
+                                return;
+                        }
+
+                        if (f != SERVICE_SUCCESS && s->exec_stop_post_idx < s->n_exec_stop_post)
+                                pico_log(PICO_LOG_WARNING,
+                                         "%s: ExecStopPost= command %s failed",
+                                         UNIT(s)->id,
+                                         s->exec_stop_post[s->exec_stop_post_idx].argv[0]);
+                        service_signal_cgroup_rest(s, SIGKILL);
+                        s->control_pid = 0;
+                        service_enter_dead(s);
                 } else if (s->state == SERVICE_STOP && main_pid_good(s) == 0) {
                         s->control_pid = 0;
                         /* The rest of the cgroup was signalled too: its
                          * cgroup-empty event, or the stop timeout, ends it. */
                         if (service_cgroup_populated(s) == 0)
-                                service_enter_dead(s);
+                                service_enter_stop_post(s);
                 } else
                         s->control_pid = 0;
                 return;
@@ -1151,7 +1391,7 @@ void service_sigchld_event(Service *s, pid_t pid, int code, int status) {
                 /* Not dead while the rest of the cgroup is still exiting:
                  * its cgroup-empty event, or the stop timeout, ends it. */
                 if (control_pid_good(s) == 0 && service_cgroup_populated(s) == 0)
-                        service_enter_dead(s);
+                        service_enter_stop_post(s);
                 break;
 
         default:
@@ -1203,6 +1443,7 @@ void service_cgroup_empty_event(Service *s) {
         }
 
         switch (s->state) {
+        case SERVICE_CONDITION:
         case SERVICE_START_PRE:
         case SERVICE_EXEC_START:
                 /*
@@ -1258,6 +1499,21 @@ static void service_timer_start_timeout(void *userdata, usec_t now) {
         service_enter_stop(s);
 }
 
+/* v30's SERVICE_STOP timeout: give up on the ExecStop= chain and move on to
+ * SIGTERM, which reaches the stop command too, with the stop timeout armed
+ * afresh for that phase. */
+static void service_timer_exec_stop_timeout(void *userdata, usec_t now) {
+        Service *s = userdata;
+        (void) now;
+
+        pico_log(PICO_LOG_WARNING, "%s: ExecStop= timed out, terminating", UNIT(s)->id);
+
+        if (s->result == SERVICE_SUCCESS)
+                s->result = SERVICE_FAILURE_TIMEOUT;
+
+        service_enter_stop(s);
+}
+
 static void service_timer_stop_timeout(void *userdata, usec_t now) {
         Service *s = userdata;
         (void) now;
@@ -1282,6 +1538,34 @@ static void service_timer_stop_timeout(void *userdata, usec_t now) {
          * cgroup_v2_kill() in particular); only finish now if we already
          * know both pids are gone, otherwise wait for their SIGCHLD. */
         if (main_pid_good(s) == 0 && control_pid_good(s) == 0)
+                service_enter_stop_post(s);
+}
+
+/* Upstream's STOP_POST timeout: kill the running line and whatever else is
+ * left, run no further line, and let the control process's SIGCHLD finish
+ * the unit. */
+static void service_timer_stop_post_timeout(void *userdata, usec_t now) {
+        Service *s = userdata;
+        (void) now;
+
+        pico_log(PICO_LOG_WARNING,
+                 "%s: ExecStopPost= command %s timed out, killing",
+                 UNIT(s)->id,
+                 s->exec_stop_post[s->exec_stop_post_idx].argv[0]);
+
+        if (s->result == SERVICE_SUCCESS)
+                s->result = SERVICE_FAILURE_TIMEOUT;
+
+        /* One past the last line: the chain is abandoned, and the killed
+         * line's SIGCHLD neither continues it nor counts as '-'-ignorable. */
+        s->exec_stop_post_idx = s->n_exec_stop_post;
+
+        if (s->cgroup)
+                cgroup_v2_kill(s->cgroup);
+        else if (control_pid_good(s) > 0)
+                kill(s->control_pid, SIGKILL);
+
+        if (control_pid_good(s) == 0)
                 service_enter_dead(s);
 }
 
@@ -1315,7 +1599,19 @@ static bool exec_line_is_valid(char * const *argv) {
         return argv && argv[0] && argv[0][0] == '/';
 }
 
+static bool exec_commands_are_valid(const ServiceExecCommand *cmds, unsigned n) {
+        unsigned i;
+
+        for (i = 0; i < n; i++)
+                if (!exec_line_is_valid(cmds[i].argv))
+                        return false;
+
+        return true;
+}
+
 int service_verify(Service *s) {
+        unsigned i;
+
         if (!s)
                 return -EINVAL;
 
@@ -1326,6 +1622,21 @@ int service_verify(Service *s) {
 
         if (s->exec_start_pre && !exec_line_is_valid(s->exec_start_pre)) {
                 pico_log(PICO_LOG_ERR, "%s: invalid ExecStartPre=, refusing to load", UNIT(s)->id);
+                return -ENOEXEC;
+        }
+
+        for (i = 0; i < s->n_exec_stop; i++)
+                if (!exec_line_is_valid(s->exec_stop[i].argv)) {
+                        pico_log(PICO_LOG_ERR, "%s: invalid ExecStop=, refusing to load", UNIT(s)->id);
+                        return -ENOEXEC;
+                }
+
+        if (!exec_commands_are_valid(s->exec_condition, s->n_exec_condition) ||
+            !exec_commands_are_valid(s->exec_stop_post, s->n_exec_stop_post) ||
+            !exec_commands_are_valid(s->exec_reload, s->n_exec_reload)) {
+                pico_log(PICO_LOG_ERR,
+                         "%s: invalid ExecCondition=, ExecStopPost= or ExecReload=, refusing to load",
+                         UNIT(s)->id);
                 return -ENOEXEC;
         }
 
@@ -1354,13 +1665,11 @@ const char *service_type_to_string(ServiceType t) {
  * here; a missing one would leave service_state_to_string() returning NULL
  * for a state main.c's own logging paths can reach. */
 static const char * const service_state_table[_SERVICE_STATE_MAX] = {
-        [SERVICE_DEAD] = "dead",
-        [SERVICE_START_PRE] = "start-pre",
-        [SERVICE_EXEC_START] = "exec-start",
-        [SERVICE_RUNNING] = "running",
-        [SERVICE_EXITED] = "exited",
-        [SERVICE_STOP] = "stop",
-        [SERVICE_AUTO_RESTART] = "auto-restart",
+        [SERVICE_DEAD] = "dead",           [SERVICE_CONDITION] = "condition",
+        [SERVICE_START_PRE] = "start-pre", [SERVICE_EXEC_START] = "exec-start",
+        [SERVICE_RUNNING] = "running",     [SERVICE_EXITED] = "exited",
+        [SERVICE_EXEC_STOP] = "exec-stop", [SERVICE_STOP] = "stop",
+        [SERVICE_STOP_POST] = "stop-post", [SERVICE_AUTO_RESTART] = "auto-restart",
         [SERVICE_FAILED] = "failed",
 };
 
@@ -1387,7 +1696,7 @@ static const char * const service_result_table[_SERVICE_RESULT_MAX] = {
         [SERVICE_SUCCESS] = "success",           [SERVICE_FAILURE_RESOURCES] = "resources",
         [SERVICE_FAILURE_TIMEOUT] = "timeout",   [SERVICE_FAILURE_EXIT_CODE] = "exit-code",
         [SERVICE_FAILURE_SIGNAL] = "signal",     [SERVICE_FAILURE_START_LIMIT] = "start-limit-hit",
-        [SERVICE_FAILURE_PROTOCOL] = "protocol",
+        [SERVICE_FAILURE_PROTOCOL] = "protocol", [SERVICE_SKIP_CONDITION] = "exec-condition",
 };
 
 const char *service_result_to_string(ServiceResult r) {
@@ -1395,6 +1704,27 @@ const char *service_result_to_string(ServiceResult r) {
                 return "invalid";
 
         return service_result_table[r];
+}
+
+void service_exec_stop_clear(Service *s) {
+        unsigned i;
+
+        for (i = 0; i < s->n_exec_stop; i++)
+                pico_strv_free(s->exec_stop[i].argv);
+
+        s->exec_stop = pico_mfree(s->exec_stop);
+        s->n_exec_stop = 0;
+        s->exec_stop_idx = 0;
+}
+
+void service_exec_commands_free(ServiceExecCommand **cmds, unsigned *n) {
+        unsigned i;
+
+        for (i = 0; i < *n; i++)
+                pico_strv_free((*cmds)[i].argv);
+
+        *cmds = pico_mfree(*cmds);
+        *n = 0;
 }
 
 /* --- vtable thunks --- */
@@ -1426,6 +1756,10 @@ static void service_done(Unit *u) {
 
         s->exec_start = pico_strv_free(s->exec_start);
         s->exec_start_pre = pico_strv_free(s->exec_start_pre);
+        service_exec_stop_clear(s);
+        service_exec_commands_free(&s->exec_condition, &s->n_exec_condition);
+        service_exec_commands_free(&s->exec_stop_post, &s->n_exec_stop_post);
+        service_exec_commands_free(&s->exec_reload, &s->n_exec_reload);
         s->environment = pico_strv_free(s->environment);
         s->environment_files = pico_strv_free(s->environment_files);
         s->user = pico_mfree(s->user);
@@ -1466,6 +1800,7 @@ static UnitActiveState service_active_state_of(ServiceState state, bool remain_a
         case SERVICE_DEAD:
                 return UNIT_INACTIVE;
 
+        case SERVICE_CONDITION:
         case SERVICE_START_PRE:
         case SERVICE_EXEC_START:
         case SERVICE_AUTO_RESTART:
@@ -1483,7 +1818,9 @@ static UnitActiveState service_active_state_of(ServiceState state, bool remain_a
                  * so the ternary below is defensive, not load-bearing. */
                 return remain_after_exit ? UNIT_ACTIVE : UNIT_INACTIVE;
 
+        case SERVICE_EXEC_STOP:
         case SERVICE_STOP:
+        case SERVICE_STOP_POST:
                 return UNIT_DEACTIVATING;
 
         case SERVICE_FAILED:

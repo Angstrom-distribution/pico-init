@@ -2261,6 +2261,646 @@ static void test_close_all_except_keeps_every_fd(void) {
         ASSERT_EQ_INT(WEXITSTATUS(status), 0);
 }
 
+/*
+ * ExecStop=, the normal stop: every line runs, in order, as the control
+ * process, while the main process is still alive and before anything is
+ * signalled. The daemon's own TERM trap appends after both lines, so the
+ * file's order is the proof. The oneshot + RemainAfterExit=yes half is the
+ * case with nothing to signal at all, where ExecStop= is the only teardown
+ * there is (plans/29's usb-multi-gadget).
+ */
+static void test_exec_stop_runs_before_signal(void) {
+        Manager *m;
+        Service *s, *o;
+        char *dir;
+        char unit[4 * PATH_MAX], path[PATH_MAX], v[256];
+        pid_t main_pid;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Service]\nType=simple\n"
+                 "ExecStart=/bin/sh -c \"trap 'echo term >> %s/order; exit 0' TERM; "
+                 "while :; do sleep 0.05; done\"\n"
+                 "ExecStop=/bin/sh -c \"echo stop-one >> %s/order\"\n"
+                 "ExecStop=/bin/sh -c \"echo stop-two >> %s/order\"\n",
+                 dir,
+                 dir,
+                 dir);
+        s = load_service(m, dir, "stop-cmd.service", unit);
+
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n"
+                 "ExecStop=/bin/sh -c \"echo down > %s/oneshot\"\n",
+                 dir);
+        o = load_service(m, dir, "stop-oneshot.service", unit);
+
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        ASSERT_EQ_INT(s->state, SERVICE_RUNNING);
+        main_pid = s->main_pid;
+        test_sleep_ms(100); /* past the shell's trap */
+
+        ASSERT_EQ_INT(unit_stop(UNIT(s)), 0);
+        ASSERT_EQ_INT(s->state, SERVICE_EXEC_STOP);
+        ASSERT_EQ_INT(unit_active_state(UNIT(s)), UNIT_DEACTIVATING);
+        ASSERT_TRUE(s->control_pid > 0);
+        ASSERT_EQ_INT(s->main_pid, main_pid); /* not signalled, not reaped */
+        ASSERT_EQ_INT(unit_stop(UNIT(s)), 0); /* already stopping */
+        ASSERT_EQ_INT(unit_start(UNIT(s)), -EAGAIN);
+
+        ASSERT_TRUE(drive_until(m, service_settled_done, s, 600));
+        ASSERT_EQ_INT(s->state, SERVICE_DEAD);
+        ASSERT_EQ_INT(s->result, SERVICE_SUCCESS);
+        ASSERT_EQ_INT(s->main_pid, 0);
+        ASSERT_EQ_INT(s->control_pid, 0);
+        ASSERT_TRUE(!pid_is_running(main_pid));
+
+        snprintf(path, sizeof(path), "%s/order", dir);
+        read_file(path, v, sizeof(v));
+        ASSERT_STREQ(v, "stop-one\nstop-two\nterm\n");
+
+        ASSERT_EQ_INT(unit_start(UNIT(o)), 0);
+        ASSERT_TRUE(reap_for(o, 3000));
+        ASSERT_EQ_INT(o->state, SERVICE_EXITED);
+
+        ASSERT_EQ_INT(unit_stop(UNIT(o)), 0);
+        ASSERT_EQ_INT(o->state, SERVICE_EXEC_STOP);
+        ASSERT_TRUE(drive_until(m, service_settled_done, o, 600));
+        ASSERT_EQ_INT(o->state, SERVICE_DEAD);
+        ASSERT_EQ_INT(o->result, SERVICE_SUCCESS);
+
+        snprintf(path, sizeof(path), "%s/oneshot", dir);
+        read_file(path, v, sizeof(v));
+        ASSERT_STREQ(v, "down\n");
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * No ExecStop=: exactly the old stop path. A daemon goes straight to
+ * SERVICE_STOP with SIGTERM already sent and no control process, and an
+ * exited oneshot goes straight to DEAD.
+ */
+static void test_no_exec_stop_is_unchanged(void) {
+        Manager *m;
+        Service *s, *o;
+        char *dir;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        s = load_service(m, dir, "plain-stop.service", "[Service]\nType=simple\nExecStart=/bin/sleep 100\n");
+        o = load_service(
+                        m,
+                        dir,
+                        "plain-oneshot.service",
+                        "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n");
+        ASSERT_EQ_INT(s->n_exec_stop, 0);
+
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        ASSERT_EQ_INT(unit_stop(UNIT(s)), 0);
+        ASSERT_EQ_INT(s->state, SERVICE_STOP);
+        ASSERT_EQ_INT(s->control_pid, 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, s, 600));
+        ASSERT_EQ_INT(s->state, SERVICE_DEAD);
+        ASSERT_EQ_INT(s->result, SERVICE_SUCCESS);
+
+        ASSERT_EQ_INT(unit_start(UNIT(o)), 0);
+        ASSERT_TRUE(reap_for(o, 3000));
+        ASSERT_EQ_INT(o->state, SERVICE_EXITED);
+        ASSERT_EQ_INT(unit_stop(UNIT(o)), 0);
+        ASSERT_EQ_INT(o->state, SERVICE_DEAD);
+        ASSERT_EQ_INT(o->result, SERVICE_SUCCESS);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * A failing ExecStop= line ends the chain and fails the unit, but never
+ * keeps it up: the daemon is still signalled and the unit still reaches a
+ * stopped state. With '-' the failure does not count and the chain goes on.
+ */
+static void test_exec_stop_failure_still_stops(void) {
+        Manager *m;
+        Service *s, *d;
+        char *dir;
+        char unit[2 * PATH_MAX], path[PATH_MAX], v[64];
+        pid_t main_pid;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Service]\nType=simple\nExecStart=/bin/sleep 100\n"
+                 "ExecStop=/bin/false\nExecStop=/bin/sh -c \"echo x > %s/skipped\"\n",
+                 dir);
+        s = load_service(m, dir, "stop-fails.service", unit);
+
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Service]\nType=simple\nExecStart=/bin/sleep 100\n"
+                 "ExecStop=-/bin/false\nExecStop=/bin/sh -c \"echo ran > %s/after-dash\"\n",
+                 dir);
+        d = load_service(m, dir, "stop-dash.service", unit);
+
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        main_pid = s->main_pid;
+        ASSERT_EQ_INT(unit_stop(UNIT(s)), 0);
+        ASSERT_EQ_INT(s->state, SERVICE_EXEC_STOP);
+        ASSERT_TRUE(drive_until(m, service_settled_done, s, 600));
+        ASSERT_EQ_INT(s->state, SERVICE_FAILED);
+        ASSERT_EQ_INT(s->result, SERVICE_FAILURE_EXIT_CODE);
+        ASSERT_EQ_INT(s->main_pid, 0);
+        ASSERT_TRUE(!pid_is_running(main_pid));
+        snprintf(path, sizeof(path), "%s/skipped", dir);
+        ASSERT_TRUE(access(path, F_OK) < 0);
+
+        ASSERT_EQ_INT(unit_start(UNIT(d)), 0);
+        ASSERT_EQ_INT(unit_stop(UNIT(d)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, d, 600));
+        ASSERT_EQ_INT(d->state, SERVICE_DEAD);
+        ASSERT_EQ_INT(d->result, SERVICE_SUCCESS);
+        snprintf(path, sizeof(path), "%s/after-dash", dir);
+        read_file(path, v, sizeof(v));
+        ASSERT_STREQ(v, "ran\n");
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * The other entry points, each upstream's: a clean exit without
+ * RemainAfterExit= runs ExecStop= too; a stop mid-start skips it and
+ * signals at once; and TimeoutStopSec= bounds a wedged ExecStop=, then
+ * SIGTERM reaches both it and the daemon.
+ */
+static void test_exec_stop_entry_points(void) {
+        Manager *m;
+        Service *e, *mid, *w;
+        char *dir;
+        char unit[2 * PATH_MAX], path[PATH_MAX], v[64];
+        pid_t main_pid;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Service]\nType=oneshot\nExecStart=/bin/true\n"
+                 "ExecStop=/bin/sh -c \"echo after > %s/exited\"\n",
+                 dir);
+        e = load_service(m, dir, "stop-exited.service", unit);
+
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Service]\nType=oneshot\nExecStart=/bin/sleep 100\n"
+                 "ExecStop=/bin/sh -c \"echo wrong > %s/midstart\"\n",
+                 dir);
+        mid = load_service(m, dir, "stop-midstart.service", unit);
+
+        w = load_service(
+                        m,
+                        dir,
+                        "stop-wedged-cmd.service",
+                        "[Service]\nType=simple\nTimeoutStopSec=200ms\nExecStart=/bin/sleep 100\n"
+                        "ExecStop=/bin/sleep 100\n");
+
+        ASSERT_EQ_INT(unit_start(UNIT(e)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, e, 600));
+        ASSERT_EQ_INT(e->state, SERVICE_DEAD);
+        ASSERT_EQ_INT(e->result, SERVICE_SUCCESS);
+        snprintf(path, sizeof(path), "%s/exited", dir);
+        read_file(path, v, sizeof(v));
+        ASSERT_STREQ(v, "after\n");
+
+        ASSERT_EQ_INT(unit_start(UNIT(mid)), 0);
+        ASSERT_EQ_INT(mid->state, SERVICE_EXEC_START);
+        ASSERT_EQ_INT(unit_stop(UNIT(mid)), 0);
+        ASSERT_EQ_INT(mid->state, SERVICE_STOP);
+        ASSERT_EQ_INT(mid->control_pid, 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, mid, 600));
+        snprintf(path, sizeof(path), "%s/midstart", dir);
+        ASSERT_TRUE(access(path, F_OK) < 0);
+
+        ASSERT_EQ_INT(unit_start(UNIT(w)), 0);
+        main_pid = w->main_pid;
+        ASSERT_EQ_INT(unit_stop(UNIT(w)), 0);
+        ASSERT_EQ_INT(w->state, SERVICE_EXEC_STOP);
+        ASSERT_TRUE(drive_until(m, service_settled_done, w, 600));
+        ASSERT_EQ_INT(w->state, SERVICE_FAILED);
+        ASSERT_EQ_INT(w->result, SERVICE_FAILURE_TIMEOUT);
+        ASSERT_EQ_INT(w->main_pid, 0);
+        ASSERT_EQ_INT(w->control_pid, 0);
+        ASSERT_TRUE(!pid_is_running(main_pid));
+        ASSERT_TRUE(w->timer_event == NULL);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+static bool service_stop_post_done(void *userdata) {
+        return ((Service *) userdata)->state == SERVICE_STOP_POST;
+}
+
+static bool service_exited_done(void *userdata) {
+        return ((Service *) userdata)->state == SERVICE_EXITED;
+}
+
+/* A SIGKILLed pid is gone within a second, zombie included once reaped. */
+static bool pid_dies_within(pid_t pid, int timeout_ms) {
+        int waited;
+
+        for (waited = 0; waited < timeout_ms; waited += 10) {
+                if (!pid_is_running(pid))
+                        return true;
+                test_sleep_ms(10);
+        }
+
+        return !pid_is_running(pid);
+}
+
+/*
+ * ExecStopPost=, the normal stop: it runs after ExecStop= and after the
+ * daemon has exited, every line in order, and the unit reaches DEAD only
+ * once the last line has. The daemon's own TERM trap writes between the two
+ * phases, so the file's order is the proof; the first line sleeps so the
+ * STOP_POST state itself can be observed with the main pid already gone.
+ */
+static void test_exec_stop_post_runs_last(void) {
+        Manager *m;
+        Service *s;
+        char *dir;
+        char unit[4 * PATH_MAX], path[PATH_MAX], v[256];
+        pid_t main_pid;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Service]\nType=simple\n"
+                 "ExecStart=/bin/sh -c \"trap 'echo term >> %s/order; exit 0' TERM; "
+                 "while :; do sleep 0.05; done\"\n"
+                 "ExecStop=/bin/sh -c \"echo stop >> %s/order\"\n"
+                 "ExecStopPost=/bin/sh -c \"echo post-one >> %s/order; sleep 0.2\"\n"
+                 "ExecStopPost=/bin/sh -c \"echo post-two >> %s/order\"\n",
+                 dir,
+                 dir,
+                 dir,
+                 dir);
+        s = load_service(m, dir, "stop-post.service", unit);
+        ASSERT_EQ_INT(s->n_exec_stop_post, 2);
+
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        ASSERT_EQ_INT(s->state, SERVICE_RUNNING);
+        main_pid = s->main_pid;
+        test_sleep_ms(100); /* past the shell's trap */
+
+        ASSERT_EQ_INT(unit_stop(UNIT(s)), 0);
+        ASSERT_EQ_INT(s->state, SERVICE_EXEC_STOP);
+
+        ASSERT_TRUE(drive_until(m, service_stop_post_done, s, 600));
+        ASSERT_EQ_INT(unit_active_state(UNIT(s)), UNIT_DEACTIVATING);
+        ASSERT_STREQ(service_state_to_string(s->state), "stop-post");
+        ASSERT_EQ_INT(s->main_pid, 0);
+        ASSERT_TRUE(s->control_pid > 0);
+        ASSERT_TRUE(!pid_is_running(main_pid));
+        ASSERT_EQ_INT(unit_stop(UNIT(s)), 0); /* already stopping */
+        ASSERT_EQ_INT(unit_start(UNIT(s)), -EAGAIN);
+
+        ASSERT_TRUE(drive_until(m, service_settled_done, s, 600));
+        ASSERT_EQ_INT(s->state, SERVICE_DEAD);
+        ASSERT_EQ_INT(s->result, SERVICE_SUCCESS);
+        ASSERT_EQ_INT(s->control_pid, 0);
+        ASSERT_TRUE(s->timer_event == NULL);
+
+        snprintf(path, sizeof(path), "%s/order", dir);
+        read_file(path, v, sizeof(v));
+        ASSERT_STREQ(v, "stop\nterm\npost-one\npost-two\n");
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * ExecStopPost= is the cleanup for a start that never got anywhere too: a
+ * failed ExecStartPre= and a crashed daemon both run it, and both still end
+ * FAILED with the original result. Whatever it leaves behind in the cgroup
+ * is killed before the unit is declared dead.
+ */
+static void test_exec_stop_post_after_failure(void) {
+        Manager *m;
+        Service *pre, *crash, *leak;
+        char *dir;
+        char unit[2 * PATH_MAX], path[PATH_MAX], v[64];
+        pid_t leftover;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Service]\nType=oneshot\nExecStartPre=/bin/false\n"
+                 "ExecStart=/bin/sh -c \"echo wrong > %s/started\"\n"
+                 "ExecStopPost=/bin/sh -c \"echo cleaned > %s/pre-cleaned\"\n",
+                 dir,
+                 dir);
+        pre = load_service(m, dir, "post-pre-fails.service", unit);
+
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Service]\nType=simple\nExecStart=/bin/sh -c \"sleep 0.1; exit 3\"\n"
+                 "ExecStopPost=/bin/sh -c \"echo cleaned > %s/crash-cleaned\"\n",
+                 dir);
+        crash = load_service(m, dir, "post-crash.service", unit);
+
+        write_forkd(dir, "leak.sh", "#!/bin/sh\ntrap '' HUP\nsleep 100 &\necho $! > \"$1\"\n");
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Service]\nType=simple\nExecStart=/bin/sleep 100\n"
+                 "ExecStopPost=%s/leak.sh %s/leftover\n",
+                 dir,
+                 dir);
+        leak = load_service(m, dir, "post-leak.service", unit);
+
+        ASSERT_EQ_INT(unit_start(UNIT(pre)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, pre, 600));
+        ASSERT_EQ_INT(pre->state, SERVICE_FAILED);
+        ASSERT_EQ_INT(pre->result, SERVICE_FAILURE_EXIT_CODE);
+        snprintf(path, sizeof(path), "%s/pre-cleaned", dir);
+        read_file(path, v, sizeof(v));
+        ASSERT_STREQ(v, "cleaned\n");
+        snprintf(path, sizeof(path), "%s/started", dir);
+        ASSERT_TRUE(access(path, F_OK) < 0);
+
+        ASSERT_EQ_INT(unit_start(UNIT(crash)), 0);
+        ASSERT_EQ_INT(crash->state, SERVICE_RUNNING);
+        ASSERT_TRUE(drive_until(m, service_settled_done, crash, 600));
+        ASSERT_EQ_INT(crash->state, SERVICE_FAILED);
+        ASSERT_EQ_INT(crash->result, SERVICE_FAILURE_EXIT_CODE);
+        snprintf(path, sizeof(path), "%s/crash-cleaned", dir);
+        read_file(path, v, sizeof(v));
+        ASSERT_STREQ(v, "cleaned\n");
+
+        ASSERT_EQ_INT(unit_start(UNIT(leak)), 0);
+        ASSERT_EQ_INT(unit_stop(UNIT(leak)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, leak, 600));
+        ASSERT_EQ_INT(leak->state, SERVICE_DEAD);
+        ASSERT_EQ_INT(leak->result, SERVICE_SUCCESS);
+        snprintf(path, sizeof(path), "%s/leftover", dir);
+        leftover = read_pid_file(path);
+        ASSERT_TRUE(leftover > 0);
+        ASSERT_TRUE(pid_dies_within(leftover, 1000));
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * A failing ExecStopPost= line fails the unit and ends the chain; with '-'
+ * it does neither. TimeoutStopSec= bounds a wedged line: it is killed, no
+ * further line runs, and the unit ends FAILED with result=timeout.
+ */
+static void test_exec_stop_post_failure_and_timeout(void) {
+        Manager *m;
+        Service *s, *d, *w;
+        char *dir;
+        char unit[2 * PATH_MAX], path[PATH_MAX], v[64];
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Service]\nType=simple\nExecStart=/bin/sleep 100\n"
+                 "ExecStopPost=/bin/false\nExecStopPost=/bin/sh -c \"echo x > %s/skipped\"\n",
+                 dir);
+        s = load_service(m, dir, "post-fails.service", unit);
+
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Service]\nType=simple\nExecStart=/bin/sleep 100\n"
+                 "ExecStopPost=-/bin/false\nExecStopPost=/bin/sh -c \"echo ran > %s/after-dash\"\n",
+                 dir);
+        d = load_service(m, dir, "post-dash.service", unit);
+
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Service]\nType=simple\nTimeoutStopSec=200ms\nExecStart=/bin/sleep 100\n"
+                 "ExecStopPost=-/bin/sleep 100\nExecStopPost=/bin/sh -c \"echo x > %s/after-timeout\"\n",
+                 dir);
+        w = load_service(m, dir, "post-wedged.service", unit);
+
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        ASSERT_EQ_INT(unit_stop(UNIT(s)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, s, 600));
+        ASSERT_EQ_INT(s->state, SERVICE_FAILED);
+        ASSERT_EQ_INT(s->result, SERVICE_FAILURE_EXIT_CODE);
+        snprintf(path, sizeof(path), "%s/skipped", dir);
+        ASSERT_TRUE(access(path, F_OK) < 0);
+
+        ASSERT_EQ_INT(unit_start(UNIT(d)), 0);
+        ASSERT_EQ_INT(unit_stop(UNIT(d)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, d, 600));
+        ASSERT_EQ_INT(d->state, SERVICE_DEAD);
+        ASSERT_EQ_INT(d->result, SERVICE_SUCCESS);
+        snprintf(path, sizeof(path), "%s/after-dash", dir);
+        read_file(path, v, sizeof(v));
+        ASSERT_STREQ(v, "ran\n");
+
+        ASSERT_EQ_INT(unit_start(UNIT(w)), 0);
+        ASSERT_EQ_INT(unit_stop(UNIT(w)), 0);
+        ASSERT_TRUE(drive_until(m, service_stop_post_done, w, 600));
+        ASSERT_TRUE(w->control_pid > 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, w, 600));
+        ASSERT_EQ_INT(w->state, SERVICE_FAILED);
+        ASSERT_EQ_INT(w->result, SERVICE_FAILURE_TIMEOUT);
+        ASSERT_EQ_INT(w->control_pid, 0);
+        ASSERT_TRUE(w->timer_event == NULL);
+        snprintf(path, sizeof(path), "%s/after-timeout", dir);
+        ASSERT_TRUE(access(path, F_OK) < 0);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * ExecCondition= exiting 1-254 skips the start: nothing after it runs, the
+ * unit ends DEAD with Result=exec-condition rather than FAILED,
+ * Restart=on-failure does not fire, ExecStopPost= still cleans up, and the
+ * start job completes -- a unit that Requires= it still starts, as it would
+ * not after a failure.
+ */
+static void test_exec_condition_skips_start(void) {
+        Manager *m;
+        Service *a, *b;
+        char *dir;
+        char unit[4 * PATH_MAX], path[PATH_MAX], v[256];
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Service]\nType=oneshot\nRemainAfterExit=yes\nRestart=on-failure\nRestartSec=0\n"
+                 "ExecCondition=/bin/sh -c \"echo cond >> %s/order; exit 1\"\n"
+                 "ExecStartPre=/bin/sh -c \"echo pre >> %s/order\"\n"
+                 "ExecStart=/bin/sh -c \"echo start >> %s/order\"\n"
+                 "ExecStopPost=/bin/sh -c \"echo post >> %s/order\"\n",
+                 dir,
+                 dir,
+                 dir,
+                 dir);
+        a = load_service(m, dir, "cond-a.service", unit);
+        b = load_service(
+                        m,
+                        dir,
+                        "cond-b.service",
+                        "[Unit]\nRequires=cond-a.service\nAfter=cond-a.service\n"
+                        "[Service]\nType=simple\nExecStart=/bin/sleep 100\n");
+        ASSERT_EQ_INT(a->n_exec_condition, 1);
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, UNIT(b), NULL), 0);
+        ASSERT_EQ_INT(manager_dispatch_run_queue(m), 1); /* only a ran */
+        ASSERT_EQ_INT(a->state, SERVICE_CONDITION);
+        ASSERT_EQ_INT(unit_active_state(UNIT(a)), UNIT_ACTIVATING);
+        ASSERT_TRUE(a->control_pid > 0);
+        ASSERT_EQ_INT(unit_start(UNIT(a)), 0); /* already starting */
+
+        ASSERT_TRUE(drive_until(m, jobs_idle_done, m, 600));
+        ASSERT_EQ_INT(a->state, SERVICE_DEAD);
+        ASSERT_EQ_INT(unit_active_state(UNIT(a)), UNIT_INACTIVE);
+        ASSERT_EQ_INT(a->result, SERVICE_SKIP_CONDITION);
+        ASSERT_STREQ(service_result_to_string(a->result), "exec-condition");
+        ASSERT_EQ_INT(a->n_restarts, 0);
+        ASSERT_TRUE(!UNIT(a)->condition_result);
+        ASSERT_EQ_INT(b->state, SERVICE_RUNNING);
+
+        snprintf(path, sizeof(path), "%s/order", dir);
+        read_file(path, v, sizeof(v));
+        ASSERT_STREQ(v, "cond\npost\n");
+
+        ASSERT_EQ_INT(unit_stop(UNIT(b)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, b, 600));
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * ExecCondition='s exit space, line by line. Every line must pass, '-'
+ * makes a line pass whatever it returns, and the first line that does not
+ * pass ends the chain (254 still skips). 255, a signal, and a condition
+ * binary that cannot be exec'd at all (pico-init's own exit 203, inside
+ * 1-254 but never the command's answer) fail the unit instead.
+ */
+static void test_exec_condition_exit_space(void) {
+        Manager *m;
+        Service *pass, *skip, *hard, *sig, *missing;
+        char *dir;
+        char unit[2 * PATH_MAX], path[PATH_MAX], v[64];
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Service]\nType=oneshot\nRemainAfterExit=yes\n"
+                 "ExecCondition=/bin/true\nExecCondition=-/bin/false\n"
+                 "ExecCondition=/bin/sh -c \"echo third >> %s/pass\"\n"
+                 "ExecStart=/bin/sh -c \"echo start >> %s/pass\"\n",
+                 dir,
+                 dir);
+        pass = load_service(m, dir, "cond-pass.service", unit);
+
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Service]\nType=oneshot\nExecCondition=/bin/sh -c \"exit 254\"\n"
+                 "ExecCondition=/bin/sh -c \"echo wrong > %s/second\"\n"
+                 "ExecStart=/bin/true\n",
+                 dir);
+        skip = load_service(m, dir, "cond-254.service", unit);
+
+        hard = load_service(
+                        m,
+                        dir,
+                        "cond-255.service",
+                        "[Service]\nType=oneshot\nExecCondition=/bin/sh -c \"exit 255\"\n"
+                        "ExecStart=/bin/true\n");
+        sig = load_service(
+                        m,
+                        dir,
+                        "cond-signal.service",
+                        "[Service]\nType=oneshot\nExecCondition=/bin/sh -c \"kill -KILL $$$$\"\n"
+                        "ExecStart=/bin/true\n");
+        missing = load_service(
+                        m,
+                        dir,
+                        "cond-missing.service",
+                        "[Service]\nType=oneshot\nExecCondition=/nonexistent/pico-init-no-such-condition\n"
+                        "ExecStart=/bin/true\n");
+
+        ASSERT_EQ_INT(unit_start(UNIT(pass)), 0);
+        ASSERT_TRUE(drive_until(m, service_exited_done, pass, 600));
+        ASSERT_EQ_INT(pass->state, SERVICE_EXITED);
+        ASSERT_EQ_INT(pass->result, SERVICE_SUCCESS);
+        snprintf(path, sizeof(path), "%s/pass", dir);
+        read_file(path, v, sizeof(v));
+        ASSERT_STREQ(v, "third\nstart\n");
+
+        ASSERT_EQ_INT(unit_start(UNIT(skip)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, skip, 600));
+        ASSERT_EQ_INT(skip->state, SERVICE_DEAD);
+        ASSERT_EQ_INT(skip->result, SERVICE_SKIP_CONDITION);
+        snprintf(path, sizeof(path), "%s/second", dir);
+        ASSERT_TRUE(access(path, F_OK) < 0);
+
+        ASSERT_EQ_INT(unit_start(UNIT(hard)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, hard, 600));
+        ASSERT_EQ_INT(hard->state, SERVICE_FAILED);
+        ASSERT_EQ_INT(hard->result, SERVICE_FAILURE_EXIT_CODE);
+
+        ASSERT_EQ_INT(unit_start(UNIT(sig)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, sig, 600));
+        ASSERT_EQ_INT(sig->state, SERVICE_FAILED);
+        ASSERT_EQ_INT(sig->result, SERVICE_FAILURE_SIGNAL);
+
+        ASSERT_EQ_INT(unit_start(UNIT(missing)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, missing, 600));
+        ASSERT_EQ_INT(missing->state, SERVICE_FAILED);
+        ASSERT_EQ_INT(missing->result, SERVICE_FAILURE_RESOURCES);
+
+        ASSERT_EQ_INT(unit_stop(UNIT(pass)), 0);
+        ASSERT_EQ_INT(pass->state, SERVICE_DEAD);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
         test_close_all_except_keeps_every_fd();
         test_lifecycle_simple();
@@ -2299,6 +2939,15 @@ int main(void) {
         test_replace_env_helpers();
         test_exec_line_expansion();
         test_exec_type_with_expanded_argv();
+        test_exec_stop_runs_before_signal();
+        test_no_exec_stop_is_unchanged();
+        test_exec_stop_failure_still_stops();
+        test_exec_stop_entry_points();
+        test_exec_stop_post_runs_last();
+        test_exec_stop_post_after_failure();
+        test_exec_stop_post_failure_and_timeout();
+        test_exec_condition_skips_start();
+        test_exec_condition_exit_space();
 
         printf("test-service: all checks passed\n");
         return 0;
