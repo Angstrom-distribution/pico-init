@@ -40,6 +40,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -1193,7 +1194,8 @@ static void usage(void) {
         fprintf(stderr,
                 "usage: picoctl [--root DIR] VERB [UNIT...] [--no-block]\n"
                 "verbs: status list-units is-active is-failed is-system-running show enable "
-                "disable is-enabled preset start stop restart reset-failed\n");
+                "disable is-enabled preset start stop restart reset-failed reboot poweroff halt\n"
+                "invoked as reboot/poweroff/halt/shutdown (no verb): same, immediately\n");
 }
 
 /*
@@ -1229,6 +1231,77 @@ static char *mangle_unit_arg(const char *arg) {
         return out;
 }
 
+/*
+ * reboot/poweroff/halt/shutdown: real systemctl's own mechanism for these,
+ * not a new one -- PID 1 already listens for exactly these signals
+ * (manager-loop.c's manager_dispatch_signal(): SIGINT -> MANAGER_REBOOT,
+ * SIGRTMIN+3/+4 -> MANAGER_POWEROFF, both real systemd's own ctrl-alt-del/
+ * shutdown-signal convention), it was simply never reachable from a
+ * command. picoctl itself needs no control-socket round trip for this --
+ * kill(1, sig) is the whole mechanism, same as real systemd's own
+ * reboot(8)/halt(8) fall back to when not run via D-Bus.
+ *
+ * /sbin/reboot, /sbin/poweroff, /sbin/halt and /sbin/shutdown are meant to
+ * be ALTERNATIVE-aliased straight at this binary (the recipe's own
+ * ALTERNATIVE_TARGET[reboot] etc., same mechanism as systemctl itself) --
+ * main() below dispatches on argv[0]'s basename before any verb parsing,
+ * exactly as real systemctl does for these same four names.
+ */
+static int send_pid1_signal(int sig, const char *what) {
+        if (kill(1, sig) < 0) {
+                fprintf(stderr, "picoctl: %s: kill(1, %d): %s\n", what, sig, strerror(errno));
+                return 1;
+        }
+        return 0;
+}
+
+static int cmd_reboot(int argc, char *argv[]) {
+        (void) argc;
+        (void) argv;
+        return send_pid1_signal(SIGINT, "reboot");
+}
+
+static int cmd_poweroff(int argc, char *argv[]) {
+        (void) argc;
+        (void) argv;
+        return send_pid1_signal(SIGRTMIN + 4, "poweroff");
+}
+
+static int cmd_halt(int argc, char *argv[]) {
+        (void) argc;
+        (void) argv;
+        return send_pid1_signal(SIGRTMIN + 3, "halt");
+}
+
+/*
+ * No scheduler and no wall(1) broadcast exist here -- `shutdown` only ever
+ * accepts the immediate case, same spirit as every other "not implemented,
+ * refuse rather than silently do something else" choice in this codebase.
+ * -h/-P means poweroff (the default, matching real shutdown(8)), -r reboot.
+ */
+static int cmd_shutdown(int argc, char *argv[]) {
+        bool do_reboot = false;
+        int i;
+
+        for (i = 0; i < argc; i++) {
+                if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--reboot") == 0)
+                        do_reboot = true;
+                else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "-P") == 0 ||
+                         strcmp(argv[i], "--poweroff") == 0)
+                        do_reboot = false;
+                else if (strcmp(argv[i], "now") == 0)
+                        continue;
+                else {
+                        fprintf(stderr,
+                                "picoctl: shutdown: no scheduler or wall message here, only "
+                                "'shutdown [-r|-h|-P] [now]'\n");
+                        return 1;
+                }
+        }
+
+        return do_reboot ? cmd_reboot(0, NULL) : cmd_poweroff(0, NULL);
+}
+
 int main(int argc, char *argv[]) {
         static const struct {
                 const char *name;
@@ -1248,9 +1321,26 @@ int main(int argc, char *argv[]) {
                 {              "stop",              cmd_stop },
                 {           "restart",           cmd_restart },
                 {      "reset-failed",      cmd_reset_failed },
+                {            "reboot",            cmd_reboot },
+                {          "poweroff",          cmd_poweroff },
+                {              "halt",              cmd_halt },
         };
+        const char *prog0;
         int argi = 1;
         size_t i;
+
+        /* argv[0] dispatch, before --root/verb parsing: a real reboot(8)/
+         * poweroff(8)/halt(8)/shutdown(8) invocation never passes a verb. */
+        prog0 = strrchr(argv[0], '/');
+        prog0 = prog0 ? prog0 + 1 : argv[0];
+        if (strcmp(prog0, "reboot") == 0)
+                return cmd_reboot(argc - 1, argv + 1);
+        if (strcmp(prog0, "poweroff") == 0)
+                return cmd_poweroff(argc - 1, argv + 1);
+        if (strcmp(prog0, "halt") == 0)
+                return cmd_halt(argc - 1, argv + 1);
+        if (strcmp(prog0, "shutdown") == 0)
+                return cmd_shutdown(argc - 1, argv + 1);
 
         while (argi < argc) {
                 if (strcmp(argv[argi], "--root") == 0 && argi + 1 < argc) {
