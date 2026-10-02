@@ -37,6 +37,7 @@
 #include "netd-loop.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
 #include <stddef.h>
@@ -374,11 +375,74 @@ static void netd_apply_static_ntp(Netd *n) {
         (void) netd_sntp_start(n->sntp);
 }
 
+/*
+ * net.core.default_qdisc / net.ipv4.tcp_congestion_control: applied once,
+ * system-wide, rather than per-link -- the kernel's own dev_init_scheduler()
+ * reads net.core.default_qdisc for every interface at creation time,
+ * including one a DHCP lease or a bnep PAN connection creates long after
+ * boot, so this needs no per-link rtnetlink work at all (netd-rtnl.c's own
+ * scope never covered TCA_QDISC, and does not need to for this).
+ *
+ * Each list is tried in order and the first value the kernel actually
+ * accepts wins; a value failing just means that qdisc/congestion-control
+ * module is not built into this particular kernel (this project's pico
+ * kernels are deliberately minimal -- see h2200/h3800's own
+ * CONFIG_NET_SCH_FQ_CODEL=y, with CONFIG_NET_SCH_FQ/CONFIG_NET_SCH_CAKE/
+ * CONFIG_TCP_CONG_BBR not yet added anywhere), not a bug here. Silent
+ * otherwise-than-debug-log: a bufferbloat-mitigating qdisc and a modern
+ * congestion control are both real quality improvements, never something
+ * to fail boot over.
+ */
+static void netd_set_default_qdisc_and_congestion_control(void) {
+        static const char *const qdiscs[] = { "fq_codel", "fq", "cake" };
+        static const char *const congestion_control[] = { "bbr" };
+        size_t i;
+
+        for (i = 0; i < sizeof(qdiscs) / sizeof(qdiscs[0]); i++) {
+                int fd = open("/proc/sys/net/core/default_qdisc", O_WRONLY | O_CLOEXEC);
+
+                if (fd < 0) {
+                        pico_log(PICO_LOG_DEBUG, "netd: default_qdisc: %s", strerror(errno));
+                        break; /* no /proc/sys/net/core/default_qdisc at all: CONFIG_NET_SCHED unset */
+                }
+
+                if (write(fd, qdiscs[i], strlen(qdiscs[i])) == (ssize_t) strlen(qdiscs[i])) {
+                        close(fd);
+                        pico_log(PICO_LOG_INFO, "netd: default_qdisc: %s", qdiscs[i]);
+                        break;
+                }
+
+                close(fd);
+        }
+
+        for (i = 0; i < sizeof(congestion_control) / sizeof(congestion_control[0]); i++) {
+                int fd = open("/proc/sys/net/ipv4/tcp_congestion_control", O_WRONLY | O_CLOEXEC);
+
+                if (fd < 0) {
+                        pico_log(PICO_LOG_DEBUG, "netd: tcp_congestion_control: %s", strerror(errno));
+                        break;
+                }
+
+                if (write(fd, congestion_control[i], strlen(congestion_control[i])) ==
+                    (ssize_t) strlen(congestion_control[i])) {
+                        close(fd);
+                        pico_log(PICO_LOG_INFO, "netd: tcp_congestion_control: %s", congestion_control[i]);
+                        break;
+                }
+
+                close(fd);
+        }
+}
+
 int netd_startup(Netd *n) {
         int r;
 
         if (!n)
                 return -EINVAL;
+
+        /* 0. System-wide, not per-link -- see the function's own comment for
+         * why this needs no rtnetlink work. Best-effort, logged either way. */
+        netd_set_default_qdisc_and_congestion_control();
 
         /*
          * 1. Clock floor, before anything timestamps anything (netd.h). Never
