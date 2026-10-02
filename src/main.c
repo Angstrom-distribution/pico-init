@@ -19,6 +19,7 @@
 #include "fstab-mount.h"
 #include "fstab.h"
 #include "gpt-scan.h"
+#include "hostname-setup.h"
 #include "manager.h"
 #include "mount-setup.h"
 #include "root-check.h"
@@ -81,6 +82,12 @@ int main(void) {
                 pico_log(PICO_LOG_WARNING, "dev_setup: %s", strerror(-r));
         else
                 pico_log(PICO_LOG_DEBUG, "dev_setup: %d /dev symlinks in place", r);
+
+        /* Needs the root filesystem mount_setup() left alone (/etc/hostname
+         * lives there) and nothing else; best-effort, same as dev_setup. */
+        r = hostname_setup();
+        if (r < 0)
+                pico_log(PICO_LOG_WARNING, "hostname_setup: %s", strerror(-r));
 
         /* Needs the /proc that mount_setup() just made, and must land before
          * the first service exists to write into a log socket. */

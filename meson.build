@@ -67,6 +67,7 @@ pico_init_core_sources = files(
   'src/manager-shutdown.c',
   'src/manager-startup.c',
   'src/mount-setup.c',
+  'src/hostname-setup.c',
   # The GPT reader and the Discoverable-Partitions swap activation on top of
   # it (plans/31, Slice A). In the core library rather than beside main.c
   # because the parser half is meant to have a second consumer later.
