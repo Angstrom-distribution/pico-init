@@ -855,6 +855,18 @@ static _Noreturn void
         if (sigprocmask(SIG_SETMASK, &empty, NULL) < 0)
                 _exit(PICO_EXIT_SIGNAL_MASK);
 
+        /*
+         * StandardInput=socket (service.h's ServiceStandardInput comment):
+         * the one accepted connection goes to fd 0/1 directly, never
+         * through LISTEN_FDS -- the two mechanisms are mutually exclusive
+         * in upstream too, a consumer using this one never calls
+         * sd_listen_fds(). n_sock_fds == 1 is socket.c's own invariant for
+         * an Accept=yes instance (exactly one connection fd); anything else
+         * here is a real bug upstream of this function, not something to
+         * paper over by picking fd 0 of several.
+         */
+        bool stdin_socket = s->standard_input == SERVICE_STANDARD_INPUT_SOCKET && n_sock_fds == 1;
+
         /* 5. Close everything this process inherited, except the fds being
          * passed for socket activation (sock_fds -- LISTEN_FDS) and the
          * logd stdout socket (stdout_fd, if create_stdout_socket()
@@ -884,8 +896,9 @@ static _Noreturn void
          * but this child's own consumer does not (O_NONBLOCK, FD_CLOEXEC).
          * Fatal on failure -- a partially-renumbered or still-CLOEXEC'd fd
          * is worse than not starting at all, since a consumer trusting
-         * LISTEN_FDS would silently read or write the wrong descriptor. */
-        if (n_sock_fds > 0) {
+         * LISTEN_FDS would silently read or write the wrong descriptor.
+         * Skipped entirely for stdin_socket -- see its own comment above. */
+        if (n_sock_fds > 0 && !stdin_socket) {
                 /*
                  * shift_fds() renumbers into [3, n_sock_fds + 2] and assumes
                  * every fd still open in that range is one of its OWN. The
@@ -949,44 +962,70 @@ static _Noreturn void
                 child_attach_cgroup(s->cgroup);
 
         /*
-         * 8. O_RDWR, not O_RDONLY (171ceb4a00): a read-only console dup'd
-         * onto stdin gives every read() a silent EBADF. Never
+         * 8. StandardInput=socket: the accepted connection replaces the
+         * console on all three of 0/1/2, matching upstream's own
+         * StandardOutput=inherit-from-stdin default for this case (classic
+         * inetd nowait semantics -- dropbear's own per-connection mode just
+         * reads/writes fd 0). Real systemd's own split (stdin=socket,
+         * stdout/stderr independently settable) is not carried: no consumer
+         * here wants anything else, and keeping the regular console path
+         * entirely separate from this one is what keeps both simple.
+         *
+         * Otherwise: O_RDWR, not O_RDONLY (171ceb4a00): a read-only console
+         * dup'd onto stdin gives every read() a silent EBADF. Never
          * vhangu()/reset/lock it (43efbc3959): every unit here shares this
          * same console, and clearing it out from under a concurrent writer
          * is a real boot deadlock in pico-init's design, not a hypothetical
          * one. stdin always comes from the console (plan §3.6) -- opened
          * first regardless of what stdout/stderr end up as below.
          */
-        fd = open(PICO_CONSOLE_PATH, O_RDWR | O_NOCTTY);
-        if (fd < 0)
-                _exit(PICO_EXIT_STDIN);
-        if (dup2(fd, STDIN_FILENO) < 0)
-                _exit(PICO_EXIT_STDIN);
+        if (stdin_socket) {
+                int cfd = sock_fds[0];
 
-        /*
-         * stdout/stderr: logd's socket when create_stdout_socket() (the
-         * PARENT, before fork()) succeeded, else the same console fd stdin
-         * just got -- the pre-J2 behaviour, unchanged, so an image without
-         * logd (or one where it simply is not listening yet) behaves
-         * exactly as before (plan §3.6). Either way both descriptors point
-         * at the SAME open file description, matching upstream's own
-         * stdout==stderr default and this file's pre-J2 console behaviour.
-         */
-        if (stdout_fd >= 0) {
-                if (dup2(stdout_fd, STDOUT_FILENO) < 0)
+                if (dup2(cfd, STDIN_FILENO) < 0)
+                        _exit(PICO_EXIT_STDIN);
+                if (dup2(cfd, STDOUT_FILENO) < 0)
                         _exit(PICO_EXIT_STDOUT);
-                if (dup2(stdout_fd, STDERR_FILENO) < 0)
+                if (dup2(cfd, STDERR_FILENO) < 0)
                         _exit(PICO_EXIT_STDERR);
-                if (stdout_fd > STDERR_FILENO)
+                if (cfd > STDERR_FILENO)
+                        close(cfd);
+                if (stdout_fd >= 0 && stdout_fd > STDERR_FILENO)
                         close(stdout_fd);
         } else {
-                if (dup2(fd, STDOUT_FILENO) < 0)
-                        _exit(PICO_EXIT_STDOUT);
-                if (dup2(fd, STDERR_FILENO) < 0)
-                        _exit(PICO_EXIT_STDERR);
+                fd = open(PICO_CONSOLE_PATH, O_RDWR | O_NOCTTY);
+                if (fd < 0)
+                        _exit(PICO_EXIT_STDIN);
+                if (dup2(fd, STDIN_FILENO) < 0)
+                        _exit(PICO_EXIT_STDIN);
+
+                /*
+                 * stdout/stderr: logd's socket when create_stdout_socket()
+                 * (the PARENT, before fork()) succeeded, else the same
+                 * console fd stdin just got -- the pre-J2 behaviour,
+                 * unchanged, so an image without logd (or one where it
+                 * simply is not listening yet) behaves exactly as before
+                 * (plan §3.6). Either way both descriptors point at the
+                 * SAME open file description, matching upstream's own
+                 * stdout==stderr default and this file's pre-J2 console
+                 * behaviour.
+                 */
+                if (stdout_fd >= 0) {
+                        if (dup2(stdout_fd, STDOUT_FILENO) < 0)
+                                _exit(PICO_EXIT_STDOUT);
+                        if (dup2(stdout_fd, STDERR_FILENO) < 0)
+                                _exit(PICO_EXIT_STDERR);
+                        if (stdout_fd > STDERR_FILENO)
+                                close(stdout_fd);
+                } else {
+                        if (dup2(fd, STDOUT_FILENO) < 0)
+                                _exit(PICO_EXIT_STDOUT);
+                        if (dup2(fd, STDERR_FILENO) < 0)
+                                _exit(PICO_EXIT_STDERR);
+                }
+                if (fd > STDERR_FILENO)
+                        close(fd);
         }
-        if (fd > STDERR_FILENO)
-                close(fd);
 
         /*
          * 9. 1fb0682e78: TIOCSCTTY is a real ioctl on a real tty; issuing it

@@ -633,6 +633,29 @@ static int config_parse_type(Unit *u, const char *path, unsigned line, const cha
 }
 
 /*
+ * StandardInput=socket is the one value real Accept=yes consumers actually
+ * need (see service.h's ServiceStandardInput comment) -- recognised here so
+ * socket.c's socket_instance_refused() (which refuses a connection to any
+ * instance that still carries "StandardInput" in its degraded-directives
+ * list) stops refusing it. Any other value is left exactly as before: not
+ * parsed, falls through to the generic unknown-directive degradation.
+ */
+static int config_parse_standard_input(Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        Service *s = unit_to_service(u, path, line);
+        (void) lvalue;
+
+        if (!s)
+                return 0;
+
+        if (strcmp(rvalue, "socket") == 0) {
+                s->standard_input = SERVICE_STANDARD_INPUT_SOCKET;
+                return 0;
+        }
+
+        return unit_add_degradation(u, "StandardInput");
+}
+
+/*
  * systemd's own boolean spellings (parse_boolean() in src/basic/parse-util.c):
  * 1/yes/y/true/t/on and 0/no/n/false/f/off, case-insensitively. Matching that
  * set exactly is part of the drop-in goal -- "RemainAfterExit=on" and "=true"
@@ -1532,6 +1555,7 @@ static const ConfigItem config_items[] = {
         {    SECTION_UNIT,      "ConditionPathExists",       config_parse_condition_path_exists },
         {    SECTION_UNIT, "ConditionPathIsDirectory", config_parse_condition_path_is_directory },
         { SECTION_SERVICE,                     "Type",                        config_parse_type },
+        { SECTION_SERVICE,            "StandardInput",            config_parse_standard_input },
         { SECTION_SERVICE,                "ExecStart",                  config_parse_exec_start },
         { SECTION_SERVICE,             "ExecStartPre",              config_parse_exec_start_pre },
         { SECTION_SERVICE,                 "ExecStop",                   config_parse_exec_stop },

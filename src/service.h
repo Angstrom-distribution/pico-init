@@ -69,6 +69,20 @@ typedef enum ServiceType {
         _SERVICE_TYPE_INVALID = -1,
 } ServiceType;
 
+/*
+ * StandardInput=. Only the one value a real Accept=yes consumer (oe-core's
+ * dropbear@.service) actually needs: the accepted connection duped onto fd
+ * 0 (and, matching upstream's own StandardOutput=inherit-from-stdin default
+ * for this case, fd 1 too) instead of handed over via LISTEN_FDS. Every
+ * other StandardInput= value (tty, file, data, ...) is unparsed and falls
+ * through to the generic degraded-directive path, same as before this
+ * existed.
+ */
+typedef enum ServiceStandardInput {
+        SERVICE_STANDARD_INPUT_NULL, /* default: console, same as today */
+        SERVICE_STANDARD_INPUT_SOCKET,
+} ServiceStandardInput;
+
 typedef enum ServiceState {
         SERVICE_DEAD,
         SERVICE_CONDITION,    /* ExecCondition= running as the control process */
@@ -118,6 +132,7 @@ typedef struct Service {
         ServiceType type;
         ServiceState state;
         ServiceResult result;
+        ServiceStandardInput standard_input; /* StandardInput=, default SERVICE_STANDARD_INPUT_NULL */
 
         /* argv-style NULL-terminated vectors, owned */
         char **exec_start_pre; /* may be NULL */
