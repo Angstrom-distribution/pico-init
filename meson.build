@@ -389,6 +389,20 @@ netd_exe = executable(
   install_dir: get_option('sbindir'),
 )
 
+# networkctl -- a client for netd, not a second copy of it (see netctl.c's own
+# header). bindir, not sbindir: reading network status is not a privileged
+# operation, matching picolog's own reasoning; aliased as "networkctl" by the
+# recipe's ALTERNATIVE, same mechanism as picoctl -> systemctl. No link to
+# netd_core or pico_init_core at all -- it talks to the kernel directly
+# (sysfs + getifaddrs(3)) and to netd's pid only via SIGHUP, not through any
+# of netd's own internals.
+netctl_exe = executable(
+  'netctl',
+  'src/netd/netctl.c',
+  install: true,
+  install_dir: get_option('bindir'),
+)
+
 # netd's own units (plan §2.7): $prefix/lib/systemd/system, not
 # $prefix/lib64 -- systemd's own convention for unit files even on a
 # multilib install, and the path meta-angstrom's recipe's FILES:netd already
