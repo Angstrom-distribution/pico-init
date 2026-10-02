@@ -66,6 +66,20 @@ static const MountPoint mount_table[] = {
          * the boot log is the thing to chase.
          */
         {  "cgroup2", "/sys/fs/cgroup",  "cgroup2",     "nsdelegate",      MS_NOSUID | MS_NOEXEC | MS_NODEV, false },
+
+        /*
+         * USB gadget (and any other configfs-based subsystem's) control
+         * tree. Without this mount, a kernel built with CONFIG_USB_CONFIGFS=y
+         * registers its "usb_gadget" group internally but nothing ever makes
+         * it visible: /sys/kernel/config exists as a bare sysfs directory
+         * either way, so `mkdir /sys/kernel/config/usb_gadget` fails with
+         * ENOENT the same way whether the kernel support is present or not --
+         * confirmed live on h2200 (CONFIG_USB_CONFIGFS=y in the running
+         * kernel's own .config, usb-multi-gadget.service still failing on
+         * this exact mkdir). systemd mounts this as one of its standard
+         * early API filesystems; it was simply missing here.
+         */
+        {  "configfs", "/sys/kernel/config", "configfs",        NULL,      MS_NOSUID | MS_NOEXEC | MS_NODEV, false },
 };
 
 /*
