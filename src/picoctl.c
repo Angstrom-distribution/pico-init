@@ -1196,6 +1196,39 @@ static void usage(void) {
                 "disable is-enabled preset start stop restart reset-failed\n");
 }
 
+/*
+ * Real systemctl auto-appends ".service" to a bare unit name with no type
+ * suffix (unit_name_mangle() in systemd's own src/shared/unit-name.c).
+ * picoctl never did this: unit-name.c's unit_name_is_valid() requires a
+ * recognised suffix and every verb below passes argv straight through to it
+ * (via manager_load_unit(), load_install_info(), ctrl_roundtrip(), ...), so
+ * "picoctl status bt-pan-client" looked for a unit literally named
+ * "bt-pan-client" and reported not-found even with bt-pan-client.service
+ * genuinely installed. Confirmed live on h2200 -- status, start and restart
+ * all hit this identically, for bt-pan-client, usb-multi-gadget and gpe-dm.
+ *
+ * Returns NULL (meaning: use `arg` unchanged) for anything that is not a
+ * bare identifier -- a flag (leading '-'), or an argument that already names
+ * a type (contains '.': foo.service, a glob pattern, foo.target...). A
+ * caller-owned, malloc'd ".service"-suffixed copy otherwise.
+ */
+static char *mangle_unit_arg(const char *arg) {
+        char *out;
+        size_t len;
+
+        if (!arg || arg[0] == '-' || strchr(arg, '.'))
+                return NULL;
+
+        len = strlen(arg);
+        out = malloc(len + sizeof(".service"));
+        if (!out)
+                return NULL;
+
+        memcpy(out, arg, len);
+        memcpy(out + len, ".service", sizeof(".service"));
+        return out;
+}
+
 int main(int argc, char *argv[]) {
         static const struct {
                 const char *name;
@@ -1239,8 +1272,30 @@ int main(int argc, char *argv[]) {
         }
 
         for (i = 0; i < sizeof(verbs) / sizeof(verbs[0]); i++)
-                if (strcmp(argv[argi], verbs[i].name) == 0)
-                        return verbs[i].fn(argc - argi - 1, argv + argi + 1);
+                if (strcmp(argv[argi], verbs[i].name) == 0) {
+                        int n = argc - argi - 1;
+                        char **orig = argv + argi + 1;
+                        char **mangled;
+                        int rc, j;
+
+                        mangled = n > 0 ? calloc((size_t) n, sizeof(char *)) : NULL;
+                        if (n > 0 && !mangled)
+                                return verbs[i].fn(n, orig); /* OOM: fall back unmangled */
+
+                        for (j = 0; j < n; j++) {
+                                char *m = mangle_unit_arg(orig[j]);
+                                mangled[j] = m ? m : orig[j];
+                        }
+
+                        rc = verbs[i].fn(n, n > 0 ? mangled : orig);
+
+                        for (j = 0; j < n; j++)
+                                if (mangled[j] != orig[j])
+                                        free(mangled[j]);
+                        free(mangled);
+
+                        return rc;
+                }
 
         fprintf(stderr, "picoctl: unknown verb '%s'\n", argv[argi]);
         usage();
