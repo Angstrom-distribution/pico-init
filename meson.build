@@ -477,6 +477,7 @@ devd_core_sources = files(
   'src/devd/devd-rules.c',
   'src/devd/devd-match.c',
   'src/devd/devd-run.c',
+  'src/devd/devd-modalias.c',
 )
 
 devd_core = static_library(

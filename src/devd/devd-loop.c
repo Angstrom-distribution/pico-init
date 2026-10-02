@@ -37,6 +37,7 @@
 #include "../gpt-scan.h"
 #include "../util.h"
 #include "devd-media.h"
+#include "devd-modalias.h"
 #include "devd-probe.h"
 #include "devd-symlink.h"
 #include "devd-uevent.h"
@@ -666,6 +667,10 @@ static void devd_process_uevent(Devd *d, const DevdUevent *u) {
         if (devd_rule_device_from_uevent(d->rule_device, d->sys_root, d->dev_root, u) == 0)
                 devd_rules_react(d, d->rule_device);
 
+        /* Independent of the rule engine above and of whether this is a block
+         * device at all -- see devd-modalias.h for why this exists. */
+        devd_modalias_autoload_uevent(d, u);
+
         r = devd_block_event(&d->block, u, now_monotonic(), &outcome, &disk, &part);
         if (r < 0) {
                 pico_log(PICO_LOG_DEBUG, "devd: unusable block uevent for %s", u->devpath);
@@ -812,6 +817,13 @@ static int devd_coldplug(Devd *d) {
                 pico_log(PICO_LOG_INFO, "devd: removed %d stale /dev/disk symlink(s)", r);
 
         coldplug_sweep_rule_links(d);
+
+        /* Before anything else below: a module a rule or the block core is
+         * about to depend on should already be requested by the time either
+         * runs, even though neither currently depends on one. See
+         * devd-modalias.h for why this exists and why it is not scoped to
+         * block/USB the way the two walks below are. */
+        devd_coldplug_modalias(d);
 
         /* Before the block core's own walk, so a rule that renames or
          * permissions a disk has run by the time it is mounted. */
