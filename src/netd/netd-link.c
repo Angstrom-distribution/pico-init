@@ -199,6 +199,8 @@ int link_new(Netd *n, const NetdRtnlLink *rl, Link **ret) {
         n->links = grown;
         n->links[n->n_links++] = l;
 
+        (void) link_write_state_file(l);
+
         if (ret)
                 *ret = l;
 
@@ -227,6 +229,8 @@ Link *link_free(Link *l) {
 
         if (l->lease)
                 l->lease = dhcp_lease_unref(l->lease);
+
+        (void) link_remove_state_file(l);
 
         if (n) {
                 for (size_t i = 0; i < n->n_links; i++)
@@ -658,7 +662,7 @@ fail:
 
 /* --- the state machine --- */
 
-int link_configure(Link *l) {
+static int link_configure_impl(Link *l) {
         Netd *n;
         Network *nw;
         bool converged = true;
@@ -782,6 +786,27 @@ int link_configure(Link *l) {
                 pico_log(PICO_LOG_WARNING, "netd: resolv.conf: %s", strerror(-r));
 
         return 0;
+}
+
+/*
+ * Public entry point: run the real logic above, then publish whatever state
+ * it settled on -- UNMANAGED/CONFIGURING/CONFIGURED/FAILED, every one of
+ * link_configure_impl()'s return paths -- in a single place rather than at
+ * each of its returns. Best-effort: a state file write failing is logged by
+ * link_write_state_file()'s own caller contract (none here -- see its
+ * header) and never turns a real configure success into a reported failure.
+ */
+int link_configure(Link *l) {
+        int r = link_configure_impl(l);
+
+        if (l) {
+                int wr = link_write_state_file(l);
+
+                if (wr < 0)
+                        pico_log(PICO_LOG_WARNING, "netd: %s: state file: %s", l->ifname, strerror(-wr));
+        }
+
+        return r;
 }
 
 int link_reconfigure(Link *l) {
@@ -1068,6 +1093,7 @@ int link_apply_lease(Link *l, DhcpLease *lease) {
 
         l->state = LINK_CONFIGURED;
         l->applying_lease = false;
+        (void) link_write_state_file(l);
         return 0;
 
 fail:
@@ -1094,6 +1120,7 @@ int link_lose_lease(Link *l) {
         r = link_teardown_kernel_state(l);
         l->state = LINK_CONFIGURING;
         l->applying_lease = false;
+        (void) link_write_state_file(l);
 
         return r;
 }
@@ -1237,6 +1264,104 @@ int link_remove_lease_file(Link *l) {
                 return -ENAMETOOLONG;
 
         r = netd_runtime_path(n, "leases", name, false, &path);
+        if (r < 0)
+                return r;
+
+        if (unlink(path) < 0 && errno != ENOENT) {
+                r = -errno;
+                free(path);
+                return r;
+        }
+
+        free(path);
+        return 0;
+}
+
+/* --- link state files --- */
+
+int link_write_state_file(Link *l) {
+        Netd *n;
+        char *path = NULL;
+        char name[32];
+        char tmp[PATH_MAX];
+        FILE *f;
+        int len, r;
+
+        if (!l)
+                return -EINVAL;
+
+        n = l->netd;
+
+        len = snprintf(name, sizeof(name), "%d", l->ifindex);
+        if (len < 0 || (size_t) len >= sizeof(name))
+                return -ENAMETOOLONG;
+
+        r = netd_runtime_path(n, "links", name, true, &path);
+        if (r < 0)
+                return r;
+
+        len = snprintf(tmp, sizeof(tmp), "%s.netd-tmp", path);
+        if (len < 0 || (size_t) len >= sizeof(tmp)) {
+                free(path);
+                return -ENAMETOOLONG;
+        }
+
+        f = fopen(tmp, "we");
+        if (!f) {
+                r = -errno;
+                free(path);
+                return r;
+        }
+
+        fprintf(f, "IFNAME=%s\n", l->ifname);
+        fprintf(f, "STATE=%s\n", link_state_to_string(l->state));
+        if (l->network && l->network->filename)
+                fprintf(f, "NETWORK=%s\n", l->network->filename);
+
+        if (fflush(f) != 0 || ferror(f)) {
+                r = -EIO;
+                goto fail;
+        }
+
+        if (fclose(f) != 0) {
+                r = -errno;
+                f = NULL;
+                goto fail_unlink;
+        }
+
+        if (rename(tmp, path) < 0) {
+                r = -errno;
+                goto fail_unlink;
+        }
+
+        free(path);
+        return 0;
+
+fail:
+        if (f)
+                (void) fclose(f);
+fail_unlink:
+        (void) unlink(tmp);
+        free(path);
+        return r;
+}
+
+int link_remove_state_file(Link *l) {
+        Netd *n;
+        char *path = NULL;
+        char name[32];
+        int len, r;
+
+        if (!l)
+                return -EINVAL;
+
+        n = l->netd;
+
+        len = snprintf(name, sizeof(name), "%d", l->ifindex);
+        if (len < 0 || (size_t) len >= sizeof(name))
+                return -ENAMETOOLONG;
+
+        r = netd_runtime_path(n, "links", name, false, &path);
         if (r < 0)
                 return r;
 

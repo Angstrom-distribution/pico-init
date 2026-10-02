@@ -245,4 +245,22 @@ int link_lose_lease(Link *l);
 int link_write_lease_file(Link *l);
 int link_remove_lease_file(Link *l);
 
+/* --- link state files --- */
+
+/*
+ * /run/netd/links/<ifindex>, same trivial documented text format and the
+ * same write-atomically discipline as the lease files above, but written
+ * for every link regardless of whether it ever gets a lease: a LINK_PENDING
+ * or LINK_UNMANAGED link never has one. Keys: IFNAME, STATE (one of
+ * link_state_to_string()'s own strings), and NETWORK (the matched .network
+ * file's path, omitted when l->network is NULL).
+ *
+ * Exists for networkctl (netctl.c, netd's own client) to report real setup
+ * state and the matched config file without any IPC to netd -- see that
+ * file's own header for why it reads kernel/netd state directly rather than
+ * inventing an IPC protocol.
+ */
+int link_write_state_file(Link *l);
+int link_remove_state_file(Link *l);
+
 const char *link_state_to_string(LinkState s);
