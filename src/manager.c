@@ -362,6 +362,22 @@ int manager_dispatch_load_queue(Manager *m) {
                  * an error for the queue as a whole, so the return is ignored
                  * deliberately rather than by omission. */
                 (void) unit_load(u);
+
+                /*
+                 * Publish on load, not just on the next active-state
+                 * transition. Every other manager_state_notify_unit() call
+                 * site (unit.c's unit_notify(), job.c, unit-reload.c,
+                 * manager-notify.c) fires only on a transition -- a unit
+                 * that loads cleanly but is simply never started (no
+                 * WantedBy=/Requires= pulled it in, nobody ran `picoctl
+                 * start` yet) never transitions, so it never got a state
+                 * file at all. picoctl status then reported "not-found" for
+                 * a unit that was genuinely loaded and valid -- confirmed
+                 * live on h2200 for bt-pan-client.service, not WantedBy=
+                 * anything and never auto-started. Real systemctl status on
+                 * the same case shows Loaded: loaded / Active: inactive.
+                 */
+                manager_state_notify_unit(u);
                 n++;
         }
 
