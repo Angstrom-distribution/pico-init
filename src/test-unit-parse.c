@@ -681,8 +681,50 @@ static void test_quoting_and_trailing_garbage(void) {
                                       "ExecStart=/bin/echo \"bar\"baz\n"),
                       0);
 
+        /* Single quotes group like double ones; the other quote is literal inside. */
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "g.service",
+                                      "[Service]\n"
+                                      "ExecStart=/bin/sh -c 'for i in 1 2; do echo \"x y\"; done' \"it's\"\n"),
+                      0);
+
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "h.service",
+                                      "[Unit]\n"
+                                      "Description=H\n"
+                                      "\n"
+                                      "[Service]\n"
+                                      "ExecStart=/bin/echo 'bar'baz\n"),
+                      0);
+
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "i.service",
+                                      "[Unit]\n"
+                                      "Description=I\n"
+                                      "\n"
+                                      "[Service]\n"
+                                      "ExecStart=/bin/echo 'open\n"),
+                      0);
+
         m = manager_for(dir);
         ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+
+        u = manager_get_unit(m, "g.service");
+        ASSERT_TRUE(u != NULL);
+        s = (Service *) u;
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        ASSERT_STREQ(s->exec_start[0], "/bin/sh");
+        ASSERT_STREQ(s->exec_start[1], "-c");
+        ASSERT_STREQ(s->exec_start[2], "for i in 1 2; do echo \"x y\"; done");
+        ASSERT_STREQ(s->exec_start[3], "it's");
+        ASSERT_TRUE(s->exec_start[4] == NULL);
+
+        u = manager_get_unit(m, "h.service");
+        ASSERT_TRUE(u != NULL);
+        ASSERT_EQ_INT(u->load_state, UNIT_ERROR);
+        u = manager_get_unit(m, "i.service");
+        ASSERT_TRUE(u != NULL);
+        ASSERT_EQ_INT(u->load_state, UNIT_ERROR);
 
         /* A quoted argument is one argument, quotes removed. */
         u = manager_get_unit(m, "e.service");

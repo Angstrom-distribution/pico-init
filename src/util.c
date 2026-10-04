@@ -298,7 +298,7 @@ char *pico_strv_env_get(char * const *l, const char *name) {
 int pico_extract_first_word(const char **state, char **ret) {
         const char *p = *state;
         char *buf, *w;
-        bool quoted = false;
+        char quote = '\0'; /* the open quote character, or 0 outside quotes */
 
         while (*p == ' ' || *p == '\t')
                 p++;
@@ -314,14 +314,19 @@ int pico_extract_first_word(const char **state, char **ret) {
 
         for (;;) {
                 if (*p == '\0') {
-                        if (quoted) {
+                        if (quote) {
                                 free(buf);
                                 return -EINVAL; /* unterminated quote */
                         }
                         break;
                 }
-                if (*p == '"') {
-                        if (quoted) {
+                /*
+                 * Either quote character opens a quoted run, as in
+                 * extract_first_word()'s UNQUOTE; inside one, the other
+                 * character is literal.
+                 */
+                if ((*p == '"' || *p == '\'') && (!quote || *p == quote)) {
+                        if (quote) {
                                 /*
                                  * Closing a quote: the next character must be
                                  * unquoted whitespace or end-of-string, or
@@ -341,7 +346,7 @@ int pico_extract_first_word(const char **state, char **ret) {
                                         return -EINVAL;
                                 }
                         }
-                        quoted = !quoted;
+                        quote = quote ? '\0' : *p;
                         p++;
                         continue;
                 }
@@ -350,7 +355,7 @@ int pico_extract_first_word(const char **state, char **ret) {
                         p += 2;
                         continue;
                 }
-                if (!quoted && (*p == ' ' || *p == '\t'))
+                if (!quote && (*p == ' ' || *p == '\t'))
                         break;
                 *w++ = *p++;
         }
