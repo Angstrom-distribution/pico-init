@@ -96,7 +96,8 @@ typedef struct LldpFrame {
         LldpSlice chassis;
         uint8_t port_subtype;
         LldpSlice port;
-        uint16_t ttl; /* seconds; 0 is a shutdown frame */
+        uint16_t ttl;     /* seconds; 0 is a shutdown frame */
+        uint16_t ttl_off; /* where the two TTL bytes sit in the frame */
 
         LldpSlice port_description;
         LldpSlice system_name;

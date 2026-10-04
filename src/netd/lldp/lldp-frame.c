@@ -162,6 +162,7 @@ int lldp_frame_parse(const uint8_t *frame, size_t len, LldpFrame *ret, const cha
                         if (length != 2)
                                 return reject(why, "TTL TLV has the wrong size");
                         f.ttl = be16(v);
+                        f.ttl_off = (uint16_t) pos;
                         break;
 
                 case LLDP_TLV_PORT_DESCRIPTION:

@@ -385,6 +385,7 @@ netd_own_sources = files(
   # LLDP (IEEE 802.1AB): the frame codec, the neighbour table and the receive
   # and transmit sides. Shaped after systemd's sd-lldp-rx/-tx and lldpd.
   'src/netd/lldp/lldp-frame.c',
+  'src/netd/lldp/lldp-table.c',
 )
 
 # The DHCPv4 implementation lifted from systemd v261.2 (commit 4925d9f07f).
@@ -502,6 +503,7 @@ netd_tests = [
   'test-netd-mac',
   # LLDP frame parser and builder: real frames, rejection rules, mutation run.
   'test-netd-lldp-frame',
+  'test-netd-lldp-table',
 ]
 
 foreach t : netd_tests
