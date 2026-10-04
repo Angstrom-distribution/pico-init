@@ -47,16 +47,16 @@ typedef struct MountPoint {
 } MountPoint;
 
 static const MountPoint mount_table[] = {
-        {     "proc",          "/proc",     "proc",             NULL,      MS_NOSUID | MS_NOEXEC | MS_NODEV,  true },
-        {    "sysfs",           "/sys",    "sysfs",             NULL,      MS_NOSUID | MS_NOEXEC | MS_NODEV,  true },
+        {     "proc",              "/proc",     "proc",             NULL,      MS_NOSUID | MS_NOEXEC | MS_NODEV,  true },
+        {    "sysfs",               "/sys",    "sysfs",             NULL,      MS_NOSUID | MS_NOEXEC | MS_NODEV,  true },
 
         /* Usually already mounted by the kernel (CONFIG_DEVTMPFS_MOUNT) or by
          * an initramfs; mounted here only for the case where it is not. */
-        { "devtmpfs",           "/dev", "devtmpfs",      "mode=0755",            MS_NOSUID | MS_STRICTATIME, false },
+        { "devtmpfs",               "/dev", "devtmpfs",      "mode=0755",            MS_NOSUID | MS_STRICTATIME, false },
 
-        {   "devpts",       "/dev/pts",   "devpts", "gid=5,mode=620",                 MS_NOSUID | MS_NOEXEC, false },
-        {    "tmpfs",       "/dev/shm",    "tmpfs",      "mode=1777", MS_NOSUID | MS_NODEV | MS_STRICTATIME, false },
-        {    "tmpfs",           "/run",    "tmpfs",      "mode=0755", MS_NOSUID | MS_NODEV | MS_STRICTATIME, false },
+        {   "devpts",           "/dev/pts",   "devpts", "gid=5,mode=620",                 MS_NOSUID | MS_NOEXEC, false },
+        {    "tmpfs",           "/dev/shm",    "tmpfs",      "mode=1777", MS_NOSUID | MS_NODEV | MS_STRICTATIME, false },
+        {    "tmpfs",               "/run",    "tmpfs",      "mode=0755", MS_NOSUID | MS_NODEV | MS_STRICTATIME, false },
 
         /*
          * The unified cgroup hierarchy this project's whole supervision layer
@@ -65,7 +65,7 @@ static const MountPoint mount_table[] = {
          * cgroups-v2.c degrades loudly when it is missing, and that warning in
          * the boot log is the thing to chase.
          */
-        {  "cgroup2", "/sys/fs/cgroup",  "cgroup2",     "nsdelegate",      MS_NOSUID | MS_NOEXEC | MS_NODEV, false },
+        {  "cgroup2",     "/sys/fs/cgroup",  "cgroup2",     "nsdelegate",      MS_NOSUID | MS_NOEXEC | MS_NODEV, false },
 
         /*
          * USB gadget (and any other configfs-based subsystem's) control
@@ -79,7 +79,7 @@ static const MountPoint mount_table[] = {
          * this exact mkdir). systemd mounts this as one of its standard
          * early API filesystems; it was simply missing here.
          */
-        {  "configfs", "/sys/kernel/config", "configfs",        NULL,      MS_NOSUID | MS_NOEXEC | MS_NODEV, false },
+        { "configfs", "/sys/kernel/config", "configfs",             NULL,      MS_NOSUID | MS_NOEXEC | MS_NODEV, false },
 };
 
 /*

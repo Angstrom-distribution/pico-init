@@ -146,7 +146,8 @@ static void print_short(const LogdEntry *e, bool show_all) {
         else if (msg && show_all)
                 print_escaped(msg->value, msg->value_len);
         else if (msg)
-                printf("[%zu bytes blob data]", msg->value_len); /* real's FORMAT_BYTES() wording (logs-show.c) */
+                printf("[%zu bytes blob data]",
+                       msg->value_len); /* real's FORMAT_BYTES() wording (logs-show.c) */
 
         putchar('\n');
 }

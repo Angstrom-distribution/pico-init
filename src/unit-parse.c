@@ -640,7 +640,8 @@ static int config_parse_type(Unit *u, const char *path, unsigned line, const cha
  * list) stops refusing it. Any other value is left exactly as before: not
  * parsed, falls through to the generic unknown-directive degradation.
  */
-static int config_parse_standard_input(Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+static int config_parse_standard_input(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
         Service *s = unit_to_service(u, path, line);
         (void) lvalue;
 
@@ -1555,7 +1556,7 @@ static const ConfigItem config_items[] = {
         {    SECTION_UNIT,      "ConditionPathExists",       config_parse_condition_path_exists },
         {    SECTION_UNIT, "ConditionPathIsDirectory", config_parse_condition_path_is_directory },
         { SECTION_SERVICE,                     "Type",                        config_parse_type },
-        { SECTION_SERVICE,            "StandardInput",            config_parse_standard_input },
+        { SECTION_SERVICE,            "StandardInput",              config_parse_standard_input },
         { SECTION_SERVICE,                "ExecStart",                  config_parse_exec_start },
         { SECTION_SERVICE,             "ExecStartPre",              config_parse_exec_start_pre },
         { SECTION_SERVICE,                 "ExecStop",                   config_parse_exec_stop },

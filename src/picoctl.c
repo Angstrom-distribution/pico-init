@@ -36,11 +36,11 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <signal.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -584,7 +584,8 @@ static void print_log_line(const LogdEntry *e) {
         if (msg && !msg->binary)
                 fwrite(msg->value, 1, msg->value_len, stdout);
         else if (msg)
-                printf("[%zu bytes blob data]", msg->value_len); /* real's FORMAT_BYTES() wording (logs-show.c) */
+                printf("[%zu bytes blob data]",
+                       msg->value_len); /* real's FORMAT_BYTES() wording (logs-show.c) */
 
         putchar('\n');
 }
@@ -665,7 +666,10 @@ static int cmd_status(int argc, char *argv[]) {
                  * bus property never shown in human status output at all. */
                 if (st.main_pid > 0) {
                         if (st.exec_main_code[0])
-                                printf("   Main PID: %d (code=%s, status=%d)\n", st.main_pid, st.exec_main_code, st.exec_main_status);
+                                printf("   Main PID: %d (code=%s, status=%d)\n",
+                                       st.main_pid,
+                                       st.exec_main_code,
+                                       st.exec_main_status);
                         else
                                 printf("   Main PID: %d\n", st.main_pid);
                 }

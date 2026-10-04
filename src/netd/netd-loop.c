@@ -394,8 +394,8 @@ static void netd_apply_static_ntp(Netd *n) {
  * to fail boot over.
  */
 static void netd_set_default_qdisc_and_congestion_control(void) {
-        static const char *const qdiscs[] = { "fq_codel", "fq", "cake" };
-        static const char *const congestion_control[] = { "bbr" };
+        static const char * const qdiscs[] = { "fq_codel", "fq", "cake" };
+        static const char * const congestion_control[] = { "bbr" };
         size_t i;
 
         for (i = 0; i < sizeof(qdiscs) / sizeof(qdiscs[0]); i++) {

@@ -391,9 +391,13 @@ static void status_one(const char *ifname) {
                         if (a->ifa_addr->sa_family != AF_INET && a->ifa_addr->sa_family != AF_INET6)
                                 continue;
                         if (getnameinfo(a->ifa_addr,
-                                         a->ifa_addr->sa_family == AF_INET ? sizeof(struct sockaddr_in)
-                                                                            : sizeof(struct sockaddr_in6),
-                                         host, sizeof host, NULL, 0, NI_NUMERICHOST) != 0)
+                                        a->ifa_addr->sa_family == AF_INET ? sizeof(struct sockaddr_in) :
+                                                                            sizeof(struct sockaddr_in6),
+                                        host,
+                                        sizeof host,
+                                        NULL,
+                                        0,
+                                        NI_NUMERICHOST) != 0)
                                 continue;
 
                         /* real dump_addresses() never appends a /prefix, per-link
@@ -442,7 +446,12 @@ static void status_all(void) {
         }
         if_freenameindex(list);
 
-        printf("%*s: %s\n", LABEL_WIDTH, "State", any_routable ? "routable" : any_carrier ? "carrier" : "no-carrier");
+        printf("%*s: %s\n",
+               LABEL_WIDTH,
+               "State",
+               any_routable                ? "routable" :
+                               any_carrier ? "carrier" :
+                                             "no-carrier");
         /* real system_status() always adds Online state right after State
          * (networkctl-status-system.c); netd has no separate online-state
          * concept, so this is honestly always "unknown". */
@@ -460,9 +469,14 @@ static void status_all(void) {
                                 if (a->ifa_addr->sa_family != AF_INET && a->ifa_addr->sa_family != AF_INET6)
                                         continue;
                                 if (getnameinfo(a->ifa_addr,
-                                                 a->ifa_addr->sa_family == AF_INET ? sizeof(struct sockaddr_in)
-                                                                                    : sizeof(struct sockaddr_in6),
-                                                 host, sizeof host, NULL, 0, NI_NUMERICHOST) != 0)
+                                                a->ifa_addr->sa_family == AF_INET ?
+                                                                sizeof(struct sockaddr_in) :
+                                                                sizeof(struct sockaddr_in6),
+                                                host,
+                                                sizeof host,
+                                                NULL,
+                                                0,
+                                                NI_NUMERICHOST) != 0)
                                         continue;
 
                                 collect_addr_on_iface(&addrs, a->ifa_name, if_nametoindex(a->ifa_name), host);
