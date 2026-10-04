@@ -1063,6 +1063,43 @@ static void test_is_system_running_fstab(void) {
         free(root);
 }
 
+/*
+ * `systemctl status` with no unit name shows the manager's own overview
+ * (systemctl-show.c show_system_status()), not an error -- the bug this
+ * milestone fixes (picoctl used to print "missing unit name" and exit 1).
+ * One active and one failed unit, exactly as the fixture name says, so
+ * State/Units/Jobs/Failed all have a real, assertable answer.
+ */
+static void test_status_no_argument_system_overview(void) {
+        char *root;
+        char rtdir[PATH_MAX], unitsdir[PATH_MAX + 16];
+        struct run_result res;
+
+        root = test_tmpdir_new();
+        ASSERT_TRUE(root != NULL);
+
+        snprintf(rtdir, sizeof(rtdir), "%s%s", root, PICO_RUNTIME_DIR);
+        snprintf(unitsdir, sizeof(unitsdir), "%s/units", rtdir);
+        ASSERT_EQ_INT(fixture_mkdir_p(unitsdir), 0);
+        ASSERT_EQ_INT(test_write_file(rtdir, "manager", "Objective=running\nNUnits=2\nNJobs=0\n"), 0);
+        ASSERT_EQ_INT(test_write_file(unitsdir, "demo.service", "ActiveState=active\nSubState=running\n"), 0);
+        ASSERT_EQ_INT(test_write_file(unitsdir,
+                                      "broken.service",
+                                      "ActiveState=failed\nSubState=failed\nResult=exit-code\n"),
+                      0);
+
+        RUN_PICOCTL(&res, "--root", root, "status");
+        ASSERT_EQ_INT(res.exit_code, 0); /* never an error, same as upstream */
+
+        ASSERT_TRUE(strstr(res.out, "State: degraded\n") != NULL); /* the failed unit above */
+        ASSERT_TRUE(strstr(res.out, "Units: 2 loaded (incl. loaded aliases)\n") != NULL);
+        ASSERT_TRUE(strstr(res.out, "Jobs: 0 queued\n") != NULL);
+        ASSERT_TRUE(strstr(res.out, "Failed: 1 units\n") != NULL);
+
+        test_rm_rf(root);
+        free(root);
+}
+
 int main(void) {
         test_enable_disable_is_enabled();
         test_preset();
@@ -1072,6 +1109,7 @@ int main(void) {
         test_read_verbs_against_real_boot();
         test_status_log_tail();
         test_is_system_running_fstab();
+        test_status_no_argument_system_overview();
         /* Last: it exit(77)s on a host without systemctl, and a SKIP must not
          * hide the in-process checks above. */
         test_oracle_symlinks_byte_identical();

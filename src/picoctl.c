@@ -420,62 +420,100 @@ static int cmd_list_units(int argc, char *argv[]) {
  * too, as a failed .mount unit does upstream. Those lines never become units
  * here -- the pass runs before the manager exists -- so they are read from the
  * pass's own record rather than from units/.
+ *
+ * Manager-file fields both this and the system-status overview need
+ * (manager-state.c's manager_state_notify_manager()): read once, here, so
+ * the two can never parse "NUnits="/"NJobs=" two different ways.
  */
-/* Split from cmd_is_system_running() so is-failed's own no-unit case
- * (cmd_is_failed(), below) can compute and report the exact same word
- * under its own -q, rather than re-deriving "degraded" a second way. */
-static int is_system_running_compute(bool quiet) {
-        char rt[PATH_MAX];
-        char manager_path[PATH_MAX + 16];
-        char unitsdir[PATH_MAX + 16];
+struct manager_state_info {
+        bool found;
+        unsigned n_units;
+        unsigned n_jobs;
+};
+
+static void read_manager_state(const char *runtime_dir, struct manager_state_info *out) {
+        char path[PATH_MAX + 16];
         FILE *f;
         char line[256];
-        DIR *d;
-        struct dirent *de;
-        unsigned n_jobs = 0;
-        bool any_failed = false;
 
-        if (path_join(rt, sizeof(rt), PICO_RUNTIME_DIR) < 0) {
-                if (!quiet)
-                        printf("offline\n");
-                return 1;
-        }
+        memset(out, 0, sizeof(*out));
 
-        snprintf(manager_path, sizeof(manager_path), "%s/manager", rt);
-        f = fopen(manager_path, "re");
-        if (!f) {
-                if (!quiet)
-                        printf("offline\n");
-                return 1;
-        }
+        snprintf(path, sizeof(path), "%s/manager", runtime_dir);
+        f = fopen(path, "re");
+        if (!f)
+                return;
+        out->found = true;
+
         while (fgets(line, sizeof(line), f)) {
                 unsigned v;
 
-                if (sscanf(line, "NJobs=%u", &v) == 1)
-                        n_jobs = v;
+                if (sscanf(line, "NUnits=%u", &v) == 1)
+                        out->n_units = v;
+                else if (sscanf(line, "NJobs=%u", &v) == 1)
+                        out->n_jobs = v;
         }
         fclose(f);
+}
 
-        if (n_jobs > 0) {
-                if (!quiet)
-                        printf("starting\n");
-                return 1;
+/* The one scan for ActiveState=failed under <runtime>/units -- shared by
+ * is_system_running_compute()'s any-failed check and the system-status
+ * overview's own "Failed: N units" row, so the two never drift apart. */
+static unsigned count_failed_units(const char *units_dir) {
+        DIR *d = opendir(units_dir);
+        struct dirent *de;
+        unsigned n = 0;
+
+        if (!d)
+                return 0;
+
+        while ((de = readdir(d))) {
+                struct unit_state st;
+
+                if (de->d_name[0] == '.')
+                        continue;
+                read_unit_state(de->d_name, &st);
+                if (strcmp(st.active_state, "failed") == 0)
+                        n++;
         }
+        closedir(d);
+        return n;
+}
+
+/* Print `word` unless quiet, copy it to word_out when the caller wants it
+ * (print_system_status()'s "State:" row does; is-system-running/is-failed's
+ * own plain output does not), return systemd's own exit code for it. */
+static int report_running_word(bool quiet, char *word_out, size_t word_out_size, const char *word, int code) {
+        if (!quiet)
+                printf("%s\n", word);
+        if (word_out && word_out_size)
+                snprintf(word_out, word_out_size, "%s", word);
+        return code;
+}
+
+/* Split from cmd_is_system_running() so is-failed's own no-unit case
+ * (cmd_is_failed(), below) -- and now print_system_status()'s "State:" row --
+ * can all read and report the exact same word, rather than re-deriving
+ * "degraded" a second way. word_out/word_out_size are optional (NULL/0): the
+ * two LSB-exit-code callers below don't need the word back, only its exit
+ * code and (unless quiet) its stdout line. */
+static int is_system_running_compute(bool quiet, char *word_out, size_t word_out_size) {
+        char rt[PATH_MAX];
+        char unitsdir[PATH_MAX + 16];
+        struct manager_state_info ms;
+        bool any_failed;
+
+        if (path_join(rt, sizeof(rt), PICO_RUNTIME_DIR) < 0)
+                return report_running_word(quiet, word_out, word_out_size, "offline", 1);
+
+        read_manager_state(rt, &ms);
+        if (!ms.found)
+                return report_running_word(quiet, word_out, word_out_size, "offline", 1);
+
+        if (ms.n_jobs > 0)
+                return report_running_word(quiet, word_out, word_out_size, "starting", 1);
 
         snprintf(unitsdir, sizeof(unitsdir), "%s/units", rt);
-        d = opendir(unitsdir);
-        if (d) {
-                while ((de = readdir(d))) {
-                        struct unit_state st;
-
-                        if (de->d_name[0] == '.')
-                                continue;
-                        read_unit_state(de->d_name, &st);
-                        if (strcmp(st.active_state, "failed") == 0)
-                                any_failed = true;
-                }
-                closedir(d);
-        }
+        any_failed = count_failed_units(unitsdir) > 0;
 
         if (!any_failed) {
                 char record[PATH_MAX];
@@ -485,22 +523,17 @@ static int is_system_running_compute(bool quiet) {
                         any_failed = true;
         }
 
-        if (any_failed) {
-                if (!quiet)
-                        printf("degraded\n");
-                return 1;
-        }
+        if (any_failed)
+                return report_running_word(quiet, word_out, word_out_size, "degraded", 1);
 
-        if (!quiet)
-                printf("running\n");
-        return 0;
+        return report_running_word(quiet, word_out, word_out_size, "running", 0);
 }
 
 static int cmd_is_system_running(int argc, char *argv[]) {
         (void) argc;
         (void) argv;
 
-        return is_system_running_compute(false);
+        return is_system_running_compute(false, NULL, 0);
 }
 
 /* --- is-active / is-failed: LSB init-script exit codes --- */
@@ -576,43 +609,117 @@ static int cmd_is_failed(int argc, char *argv[]) {
         if (n_units > 0)
                 return cmd_is_state_generic(argc, argv, "failed", 1); /* LSB 1: dead */
 
-        return is_system_running_compute(quiet);
+        return is_system_running_compute(quiet, NULL, 0);
 }
 
 /* --- status --- */
 
-/* The process list, read from cgroup.procs under the unit's cgroup -- the
- * same source upstream's own status block uses (plan §1.7). Best-effort: no
- * cgroup (never started, or supervision degraded per manager-state.h's own
- * "never cost the boot" rule) just means nothing to print here, not a
- * failure of the whole verb. */
-static void print_cgroup_procs(const char *unit_id) {
-        char cgroup_root[PATH_MAX];
-        char path[PATH_MAX + 64];
+/*
+ * Tree glyphs, byte for byte from upstream's glyph-util.c UTF-8 table
+ * (GLYPH_TREE_BRANCH/_RIGHT/_VERTICAL) -- the same table cgroup-show.c's
+ * show_pid_array()/show_cgroup_name() draw with. Locale/$TERM fallback to
+ * the ASCII "`-"/"|-" forms is real upstream behaviour too (glyph_full()'s
+ * emoji_enabled() check) but is bundled with colour support into a later
+ * change; hardcoding UTF-8 keeps this one change's job to the row/tree
+ * CONTENT, not terminal capability detection.
+ */
+#define PICOCTL_TREE_BRANCH "\xe2\x94\x9c\xe2\x94\x80" /* UTF8("├─") */
+#define PICOCTL_TREE_RIGHT "\xe2\x94\x94\xe2\x94\x80"  /* UTF8("└─") */
+#define PICOCTL_TREE_VERTICAL "\xe2\x94\x82 "          /* UTF8("│ ") */
+
+/*
+ * This walks live cgroupfs state of a shape nothing here controls (a
+ * misbehaving delegate could nest arbitrarily), unlike every other status
+ * row, which is bounded by picoctl's own finite unit list -- hence caps on
+ * depth, on children read per directory, and on total lines printed, none
+ * of which upstream itself needs.
+ */
+#define PICOCTL_CGROUP_MAX_DEPTH 8
+#define PICOCTL_CGROUP_MAX_CHILDREN 256
+#define PICOCTL_CGROUP_MAX_LINES 4096
+
+static unsigned cgroup_lines_printed;
+
+/* Mirrors upstream's cg_is_empty() (src/basic/cgroup-util.c): without this,
+ * every long-dead test/scope cgroup still sitting on disk clutters the tree
+ * forever, which real `systemctl status` never shows. The kernel's own
+ * "cgroup.events" "populated" field is already recursive -- 1 if this
+ * cgroup or any descendant holds a live process, 0 otherwise -- so one read
+ * decides whether to show (and recurse into) a child. Missing
+ * cgroup.events (ENOENT, same as upstream's r == -ENOENT case) means empty:
+ * a child mid-removal races the kernel, not a child to show. */
+static bool cgroup_is_populated(const char *path) {
+        char events_path[PATH_MAX + 32];
+        FILE *f;
+        char line[64];
+        bool populated = false;
+
+        snprintf(events_path, sizeof(events_path), "%s/cgroup.events", path);
+        f = fopen(events_path, "re");
+        if (!f)
+                return false;
+
+        while (fgets(line, sizeof(line), f)) {
+                int v;
+
+                if (sscanf(line, "populated %d", &v) == 1) {
+                        populated = v != 0;
+                        break;
+                }
+        }
+        fclose(f);
+        return populated;
+}
+
+/* strlen+memcpy+clamp, not snprintf(dir "/" name): `name` is a dirent's
+ * fixed-size d_name (cgroupfs child names are attacker/workload controlled,
+ * not picoctl's own finite unit list), the exact shape gcc -Os's format-
+ * truncation check already flagged once in this tree for ifname+ifindex
+ * (netctl.c's ifaddr_to_string()) -- skip a child silently rather than ever
+ * truncate into a wrong path. */
+static bool cgroup_path_join(char *out, size_t out_size, const char *dir, const char *name) {
+        size_t dlen = strlen(dir), nlen = strlen(name);
+
+        if (dlen + 1 + nlen + 1 > out_size)
+                return false;
+        memcpy(out, dir, dlen);
+        out[dlen] = '/';
+        memcpy(out + dlen + 1, name, nlen);
+        out[dlen + 1 + nlen] = '\0';
+        return true;
+}
+
+/* upstream's show_pid_array(): every pid in one cgroup.procs, in the same
+ * fixed-capacity read-then-print shape print_cgroup_procs() always used
+ * (plan §1.7) -- `more_after` is true when child cgroups will be printed
+ * below these pids, which is what decides branch-vs-corner glyph on the
+ * last one. */
+static void print_cgroup_pids(const char *path, const char *prefix, bool more_after) {
+        char procs_path[PATH_MAX + 32];
         FILE *f;
         char line[32];
-        bool header = false;
+        pid_t pids[PICOCTL_CGROUP_MAX_CHILDREN];
+        size_t n = 0, i;
 
-        if (path_join(cgroup_root, sizeof(cgroup_root), PICO_CGROUP_ROOT) < 0)
+        if (cgroup_lines_printed >= PICOCTL_CGROUP_MAX_LINES)
                 return;
-        snprintf(path, sizeof(path), "%s/system.slice/%s/cgroup.procs", cgroup_root, unit_id);
 
-        f = fopen(path, "re");
+        snprintf(procs_path, sizeof(procs_path), "%s/cgroup.procs", path);
+        f = fopen(procs_path, "re");
         if (!f)
                 return;
 
-        while (fgets(line, sizeof(line), f)) {
-                pid_t pid = (pid_t) atoi(line);
+        while (n < PICOCTL_CGROUP_MAX_CHILDREN && fgets(line, sizeof(line), f))
+                pids[n++] = (pid_t) atoi(line);
+        fclose(f);
+
+        for (i = 0; i < n && cgroup_lines_printed < PICOCTL_CGROUP_MAX_LINES; i++) {
                 char comm_path[64];
                 char comm[256] = "";
                 FILE *cf;
+                bool last_line = !more_after && i + 1 == n;
 
-                if (!header) {
-                        printf("     CGroup: %s/system.slice/%s\n", PICO_CGROUP_ROOT, unit_id);
-                        header = true;
-                }
-
-                snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", (int) pid);
+                snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", (int) pids[i]);
                 cf = fopen(comm_path, "re");
                 if (cf) {
                         if (fgets(comm, sizeof(comm), cf)) {
@@ -623,10 +730,101 @@ static void print_cgroup_procs(const char *unit_id) {
                         }
                         fclose(cf);
                 }
-                printf("             |- %d %s\n", (int) pid, comm);
+                printf("%s%s%d %s\n",
+                       prefix,
+                       last_line ? PICOCTL_TREE_RIGHT : PICOCTL_TREE_BRANCH,
+                       (int) pids[i],
+                       comm);
+                cgroup_lines_printed++;
+        }
+}
+
+/*
+ * upstream's show_cgroup_by_path() (src/shared/cgroup-show.c): this cgroup's
+ * own pids, then every child cgroup depth-first, branch glyph on every line
+ * but the very last at that level. Shared by print_cgroup_procs() (a single
+ * unit's cgroup) and print_system_status()'s CGroup row (the root cgroup) --
+ * the same code either way, per plan §1.7's "status <unit>" tree finally
+ * growing real glyphs rather than a flat "|-" list.
+ */
+static void print_cgroup_tree(const char *path, const char *prefix, unsigned depth) {
+        DIR *d;
+        struct dirent *de;
+        char *children[PICOCTL_CGROUP_MAX_CHILDREN];
+        size_t n_children = 0, i;
+
+        if (depth >= PICOCTL_CGROUP_MAX_DEPTH || cgroup_lines_printed >= PICOCTL_CGROUP_MAX_LINES)
+                return;
+
+        d = opendir(path);
+        if (!d)
+                return;
+
+        while (n_children < PICOCTL_CGROUP_MAX_CHILDREN && (de = readdir(d))) {
+                char childpath[PATH_MAX];
+                struct stat st;
+
+                if (de->d_name[0] == '.')
+                        continue;
+                if (!cgroup_path_join(childpath, sizeof(childpath), path, de->d_name))
+                        continue;
+                if (stat(childpath, &st) < 0 || !S_ISDIR(st.st_mode))
+                        continue;
+                if (!cgroup_is_populated(childpath))
+                        continue;
+
+                children[n_children] = strdup(de->d_name);
+                if (children[n_children])
+                        n_children++;
+        }
+        closedir(d);
+
+        print_cgroup_pids(path, prefix, n_children > 0);
+
+        for (i = 0; i < n_children && cgroup_lines_printed < PICOCTL_CGROUP_MAX_LINES; i++) {
+                bool last = (i + 1 == n_children);
+                char childpath[PATH_MAX];
+                char newprefix[PATH_MAX];
+
+                if (cgroup_path_join(childpath, sizeof(childpath), path, children[i])) {
+                        printf("%s%s%s\n", prefix, last ? PICOCTL_TREE_RIGHT : PICOCTL_TREE_BRANCH, children[i]);
+                        cgroup_lines_printed++;
+
+                        snprintf(newprefix,
+                                 sizeof(newprefix),
+                                 "%s%s",
+                                 prefix,
+                                 last ? "  " : PICOCTL_TREE_VERTICAL);
+                        print_cgroup_tree(childpath, newprefix, depth + 1);
+                }
         }
 
-        fclose(f);
+        for (i = 0; i < n_children; i++)
+                free(children[i]);
+}
+
+/* The process list, read from cgroup.procs under the unit's cgroup -- the
+ * same source upstream's own status block uses (plan §1.7). Best-effort: no
+ * cgroup (never started, or supervision degraded per manager-state.h's own
+ * "never cost the boot" rule) just means nothing to print here, not a
+ * failure of the whole verb. */
+static void print_cgroup_procs(const char *unit_id) {
+        char cgroup_root[PATH_MAX];
+        char unit_cgroup[PATH_MAX + 64];
+        DIR *d;
+
+        if (path_join(cgroup_root, sizeof(cgroup_root), PICO_CGROUP_ROOT) < 0)
+                return;
+        snprintf(unit_cgroup, sizeof(unit_cgroup), "%s/system.slice/%s", cgroup_root, unit_id);
+
+        d = opendir(unit_cgroup);
+        if (!d)
+                return;
+        closedir(d);
+
+        printf("     CGroup: %s/system.slice/%s\n", PICO_CGROUP_ROOT, unit_id);
+        cgroup_lines_printed = 0;
+        print_cgroup_tree(unit_cgroup, "             ", 0);
 }
 
 /* --- status: per-unit log tail --- */
@@ -728,12 +926,201 @@ static void print_log_tail(const char *unit_id) {
         logd_ring_free(ring);
 }
 
+/* --- status: no-argument system overview --- */
+
+/*
+ * Boot time, real upstream's UserspaceTimestamp-via-bus equivalent, but read
+ * from /proc/stat's own "btime" field -- a TRUE source independent of
+ * pico-init (it is the kernel's, published whether or not PID 1 itself is
+ * even picoctl's own manager) and not --root-relative, matching real
+ * systemctl: `--root` retargets the filesystem picoctl reads unit/manager
+ * state from, never the live kernel's own idea of when it booted.
+ */
+static bool read_proc_stat_btime(time_t *out) {
+        FILE *f = fopen("/proc/stat", "re");
+        char line[256];
+        bool found = false;
+
+        if (!f)
+                return false;
+
+        while (fgets(line, sizeof(line), f)) {
+                long long v;
+
+                if (sscanf(line, "btime %lld", &v) == 1) {
+                        *out = (time_t) v;
+                        found = true;
+                        break;
+                }
+        }
+        fclose(f);
+        return found;
+}
+
+/*
+ * format_timestamp_style(TIMESTAMP_PRETTY) + format_timestamp_relative()
+ * (src/basic/time-util.c), both reimplemented in whole seconds -- /proc/
+ * stat's btime has no finer resolution, so there is nothing truthful a
+ * microsecond field would add. Every threshold/wording below is copied from
+ * format_timestamp_relative_full(), just usec constants turned into their
+ * second equivalents (USEC_PER_YEAR=31557600s, USEC_PER_MONTH=2629800s).
+ */
+static void format_since_relative(time_t boot, char *buf, size_t size) {
+        long long d = (long long) time(NULL) - (long long) boot;
+        long long a, b;
+
+        if (d < 0)
+                d = 0;
+
+        if (d >= 31557600LL) {
+                a = d / 31557600LL;
+                b = (d % 31557600LL) / 2629800LL;
+                snprintf(buf,
+                         size,
+                         "%lld %s %lld %s ago",
+                         a,
+                         a == 1 ? "year" : "years",
+                         b,
+                         b == 1 ? "month" : "months");
+        } else if (d >= 2629800LL) {
+                a = d / 2629800LL;
+                b = (d % 2629800LL) / 86400LL;
+                snprintf(buf,
+                         size,
+                         "%lld %s %lld %s ago",
+                         a,
+                         a == 1 ? "month" : "months",
+                         b,
+                         b == 1 ? "day" : "days");
+        } else if (d >= 604800LL) {
+                a = d / 604800LL;
+                b = (d % 604800LL) / 86400LL;
+                snprintf(buf, size, "%lld %s %lld %s ago", a, a == 1 ? "week" : "weeks", b, b == 1 ? "day" : "days");
+        } else if (d >= 2 * 86400LL) {
+                snprintf(buf, size, "%lld days ago", d / 86400LL);
+        } else if (d >= 25 * 3600LL) {
+                snprintf(buf, size, "1 day %lldh ago", (d - 86400LL) / 3600LL);
+        } else if (d >= 6 * 3600LL) {
+                snprintf(buf, size, "%lldh ago", d / 3600LL);
+        } else if (d >= 3600LL) {
+                snprintf(buf, size, "%lldh %lldmin ago", d / 3600LL, (d % 3600LL) / 60LL);
+        } else if (d >= 5 * 60LL) {
+                snprintf(buf, size, "%lldmin ago", d / 60LL);
+        } else if (d >= 60LL) {
+                snprintf(buf, size, "%lldmin %llds ago", d / 60LL, d % 60LL);
+        } else if (d >= 1) {
+                snprintf(buf, size, "%llds ago", d);
+        } else {
+                snprintf(buf, size, "now");
+        }
+}
+
+/* "    Since: %s; %s\n" row: the absolute timestamp, upstream's own weekday
+ * + date + time + zone shape, then format_since_relative() above. */
+static void print_since_row(time_t boot) {
+        struct tm tmv;
+        char datebuf[64];
+        char relbuf[64];
+
+        if (!localtime_r(&boot, &tmv))
+                return;
+        /* upstream prefixes the 3-letter weekday itself (weekday_to_string())
+         * rather than trusting the current locale's %a, so this project's
+         * build does not have to be run under the C locale to match it. */
+        strftime(datebuf, sizeof(datebuf), "%a %Y-%m-%d %H:%M:%S %Z", &tmv);
+        format_since_relative(boot, relbuf, sizeof(relbuf));
+        printf("    Since: %s; %s\n", datebuf, relbuf);
+}
+
+/*
+ * systemctl-show.c's show_system_status(): the manager overview real
+ * `systemctl status` (no unit, no filter) prints. Every row below has a
+ * TRUE source -- the manager's own published state, /proc, or uname/
+ * gethostname -- and a row with none is simply left out; see picoctl's own
+ * change notes for exactly which upstream rows that is and why.
+ *
+ * Always exits 0: like upstream (verb_show() only propagates a hard bus
+ * error, never the state word itself, as a failure), a degraded or even
+ * offline system is successfully reported on, not a picoctl failure.
+ */
+static void print_system_status(void) {
+        char rt[PATH_MAX];
+        char unitsdir[PATH_MAX + 16];
+        char cgroup_root[PATH_MAX];
+        struct manager_state_info ms;
+        char hostname[256];
+        char word[16] = "";
+        unsigned n_failed = 0;
+        time_t boot;
+
+        memset(&ms, 0, sizeof(ms));
+        if (path_join(rt, sizeof(rt), PICO_RUNTIME_DIR) == 0) {
+                read_manager_state(rt, &ms);
+                snprintf(unitsdir, sizeof(unitsdir), "%s/units", rt);
+                n_failed = count_failed_units(unitsdir);
+        }
+
+        if (gethostname(hostname, sizeof(hostname)) < 0 || hostname[0] == '\0')
+                snprintf(hostname, sizeof(hostname), "(none)");
+        hostname[sizeof(hostname) - 1] = '\0';
+
+        /* glyph-util.c's GLYPH_BLACK_CIRCLE, UTF8("●"); its state-coloured
+         * variant is the colour change this is deliberately leaving for
+         * later (status.h's own header explains why one callsite, not two,
+         * matters here). */
+        printf("\xe2\x97\x8f %s\n", hostname);
+
+        is_system_running_compute(/* quiet= */ true, word, sizeof(word));
+        printf("    State: %s\n", word);
+
+        /* Only printed once a manager has actually published something --
+         * an offline system has no truthful loaded/queued count, not a "0"
+         * (manager-state.c's own NUnits=/NJobs= are what these mirror). */
+        if (ms.found) {
+                printf("    Units: %u loaded (incl. loaded aliases)\n", ms.n_units);
+                printf("     Jobs: %u queued\n", ms.n_jobs);
+                printf("   Failed: %u units\n", n_failed);
+        }
+
+        if (read_proc_stat_btime(&boot))
+                print_since_row(boot);
+
+        /* main.c's own boot banner ("pico-init " PICO_INIT_VERSION_STRING
+         * " running as PID 1") and `picoctl --version` both already use this
+         * label, not "systemd" -- "pico-init:" is coincidentally the same
+         * 10-column width upstream right-aligns every row label to. */
+        printf("pico-init: %s\n", PICO_INIT_VERSION_STRING);
+
+        /* Tainted: has no truthful source -- pico-init tracks no taint flags
+         * at all -- and real systemctl itself only prints this row when
+         * non-empty, so omitting it is consistent with upstream, not a gap
+         * in it. */
+
+        if (path_join(cgroup_root, sizeof(cgroup_root), PICO_CGROUP_ROOT) == 0) {
+                DIR *d = opendir(cgroup_root);
+
+                if (d) {
+                        closedir(d);
+                        /* pico-init only ever creates system.slice under this
+                         * root (cgroups-v2.h); the root cgroup itself is what
+                         * upstream's own control_group empty-string case
+                         * prints as "/" (empty_to_root()), so this matches
+                         * that literally, not just in spirit. */
+                        printf("   CGroup: /\n");
+                        cgroup_lines_printed = 0;
+                        print_cgroup_tree(cgroup_root, "             ", 0);
+                }
+        }
+}
+
 static int cmd_status(int argc, char *argv[]) {
         int i, worst = 0;
 
+        /* real verb_show()'s own argc<=1 dispatch (systemctl-show.c):
+         * no unit name inspects the manager itself, it is not an error. */
         if (argc < 1) {
-                fprintf(stderr, "picoctl status: missing unit name\n");
-                return 1;
+                print_system_status();
+                return 0;
         }
 
         for (i = 0; i < argc; i++) {
