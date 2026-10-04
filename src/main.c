@@ -80,6 +80,8 @@ int main(void) {
         bool fstab_swap;
         bool first_boot = false;
         Manager *m = NULL;
+        int64_t clock_target = 0;
+        int clock_restored;
         int objective;
         int r;
 
@@ -131,11 +133,8 @@ int main(void) {
          * forward from /etc/timestamp, its mtime and the build epoch, never
          * backwards; netd's NTP sync corrects it later.
          */
-        r = clock_persist_restore(CLOCK_PERSIST_FILE, (int64_t) time(NULL), clock_persist_set_realtime);
-        if (r > 0)
-                pico_log(PICO_LOG_INFO, "clock set forward from " CLOCK_PERSIST_FILE);
-        else if (r < 0)
-                pico_log(PICO_LOG_WARNING, "clock restore: %s", strerror(-r));
+        clock_restored = clock_persist_restore(
+                        CLOCK_PERSIST_FILE, (int64_t) time(NULL), clock_persist_set_realtime, &clock_target);
 
         /* Needs the /proc that mount_setup() just made, and must land before
          * the first service exists to write into a log socket. */
@@ -171,6 +170,18 @@ int main(void) {
          * of that split.
          */
         pico_log(PICO_LOG_INFO, "pico-init " PICO_INIT_VERSION_STRING " running as PID 1");
+
+        /* The restore above ran before this process logged anywhere that is kept,
+         * so it is reported here. */
+        if (clock_restored > 0) {
+                char stamp[CLOCK_PERSIST_TEXT_MAX];
+
+                if (clock_persist_format(clock_target, stamp) > 0)
+                        pico_log(PICO_LOG_INFO,
+                                 "clock moved forward to %.14s UTC from " CLOCK_PERSIST_FILE,
+                                 stamp);
+        } else if (clock_restored < 0)
+                pico_log(PICO_LOG_WARNING, "clock restore: %s", strerror(-clock_restored));
 
         /*
          * And the console channel itself, opened here rather than lazily on

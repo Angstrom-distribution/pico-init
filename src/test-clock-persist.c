@@ -114,7 +114,12 @@ static void test_restore(void) {
         /* No file: the epoch still applies, once. */
         set_calls = 0;
         set_result = 0;
-        ASSERT_EQ_INT(clock_persist_restore(path, 23, fake_set), 1);
+        {
+                int64_t reported = 0;
+
+                ASSERT_EQ_INT(clock_persist_restore(path, 23, fake_set, &reported), 1);
+                ASSERT_TRUE(reported == CLOCK_PERSIST_EPOCH_SEC);
+        }
         ASSERT_EQ_INT(set_calls, 1);
         ASSERT_TRUE(set_to == CLOCK_PERSIST_EPOCH_SEC);
 
@@ -123,23 +128,23 @@ static void test_restore(void) {
          * assert only that the result is at least the saved time). */
         ASSERT_EQ_INT(test_write_file(dir, "timestamp", "20261004180000\n"), 0);
         set_calls = 0;
-        ASSERT_EQ_INT(clock_persist_restore(path, 23, fake_set), 1);
+        ASSERT_EQ_INT(clock_persist_restore(path, 23, fake_set, NULL), 1);
         ASSERT_TRUE(set_to >= T_2026_10_04_18_00_00);
 
         /* A garbled file is not an error: the epoch (and the mtime) still apply. */
         ASSERT_EQ_INT(test_write_file(dir, "timestamp", "garbage\n"), 0);
         set_calls = 0;
-        ASSERT_EQ_INT(clock_persist_restore(path, 23, fake_set), 1);
+        ASSERT_EQ_INT(clock_persist_restore(path, 23, fake_set, NULL), 1);
         ASSERT_TRUE(set_to >= CLOCK_PERSIST_EPOCH_SEC);
 
         /* A clock already past every floor: nothing is set. */
         set_calls = 0;
-        ASSERT_EQ_INT(clock_persist_restore(path, CLOCK_PERSIST_MAX_SEC, fake_set), 0);
+        ASSERT_EQ_INT(clock_persist_restore(path, CLOCK_PERSIST_MAX_SEC, fake_set, NULL), 0);
         ASSERT_EQ_INT(set_calls, 0);
 
         /* The setter failing is reported. */
         set_result = -EPERM;
-        ASSERT_EQ_INT(clock_persist_restore(path, 23, fake_set), -EPERM);
+        ASSERT_EQ_INT(clock_persist_restore(path, 23, fake_set, NULL), -EPERM);
 
         test_rm_rf(dir);
         free(dir);

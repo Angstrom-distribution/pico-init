@@ -63,10 +63,11 @@ bool clock_persist_decide(int64_t file_sec, int64_t mtime_sec, int64_t now_sec, 
 /*
  * Reads `path`, decides, and calls set(target) when the clock needs to move
  * forward. A missing or garbled file is not an error: the epoch still applies.
- * 1 when set() ran and succeeded, 0 when nothing needed doing, -errno when
- * set() failed (its own return value).
+ * 1 when set() ran and succeeded (the time it set is stored in *ret_target
+ * when that is not NULL), 0 when nothing needed doing, -errno when set()
+ * failed (its own return value).
  */
-int clock_persist_restore(const char *path, int64_t now_sec, int (*set)(int64_t sec));
+int clock_persist_restore(const char *path, int64_t now_sec, int (*set)(int64_t sec), int64_t *ret_target);
 
 /*
  * Writes now_sec to `path`, atomically (temp file in the same directory,

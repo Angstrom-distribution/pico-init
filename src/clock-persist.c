@@ -128,7 +128,7 @@ static void read_state(const char *path, int64_t *ret_file_sec, int64_t *ret_mti
         }
 }
 
-int clock_persist_restore(const char *path, int64_t now_sec, int (*set)(int64_t sec)) {
+int clock_persist_restore(const char *path, int64_t now_sec, int (*set)(int64_t sec), int64_t *ret_target) {
         int64_t file_sec, mtime_sec, target;
         int r;
 
@@ -143,6 +143,8 @@ int clock_persist_restore(const char *path, int64_t now_sec, int (*set)(int64_t 
         r = set(target);
         if (r < 0)
                 return r;
+        if (ret_target)
+                *ret_target = target;
         return 1;
 }
 
