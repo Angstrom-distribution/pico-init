@@ -39,6 +39,7 @@ typedef struct Network Network;
 typedef struct DhcpClient DhcpClient;
 typedef struct DhcpServer DhcpServer;
 typedef struct DhcpLease DhcpLease;
+typedef struct LldpLink LldpLink;
 
 /*
  * Per-link states. Deliberately coarser than networkd's two-axis
@@ -87,6 +88,9 @@ struct Link {
          * failed renewal never leaves the link with no lease at all.
          */
         DhcpLease *lease;
+
+        /* LLDP receive/transmit, owned; NULL unless the .network asked for either. */
+        LldpLink *lldp;
 
         /*
          * What netd actually put into the kernel, so teardown removes exactly

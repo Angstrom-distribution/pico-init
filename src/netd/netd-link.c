@@ -28,6 +28,7 @@
 #include "dhcp/dhcp-lease-internal.h"
 #include "dhcp/dhcp-server-internal.h"
 #include "dhcp/siphash24.h"
+#include "lldp/lldp-link.h"
 #include "netd-network.h"
 #include "netd-resolv.h"
 #include "netd-sntp.h"
@@ -435,6 +436,7 @@ static int apply_static_gateway(Link *l, const Network *nw) {
  * teardown helpers they share with link_deconfigure() itself. */
 static void link_stop_dhcp_client(Link *l);
 static void link_stop_dhcp_server(Link *l);
+static void link_sync_lldp(Link *l, const Network *nw);
 
 /* --- DHCPv4 client --- */
 
@@ -960,6 +962,8 @@ static int link_configure_impl(Link *l) {
                 /* DHCPServer= was removed by a reload: stop serving. */
                 link_stop_dhcp_server(l);
 
+        link_sync_lldp(l, nw);
+
         l->state = converged ? LINK_CONFIGURED : LINK_CONFIGURING;
 
         /* Static DNS= may have just changed; not incremental, see
@@ -1128,6 +1132,66 @@ static void link_stop_dhcp_server(Link *l) {
         link_release_dhcp_object(l, server, dhcp_server_unref_void, "DHCP server");
 }
 
+/* Sends the shutdown frame, then queues the object for release (see link_release_dhcp_object()). */
+static void link_stop_lldp(Link *l) {
+        LldpLink *lldp = l->lldp;
+
+        if (!lldp)
+                return;
+
+        lldp_link_stop(lldp);
+        l->lldp = NULL;
+        link_release_dhcp_object(l, lldp, lldp_link_free_void, "LLDP state");
+}
+
+static void link_lldp_update_address(Link *l) {
+        if (l->lldp)
+                lldp_link_set_address(l->lldp, l->address_configured, l->address);
+}
+
+/*
+ * Brings LLDP in line with LLDP=/EmitLLDP=. Only Ethernet-type links with a
+ * 6 byte address can carry it. Failure is logged and leaves LLDP off on this
+ * link; it never fails the link, which has nothing to do with its neighbours.
+ */
+static void link_sync_lldp(Link *l, const Network *nw) {
+        LldpLinkConfig cfg = {
+                .rx = nw->lldp != NETWORK_LLDP_NO,
+                .routers_only = nw->lldp == NETWORK_LLDP_ROUTERS_ONLY,
+                .tx = nw->emit_lldp != NETWORK_EMIT_LLDP_NO,
+                .tx_scope = nw->emit_lldp == NETWORK_EMIT_LLDP_NO ? LLDP_SCOPE_NEAREST_BRIDGE :
+                                                                    (LldpScope) (nw->emit_lldp - 1),
+        };
+        NetdId128 mid;
+        bool have_mid;
+        int r;
+
+        if ((!cfg.rx && !cfg.tx) || (l->flags & IFF_LOOPBACK) || l->arp_type != ARPHRD_ETHER ||
+            l->hw_addr_len != 6) {
+                link_stop_lldp(l);
+                return;
+        }
+
+        if (!l->lldp) {
+                r = lldp_link_new(l->netd, l->ifindex, l->ifname, &l->lldp);
+                if (r < 0) {
+                        pico_log(PICO_LOG_WARNING, "netd: %s: LLDP: %s", l->ifname, strerror(-r));
+                        return;
+                }
+        }
+
+        have_mid = netd_machine_id(&mid) >= 0 && !id128_is_null(&mid);
+        r = lldp_link_configure(l->lldp, &cfg, l->hw_addr, have_mid ? mid.bytes : NULL);
+        if (r < 0) {
+                pico_log(PICO_LOG_WARNING, "netd: %s: LLDP: cannot start: %s", l->ifname, strerror(-r));
+                link_stop_lldp(l);
+                return;
+        }
+
+        link_lldp_update_address(l);
+        lldp_link_set_carrier(l->lldp, (l->flags & (IFF_UP | IFF_RUNNING)) == (IFF_UP | IFF_RUNNING));
+}
+
 int link_deconfigure(Link *l) {
         if (!l)
                 return -EINVAL;
@@ -1141,6 +1205,7 @@ int link_deconfigure(Link *l) {
 
         link_stop_dhcp_client(l);
         link_stop_dhcp_server(l);
+        link_stop_lldp(l);
 
         return link_teardown_kernel_state(l);
 }
@@ -1276,6 +1341,7 @@ int link_apply_lease(Link *l, DhcpLease *lease) {
 
         l->state = LINK_CONFIGURED;
         l->applying_lease = false;
+        link_lldp_update_address(l);
         (void) link_write_state_file(l);
         return 0;
 
@@ -1303,6 +1369,7 @@ int link_lose_lease(Link *l) {
         r = link_teardown_kernel_state(l);
         l->state = LINK_CONFIGURING;
         l->applying_lease = false;
+        link_lldp_update_address(l);
         (void) link_write_state_file(l);
 
         return r;

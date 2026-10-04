@@ -386,6 +386,7 @@ netd_own_sources = files(
   # and transmit sides. Shaped after systemd's sd-lldp-rx/-tx and lldpd.
   'src/netd/lldp/lldp-frame.c',
   'src/netd/lldp/lldp-table.c',
+  'src/netd/lldp/lldp-link.c',
 )
 
 # The DHCPv4 implementation lifted from systemd v261.2 (commit 4925d9f07f).
@@ -504,6 +505,8 @@ netd_tests = [
   # LLDP frame parser and builder: real frames, rejection rules, mutation run.
   'test-netd-lldp-frame',
   'test-netd-lldp-table',
+  # LLDP over a veth pair in a private network namespace.
+  'test-netd-lldp-link',
 ]
 
 foreach t : netd_tests

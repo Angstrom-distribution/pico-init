@@ -843,6 +843,7 @@ static const char * const netd_epoll_source_table[_NETD_EPOLL_SOURCE_MAX] = {
         [NETD_EPOLL_DHCP_CLIENT] = "dhcp-client",
         [NETD_EPOLL_DHCP_SERVER] = "dhcp-server",
         [NETD_EPOLL_SNTP] = "sntp",
+        [NETD_EPOLL_LLDP] = "lldp",
 };
 
 const char *netd_epoll_source_to_string(NetdEpollSource s) {
