@@ -17,6 +17,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <limits.h>
+#include <net/if_arp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +27,7 @@
 #include "dhcp/dhcp-client-internal.h"
 #include "dhcp/dhcp-lease-internal.h"
 #include "dhcp/dhcp-server-internal.h"
+#include "dhcp/siphash24.h"
 #include "netd-network.h"
 #include "netd-resolv.h"
 #include "netd-sntp.h"
@@ -660,6 +662,164 @@ fail:
         return r;
 }
 
+/* --- persistent MAC for a random-hardware-address link --- */
+
+/*
+ * include/linux/netdevice.h's enum netdev_addr_type, read back out of
+ * /sys/class/net/<if>/addr_assign_type as a plain integer -- not a UAPI
+ * header, so these four values are transcribed rather than #include'd.
+ * Stable since the sysfs attribute was added and documented at
+ * Documentation/ABI/testing/sysfs-class-net; confirmed against the build
+ * container's own kernel headers before this lands, not re-derived here.
+ */
+#define NETD_NET_ADDR_PERM 0
+#define NETD_NET_ADDR_RANDOM 1
+#define NETD_NET_ADDR_STOLEN 2
+#define NETD_NET_ADDR_SET 3
+
+/* *out is one of the NETD_NET_ADDR_* values above. false when the
+ * attribute is missing or unreadable (a kernel too old to have it, or a
+ * link type that never gets one) -- the caller treats that the same as any
+ * other "nothing to go on", never guessing. */
+static bool link_read_addr_assign_type(const char *ifname, unsigned *out) {
+        char path[128];
+        FILE *f;
+        int v;
+
+        snprintf(path, sizeof path, "/sys/class/net/%s/addr_assign_type", ifname);
+        f = fopen(path, "re");
+        if (!f)
+                return false;
+
+        if (fscanf(f, "%d", &v) != 1) {
+                fclose(f);
+                return false;
+        }
+        fclose(f);
+
+        *out = (unsigned) v;
+        return true;
+}
+
+/*
+ * Upstream's own HASH_KEY for net_get_unique_predictable_data_from_name()
+ * (systemd netif-util.c) -- cited by name so this constant can be checked
+ * directly against that source. Not dhcp-client-id.c's own HASH_KEY, which
+ * is a different constant for a different purpose (the DHCP DUID-derived
+ * client id) -- the two must never be conflated.
+ */
+static const uint8_t PERSISTENT_MAC_HASH_KEY[16] = {
+        0xd3, 0x1e, 0x48, 0xfa, 0x90, 0xfe, 0x4b, 0x4c, 0x9d, 0xaf, 0xd5, 0xd7, 0xa1, 0xb1, 0x2e, 0x8a,
+};
+
+/* True when every byte of a 16-byte id is 0 -- an uninitialized placeholder
+ * /etc/machine-id, not a real identity yet. netd_machine_id() (netd-compat.h)
+ * does not reject this on its own (it only rejects a short/malformed file),
+ * so link_apply_persistent_mac() checks it at this one call site rather than
+ * changing that function's contract for dhcp-client-id.c's own, unrelated
+ * caller. */
+static bool id128_is_null(const NetdId128 *id) {
+        for (size_t i = 0; i < sizeof(id->bytes); i++)
+                if (id->bytes[i] != 0)
+                        return false;
+
+        return true;
+}
+
+void netd_persistent_mac_derive(
+                const uint8_t machine_id[16], const char *ifname, uint8_t mac_out[NETD_HW_ADDR_MAX]) {
+        uint8_t v[16 + IFNAMSIZ];
+        size_t namelen = strlen(ifname);
+        uint64_t result;
+
+        memcpy(v, machine_id, 16);
+        memcpy(v + 16, ifname, namelen);
+
+        result = htole64(siphash24(v, 16 + namelen, PERSISTENT_MAC_HASH_KEY));
+        memcpy(mac_out, &result, NETD_HW_ADDR_MAX);
+
+        mac_out[0] &= 0xfe; /* clear multicast */
+        mac_out[0] |= 0x02; /* set local-admin */
+}
+
+/*
+ * Derive and apply a stable hardware address for `l`, the same algorithm
+ * real systemd-networkd uses for MACAddressPolicy=persistent
+ * (link-config.c's link_generate_new_hw_addr() plus
+ * net_get_unique_predictable_data()/net_get_unique_predictable_data_from_name(),
+ * netif-util.c), gated down to exactly the "not a real burned-in address"
+ * case:
+ *
+ *   mac = low 6 bytes of htole64(siphash24(machine_id || ifname,
+ *                                          PERSISTENT_MAC_HASH_KEY))
+ *   mac[0] &= ~0x01 (clear multicast); mac[0] |= 0x02 (set local-admin)
+ *
+ * -- both unconditional for a generated address (net_verify_hardware_
+ * address(), netif-util.c). Called once per link_configure_impl()
+ * invocation, right before netd_rtnl_link_up(), so every exemption below
+ * has to be re-checked on every call, not just the first:
+ *
+ *   - already up: the kernel refuses an address change on most drivers once
+ *     a link is administratively up, and real policy never touches an
+ *     already-up link's address either.
+ *   - loopback: never gets a generated address (link-config.c's own
+ *     loopback short-circuit).
+ *   - non-Ethernet: pico-init's own scope narrowing versus upstream (which
+ *     also covers ARPHRD_INFINIBAND) -- no InfiniBand pico target, and
+ *     NETD_HW_ADDR_MAX (netd-rtnl.h) is 6 bytes, too short regardless.
+ *   - addr_assign_type PERM/SET/STOLEN, or unreadable/unrecognized: a real
+ *     burned-in address, one something else already set deliberately, or
+ *     nothing to go on -- never overwritten, never guessed.
+ *   - machine id missing or all-zero (id128_is_null()): logged once, no
+ *     address derived from a placeholder identity a later real write would
+ *     invalidate.
+ *
+ * Non-fatal end to end: a MAC that could not be derived or applied is
+ * cosmetic, not a configuration failure (matches upstream's own
+ * warn-and-continue at the equivalent call site, link-config.c's
+ * link_apply_rtnl_settings()) -- the caller's return value and l->state are
+ * never affected by this function.
+ */
+static void link_apply_persistent_mac(Link *l) {
+        Netd *n = l->netd;
+        unsigned addr_assign_type;
+        NetdId128 mid;
+        uint8_t mac[NETD_HW_ADDR_MAX];
+        int r;
+
+        if (l->flags & IFF_UP)
+                return;
+
+        if (l->flags & IFF_LOOPBACK)
+                return;
+
+        if (l->arp_type != ARPHRD_ETHER)
+                return;
+
+        if (!link_read_addr_assign_type(l->ifname, &addr_assign_type))
+                return;
+
+        if (addr_assign_type != NETD_NET_ADDR_RANDOM)
+                return; /* PERM/SET/STOLEN, or a value this function does not recognize */
+
+        r = netd_machine_id(&mid);
+        if (r < 0 || id128_is_null(&mid)) {
+                pico_log(PICO_LOG_INFO,
+                         "netd: %s: machine-id not yet available, skipping persistent MAC",
+                         l->ifname);
+                return;
+        }
+
+        netd_persistent_mac_derive(mid.bytes, l->ifname, mac);
+
+        r = netd_rtnl_link_set_hwaddr(n->rtnl, l->ifindex, mac, NETD_HW_ADDR_MAX);
+        if (r < 0)
+                pico_log(PICO_LOG_WARNING,
+                         "netd: %s: failed to set persistent hardware address: %s",
+                         l->ifname,
+                         strerror(-r));
+}
+
 /* --- the state machine --- */
 
 static int link_configure_impl(Link *l) {
@@ -707,6 +867,15 @@ static int link_configure_impl(Link *l) {
         }
 
         l->state = LINK_CONFIGURING;
+
+        /*
+         * Before bringing the link up: a MAC change needs the link down,
+         * and this is the one point link_configure_impl() always reaches
+         * before netd_rtnl_link_up() below, on every call (first-seen and
+         * every reconfigure/SIGHUP alike). Self-gating -- see
+         * link_apply_persistent_mac()'s own exemption list.
+         */
+        link_apply_persistent_mac(l);
 
         r = netd_rtnl_link_up(n->rtnl, l->ifindex);
         if (r < 0) {

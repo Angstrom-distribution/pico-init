@@ -9,6 +9,17 @@
  *
  * N1: link enumerate/match, RTM_NEWLINK/DELLINK subscription, link up/down,
  * RTM_NEWADDR/DELADDR, RTM_NEWROUTE/DELROUTE including a default route.
+ * Later addition: netd_rtnl_link_set_hwaddr() (persistent-MAC generation,
+ * netd-link.c's link_apply_persistent_mac()).
+ *
+ * The low-level socket/message plumbing (request construction, send/recv,
+ * NLMSG_ERROR decoding, the generic rtattr_get_* and rtattr_enter() getters) now
+ * lives in netd-rtnl-core.c, shared with netctl-rtnl.c -- see that file's
+ * header for why the split exists and what stays logging-free there. This
+ * file keeps everything that is netd's own policy: the NetdRtnl struct,
+ * event-fd subscription, ADDED/CHANGED/REMOVED bookkeeping, nl_parse_link(),
+ * every netd_rtnl_* writer, and every pico_log() call -- the core layer
+ * decodes a kernel error into a string, this file is what logs it.
  *
  * ALIGNMENT. Every multi-byte field this file reads off a socket is reached
  * through NLMSG_DATA()/RTA_DATA() on a message walked with NLMSG_OK()/
@@ -17,18 +28,18 @@
  * the netlink framing itself (NLMSG_ALIGN/RTA_ALIGN round every message and
  * every attribute up to a 4-byte boundary, and the receive buffer is a
  * `union nl_recv_buf`, the same nlmsghdr-typed-member trick struct
- * nl_request uses below, so its stack storage is never less aligned than
- * that floor requires -- a bare uint8_t[] on the stack would not be).
- * Fixed-offset struct field access (struct ifinfomsg, struct nlmsgerr) is
- * therefore safe without a copy. Attribute *payloads* of unpredictable length (an
- * interface name, a hardware address) are still copied byte-wise with
- * memcpy() rather than cast-and-dereferenced, because their length is
- * kernel-supplied and reading past what RTA_PAYLOAD() actually reports would
- * be the real bug, alignment aside. On ARMv5TE a stray unaligned word load
- * does not fault, it rotates -- so a mistake here would not crash, it would
- * silently hand netd the wrong ifindex or address. Every message loop below
- * is bounds-checked with NLMSG_OK/RTA_OK, and no attribute array is ever
- * indexed by a kernel-supplied rta_type -- dispatch is a switch, not a table.
+ * nl_request uses, so its stack storage is never less aligned than that
+ * floor requires -- a bare uint8_t[] on the stack would not be). Fixed-offset
+ * struct field access (struct ifinfomsg, struct nlmsgerr) is therefore safe
+ * without a copy. Attribute *payloads* of unpredictable length (an interface
+ * name, a hardware address) are still copied byte-wise with memcpy() rather
+ * than cast-and-dereferenced, because their length is kernel-supplied and
+ * reading past what RTA_PAYLOAD() actually reports would be the real bug,
+ * alignment aside. On ARMv5TE a stray unaligned word load does not fault, it
+ * rotates -- so a mistake here would not crash, it would silently hand netd
+ * the wrong ifindex or address. Every message loop below is bounds-checked
+ * with NLMSG_OK/RTA_OK, and no attribute array is ever indexed by a
+ * kernel-supplied rta_type -- dispatch is a switch, not a table.
  */
 
 #include "netd-rtnl.h"
@@ -47,51 +58,7 @@
 #include <unistd.h>
 
 #include "../util.h"
-
-/* Not every kernel header in the wild carries these (added for
- * NETLINK_EXT_ACK, Linux 4.12) -- cheap insurance rather than a hard
- * dependency on a specific header vintage. */
-#ifndef NLM_F_CAPPED
-#        define NLM_F_CAPPED 0x100
-#endif
-#ifndef NLM_F_ACK_TLVS
-#        define NLM_F_ACK_TLVS 0x200
-#endif
-#ifndef NLMSGERR_ATTR_MSG
-#        define NLMSGERR_ATTR_MSG 1
-#endif
-
-/* Every request this file builds is small and fixed-shape (an ifinfomsg or
- * ifaddrmsg or rtmsg plus a handful of address-sized attributes); 512 bytes
- * is generous headroom over the largest of them, not a tight fit. */
-#define NL_REQUEST_BUFSZ 512
-
-/* Best-effort SO_RCVBUF on the request socket, so a link dump on a busy
- * machine is less likely to overrun. Not load-bearing: it only reduces how
- * often a dump has to be retried whole -- see NL_RECV_BUFSZ and nl_recv(). */
-#define NETD_RTNL_RCVBUF (1 << 20)
-
-/* Real rtnetlink traffic on this target -- one link/addr/route event, one
- * dump entry, or an ACK -- comfortably fits a single page; 8KiB is the
- * commonly-cited practical bound for one netlink recv() batch. nl_recv()
- * reads into a buffer this size that every caller keeps on its own stack
- * and reuses across calls, rather than sizing and malloc()'ing one per
- * datagram. */
-#define NL_RECV_BUFSZ 8192
-
-/*
- * Storage for nl_recv(): a plain `uint8_t buf[NL_RECV_BUFSZ]` on the stack
- * is not guaranteed better than 1-byte alignment, but every message inside
- * it is walked as struct nlmsghdr -- so, same trick as struct nl_request
- * above, `hdr` pins the union (and therefore `buf`) at whatever alignment
- * the compiler gives struct nlmsghdr, comfortably over the 4-byte floor the
- * file banner's ALIGNMENT note requires. `hdr` itself is never accessed;
- * callers address the storage through `buf`.
- */
-union nl_recv_buf {
-        struct nlmsghdr hdr;
-        uint8_t buf[NL_RECV_BUFSZ];
-};
+#include "netd-rtnl-core.h"
 
 /* A dump interrupted mid-flight (ENOBUFS, or NLM_F_DUMP_INTR on the closing
  * NLMSG_DONE) is retried from scratch rather than reported: a partially
@@ -100,11 +67,8 @@ union nl_recv_buf {
 #define NETD_RTNL_DUMP_MAX_RETRIES 5
 
 struct NetdRtnl {
-        int req_fd;   /* private: synchronous request -> ACK only */
+        NlSock req;   /* private: synchronous request -> ACK only */
         int event_fd; /* subscribed to RTNLGRP_LINK; the only fd netd polls */
-
-        uint32_t req_pid;
-        uint32_t req_seq;
 
         netd_rtnl_link_handler_t link_handler;
         void *link_userdata;
@@ -118,278 +82,28 @@ struct NetdRtnl {
         size_t known_cap;
 };
 
-/* --- request message construction --- */
+/* --- thin wrappers that add netd's own logging over the silent core --- */
 
-/*
- * A netlink request under construction. The union guarantees `hdr` and `buf`
- * start at the same, correctly-aligned address without relying on `len`'s
- * incidental alignment to do it -- see the file banner.
- */
-struct nl_request {
-        union {
-                struct nlmsghdr hdr;
-                uint8_t buf[NL_REQUEST_BUFSZ];
-        };
-        size_t len;
-};
+static ssize_t rtnl_recv(int fd, bool nonblock, union nl_recv_buf *rb) {
+        ssize_t len = nl_recv(fd, nonblock, rb);
 
-/* Reserve `len` bytes at the end of the message, NLMSG_ALIGNed and
- * zero-filled (so any padding bytes the kernel sees are well-defined rather
- * than stack garbage). NULL on overflow. */
-static void *nl_reserve(struct nl_request *req, size_t len) {
-        size_t aligned = NLMSG_ALIGN(len);
-        void *ptr;
-
-        if (aligned > sizeof(req->buf) - req->len)
-                return NULL;
-
-        ptr = req->buf + req->len;
-        memset(ptr, 0, aligned);
-        req->len += aligned;
-        return ptr;
-}
-
-static struct nlmsghdr *nl_req_init(struct nl_request *req, uint16_t type, uint16_t flags) {
-        struct nlmsghdr *nlh;
-
-        req->len = 0;
-        nlh = nl_reserve(req, sizeof(struct nlmsghdr));
-        if (!nlh)
-                return NULL;
-
-        nlh->nlmsg_type = type;
-        nlh->nlmsg_flags = flags;
-        /* nlmsg_len/seq/pid are filled in by nl_finish_and_send(), once the
-         * caller is done appending the payload and attributes. */
-        return nlh;
-}
-
-/* Append one rtattr, RTA_ALIGNed and zero-padded. -ENOBUFS on overflow. */
-static int nl_add_attr(struct nl_request *req, unsigned short type, const void *data, size_t datalen) {
-        struct rtattr *rta;
-        size_t rtalen = RTA_LENGTH(datalen);
-        size_t total = RTA_ALIGN(rtalen);
-        size_t pad;
-
-        if (total > sizeof(req->buf) - req->len)
-                return -ENOBUFS;
-
-        rta = (struct rtattr *) (req->buf + req->len);
-        rta->rta_type = type;
-        rta->rta_len = (unsigned short) rtalen;
-
-        if (datalen)
-                memcpy(RTA_DATA(rta), data, datalen);
-
-        pad = total - rtalen;
-        if (pad)
-                memset(req->buf + req->len + rtalen, 0, pad);
-
-        req->len += total;
-        return 0;
-}
-
-/* --- socket-level send/receive --- */
-
-static int nl_send(int fd, const void *buf, size_t len) {
-        struct sockaddr_nl kernel;
-        ssize_t n;
-
-        memset(&kernel, 0, sizeof(kernel));
-        kernel.nl_family = AF_NETLINK;
-
-        do {
-                n = sendto(fd, buf, len, 0, (struct sockaddr *) &kernel, sizeof(kernel));
-        } while (n < 0 && errno == EINTR);
-
-        return n < 0 ? -errno : 0;
-}
-
-/*
- * Read the next pending datagram into `rb->buf` -- every caller keeps one
- * `union nl_recv_buf` on its own stack and passes the same one in across
- * every call, so there is no per-datagram malloc()/free() and, in the
- * common case below, no second syscall either.
- *
- * One recv() with MSG_TRUNC covers that common case: MSG_TRUNC makes the
- * kernel report the datagram's real length even when only part of it got
- * copied, so a message that fits inside NL_RECV_BUFSZ -- which is
- * effectively all real rtnetlink traffic, see NL_RECV_BUFSZ's comment -- is
- * both sized and fully captured by that single syscall, no prior peek
- * needed.
- *
- * A datagram that does *not* fit is the rare/exceptional case, and unlike
- * the old peek-then-allocate code this cannot recover it by reading again
- * bigger: a netlink socket dequeues (and discards whatever didn't fit) on
- * every non-peek recv() regardless of the buffer supplied, so by the time
- * MSG_TRUNC's return value reveals the overflow the excess bytes are
- * already gone -- there is nothing left to re-peek. Rather than hand a
- * silently truncated message up into the NLMSG_OK/NLMSG_NEXT parsing loop
- * (the real bug, per this file's ALIGNMENT comment), that case is reported
- * as -ENOBUFS: the same code this file already uses for a genuine
- * receive-queue overrun, so it drives the exact same resync-and-retry
- * handling documented in netd-rtnl.h -- the whole dump is retried in
- * netd_rtnl_enumerate_links(), and it is propagated as an ordinary error
- * everywhere else. Correctness over speed: a lost datagram is reported and
- * recovered from at the protocol level, never quietly mis-parsed.
- *
- * Returns the message length (>= 0), or -errno -- including -EAGAIN when
- * `nonblock` and nothing is pending, and -ENOBUFS both for a real
- * receive-queue overrun and for the oversized-datagram case above.
- */
-static ssize_t nl_recv(int fd, bool nonblock, union nl_recv_buf *rb) {
-        int flags = MSG_TRUNC | (nonblock ? MSG_DONTWAIT : 0);
-        ssize_t len;
-
-        for (;;) {
-                len = recv(fd, rb->buf, NL_RECV_BUFSZ, flags);
-                if (len < 0) {
-                        if (errno == EINTR)
-                                continue;
-                        return -errno;
-                }
-                break;
-        }
-
-        if (len > NL_RECV_BUFSZ) {
+        if (len == -ENOBUFS)
                 pico_log(PICO_LOG_WARNING,
-                         "netd: rtnl: datagram of %zd bytes exceeds the %d-byte receive "
-                         "buffer -- kernel already discarded the excess, treating as a "
-                         "receive-queue overrun",
-                         len,
-                         NL_RECV_BUFSZ);
-                return -ENOBUFS;
-        }
+                         "netd: rtnl: receive-queue overrun or oversized datagram on fd %d -- "
+                         "resyncing",
+                         fd);
 
         return len;
 }
 
-static int nl_finish_and_send(NetdRtnl *rtnl, struct nl_request *req, uint32_t *ret_seq) {
-        req->hdr.nlmsg_len = (uint32_t) req->len;
-        req->hdr.nlmsg_pid = rtnl->req_pid;
-        req->hdr.nlmsg_seq = ++rtnl->req_seq;
+static int rtnl_execute(NetdRtnl *rtnl, struct nl_request *req) {
+        char errbuf[256] = "";
+        int r = nl_execute(&rtnl->req, req, errbuf, sizeof errbuf);
 
-        *ret_seq = req->hdr.nlmsg_seq;
+        if (r != 0 && errbuf[0] != '\0')
+                pico_log(PICO_LOG_WARNING, "netd: rtnl: kernel: %s (%s)", errbuf, strerror(-r));
 
-        return nl_send(rtnl->req_fd, req->buf, req->len);
-}
-
-/* --- NLMSG_ERROR / extended-ACK decoding --- */
-
-/*
- * The TLV attributes after a struct nlmsgerr are preceded by an echo of the
- * failing request -- just its header if NLM_F_CAPPED, header-plus-payload
- * otherwise -- so the TLVs start at a variable offset that has to be computed
- * from what the kernel actually says it echoed, not assumed. `total` is the
- * bounds of the whole NLMSG_ERROR message (already validated by the caller's
- * NLMSG_OK); `off` is checked against it before anything is read from there.
- */
-static int nl_parse_ext_ack(
-                const struct nlmsghdr *nlh, const struct nlmsgerr *err, char *msgbuf, size_t msgbuf_len) {
-        size_t total = nlh->nlmsg_len;
-        size_t off = NLMSG_LENGTH(sizeof(*err));
-        const struct rtattr *rta;
-        int rem;
-
-        if (!(nlh->nlmsg_flags & NLM_F_CAPPED) && err->msg.nlmsg_len >= sizeof(struct nlmsghdr))
-                off += NLMSG_ALIGN(err->msg.nlmsg_len) - sizeof(struct nlmsghdr);
-
-        if (off > total)
-                return -EBADMSG;
-
-        rta = (const struct rtattr *) ((const uint8_t *) nlh + off);
-        rem = (int) (total - off);
-
-        for (; RTA_OK(rta, rem); rta = RTA_NEXT(rta, rem)) {
-                if (rta->rta_type == NLMSGERR_ATTR_MSG) {
-                        size_t n = RTA_PAYLOAD(rta);
-
-                        if (n >= msgbuf_len)
-                                n = msgbuf_len - 1;
-                        memcpy(msgbuf, RTA_DATA(rta), n);
-                        msgbuf[n] = '\0';
-                        return 0;
-                }
-        }
-
-        return -ENOENT;
-}
-
-/* Decode one NLMSG_ERROR message. Returns the kernel's own -errno (0 for a
- * plain ACK), logging the extended-ACK string when the kernel provided one --
- * this is the whole reason a bare -EINVAL becomes a real diagnostic. */
-static int nl_parse_error(const struct nlmsghdr *nlh) {
-        const struct nlmsgerr *err;
-        int error;
-
-        if (nlh->nlmsg_len < NLMSG_LENGTH(sizeof(*err)))
-                return -EBADMSG;
-
-        err = (const struct nlmsgerr *) NLMSG_DATA(nlh);
-        error = err->error;
-
-        if (error != 0 && (nlh->nlmsg_flags & NLM_F_ACK_TLVS)) {
-                char msg[256];
-
-                if (nl_parse_ext_ack(nlh, err, msg, sizeof(msg)) == 0)
-                        pico_log(PICO_LOG_WARNING, "netd: rtnl: kernel: %s (%s)", msg, strerror(-error));
-        }
-
-        return error;
-}
-
-static int nl_execute(NetdRtnl *rtnl, struct nl_request *req) {
-        uint32_t seq;
-        int r;
-
-        r = nl_finish_and_send(rtnl, req, &seq);
-        if (r < 0)
-                return r;
-
-        for (;;) {
-                union nl_recv_buf rb;
-                ssize_t len;
-                struct nlmsghdr *m;
-                int rem;
-
-                len = nl_recv(rtnl->req_fd, false, &rb);
-                if (len < 0)
-                        return (int) len;
-                if (len == 0)
-                        return -EIO;
-
-                m = (struct nlmsghdr *) rb.buf;
-                rem = (int) len;
-
-                /*
-                 * rem stays int -- NLMSG_NEXT subtracts from it, and the
-                 * kernel's own iteration idiom needs that to go negative on a
-                 * truncated tail. clang's sign-compare inside NLMSG_OK is a
-                 * false positive: the macro's first clause has already
-                 * established rem >= sizeof(struct nlmsghdr) before the
-                 * unsigned comparison, so the promotion is value-preserving.
-                 * gcc suppresses it as system-header-originated; clang blames
-                 * the expansion site. Same at the loops in
-                 * netd_rtnl_enumerate_links() and netd_rtnl_process().
-                 */
-                for (; NLMSG_OK(m, rem); m = NLMSG_NEXT(m, rem)) {
-                        int result;
-
-                        if (m->nlmsg_seq != seq)
-                                continue;
-
-                        if (m->nlmsg_type != NLMSG_ERROR) {
-                                pico_log(PICO_LOG_DEBUG,
-                                         "netd: rtnl: unexpected reply type %u to seq %u",
-                                         m->nlmsg_type,
-                                         seq);
-                                continue;
-                        }
-
-                        result = nl_parse_error(m);
-                        return result;
-                }
-        }
+        return r;
 }
 
 /* --- RTM_(NEW|DEL)LINK parsing --- */
@@ -401,7 +115,7 @@ static int nl_execute(NetdRtnl *rtnl, struct nl_request *req) {
  */
 static int nl_parse_link(const struct nlmsghdr *nlh, NetdRtnlLink *out) {
         const struct ifinfomsg *ifi;
-        const struct rtattr *rta;
+        const struct rtattr *rta, *addr_rta;
         int rem;
 
         if (nlh->nlmsg_len < NLMSG_LENGTH(sizeof(*ifi)))
@@ -420,37 +134,17 @@ static int nl_parse_link(const struct nlmsghdr *nlh, NetdRtnlLink *out) {
         rem = (int) (nlh->nlmsg_len - NLMSG_LENGTH(sizeof(*ifi)));
         rta = (const struct rtattr *) ((const uint8_t *) ifi + NLMSG_ALIGN(sizeof(*ifi)));
 
-        for (; RTA_OK(rta, rem); rta = RTA_NEXT(rta, rem)) {
-                size_t n;
+        (void) rtattr_get_string(rta, rem, IFLA_IFNAME, out->ifname, sizeof(out->ifname));
+        (void) rtattr_get_u32(rta, rem, IFLA_MTU, &out->mtu);
 
-                switch (rta->rta_type) {
+        addr_rta = rtattr_find(rta, rem, IFLA_ADDRESS);
+        if (addr_rta) {
+                size_t n = RTA_PAYLOAD(addr_rta);
 
-                case IFLA_IFNAME:
-                        n = RTA_PAYLOAD(rta);
-                        if (n == 0)
-                                break;
-                        if (n >= sizeof(out->ifname))
-                                n = sizeof(out->ifname) - 1;
-                        memcpy(out->ifname, RTA_DATA(rta), n);
-                        out->ifname[n] = '\0';
-                        break;
-
-                case IFLA_ADDRESS:
-                        n = RTA_PAYLOAD(rta);
-                        if (n > NETD_HW_ADDR_MAX)
-                                n = NETD_HW_ADDR_MAX;
-                        memcpy(out->hw_addr, RTA_DATA(rta), n);
-                        out->hw_addr_len = n;
-                        break;
-
-                case IFLA_MTU:
-                        if (RTA_PAYLOAD(rta) >= sizeof(uint32_t))
-                                memcpy(&out->mtu, RTA_DATA(rta), sizeof(out->mtu));
-                        break;
-
-                default:
-                        break;
-                }
+                if (n > NETD_HW_ADDR_MAX)
+                        n = NETD_HW_ADDR_MAX;
+                memcpy(out->hw_addr, RTA_DATA(addr_rta), n);
+                out->hw_addr_len = n;
         }
 
         return 0;
@@ -544,50 +238,9 @@ static void dispatch_link(NetdRtnl *rtnl, const struct nlmsghdr *m, bool from_du
 
 /* --- lifecycle --- */
 
-static int nl_socket_open(bool subscribe_link_group) {
-        int fd, one = 1, rcvbuf = NETD_RTNL_RCVBUF, e;
-        struct sockaddr_nl addr;
-
-        fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
-        if (fd < 0)
-                return -errno;
-
-        if (setsockopt(fd, SOL_NETLINK, NETLINK_EXT_ACK, &one, sizeof(one)) < 0) {
-                e = errno;
-                goto fail;
-        }
-
-        /* Best-effort: see NETD_RTNL_RCVBUF's comment. */
-        (void) setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-
-        memset(&addr, 0, sizeof(addr));
-        addr.nl_family = AF_NETLINK;
-
-        if (bind(fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
-                e = errno;
-                goto fail;
-        }
-
-        if (subscribe_link_group) {
-                int group = RTNLGRP_LINK;
-
-                if (setsockopt(fd, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, &group, sizeof(group)) < 0) {
-                        e = errno;
-                        goto fail;
-                }
-        }
-
-        return fd;
-
-fail:
-        (void) close(fd);
-        return -e;
-}
-
 int netd_rtnl_new(NetdRtnl **ret) {
         NetdRtnl *rtnl;
-        struct sockaddr_nl local;
-        socklen_t local_len = sizeof(local);
+        NlSock event_sock;
         int r;
 
         if (!ret)
@@ -597,24 +250,17 @@ int netd_rtnl_new(NetdRtnl **ret) {
         if (!rtnl)
                 return -ENOMEM;
 
-        rtnl->req_fd = -1;
+        rtnl->req.fd = -1;
         rtnl->event_fd = -1;
 
-        r = nl_socket_open(false);
+        r = nl_sock_open(&rtnl->req, false);
         if (r < 0)
                 goto fail;
-        rtnl->req_fd = r;
 
-        /* Best-effort: an unset req_pid (0) still works, the kernel does not
-         * require the requester's own port id back in nlmsg_pid to route an
-         * ACK on a connected/bound socket -- this just matches convention. */
-        if (getsockname(rtnl->req_fd, (struct sockaddr *) &local, &local_len) == 0)
-                rtnl->req_pid = local.nl_pid;
-
-        r = nl_socket_open(true);
+        r = nl_sock_open(&event_sock, true);
         if (r < 0)
                 goto fail;
-        rtnl->event_fd = r;
+        rtnl->event_fd = event_sock.fd;
 
         *ret = rtnl;
         return 0;
@@ -628,8 +274,7 @@ NetdRtnl *netd_rtnl_free(NetdRtnl *rtnl) {
         if (!rtnl)
                 return NULL;
 
-        if (rtnl->req_fd >= 0)
-                (void) close(rtnl->req_fd);
+        nl_sock_close(&rtnl->req);
         if (rtnl->event_fd >= 0)
                 (void) close(rtnl->event_fd);
 
@@ -680,7 +325,7 @@ int netd_rtnl_enumerate_links(NetdRtnl *rtnl) {
                         return -ENOBUFS;
                 ifi->ifi_family = AF_UNSPEC;
 
-                r = nl_finish_and_send(rtnl, &req, &seq);
+                r = nl_finish_and_send(&rtnl->req, &req, &seq);
                 if (r < 0)
                         return r;
 
@@ -690,7 +335,7 @@ int netd_rtnl_enumerate_links(NetdRtnl *rtnl) {
                         struct nlmsghdr *m;
                         int rem;
 
-                        len = nl_recv(rtnl->req_fd, false, &rb);
+                        len = rtnl_recv(rtnl->req.fd, false, &rb);
                         if (len == -ENOBUFS) {
                                 retry = true;
                                 break;
@@ -703,13 +348,22 @@ int netd_rtnl_enumerate_links(NetdRtnl *rtnl) {
                         m = (struct nlmsghdr *) rb.buf;
                         rem = (int) len;
 
-                        /* int rem, NLMSG_OK sign-compare: see nl_execute(). */
+                        /* int rem, NLMSG_OK sign-compare: see this file's
+                         * predecessor's note, unchanged by the rtnl-core
+                         * split. */
                         for (; NLMSG_OK(m, rem); m = NLMSG_NEXT(m, rem)) {
                                 if (m->nlmsg_seq != seq)
                                         continue;
 
                                 if (m->nlmsg_type == NLMSG_ERROR) {
-                                        r = nl_parse_error(m);
+                                        char errbuf[256] = "";
+
+                                        r = nl_parse_error(m, errbuf, sizeof errbuf);
+                                        if (r != 0 && errbuf[0] != '\0')
+                                                pico_log(PICO_LOG_WARNING,
+                                                         "netd: rtnl: kernel: %s (%s)",
+                                                         errbuf,
+                                                         strerror(-r));
                                         return r;
                                 }
 
@@ -748,7 +402,7 @@ int netd_rtnl_process(NetdRtnl *rtnl) {
                 struct nlmsghdr *m;
                 int rem;
 
-                len = nl_recv(rtnl->event_fd, true, &rb);
+                len = rtnl_recv(rtnl->event_fd, true, &rb);
                 if (len == -EAGAIN)
                         break;
                 if (len < 0)
@@ -759,7 +413,6 @@ int netd_rtnl_process(NetdRtnl *rtnl) {
                 m = (struct nlmsghdr *) rb.buf;
                 rem = (int) len;
 
-                /* int rem, NLMSG_OK sign-compare: see nl_execute(). */
                 for (; NLMSG_OK(m, rem); m = NLMSG_NEXT(m, rem)) {
                         switch (m->nlmsg_type) {
 
@@ -770,11 +423,14 @@ int netd_rtnl_process(NetdRtnl *rtnl) {
                                 break;
 
                         case NLMSG_ERROR: {
-                                int err = nl_parse_error(m);
+                                char errbuf[256] = "";
+                                int err = nl_parse_error(m, errbuf, sizeof errbuf);
 
                                 pico_log(PICO_LOG_WARNING,
-                                         "netd: rtnl: unexpected error message on event socket: %s",
-                                         strerror(-err));
+                                         "netd: rtnl: unexpected error message on event socket: %s%s%s",
+                                         strerror(-err),
+                                         errbuf[0] ? " -- " : "",
+                                         errbuf);
                                 break;
                         }
 
@@ -810,7 +466,7 @@ static int set_link_flags(NetdRtnl *rtnl, int ifindex, unsigned int flags, unsig
         ifi->ifi_flags = flags;
         ifi->ifi_change = change;
 
-        return nl_execute(rtnl, &req);
+        return rtnl_execute(rtnl, &req);
 }
 
 int netd_rtnl_link_up(NetdRtnl *rtnl, int ifindex) {
@@ -819,6 +475,42 @@ int netd_rtnl_link_up(NetdRtnl *rtnl, int ifindex) {
 
 int netd_rtnl_link_down(NetdRtnl *rtnl, int ifindex) {
         return set_link_flags(rtnl, ifindex, 0, IFF_UP);
+}
+
+/*
+ * RTM_SETLINK carrying only IFLA_ADDRESS, ifi_flags/ifi_change left at 0 so
+ * this never touches admin state -- link_apply_persistent_mac() (netd-link.c)
+ * is the one caller, and it decides up/down separately. Mirrors
+ * set_link_flags()'s own shape; see that function and netd-rtnl.h's writer
+ * contract (0/-errno, -EEXIST-style translation is the *caller's* job, not
+ * this layer's -- though a MAC change has no natural "already exists" case
+ * the way an address add does).
+ */
+int netd_rtnl_link_set_hwaddr(NetdRtnl *rtnl, int ifindex, const uint8_t *addr, size_t len) {
+        struct nl_request req;
+        struct nlmsghdr *nlh;
+        struct ifinfomsg *ifi;
+        int r;
+
+        if (!rtnl || ifindex <= 0 || !addr || len == 0)
+                return -EINVAL;
+
+        nlh = nl_req_init(&req, RTM_SETLINK, NLM_F_REQUEST | NLM_F_ACK);
+        if (!nlh)
+                return -ENOBUFS;
+
+        ifi = nl_reserve(&req, sizeof(*ifi));
+        if (!ifi)
+                return -ENOBUFS;
+
+        ifi->ifi_family = AF_UNSPEC;
+        ifi->ifi_index = ifindex;
+
+        r = nl_add_attr(&req, IFLA_ADDRESS, addr, len);
+        if (r < 0)
+                return r;
+
+        return rtnl_execute(rtnl, &req);
 }
 
 /* address | ~mask, entirely in network byte order: OR and NOT are
@@ -897,7 +589,7 @@ int netd_rtnl_address_add(
         if (r < 0)
                 return r;
 
-        return nl_execute(rtnl, &req);
+        return rtnl_execute(rtnl, &req);
 }
 
 int netd_rtnl_address_del(NetdRtnl *rtnl, int ifindex, const struct in_addr *address, unsigned char prefixlen) {
@@ -929,7 +621,7 @@ int netd_rtnl_address_del(NetdRtnl *rtnl, int ifindex, const struct in_addr *add
         if (r < 0)
                 return r;
 
-        return nl_execute(rtnl, &req);
+        return rtnl_execute(rtnl, &req);
 }
 
 static int
@@ -1010,7 +702,7 @@ int netd_rtnl_route_add(
         if (r < 0)
                 return r;
 
-        return nl_execute(rtnl, &req);
+        return rtnl_execute(rtnl, &req);
 }
 
 int netd_rtnl_route_add_default(NetdRtnl *rtnl, int ifindex, const struct in_addr *gateway, uint32_t metric) {
@@ -1042,7 +734,7 @@ int netd_rtnl_route_del(
         if (r < 0)
                 return r;
 
-        return nl_execute(rtnl, &req);
+        return rtnl_execute(rtnl, &req);
 }
 
 static const char * const netd_rtnl_link_event_table[_NETD_RTNL_LINK_EVENT_MAX] = {

@@ -22,19 +22,26 @@
  * Output is modelled on real systemd's own `networkctl`/`networkctl
  * status`/`networkctl status IFACE`, close enough to be useful to someone
  * who already knows that tool, but it does not claim fields netd has no way
- * to back honestly. Driver, Vendor, Model, IPv6 Address Generation Mode and
- * Number of Queues (Tx/Rx) are real sysfs/procfs reads, same as every other
- * row below; still missing, because nothing in this tree computes them:
- * NetDev/Link File (no udev .link matching), Path (ID_PATH is udev's own
- * topology algorithm, not replicated here), Alternative Names and QDisc
- * (both rtnetlink-only attributes netd-rtnl.c does not parse and this file
- * deliberately never opens a netlink socket to get), Activation Policy and
- * Required For Online (.network directives netd-network.c does not
- * implement), and Route Domains (networkd's per-link Domains=~ routing-only
- * domains) -- netd tracks none of them. Offered DHCP leases is omitted too:
- * it is a DHCP-server-only row, and DhcpServerLease state is kept in memory
- * only (dhcp-server-lease-internal.h), with nothing published for this file
- * to read even when a link is running one.
+ * to back honestly. Driver, Vendor and Model are sysfs reads with no
+ * rtnetlink equivalent (real networkctl's own ID_NET_DRIVER/vendor/model
+ * resolve through udev/hwdb this tree does not have); `status <iface>`'s
+ * kernel-sourced rows (Type, Alternative Names, MTU min/max, QDisc, IPv6
+ * Address Generation Mode, Number of Queues) come from one
+ * netctl_rtnl_get_link() round trip (netctl-rtnl.c) -- this file's own tiny
+ * rtnetlink client, built from netd-rtnl-core.c only, with no link to
+ * netd_core or pico_init_core: `networkctl` stays a standalone binary that
+ * works whether or not netd is running, it just now also talks to the
+ * kernel directly for the handful of fields sysfs cannot answer. Path is a
+ * third source again (netctl-path.c, a scope-limited udev builtin_path_id()
+ * port over plain sysfs directory walking -- no netlink involved). Still
+ * missing, because nothing in this tree computes them: NetDev/Link File (no
+ * udev .link matching), Activation Policy and Required For Online (.network
+ * directives netd-network.c does not implement), and Route Domains
+ * (networkd's per-link Domains=~ routing-only domains) -- netd tracks none
+ * of them. Offered DHCP leases is omitted too: it is a DHCP-server-only row,
+ * and DhcpServerLease state is kept in memory only
+ * (dhcp-server-lease-internal.h), with nothing published for this file to
+ * read even when a link is running one.
  */
 
 #include <arpa/inet.h>
@@ -49,6 +56,7 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -56,6 +64,9 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+#include "netctl-path.h"
+#include "netctl-rtnl.h"
 
 #define NETD_LINKS_DIR "/run/netd/links"
 #define NETD_LEASES_DIR "/run/netd/leases"
@@ -155,9 +166,10 @@ static void netd_link_file_path(unsigned ifindex, char *out, size_t bufsize) {
         snprintf(out, bufsize, "%s/%u", NETD_LINKS_DIR, ifindex);
 }
 
-static void netd_lease_file_path(unsigned ifindex, char *out, size_t bufsize) {
-        snprintf(out, bufsize, "%s/%u", NETD_LEASES_DIR, ifindex);
-}
+/* NETD_LEASES_DIR's own per-ifindex path is still built directly, inline,
+ * by status_all()'s NTP aggregation loop (the only remaining reader of a
+ * lease file's path by ifindex) -- the Gateway row no longer reads one, see
+ * collect_default_gateways(). */
 
 /* "configured", "configuring", "unmanaged", "pending", "failed", or
  * "unmanaged" as the honest default when netd has never seen this link
@@ -355,72 +367,12 @@ static bool usb_string_attr(const char *ifname, const char *attr, char *out, siz
         return out[0] != '\0';
 }
 
-/* --- link classification: IPv6 Address Generation Mode, queue counts --- */
-
-/* /proc/sys/net/ipv6/conf/<if>/addr_gen_mode, the kernel's own SLAAC
- * address-generation mode sysctl (Documentation/networking/ip-sysctl.rst) --
- * the same numeric values real networkctl's own
- * ipv6_addr_gen_mode_to_string() maps. */
-static bool iface_addr_gen_mode(const char *ifname, char *out, size_t bufsize) {
-        char path[128];
-        FILE *f;
-        int mode;
-
-        snprintf(path, sizeof path, "/proc/sys/net/ipv6/conf/%s/addr_gen_mode", ifname);
-        f = fopen(path, "re");
-        if (!f)
-                return false;
-        if (fscanf(f, "%d", &mode) != 1) {
-                fclose(f);
-                return false;
-        }
-        fclose(f);
-
-        switch (mode) {
-        case 0:
-                snprintf(out, bufsize, "eui64");
-                return true;
-        case 1:
-                snprintf(out, bufsize, "none");
-                return true;
-        case 2:
-                snprintf(out, bufsize, "stable-privacy");
-                return true;
-        case 3:
-                snprintf(out, bufsize, "random");
-                return true;
-        default:
-                return false;
-        }
-}
-
-/* /sys/class/net/<if>/queues/{rx,tx}-N, one directory per real queue the
- * kernel allocated for this device -- counted because sysfs has no single
- * attribute for the count. A link with no queues/ directory at all (some
- * virtual links) has no truthful answer. */
-static bool iface_queue_counts(const char *ifname, unsigned *rx, unsigned *tx) {
-        char path[128];
-        DIR *d;
-        struct dirent *e;
-
-        *rx = 0;
-        *tx = 0;
-
-        snprintf(path, sizeof path, "/sys/class/net/%s/queues", ifname);
-        d = opendir(path);
-        if (!d)
-                return false;
-
-        while ((e = readdir(d))) {
-                if (strncmp(e->d_name, "rx-", 3) == 0)
-                        (*rx)++;
-                else if (strncmp(e->d_name, "tx-", 3) == 0)
-                        (*tx)++;
-        }
-        closedir(d);
-
-        return *rx > 0 || *tx > 0;
-}
+/* IPv6 Address Generation Mode, QDisc, MTU min/max, Alternative Names and
+ * Number of Queues used to each be their own sysfs/procfs read here. All
+ * five now come from one netctl_rtnl_get_link() round trip (netctl-rtnl.c)
+ * instead -- see this file's own header comment -- so there is nothing
+ * left to define in this section; status_one() calls netctl_rtnl_get_link()
+ * directly. */
 
 /* --- status: kernel ground truth + netd's published files -------------- */
 
@@ -472,19 +424,98 @@ static void collect_addr_on_iface(FieldList *fl, const char *ifname, unsigned if
         field_add(fl, "%s on %s%%%u", addr, ifname, ifindex);
 }
 
+/*
+ * Default routes from the kernel's own plain-text table -- far simpler and
+ * just as authoritative as a raw rtnetlink dump for one field (real
+ * networkctl's own dump_gateways() queries the same kernel route table via
+ * RTM_GETROUTE instead, but needs no privileged socket either way).
+ * `only_ifname` NULL collects every default route system-wide
+ * (status_all()); non-NULL filters to that one interface (status_one()) --
+ * replacing a read of netd's own lease file there, which goes stale the
+ * moment the kernel's default route changes by any other means (manual
+ * `ip route`, a different lease, route removal) without netd rewriting it.
+ * Destination 00000000 (hex, little-endian) is the default route; Gateway
+ * is the same encoding.
+ */
+static void collect_default_gateways(const char *only_ifname, FieldList *fl) {
+        FILE *f = fopen("/proc/net/route", "re");
+        char line[256];
+        bool header = true;
+
+        if (!f)
+                return;
+
+        while (fgets(line, sizeof line, f)) {
+                char iface[IFNAMSIZ];
+                unsigned long dest, gw;
+                unsigned flags;
+                struct in_addr a;
+
+                if (header) {
+                        header = false;
+                        continue;
+                }
+
+                if (sscanf(line, "%15s %lx %lx %x", iface, &dest, &gw, &flags) != 4)
+                        continue;
+                if (dest != 0 || gw == 0)
+                        continue;
+                if (only_ifname && strcmp(iface, only_ifname) != 0)
+                        continue;
+
+                a.s_addr = gw;
+                if (only_ifname)
+                        field_add(fl, "%s", inet_ntoa(a));
+                else
+                        field_add(fl, "%s on %s", inet_ntoa(a), iface);
+        }
+        fclose(f);
+}
+
+/*
+ * MTU, with networkctl-status-link.c's own min/max formatting
+ * (format_bytes_full()'s "(min: X, max: Y)" suffix, only the parts the
+ * kernel actually reported):
+ *   neither known: "%u"
+ *   max only:      "%u (max: %u)"
+ *   min only:      "%u (min: %u)"
+ *   both known:    "%u (min: %u, max: %u)"
+ */
+static void format_mtu(const NetctlLinkInfo *info, char *out, size_t bufsize) {
+        if (info->has_min_mtu && info->has_max_mtu)
+                snprintf(out, bufsize, "%u (min: %u, max: %u)", info->mtu, info->min_mtu, info->max_mtu);
+        else if (info->has_min_mtu)
+                snprintf(out, bufsize, "%u (min: %u)", info->mtu, info->min_mtu);
+        else if (info->has_max_mtu)
+                snprintf(out, bufsize, "%u (max: %u)", info->mtu, info->max_mtu);
+        else
+                snprintf(out, bufsize, "%u", info->mtu);
+}
+
 static void status_one(const char *ifname) {
         unsigned idx = if_nametoindex(ifname);
         char buf[128];
-        const char *type;
         FieldList addrs = { .n = 0 };
         struct ifaddrs *all, *a;
+        NetctlLinkInfo info;
 
         if (idx == 0) {
                 fprintf(stderr, "networkctl: unknown interface '%s'\n", ifname);
                 return;
         }
 
-        type = iface_type(ifname);
+        /*
+         * One rtnetlink round trip for everything below that rtnetlink can
+         * answer (Type's ARPHRD, Alternative Names, MTU min/max, QDisc,
+         * IPv6 Address Generation Mode, Number of Queues). A failure here
+         * (r < 0) just means those rows are omitted below --
+         * netctl_rtnl_get_link() zeroes `info` even on failure, so every
+         * has_* / non-NULL check that follows is honest either way; not
+         * logged, to keep this file free of any dependency on netd's own
+         * logging (pico_log() lives in pico_init_core, which this binary
+         * deliberately does not link -- see this file's own header).
+         */
+        (void) netctl_rtnl_get_link(ifname, &info);
 
         printf("\xe2\x97\x8f %u: %s\n", idx, ifname); /* U+25CF BLACK CIRCLE */
 
@@ -504,7 +535,34 @@ static void status_one(const char *ifname) {
                 printf("%*s: %s\n", LABEL_WIDTH, "Online state", "unknown");
         }
 
-        printf("%*s: %s\n", LABEL_WIDTH, "Type", type);
+        {
+                /* Bridge detection has no rtnetlink equivalent (kept as the
+                 * existing sysfs check); the ARPHRD classification below it
+                 * now comes from the same RTM_GETLINK reply as every other
+                 * new row, rather than a second, separate sysfs /type
+                 * read. */
+                char bridge_path[128];
+                const char *type;
+
+                snprintf(bridge_path, sizeof bridge_path, "/sys/class/net/%s/bridge", ifname);
+                if (access(bridge_path, F_OK) == 0)
+                        type = "bridge";
+                else if (info.arp_type == ARPHRD_LOOPBACK)
+                        type = "loopback";
+                else if (info.arp_type == ARPHRD_ETHER)
+                        type = "ether";
+                else
+                        type = "other";
+
+                printf("%*s: %s\n", LABEL_WIDTH, "Type", type);
+        }
+
+        {
+                char pathid[256];
+
+                if (iface_path_id(ifname, pathid, sizeof pathid))
+                        printf("%*s: %s\n", LABEL_WIDTH, "Path", pathid);
+        }
 
         {
                 char drv[64];
@@ -528,6 +586,15 @@ static void status_one(const char *ifname) {
         }
 
         {
+                FieldList alts = { .n = 0 };
+
+                if (info.alt_names)
+                        for (size_t i = 0; info.alt_names[i]; i++)
+                                field_add(&alts, "%s", info.alt_names[i]);
+                field_print("Alternative Names", &alts);
+        }
+
+        {
                 char path[128], mac[64] = "";
                 FILE *f;
 
@@ -542,35 +609,37 @@ static void status_one(const char *ifname) {
                         printf("%*s: %s\n", LABEL_WIDTH, "Hardware Address", mac);
         }
 
-        {
-                char path[128];
-                long mtu = -1;
-                FILE *f;
+        if (info.has_mtu) {
+                char mtubuf[64];
 
-                snprintf(path, sizeof path, "/sys/class/net/%s/mtu", ifname);
-                f = fopen(path, "re");
-                if (f) {
-                        if (fscanf(f, "%ld", &mtu) != 1)
-                                mtu = -1;
-                        fclose(f);
-                }
-                if (mtu >= 0)
-                        printf("%*s: %ld\n", LABEL_WIDTH, "MTU", mtu);
+                format_mtu(&info, mtubuf, sizeof mtubuf);
+                printf("%*s: %s\n", LABEL_WIDTH, "MTU", mtubuf);
         }
 
-        {
-                char genmode[32];
+        if (info.qdisc)
+                printf("%*s: %s\n", LABEL_WIDTH, "QDisc", info.qdisc);
 
-                if (iface_addr_gen_mode(ifname, genmode, sizeof genmode))
-                        printf("%*s: %s\n", LABEL_WIDTH, "IPv6 Address Generation Mode", genmode);
+        if (info.has_addr_gen_mode) {
+                static const char * const names[] = {
+                        [0] = "eui64",
+                        [1] = "none",
+                        [2] = "stable-privacy",
+                        [3] = "random",
+                };
+
+                /* Same numeric values real networkctl's own
+                 * ipv6_addr_gen_mode_to_string() maps
+                 * (Documentation/networking/ip-sysctl.rst); an out-of-range
+                 * value is omitted rather than guessed. */
+                if (info.addr_gen_mode < sizeof names / sizeof names[0])
+                        printf("%*s: %s\n",
+                               LABEL_WIDTH,
+                               "IPv6 Address Generation Mode",
+                               names[info.addr_gen_mode]);
         }
 
-        {
-                unsigned rx, tx;
-
-                if (iface_queue_counts(ifname, &rx, &tx))
-                        printf("%*s: %u/%u\n", LABEL_WIDTH, "Number of Queues (Tx/Rx)", tx, rx);
-        }
+        if (info.has_queues)
+                printf("%*s: %u/%u\n", LABEL_WIDTH, "Number of Queues (Tx/Rx)", info.tx_queues, info.rx_queues);
 
         if (getifaddrs(&all) == 0) {
                 for (a = all; a; a = a->ifa_next) {
@@ -599,12 +668,13 @@ static void status_one(const char *ifname) {
         field_print("Address", &addrs);
 
         {
-                char path[128], router[64];
+                FieldList gw = { .n = 0 };
 
-                netd_lease_file_path(idx, path, sizeof path);
-                if (read_keyvalue(path, "ROUTER", router, sizeof router))
-                        printf("%*s: %s\n", LABEL_WIDTH, "Gateway", router);
+                collect_default_gateways(ifname, &gw);
+                field_print("Gateway", &gw);
         }
+
+        netctl_link_info_free(&info);
 }
 
 static void status_all(void) {
@@ -676,37 +746,11 @@ static void status_all(void) {
         }
         field_print("Address", &addrs);
 
-        /* Default routes, from the kernel's own plain-text table -- far
-         * simpler and just as authoritative as a raw rtnetlink dump for one
-         * field, and needs no privileged socket. Destination 00000000 (hex,
-         * little-endian) is the default route; Gateway is the same encoding. */
-        {
-                FILE *f = fopen("/proc/net/route", "re");
-                char line[256];
-                bool header = true;
-
-                if (f) {
-                        while (fgets(line, sizeof line, f)) {
-                                char iface[IFNAMSIZ];
-                                unsigned long dest, gw;
-                                unsigned flags;
-
-                                if (header) {
-                                        header = false;
-                                        continue;
-                                }
-
-                                if (sscanf(line, "%15s %lx %lx %x", iface, &dest, &gw, &flags) != 4)
-                                        continue;
-                                if (dest != 0 || gw == 0)
-                                        continue;
-
-                                struct in_addr a = { .s_addr = gw };
-                                field_add(&gateways, "%s on %s", inet_ntoa(a), iface);
-                        }
-                        fclose(f);
-                }
-        }
+        /* Every default route system-wide -- see collect_default_gateways()
+         * for why /proc/net/route is an acceptable, no-extra-socket kernel
+         * source for this field, far simpler and just as authoritative as a
+         * raw rtnetlink dump for one field. */
+        collect_default_gateways(NULL, &gateways);
         field_print("Gateway", &gateways);
 
         {

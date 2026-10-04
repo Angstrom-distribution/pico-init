@@ -35,6 +35,12 @@
  * kernel's own explanation. That is not a nicety: rtnetlink's bare -EINVAL is
  * otherwise indistinguishable between a dozen different malformed-attribute
  * mistakes, and this layer is new code that will make them.
+ *
+ * The low-level socket/message plumbing (request construction, send/recv,
+ * NLMSG_ERROR decoding, generic attribute getters) lives in
+ * netd-rtnl-core.c/.h, shared with netctl-rtnl.c -- this header and
+ * netd-rtnl.c keep only netd's own policy: the link table, event dispatch,
+ * and the idempotent writers below.
  */
 
 #pragma once
@@ -153,6 +159,16 @@ int netd_rtnl_process(NetdRtnl *rtnl);
 /* RTM_SETLINK with IFF_UP in ifi_flags/ifi_change. Idempotent. */
 int netd_rtnl_link_up(NetdRtnl *rtnl, int ifindex);
 int netd_rtnl_link_down(NetdRtnl *rtnl, int ifindex);
+
+/*
+ * RTM_SETLINK carrying only IFLA_ADDRESS -- ifi_flags/ifi_change are left at
+ * 0, so this never brings a link up or down, only changes its hardware
+ * address. `addr`/`len` are copied into IFLA_ADDRESS as given; the caller
+ * (netd-link.c's link_apply_persistent_mac()) is responsible for the link
+ * being administratively down first, which the kernel otherwise refuses a
+ * MAC change against. 0 or -errno.
+ */
+int netd_rtnl_link_set_hwaddr(NetdRtnl *rtnl, int ifindex, const uint8_t *addr, size_t len);
 
 /*
  * RTM_NEWADDR, NLM_F_REQUEST|NLM_F_CREATE|NLM_F_REPLACE|NLM_F_ACK.

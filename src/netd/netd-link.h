@@ -264,3 +264,21 @@ int link_write_state_file(Link *l);
 int link_remove_state_file(Link *l);
 
 const char *link_state_to_string(LinkState s);
+
+/* --- persistent MAC derivation (GOAL B) ---
+ *
+ * The pure half of link_apply_persistent_mac() (netd-link.c): no I/O, no
+ * gating, just real systemd-networkd's MACAddressPolicy=persistent algorithm
+ * (netif-util.c's net_get_unique_predictable_data_from_name() plus
+ * link-config.c's own bit fixup) for `machine_id`/`ifname`. `machine_id` is
+ * the raw 16 bytes (NetdId128.bytes, netd-compat.h) -- taken as a plain
+ * array rather than that type so this header does not have to pull in
+ * netd-compat.h's DHCP-lift-set shim (its assert()/log_*() redefinitions)
+ * into every translation unit that includes netd-link.h. Exposed from an
+ * otherwise-static section only so test-netd-mac.c can check it against
+ * fixed vectors without a live Link/NetdRtnl fixture; every real caller
+ * reaches it through link_configure_impl(), not directly. Writes exactly
+ * NETD_HW_ADDR_MAX bytes to `mac_out`.
+ */
+void netd_persistent_mac_derive(
+                const uint8_t machine_id[16], const char *ifname, uint8_t mac_out[NETD_HW_ADDR_MAX]);

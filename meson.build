@@ -360,6 +360,11 @@ netd_own_sources = files(
   'src/netd/netd-link.c',
   'src/netd/netd-network.c',
   'src/netd/netd-rtnl.c',
+  # Low-level rtnetlink plumbing (request construction, send/recv,
+  # NLMSG_ERROR decoding, generic attribute getters), split out of
+  # netd-rtnl.c so netctl_exe below can share it without linking netd_core
+  # or pico_init_core -- see netd-rtnl-core.h.
+  'src/netd/netd-rtnl-core.c',
   'src/netd/netd-resolv.c',
   'src/netd/netd-sntp.c',
   'src/netd/netd-time.c',
@@ -424,11 +429,18 @@ netd_exe = executable(
 # operation, matching picolog's own reasoning; aliased as "networkctl" by the
 # recipe's ALTERNATIVE, same mechanism as picoctl -> systemctl. No link to
 # netd_core or pico_init_core at all -- it talks to the kernel directly
-# (sysfs + getifaddrs(3)) and to netd's pid only via SIGHUP, not through any
-# of netd's own internals.
+# (sysfs + getifaddrs(3) + its own netctl-rtnl.c rtnetlink client, built from
+# netd-rtnl-core.c only, and its own netctl-path.c ID_PATH walk) and to netd's
+# pid only via SIGHUP, not through any of netd's own internals.
 netctl_exe = executable(
   'netctl',
-  'src/netd/netctl.c',
+  [
+    'src/netd/netctl.c',
+    'src/netd/netctl-rtnl.c',
+    'src/netd/netctl-path.c',
+    'src/netd/netd-rtnl-core.c',
+  ],
+  include_directories: netd_includes,
   install: true,
   install_dir: get_option('bindir'),
 )
@@ -462,6 +474,11 @@ netd_tests = [
   'test-netd-codec',
   'test-netd-dhcp',
   'test-netd-sntp',
+  # Persistent-MAC generation for a random-hardware-address link
+  # (netd-link.c's link_apply_persistent_mac()) -- fixed siphash24 vectors
+  # against the documented upstream key, plus the exemption cases
+  # (loopback, already up, NET_ADDR_PERM/SET/STOLEN, all-zero machine id).
+  'test-netd-mac',
 ]
 
 foreach t : netd_tests
@@ -473,6 +490,25 @@ foreach t : netd_tests
   )
   test(t, exe)
 endforeach
+
+# netctl's own tests: each built from only the one netctl-*.c file it is
+# actually testing (netd-rtnl-core.c for the rtnetlink decoder,
+# netctl-path.c for the ID_PATH walk) -- no link to netd_core or
+# pico_init_core either way, so a bug in netctl's own code can never be
+# masked by (or blamed on) netd's own rtnl code.
+test_netctl_rtnl_exe = executable(
+  'test-netctl-rtnl',
+  ['src/netd/test-netctl-rtnl.c', 'src/netd/netctl-rtnl.c', 'src/netd/netd-rtnl-core.c'] + pico_test_sources,
+  include_directories: netd_includes,
+)
+test('test-netctl-rtnl', test_netctl_rtnl_exe)
+
+test_netctl_path_exe = executable(
+  'test-netctl-path',
+  ['src/netd/test-netctl-path.c', 'src/netd/netctl-path.c'] + pico_test_sources,
+  include_directories: netd_includes,
+)
+test('test-netctl-path', test_netctl_path_exe)
 
 # ---------------------------------------------------------------------------
 # devd -- the device hotplug daemon (plans/31, Part 2, milestone H1). A third
