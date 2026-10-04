@@ -44,8 +44,17 @@ const char *device_sys_root(void) {
 }
 
 void device_set_sys_root_for_tests(const char *root) {
-        if (!root)
+        char dbroot[PATH_MAX];
+
+        /* A fixture's devnums must not resolve against the host's real
+         * /run/udev/data, so the database root follows the fixture. */
+        if (root) {
+                (void) snprintf(dbroot, sizeof(dbroot), "%s/run/udev/data", root);
+                device_set_udev_db_root_for_tests(dbroot);
+        } else {
                 root = SYS_ROOT_DEFAULT;
+                device_set_udev_db_root_for_tests(NULL);
+        }
 
         (void) snprintf(sys_root_buf, sizeof(sys_root_buf), "%s", root);
 }
