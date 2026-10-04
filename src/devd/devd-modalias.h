@@ -7,8 +7,8 @@
  * any rule file. devd's rule engine (devd-match.c's ENV{} matching) can read
  * a MODALIAS a rule already matched on, but nothing made the module load in
  * the first place: devd_rules_react() is a no-op with zero rules loaded or
- * zero rules matched, and DEVD_COLDPLUG_BLOCK/DEVD_COLDPLUG_USB (devd.h) are
- * the only two subsystems the coldplug walk ever looks at.
+ * zero rules matched, and the coldplug walks (devd.h's DEVD_COLDPLUG_*) only
+ * ever look at block, USB and input devices.
  *
  * Confirmed missing live on h2200: resistive-adc-touch.ko and hamcop-adc.ko
  * both present under /lib/modules, neither loaded, `xinput list` showing no

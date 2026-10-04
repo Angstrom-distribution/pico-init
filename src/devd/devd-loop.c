@@ -36,10 +36,12 @@
 #include "../ext-super.h"
 #include "../gpt-scan.h"
 #include "../util.h"
+#include "devd-input-id.h"
 #include "devd-media.h"
 #include "devd-modalias.h"
 #include "devd-probe.h"
 #include "devd-symlink.h"
+#include "devd-udev-db.h"
 #include "devd-uevent.h"
 
 #define DEVD_EPOLL_MAX_EVENTS 8
@@ -111,6 +113,10 @@ int devd_new(Devd **ret) {
         if (r < 0)
                 goto fail;
 
+        r = set_string(&d->udev_db_root, DEVD_UDEV_DB_ROOT);
+        if (r < 0)
+                goto fail;
+
         r = pico_signal_new(&d->signal);
         if (r < 0)
                 goto fail;
@@ -170,6 +176,7 @@ Devd *devd_free(Devd *d) {
         free(d->sys_root);
         free(d->dev_root);
         free(d->media_root);
+        free(d->udev_db_root);
 
         free(d);
         return NULL;
@@ -185,6 +192,10 @@ int devd_set_dev_root(Devd *d, const char *path) {
 
 int devd_set_media_root(Devd *d, const char *path) {
         return d ? set_string(&d->media_root, path) : -EINVAL;
+}
+
+int devd_set_udev_db_root(Devd *d, const char *path) {
+        return d ? set_string(&d->udev_db_root, path) : -EINVAL;
 }
 
 /* --- the mount table --- */
@@ -663,9 +674,16 @@ static void devd_process_uevent(Devd *d, const DevdUevent *u) {
          * below has no opinion about at all. The two reactions are independent
          * -- a rule can name a symlink for a disk while the block core mounts
          * it -- so neither waits for the other.
+         *
+         * Input classification goes between building the context and running
+         * the rules, which is where upstream's 60-input-id.rules sits relative
+         * to every consumer rule: a rule matching ENV{ID_INPUT_TOUCHSCREEN}
+         * and a RUN+= child reading it both need it already set.
          */
-        if (devd_rule_device_from_uevent(d->rule_device, d->sys_root, d->dev_root, u) == 0)
+        if (devd_rule_device_from_uevent(d->rule_device, d->sys_root, d->dev_root, u) == 0) {
+                devd_input_id_react(d, d->rule_device);
                 devd_rules_react(d, d->rule_device);
+        }
 
         /* Independent of the rule engine above and of whether this is a block
          * device at all -- see devd-modalias.h for why this exists. */
@@ -776,6 +794,56 @@ static void coldplug_rules_walk(Devd *d, const char *subdir) {
         (void) closedir(dd);
 }
 
+/*
+ * Classify everything already under <sys_root>/class/input, then run the
+ * rules over it -- coldplug_rules_walk() with the classification in front.
+ *
+ * Its own walk rather than a third coldplug_rules_walk() call, because that
+ * one returns at once with zero rules loaded and classification is not
+ * optional: the database entry is what Xorg reads, rules or no rules. And the
+ * rules still run here rather than being left to that walk, because an
+ * ENV{ID_INPUT_TOUCHSCREEN}=="1", SYMLINK+="input/touchscreen0" rule -- the
+ * tslib idiom -- has to fire for a touchscreen that was present at boot,
+ * which on h2200 is every one there is. devd_rules_react() is already a no-op
+ * when there are none.
+ */
+static void coldplug_input_walk(Devd *d) {
+        char dir[PATH_MAX];
+        struct dirent *e;
+        DIR *dd;
+
+        if ((size_t) snprintf(dir, sizeof(dir), "%s/%s", d->sys_root, DEVD_COLDPLUG_INPUT) >= sizeof(dir))
+                return;
+
+        dd = opendir(dir);
+        if (!dd)
+                return;
+
+        while ((e = readdir(dd))) {
+                char link[PATH_MAX], real[PATH_MAX];
+
+                if (e->d_name[0] == '.')
+                        continue;
+
+                if ((size_t) snprintf(link, sizeof(link), "%s/%s", dir, e->d_name) >= sizeof(link))
+                        continue;
+
+                /* Resolved for the same reason coldplug_rules_walk() gives:
+                 * the capabilities live on the parent inputN, and the parent
+                 * of /sys/class/input/event3 is class/input, not inputN. */
+                if (!realpath(link, real))
+                        continue;
+
+                if (devd_rule_device_from_sysfs(d->rule_device, d->sys_root, d->dev_root, real, "add") < 0)
+                        continue;
+
+                devd_input_id_react(d, d->rule_device);
+                devd_rules_react(d, d->rule_device);
+        }
+
+        (void) closedir(dd);
+}
+
 /* Drop rule-made symlinks whose device is gone, the H2 counterpart of
  * devd_symlink_reconcile(). Which directories to look in comes from the rules
  * themselves, so this stays true for a rules file nobody here wrote. */
@@ -824,6 +892,11 @@ static int devd_coldplug(Devd *d) {
          * devd-modalias.h for why this exists and why it is not scoped to
          * block/USB the way the two walks below are. */
         devd_coldplug_modalias(d);
+
+        /* Modules the step above asked for load asynchronously, and the input
+         * devices they register arrive later as live ADD uevents through
+         * devd_process_uevent(). This classifies the ones already here. */
+        coldplug_input_walk(d);
 
         /* Before the block core's own walk, so a rule that renames or
          * permissions a disk has run by the time it is mounted. */

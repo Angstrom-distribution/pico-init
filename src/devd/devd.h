@@ -41,6 +41,15 @@
  * clause) that keeps a partly-understood file from matching more than its
  * author meant.
  *
+ * And a fourth, which is upstream udevd's own rather than a rules file's:
+ *
+ *  - an input device appears -> classify it the way upstream's input_id
+ *    builtin does (ID_INPUT, ID_INPUT_TOUCHSCREEN, ...), before the rules run
+ *    so they can match on it, and record the answer in /run/udev/data where
+ *    the compat libsystemd's sd_device reads it back; disappears -> retire
+ *    that entry. Xorg's config/udev finds no input devices at all without it
+ *    -- see devd-input-id.h.
+ *
  * What is deliberately NOT here: MBR/FAT probing (v1 is GPT-prepared media
  * only), by-path links, and DPS swap activation -- which stays in PID 1's
  * boot-time dps_scan() precisely because it is scoped to the boot disk, and
@@ -51,8 +60,10 @@
  * listener and its parser), devd-block.c (the debounce state machine),
  * devd-probe.c (the ext superblock and by-id sysfs reads), devd-symlink.c (the
  * by-* families and the links rules name), devd-media.c (the mount policy),
- * devd-rules.c (the rules parser), devd-match.c (what a rule means) and
- * devd-run.c (the RUN+= child).
+ * devd-rules.c (the rules parser), devd-match.c (what a rule means),
+ * devd-run.c (the RUN+= child), devd-modalias.c (module autoloading),
+ * devd-input-id.c (input classification) and devd-udev-db.c (the udev
+ * database entry that classification is published through).
  */
 
 #pragma once
@@ -68,14 +79,18 @@
 #include "devd-match.h"
 #include "devd-rules.h"
 #include "devd-run.h"
+#include "devd-udev-db.h"
 
 typedef struct Devd Devd;
 
 /*
- * The three roots, fields rather than compile-time constants at the use site
- * for the reason netd's paths are settable: a test that created symlinks under
- * the host's real /dev, or mounted something on the machine running it, is a
- * test nobody can run twice.
+ * The roots, fields rather than compile-time constants at the use site for the
+ * reason netd's paths are settable: a test that created symlinks under the
+ * host's real /dev, or mounted something on the machine running it, is a test
+ * nobody can run twice. The fourth, udev_db_root, defaults to
+ * DEVD_UDEV_DB_ROOT (devd-udev-db.h) and is settable for the same reason -- a
+ * test that wrote into the host's real /run/udev/data would be feeding the
+ * host's own udev consumers.
  */
 #define DEVD_SYS_ROOT "/sys"
 #define DEVD_DEV_ROOT "/dev"
@@ -101,6 +116,14 @@ typedef struct DevdMount {
  */
 #define DEVD_COLDPLUG_BLOCK "class/block"
 #define DEVD_COLDPLUG_USB "bus/usb/devices"
+
+/*
+ * Every input device already present, for classification. Walked whether or
+ * not any rules are loaded: on h2200 every input device that exists at boot
+ * is a devicetree platform device whose ADD uevent fired before devd's socket
+ * was open, so this walk is the only path that ever classifies them.
+ */
+#define DEVD_COLDPLUG_INPUT "class/input"
 
 /*
  * One symlink a SYMLINK+= rule made, remembered so it can be removed when the
@@ -178,6 +201,7 @@ struct Devd {
         char *sys_root;
         char *dev_root;
         char *media_root;
+        char *udev_db_root;
 
         DevdObjective objective;
 };
@@ -190,6 +214,7 @@ Devd *devd_free(Devd *d);
 int devd_set_sys_root(Devd *d, const char *path);
 int devd_set_dev_root(Devd *d, const char *path);
 int devd_set_media_root(Devd *d, const char *path);
+int devd_set_udev_db_root(Devd *d, const char *path);
 
 /*
  * Subscribe first, then walk. The ordering is netd's own stated convention

@@ -478,6 +478,10 @@ devd_core_sources = files(
   'src/devd/devd-match.c',
   'src/devd/devd-run.c',
   'src/devd/devd-modalias.c',
+  # upstream's input_id builtin, and the /run/udev/data entry its answer is
+  # published through for the compat libsystemd to overlay.
+  'src/devd/devd-input-id.c',
+  'src/devd/devd-udev-db.c',
 )
 
 devd_core = static_library(
@@ -527,6 +531,8 @@ devd_tests = [
   'test-devd-match',
   'test-devd-run',
   'test-devd-media',
+  'test-devd-input-id',
+  'test-devd-udev-db',
 ]
 
 # PICO_SOURCE_DIR lets test-devd-match.c parse the very file meson installs
