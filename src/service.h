@@ -222,6 +222,15 @@ typedef struct Service {
         int main_exit_code;
         int main_exit_status;
 
+        /*
+         * Sticky mirror of main_pid: set whenever main_pid becomes a live
+         * pid, never cleared on exit. main_pid itself goes back to 0 once
+         * reaped (main_pid_good() depends on that for restart/is-active
+         * logic), but status display still needs the PID to annotate with
+         * main_exit_code/status -- matching systemd's own ExecMainPID=.
+         */
+        pid_t exec_main_pid;
+
         struct pico_cgroup *cgroup; /* owned, NULL until started */
 
         bool remain_after_exit; /* RemainAfterExit=: EXITED still counts as active */

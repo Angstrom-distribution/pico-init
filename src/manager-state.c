@@ -320,7 +320,11 @@ static void publish_unit_file(Unit *u) {
                 u->fragment_path ? u->fragment_path : "",
                 u->description ? u->description : "",
                 unit_file_state(u),
-                s ? (int) s->main_pid : 0,
+                /* exec_main_pid, not the live main_pid: it stays set after
+                 * the process is reaped and main_pid goes back to 0, which
+                 * is what lets status still show the PID alongside
+                 * ExecMainCode/Status for a unit that has since failed. */
+                s ? (int) s->exec_main_pid : 0,
                 s ? service_result_to_string(s->result) : "success",
                 s ? exec_main_code_to_string(s->main_exit_code) : "",
                 s ? s->main_exit_status : 0,

@@ -434,6 +434,7 @@ static int service_load_pid_file(Service *s) {
 
         s->main_pid = (pid_t) v;
         s->main_pid_alien = true;
+        s->exec_main_pid = s->main_pid;
         pico_log(PICO_LOG_DEBUG, "%s: main pid %d read from %s", UNIT(s)->id, (int) v, s->pid_file);
         return 0;
 }
@@ -475,6 +476,7 @@ static int service_search_main_pid(Service *s) {
 
         s->main_pid = found;
         s->main_pid_alien = true;
+        s->exec_main_pid = s->main_pid;
         pico_log(PICO_LOG_DEBUG, "%s: main pid %d guessed from the cgroup", UNIT(s)->id, (int) found);
         return 0;
 }
@@ -862,6 +864,8 @@ static void service_enter_start(Service *s) {
                 service_enter_stop(s);
                 return;
         }
+        if (s->type != SERVICE_TYPE_FORKING)
+                s->exec_main_pid = s->main_pid;
 
         /* Type=exec: service_spawn() handed back the pipe's read end; watch
          * it. Priority per manager.h. A registration failure leaves the
