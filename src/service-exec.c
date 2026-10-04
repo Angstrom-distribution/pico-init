@@ -1127,8 +1127,6 @@ static _Noreturn void
                         _exit(PICO_EXIT_STDERR);
                 if (cfd > STDERR_FILENO)
                         close(cfd);
-                if (stdout_fd >= 0 && stdout_fd > STDERR_FILENO)
-                        close(stdout_fd);
         } else if (is_tty) {
                 /*
                  * StandardInput=tty*: TTYPath= on all three for the commands
@@ -1192,8 +1190,6 @@ static _Noreturn void
                                 _exit(PICO_EXIT_STDOUT);
                         if (dup2(stdout_fd, STDERR_FILENO) < 0)
                                 _exit(PICO_EXIT_STDERR);
-                        if (stdout_fd > STDERR_FILENO)
-                                close(stdout_fd);
                 } else {
                         if (dup2(fd, STDOUT_FILENO) < 0)
                                 _exit(PICO_EXIT_STDOUT);
@@ -1202,6 +1198,49 @@ static _Noreturn void
                 }
                 if (fd > STDERR_FILENO)
                         close(fd);
+        }
+
+        /*
+         * 8b. An explicit StandardOutput=/StandardError= overrides whatever
+         * step 8 chose: journal goes to logd even when stdin is a tty (the
+         * parent made the socket for exactly that case), null discards.
+         * StandardError= inherits from StandardOutput= when unset, as
+         * upstream, but only an explicit stdout setting is followed; the
+         * default stays what step 8 did. The logd fd is closed here, once,
+         * for every branch above.
+         */
+        {
+                ServiceStdioOutput out = s->standard_output;
+                ServiceStdioOutput err = s->standard_error != SERVICE_STDIO_OUTPUT_INHERIT ?
+                                s->standard_error :
+                                out;
+
+                if (out == SERVICE_STDIO_OUTPUT_JOURNAL && stdout_fd >= 0) {
+                        if (dup2(stdout_fd, STDOUT_FILENO) < 0)
+                                _exit(PICO_EXIT_STDOUT);
+                } else if (out == SERVICE_STDIO_OUTPUT_NULL) {
+                        int nfd = open("/dev/null", O_WRONLY | O_NOCTTY);
+
+                        if (nfd < 0 || dup2(nfd, STDOUT_FILENO) < 0)
+                                _exit(PICO_EXIT_STDOUT);
+                        if (nfd > STDERR_FILENO)
+                                close(nfd);
+                }
+
+                if (err == SERVICE_STDIO_OUTPUT_JOURNAL && stdout_fd >= 0) {
+                        if (dup2(stdout_fd, STDERR_FILENO) < 0)
+                                _exit(PICO_EXIT_STDERR);
+                } else if (err == SERVICE_STDIO_OUTPUT_NULL) {
+                        int nfd = open("/dev/null", O_WRONLY | O_NOCTTY);
+
+                        if (nfd < 0 || dup2(nfd, STDERR_FILENO) < 0)
+                                _exit(PICO_EXIT_STDERR);
+                        if (nfd > STDERR_FILENO)
+                                close(nfd);
+                }
+
+                if (stdout_fd > STDERR_FILENO)
+                        close(stdout_fd);
         }
 
         /*
@@ -1442,7 +1481,11 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
          * console" below, never a reason to fail the spawn itself. Not for
          * a tty* unit: its stdout follows stdin to the terminal (child_exec()
          * step 8). */
-        stdout_fd = service_standard_input_is_tty(s->standard_input) ? -1 : create_stdout_socket(UNIT(s)->id);
+        stdout_fd = service_standard_input_is_tty(s->standard_input) &&
+                                        s->standard_output != SERVICE_STDIO_OUTPUT_JOURNAL &&
+                                        s->standard_error != SERVICE_STDIO_OUTPUT_JOURNAL ?
+                        -1 :
+                        create_stdout_socket(UNIT(s)->id);
 
         /* Every enter_* function sets the state before it spawns, so the
          * state names the command: upstream's EXEC_APPLY_TTY_STDIN set. */

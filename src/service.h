@@ -96,6 +96,21 @@ static inline bool service_standard_input_is_tty(ServiceStandardInput i) {
                         i == SERVICE_STANDARD_INPUT_TTY_FAIL;
 }
 
+/*
+ * StandardOutput=/StandardError=. INHERIT is upstream's default: stdout follows
+ * stdin where that is a socket or a tty (so a StandardInput=tty unit logs to its
+ * terminal), otherwise it goes to logd; stderr follows stdout. Setting either
+ * explicitly overrides that: journal (also syslog, journal+console,
+ * syslog+console, which differ only in the console copy this does not make)
+ * sends it to logd even when stdin is a tty, null discards it. Other values
+ * (kmsg, file:, ...) still fall through to the degraded-directive path.
+ */
+typedef enum ServiceStdioOutput {
+        SERVICE_STDIO_OUTPUT_INHERIT,
+        SERVICE_STDIO_OUTPUT_JOURNAL,
+        SERVICE_STDIO_OUTPUT_NULL,
+} ServiceStdioOutput;
+
 typedef enum ServiceState {
         SERVICE_DEAD,
         SERVICE_CONDITION,    /* ExecCondition= running as the control process */
@@ -153,6 +168,8 @@ typedef struct Service {
         ServiceState state;
         ServiceResult result;
         ServiceStandardInput standard_input; /* StandardInput=, default SERVICE_STANDARD_INPUT_NULL */
+        ServiceStdioOutput standard_output;  /* StandardOutput=, default inherit */
+        ServiceStdioOutput standard_error;   /* StandardError=, default inherit (follows stdout) */
         char *tty_path;                      /* TTYPath=, absolute, owned; NULL = PICO_CONSOLE_PATH */
 
         /* argv-style NULL-terminated vectors, owned */

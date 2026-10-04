@@ -661,6 +661,78 @@ static void test_comment_inside_continuation_is_skipped(void) {
  * in the code claiming it was rejected -- a dead check. Asserting the
  * rejection is what keeps that from regressing back into a value nobody wrote.
  */
+/*
+ * StandardOutput=/StandardError=: journal (and its syslog/+console spellings)
+ * and null are honoured, inherit is the default, and a value pico-init has no
+ * meaning for (kmsg, file:...) is recorded as dropped without touching the
+ * default.
+ */
+static void test_standard_output_and_error(void) {
+        Manager *m;
+        Service *s;
+        char *dir;
+        Unit *u;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "j.service",
+                                      "[Service]\n"
+                                      "StandardInput=tty\n"
+                                      "StandardOutput=journal\n"
+                                      "StandardError=journal\n"
+                                      "ExecStart=/bin/true\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "n.service",
+                                      "[Service]\n"
+                                      "StandardOutput=null\n"
+                                      "StandardError=syslog+console\n"
+                                      "ExecStart=/bin/true\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "k.service",
+                                      "[Service]\n"
+                                      "StandardOutput=kmsg\n"
+                                      "StandardError=file:/tmp/x\n"
+                                      "ExecStart=/bin/true\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir, "d.service", "[Service]\nExecStart=/bin/true\n"), 0);
+
+        m = manager_for(dir);
+        ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+
+        s = (Service *) manager_get_unit(m, "j.service");
+        ASSERT_TRUE(s != NULL);
+        ASSERT_EQ_INT(s->standard_output, SERVICE_STDIO_OUTPUT_JOURNAL);
+        ASSERT_EQ_INT(s->standard_error, SERVICE_STDIO_OUTPUT_JOURNAL);
+        ASSERT_EQ_INT(UNIT(s)->n_degraded_directives, 0);
+
+        s = (Service *) manager_get_unit(m, "n.service");
+        ASSERT_TRUE(s != NULL);
+        ASSERT_EQ_INT(s->standard_output, SERVICE_STDIO_OUTPUT_NULL);
+        ASSERT_EQ_INT(s->standard_error, SERVICE_STDIO_OUTPUT_JOURNAL);
+        ASSERT_EQ_INT(UNIT(s)->n_degraded_directives, 0);
+
+        u = manager_get_unit(m, "k.service");
+        ASSERT_TRUE(u != NULL);
+        s = (Service *) u;
+        ASSERT_EQ_INT(s->standard_output, SERVICE_STDIO_OUTPUT_INHERIT);
+        ASSERT_EQ_INT(s->standard_error, SERVICE_STDIO_OUTPUT_INHERIT);
+        ASSERT_EQ_INT(u->n_degraded_directives, 2);
+        ASSERT_STREQ(u->degraded_directives[0], "StandardOutput");
+        ASSERT_STREQ(u->degraded_directives[1], "StandardError");
+
+        s = (Service *) manager_get_unit(m, "d.service");
+        ASSERT_TRUE(s != NULL);
+        ASSERT_EQ_INT(s->standard_output, SERVICE_STDIO_OUTPUT_INHERIT);
+        ASSERT_EQ_INT(s->standard_error, SERVICE_STDIO_OUTPUT_INHERIT);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 static void test_exec_start_pre_list_and_reset(void) {
         Manager *m;
         Service *s;
@@ -2009,6 +2081,7 @@ int main(void) {
         test_comment_inside_continuation_is_skipped();
         test_quoting_and_trailing_garbage();
         test_exec_start_pre_list_and_reset();
+        test_standard_output_and_error();
         test_invalid_dependency_names_are_rejected();
         test_huge_requires_line_does_not_crash();
         test_conditions_are_parsed();

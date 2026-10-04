@@ -684,6 +684,38 @@ static int config_parse_standard_input(
 }
 
 /*
+ * StandardOutput= / StandardError=: inherit, journal (and the syslog and
+ * +console spellings, which this treats as journal) and null; see
+ * service.h's ServiceStdioOutput. Anything else is recorded as dropped.
+ */
+static int config_parse_standard_output(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        Service *s = unit_to_service(u, path, line);
+        ServiceStdioOutput v;
+        (void) path;
+        (void) line;
+
+        if (!s)
+                return 0;
+
+        if (strcmp(rvalue, "inherit") == 0)
+                v = SERVICE_STDIO_OUTPUT_INHERIT;
+        else if (strcmp(rvalue, "journal") == 0 || strcmp(rvalue, "journal+console") == 0 ||
+                 strcmp(rvalue, "syslog") == 0 || strcmp(rvalue, "syslog+console") == 0)
+                v = SERVICE_STDIO_OUTPUT_JOURNAL;
+        else if (strcmp(rvalue, "null") == 0)
+                v = SERVICE_STDIO_OUTPUT_NULL;
+        else
+                return unit_add_degradation(u, lvalue);
+
+        if (strcmp(lvalue, "StandardError") == 0)
+                s->standard_error = v;
+        else
+                s->standard_output = v;
+        return 0;
+}
+
+/*
  * TTYPath=: full specifier table, since getty's TTYPath=/dev/%I needs %I's
  * unescaping. Unlike PIDFile=, a relative value is not anchored anywhere:
  * upstream's config_parse_unit_path_printf() logs and ignores it, so this
@@ -1661,6 +1693,8 @@ static const ConfigItem config_items[] = {
         {    SECTION_UNIT, "ConditionPathIsDirectory", config_parse_condition_path_is_directory },
         { SECTION_SERVICE,                     "Type",                        config_parse_type },
         { SECTION_SERVICE,            "StandardInput",              config_parse_standard_input },
+        { SECTION_SERVICE,           "StandardOutput",             config_parse_standard_output },
+        { SECTION_SERVICE,            "StandardError",             config_parse_standard_output },
         { SECTION_SERVICE,                  "TTYPath",                    config_parse_tty_path },
         { SECTION_SERVICE,                "ExecStart",                  config_parse_exec_start },
         { SECTION_SERVICE,             "ExecStartPre",              config_parse_exec_start_pre },

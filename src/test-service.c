@@ -506,6 +506,52 @@ static void test_exec_start_pre_failure_stops_the_chain(void) {
 
 #pragma GCC diagnostic pop
 
+/*
+ * StandardOutput=null really discards, and StandardError= follows an explicit
+ * StandardOutput= when it is not set itself. The child checks its own
+ * descriptors through /proc: `$$$$` reaches the shell as `$$`, its own pid.
+ */
+static void test_standard_output_null_and_error_follows(void) {
+        static const struct {
+                const char *name;
+                const char *settings;
+                const char *check;
+        } cases[] = {
+                { "so-null.service",
+                 "StandardOutput=null\n", "test \"$(readlink /proc/$$$$/fd/1)\" = /dev/null && test \"$(readlink /proc/$$$$/fd/2)\" = /dev/null"                   },
+                { "se-null.service", "StandardError=null\n",                                                     "test \"$(readlink /proc/$$$$/fd/2)\" = /dev/null" },
+        };
+        Manager *m;
+        char *dir;
+        size_t i;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+                char unit[512];
+                Service *s;
+
+                snprintf(unit,
+                         sizeof unit,
+                         "[Unit]\nDescription=stdio\n[Service]\nType=oneshot\n%s"
+                         "ExecStart=/bin/sh -c '%s'\n",
+                         cases[i].settings,
+                         cases[i].check);
+                s = load_service(m, dir, cases[i].name, unit);
+
+                ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+                ASSERT_TRUE(drive_until(m, service_settled_done, s, 2000));
+                ASSERT_EQ_INT(s->state, SERVICE_DEAD);
+                ASSERT_EQ_INT(s->result, SERVICE_SUCCESS);
+        }
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 static void test_remain_after_exit(void) {
         Manager *m;
         Service *s;
@@ -3243,6 +3289,7 @@ int main(void) {
         test_exec_start_pre_dash_ignores_failure();
         test_exec_start_pre_runs_every_line_in_order();
         test_exec_start_pre_failure_stops_the_chain();
+        test_standard_output_null_and_error_follows();
         test_remain_after_exit();
         test_b2_signal_amnesty_differs_by_type();
         test_start_timeout();

@@ -114,6 +114,8 @@ static void unit_swap_directives(Unit *u, Unit *fresh) {
  */
 static void service_swap_directives(Service *s, Service *fresh) {
         SWAP_FIELD(s->type, fresh->type);
+        SWAP_FIELD(s->standard_output, fresh->standard_output);
+        SWAP_FIELD(s->standard_error, fresh->standard_error);
         SWAP_FIELD(s->exec_start_pre, fresh->exec_start_pre);
         SWAP_FIELD(s->n_exec_start_pre, fresh->n_exec_start_pre);
         SWAP_FIELD(s->exec_start, fresh->exec_start);
