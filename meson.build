@@ -457,6 +457,7 @@ netctl_exe = executable(
     'src/netd/netctl.c',
     'src/netd/netctl-rtnl.c',
     'src/netd/netctl-path.c',
+    'src/netd/netctl-lldp.c',
     'src/netd/netd-rtnl-core.c',
     # Shared ANSI colour helper (pico-color.h): on/off rules and escape
     # sequences mirroring real networkctl's. Not part of pico-init-core, so
@@ -537,6 +538,13 @@ test_netctl_path_exe = executable(
   include_directories: netd_includes,
 )
 test('test-netctl-path', test_netctl_path_exe)
+
+test_netctl_lldp_exe = executable(
+  'test-netctl-lldp',
+  ['src/netd/test-netctl-lldp.c', 'src/netd/netctl-lldp.c'] + pico_test_sources,
+  include_directories: netd_includes,
+)
+test('test-netctl-lldp', test_netctl_lldp_exe)
 
 # netctl's colour output: netctl.c's own colour helpers are file-local
 # statics with no header, so this runs the real built `netctl` binary as a

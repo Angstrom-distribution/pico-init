@@ -63,14 +63,17 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "../pico-color.h"
+#include "netctl-lldp.h"
 #include "netctl-path.h"
 #include "netctl-rtnl.h"
 
 #define NETD_LINKS_DIR "/run/netd/links"
 #define NETD_LEASES_DIR "/run/netd/leases"
+#define NETD_LLDP_DIR "/run/netd/lldp"
 
 /* --- reload: SIGHUP the running netd ---------------------------------- */
 
@@ -1024,6 +1027,107 @@ static int cmd_list(void) {
         return 0;
 }
 
+#define LLDP_ROWS_MAX 256
+
+static int lldp_row_compare(const void *a, const void *b) {
+        const NetctlLldpRow *x = a, *y = b;
+        int c = strcmp(x->link, y->link);
+
+        return c ? c : strcmp(x->chassis, y->chassis);
+}
+
+static bool lldp_wanted(int argc, char *argv[], const char *ifname) {
+        int i;
+
+        if (argc < 3)
+                return true;
+        for (i = 2; i < argc; i++)
+                if (strcmp(argv[i], ifname) == 0)
+                        return true;
+        return false;
+}
+
+/* networkctl lldp [LINK...]: the neighbours netd heard, from the files it publishes. */
+static int cmd_lldp(int argc, char *argv[]) {
+        static NetctlLldpRow rows[LLDP_ROWS_MAX];
+        size_t n = 0, i, w_link = 4, w_chassis = 10, w_name = 11, w_port = 7;
+        struct timespec now;
+        DIR *d = opendir(NETD_LLDP_DIR);
+        struct dirent *e;
+
+        clock_gettime(CLOCK_MONOTONIC, &now);
+
+        while (d && (e = readdir(d)) != NULL && n < LLDP_ROWS_MAX) {
+                char path[PATH_MAX], ifname[IFNAMSIZ], line[2048];
+                FILE *f;
+
+                if (e->d_name[0] == '.' || strstr(e->d_name, ".netd-tmp"))
+                        continue;
+                snprintf(path, sizeof path, "%s/%s", NETD_LLDP_DIR, e->d_name);
+                if (!read_keyvalue(path, "IFNAME", ifname, sizeof ifname) || !lldp_wanted(argc, argv, ifname))
+                        continue;
+
+                f = fopen(path, "re");
+                if (!f)
+                        continue;
+                while (n < LLDP_ROWS_MAX && fgets(line, sizeof line, f)) {
+                        line[strcspn(line, "\n")] = '\0';
+                        if (!netctl_lldp_parse_row(line, ifname, &rows[n]))
+                                continue;
+                        /* A file left behind by a netd that is no longer running. */
+                        if (rows[n].expires != 0 && rows[n].expires <= (uint64_t) now.tv_sec)
+                                continue;
+                        n++;
+                }
+                fclose(f);
+        }
+        if (d)
+                closedir(d);
+
+        qsort(rows, n, sizeof rows[0], lldp_row_compare);
+        for (i = 0; i < n; i++) {
+                if (strlen(rows[i].link) > w_link)
+                        w_link = strlen(rows[i].link);
+                if (strlen(rows[i].chassis) > w_chassis)
+                        w_chassis = strlen(rows[i].chassis);
+                if (strlen(rows[i].name) > w_name)
+                        w_name = strlen(rows[i].name);
+                if (strlen(rows[i].port) > w_port)
+                        w_port = strlen(rows[i].port);
+        }
+
+        printf("%-*s %-*s %-*s %-11s %-*s %s\n",
+               (int) w_link,
+               "LINK",
+               (int) w_chassis,
+               "CHASSIS-ID",
+               (int) w_name,
+               "SYSTEM-NAME",
+               "CAPS",
+               (int) w_port,
+               "PORT-ID",
+               "PORT-DESCRIPTION");
+        for (i = 0; i < n; i++)
+                printf("%-*s %-*s %-*s %-11s %-*s %s\n",
+                       (int) w_link,
+                       rows[i].link,
+                       (int) w_chassis,
+                       rows[i].chassis,
+                       (int) w_name,
+                       rows[i].name,
+                       rows[i].caps,
+                       (int) w_port,
+                       rows[i].port,
+                       rows[i].descr);
+
+        if (n)
+                printf("\nCapability Flags:\no - Other; p - Repeater; b - Bridge; w - WLAN Access Point; r - Router;\n"
+                       "t - Telephone; d - DOCSIS cable device; a - Station; c - Customer VLAN;\n"
+                       "s - Service VLAN, m - Two-port MAC Relay (TPMR)\n");
+        printf("\n%zu neighbor%s listed.\n", n, n == 1 ? "" : "s");
+        return 0;
+}
+
 int main(int argc, char *argv[]) {
         if (argc < 2)
                 return cmd_list();
@@ -1034,6 +1138,8 @@ int main(int argc, char *argv[]) {
                 return cmd_status(argc, argv);
         if (strcmp(argv[1], "list") == 0)
                 return cmd_list();
+        if (strcmp(argv[1], "lldp") == 0)
+                return cmd_lldp(argc, argv);
 
         fprintf(stderr, "networkctl: unknown command '%s'\n", argv[1]);
         return 2;
