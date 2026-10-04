@@ -743,31 +743,6 @@ static int load_install_info(const char *unit_name, Manager **ret_m, Unit **ret_
         return 0;
 }
 
-/* Every directory component of `path` except its own basename, created if
- * missing -- install.c's mkdir_parents_label(), which real `systemctl
- * enable` also runs before every symlink it creates. A read-only /etc fails
- * here with a clear -EROFS/-EACCES, exactly as upstream's would. */
-static int mkdir_parents(const char *path) {
-        char buf[PATH_MAX];
-        size_t len = strlen(path);
-        char *p;
-
-        if (len == 0 || len >= sizeof(buf))
-                return -ENAMETOOLONG;
-        memcpy(buf, path, len + 1);
-
-        for (p = buf + 1; *p; p++) {
-                if (*p != '/')
-                        continue;
-                *p = '\0';
-                if (mkdir(buf, 0755) < 0 && errno != EEXIST)
-                        return -errno;
-                *p = '/';
-        }
-
-        return 0;
-}
-
 static int enable_symlink_path(
                 const char *target, const char *suffix, const char *unit_id, char *out, size_t out_size) {
         char etcdir[PATH_MAX];
@@ -788,42 +763,35 @@ static int enable_symlink_path(
  * always force=true for .wants/.requires entries (install_info_symlink_
  * wants() passes force unconditionally; only linking the unit file itself
  * respects the CLI --force flag, which picoctl does not need since it never
- * links the fragment itself). Verified byte-identical to `systemctl --root
- * enable` in the verification container, absolute target included -- see
- * test-picoctl.c.
+ * links the fragment itself). The actual mkdir/readlink/symlink work is
+ * unit-enable.c's unit_enable_create_symlink(), shared with boot-time
+ * preset persistence so the two can never disagree about what a symlink
+ * looks like. Verified byte-identical to `systemctl --root enable` in the
+ * verification container, absolute target included -- see test-picoctl.c.
  */
 static int create_enable_symlink(const char *target, const char *suffix, Unit *u) {
-        char linkpath[PATH_MAX];
-        char destbuf[PATH_MAX];
+        char etcdir[PATH_MAX];
         const char *frag;
-        ssize_t rl;
         int r;
 
-        r = enable_symlink_path(target, suffix, u->id, linkpath, sizeof(linkpath));
-        if (r < 0)
-                return r;
-
-        r = mkdir_parents(linkpath);
-        if (r < 0)
-                return r;
+        if (path_join(etcdir, sizeof(etcdir), PICO_UNIT_DIR) < 0)
+                return -ENAMETOOLONG;
 
         frag = strip_root(u->fragment_path);
 
-        rl = readlink(linkpath, destbuf, sizeof(destbuf) - 1);
-        if (rl >= 0) {
-                destbuf[rl] = '\0';
-                if (strcmp(destbuf, frag) == 0)
-                        return 0; /* already correct: idempotent, not an error */
-                unlink(linkpath);
-        } else if (errno != ENOENT)
-                unlink(linkpath); /* something else there (e.g. a plain file); force it */
+        r = unit_enable_create_symlink(etcdir, target, suffix, u->id, frag);
+        if (r < 0)
+                return r;
 
-        if (symlink(frag, linkpath) < 0)
-                return -errno;
+        if (r == 1) {
+                char linkpath[PATH_MAX];
 
-        /* real install_change_dump_success() logs one line per symlink
-         * actually created, naming both paths (src/shared/install.c). */
-        printf("Created symlink '%s' \xe2\x86\x92 '%s'.\n", linkpath, frag);
+                /* real install_change_dump_success() logs one line per
+                 * symlink actually created, naming both paths
+                 * (src/shared/install.c). */
+                if (enable_symlink_path(target, suffix, u->id, linkpath, sizeof(linkpath)) == 0)
+                        printf("Created symlink '%s' \xe2\x86\x92 '%s'.\n", linkpath, frag);
+        }
 
         return 0;
 }

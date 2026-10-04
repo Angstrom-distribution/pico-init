@@ -133,6 +133,13 @@ int manager_set_watchdog_device(Manager *m, const char *path) {
         return 0;
 }
 
+void manager_set_first_boot(Manager *m, bool first_boot) {
+        if (!m)
+                return;
+
+        m->first_boot = first_boot;
+}
+
 int manager_new(Manager **ret) {
         Manager *m;
         int r;

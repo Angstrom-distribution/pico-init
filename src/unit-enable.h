@@ -49,7 +49,49 @@ int manager_preset_query(Manager *m, const char *unit_name);
 
 /*
  * Apply presets to every loaded unit that no symlink already enabled, calling
- * unit_install_enablement() for each one a preset says to enable. Number
- * enabled, or -errno.
+ * unit_install_enablement() for each one a preset says to enable -- and, for
+ * each of those, persisting the decision as a real .wants/.requires symlink
+ * under the manager's own unit directory (unit_path[0]), the same way
+ * `systemctl preset` would. A unit a preset left disabled gets no symlink
+ * and no edge, which is exactly what "disabled" means on disk: nothing
+ * written at all.
+ *
+ * This is what makes calling this function indistinguishable, on disk, from
+ * a real `systemctl preset-all` -- which matters because manager-startup.c
+ * calls it at most ONCE per machine's life (first boot only; see
+ * manager-startup.c's own comment on manager_startup()). A later boot never
+ * calls this again, so a unit a symlink from here no longer names (because
+ * something removed it, e.g. `picoctl disable`) stays disabled -- the
+ * preset's "enable" opinion only ever gets to act once.
+ *
+ * Number enabled, or -errno. A failure persisting one unit's symlink is
+ * logged and does not undo that unit's in-memory enablement or stop the loop
+ * over the rest -- the in-memory decision for this boot is still correct
+ * even when the write that would make it survive a reboot failed.
  */
 int manager_apply_presets(Manager *m);
+
+/*
+ * Create (or repair) one <etcdir>/<target><suffix>/<unit_id> symlink
+ * pointing at `link_target`, idempotently -- install.c's create_symlink(),
+ * shared with picoctl's own enable verb (src/picoctl.c
+ * create_enable_symlink()) so a symlink persisted here at boot and one
+ * `picoctl enable` writes by hand can never disagree about what "enabled"
+ * looks like on disk.
+ *
+ * `etcdir` is the directory .wants/.requires live under (manager.h's
+ * PICO_UNIT_DIR in production, a --root-prefixed or fixture equivalent
+ * otherwise) -- never derived internally, so a caller with its own idea of
+ * --root (picoctl) and one with none (boot time) can share this one
+ * implementation.
+ *
+ * Returns 1 if a symlink was created or replaced, 0 if the correct symlink
+ * already existed, or -errno. Never logs or prints -- each caller decides
+ * how, or whether, to report what it did.
+ */
+int unit_enable_create_symlink(
+                const char *etcdir,
+                const char *target,
+                const char *suffix,
+                const char *unit_id,
+                const char *link_target);

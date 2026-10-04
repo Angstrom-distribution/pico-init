@@ -206,10 +206,28 @@ int manager_startup(Manager *m, const char *default_target) {
                         pico_log(PICO_LOG_WARNING, "%s: scanning .wants/.requires: %s", u->id, strerror(-r));
         }
 
-        /* 4. Presets decide whatever the symlinks did not. */
-        r = manager_apply_presets(m);
-        if (r < 0)
-                pico_log(PICO_LOG_WARNING, "applying presets: %s", strerror(-r));
+        /*
+         * 4. Presets decide whatever the symlinks did not -- but only on
+         * first boot (m->first_boot, set from main.c's machine_id_setup()
+         * result before manager_startup() ran). Real systemd never applies
+         * presets from PID 1 at all: `systemctl preset-all` runs once, at
+         * image build or first-boot-gated provisioning time, and writes
+         * real symlinks that every later boot just reads. Calling
+         * manager_apply_presets() unconditionally here used to redo that
+         * decision from scratch every single boot, in memory only, which
+         * silently re-enabled any unit a preset says "enable" the moment
+         * something (e.g. `picoctl disable`) removed its symlink -- exactly
+         * the bug this gate exists to close. Persisting the first-boot
+         * result as real symlinks (unit-enable.c's own job) is what lets
+         * every later boot skip this step and still see the same units
+         * enabled, from .wants/.requires alone.
+         */
+        if (m->first_boot) {
+                r = manager_apply_presets(m);
+                if (r < 0)
+                        pico_log(PICO_LOG_WARNING, "applying presets: %s", strerror(-r));
+        } else
+                pico_log(PICO_LOG_DEBUG, "not first boot, presets already resolved to symlinks");
 
         /* 5. Order every target after what it pulls in, and every service
          * after sockets.target so nothing races a socket it may be

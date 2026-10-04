@@ -58,6 +58,29 @@ sd_event_lib = static_library(
   include_directories: libsystemd_compat_includes,
 )
 
+# sd-id128.c hoisted the same way, for the same reason: machine-id-setup.c
+# (pico_init_core) needs sd_id128_randomize()/sd_id128_to_string() and
+# id128_read_fd(), not the rest of libsystemd-compat (sd-bus, sd-journal,
+# ...), and vice versa libsystemd_compat must not depend on pico-init-core.
+# sha256.c/hmac-sha256.c ride along because they are sd-id128.c's own
+# -- sd_id128_get_app_specific()'s HMAC -- not a separate public API.
+# -Wno-error=nonnull-compare: sd-id128.c's char s[_SD_ARRAY_STATIC N]
+# parameters are real systemd's own upstream signature (_sd-common.h), and
+# the defensive `if (!s) return NULL;` alongside them is real systemd's own
+# style too -- GCC's nonnull-compare treats the [static N] bound as an
+# implicit nonnull contract and flags the very check that guards against a
+# caller violating it. Real behavior, not a bug; scoped to this one warning.
+sd_id128_lib = static_library(
+  'sd-id128',
+  files(
+    'src/compat/libsystemd/sd-id128.c',
+    'src/compat/libsystemd/sha256.c',
+    'src/compat/libsystemd/hmac-sha256.c',
+  ),
+  include_directories: libsystemd_compat_includes,
+  c_args: ['-Wno-error=nonnull-compare'],
+)
+
 # Everything except main() builds into a static library, so the test programs
 # can link the real manager, unit and job code instead of re-declaring it.
 # main.c stays out of it: a second main() would collide with every test's own.
@@ -68,6 +91,9 @@ pico_init_core_sources = files(
   'src/manager-startup.c',
   'src/mount-setup.c',
   'src/hostname-setup.c',
+  # First-boot detection and /etc/machine-id fill-in (main.c's early boot
+  # sequence, and the signal manager-startup.c gates preset application on).
+  'src/machine-id-setup.c',
   # The GPT reader and the Discoverable-Partitions swap activation on top of
   # it (plans/31, Slice A). In the core library rather than beside main.c
   # because the parser half is meant to have a second consumer later.
@@ -153,7 +179,7 @@ pico_init_core = static_library(
   pico_init_core_sources,
   version_h,
   include_directories: libsystemd_compat_includes,
-  link_with: sd_event_lib,
+  link_with: [sd_event_lib, sd_id128_lib],
 )
 
 # link_whole, not link_with: a static library only contributes the object
@@ -193,6 +219,10 @@ pico_tests = [
   'test-unit-load',
   'test-job',
   'test-boot-root',
+  # First-boot detection and the /etc/machine-id fallback (read-only /etc,
+  # inside a private mount namespace), beside the manager-startup.c tests
+  # whose first-boot gating this feeds.
+  'test-machine-id-setup',
   # test-service is registered further down, after the shared libsystemd
   # its Type=notify helper links.
   'test-timer-cgroup',
@@ -757,15 +787,13 @@ picoctl_exe = executable(
 # ring -- src/logd/logd-read.h -- never the binary .journal format), and
 # -util (helpers shared across the read side). sd-journal-internal.h is
 # their private struct sd_journal layout, never installed.
+#
+# sd-id128.c/sha256.c/hmac-sha256.c live in sd_id128_lib (above, defined
+# ahead of pico_init_core for the same reason sd_event_lib is) and are
+# pulled back into this library via link_whole below, not listed as
+# sources here.
 # ---------------------------------------------------------------------------
 libsystemd_compat_sources = files(
-  'src/compat/libsystemd/sd-id128.c',
-  # sd_id128_get_app_specific()'s HMAC-SHA256: a small pico-original pair
-  # (see sha256.h/hmac-sha256.h's own comments for why this is written from
-  # the FIPS/RFC text rather than vendored from any existing source file),
-  # not a public sd-*.h family of its own.
-  'src/compat/libsystemd/sha256.c',
-  'src/compat/libsystemd/hmac-sha256.c',
   'src/compat/libsystemd/sd-journal-util.c',
   'src/compat/libsystemd/sd-journal-send.c',
   'src/compat/libsystemd/sd-journal-sendv.c',
@@ -830,20 +858,11 @@ libsystemd_compat_sources = files(
 # behind the version script's `local: *`) link it, and
 # gen-libsystemd-sym.py reads its full symbol table through nm. Real
 # systemd ships no static libsystemd either; a consumer lands on the .so.
-#
-# -Wno-error=nonnull-compare: sd-id128.c's char s[_SD_ARRAY_STATIC N]
-# parameters are real systemd's own upstream signature (_sd-common.h), and
-# the defensive `if (!s) return NULL;` alongside them is real systemd's
-# own style too -- GCC's nonnull-compare treats the [static N] bound as an
-# implicit nonnull contract and flags the very check that guards against a
-# caller violating it. Real behavior, not a bug; scoped to this one
-# warning rather than disabling -Werror for the whole target.
 libsystemd_compat = static_library(
   'systemd-compat',
   libsystemd_compat_sources,
   include_directories: libsystemd_compat_includes,
-  c_args: ['-Wno-error=nonnull-compare'],
-  link_whole: [sd_event_lib, logd_read],
+  link_whole: [sd_event_lib, sd_id128_lib, logd_read],
 )
 
 # The installed artifact: ${libdir}/libsystemd.so.0.<minor>.<micro> with

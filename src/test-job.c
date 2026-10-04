@@ -1295,6 +1295,8 @@ static void test_alias_boot_runs_ordered_oneshot(void) {
         ASSERT_EQ_INT(manager_set_runtime_dir(m, rt), 0);
         use_private_cgroup_root(m, "alias-boot", cgroup_root, sizeof(cgroup_root));
 
+        /* a first boot: presets, not symlinks, enable these fixture units */
+        manager_set_first_boot(m, true);
         ASSERT_EQ_INT(manager_startup(m, NULL), 0);
 
         multi = manager_get_unit(m, "multi-user.target");

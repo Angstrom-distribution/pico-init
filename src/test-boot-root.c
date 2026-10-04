@@ -9,9 +9,12 @@
  */
 
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "manager.h"
 #include "test-util.h"
@@ -50,6 +53,11 @@ static void set_two_preset_dirs(Manager *m, const char *dir1, const char *dir2) 
  * out here so tests can drive it without also dragging in cycle detection and
  * job creation. Follows the same iteration hazard rule manager-startup.c
  * documents: index freshly and re-read m->n_units, never cache the array.
+ *
+ * Gated on m->first_boot exactly like manager-startup.c's own step 4: a
+ * caller that wants presets applied has to say so explicitly with
+ * manager_set_first_boot(m, true) first, matching what a real boot does
+ * exactly once per machine.
  */
 static void apply_enablement(Manager *m) {
         size_t i;
@@ -63,7 +71,22 @@ static void apply_enablement(Manager *m) {
                 ASSERT_TRUE(unit_add_wants_requires_dirs(u) == 0);
         }
 
-        ASSERT_TRUE(manager_apply_presets(m) >= 0);
+        if (m->first_boot)
+                ASSERT_TRUE(manager_apply_presets(m) >= 0);
+}
+
+/* Whether <dir>/<target><suffix>/<unit_id> exists as a symlink -- the
+ * on-disk fact manager_apply_presets() must now also produce whenever it
+ * enables a unit, not just the in-memory edge and u->enabled. */
+static bool enable_symlink_on_disk(const char *dir, const char *target, const char *suffix, const char *unit_id) {
+        char path[PATH_MAX];
+        struct stat st;
+        int n;
+
+        n = snprintf(path, sizeof(path), "%s/%s%s/%s", dir, target, suffix, unit_id);
+        ASSERT_TRUE(n > 0 && (size_t) n < sizeof(path));
+
+        return lstat(path, &st) == 0;
 }
 
 /* A default.target with no static Wants=, pulling in exactly what a real
@@ -198,6 +221,9 @@ static void test_install_wantedby_with_preset_enable(void) {
 
         ASSERT_TRUE(unit_has_dependency(target, UNIT_WANTS, foo));
         ASSERT_TRUE(foo->enabled);
+        /* the new contract: a preset-driven enable is now persisted as a
+         * real symlink too, not just an in-memory edge */
+        ASSERT_TRUE(enable_symlink_on_disk(udir, "default.target", ".wants", "foo.service"));
 
         manager_free(m);
         test_rm_rf(udir);
@@ -236,6 +262,9 @@ static void test_install_wantedby_with_preset_disable(void) {
 
         ASSERT_TRUE(!unit_has_dependency(target, UNIT_WANTS, foo));
         ASSERT_TRUE(!foo->enabled);
+        /* "disable" writes nothing: no symlink appears for a unit presets
+         * left disabled */
+        ASSERT_TRUE(!enable_symlink_on_disk(udir, "default.target", ".wants", "foo.service"));
 
         manager_free(m);
         test_rm_rf(udir);
@@ -281,6 +310,7 @@ static void test_no_matching_rule_defaults_to_enable(void) {
 
         ASSERT_TRUE(unit_has_dependency(target, UNIT_WANTS, foo));
         ASSERT_TRUE(foo->enabled);
+        ASSERT_TRUE(enable_symlink_on_disk(udir, "default.target", ".wants", "foo.service"));
 
         manager_free(m);
         test_rm_rf(udir);
@@ -491,6 +521,8 @@ static void test_default_target_boots_hand_built_set(void) {
         set_one_preset_dir(m, pdir);
         ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
 
+        /* presets only ever act on first boot */
+        manager_set_first_boot(m, true);
         apply_enablement(m);
 
         target = manager_get_unit(m, "default.target");
@@ -511,6 +543,120 @@ static void test_default_target_boots_hand_built_set(void) {
         ASSERT_TRUE(beta->enabled);
         ASSERT_TRUE(delta->enabled);
         ASSERT_TRUE(!gamma->enabled);
+
+        /* alpha's symlink was already on disk (hand-built fixture); beta
+         * and delta are new, persisted by the preset step just now; gamma
+         * gets none */
+        ASSERT_TRUE(enable_symlink_on_disk(udir, "default.target", ".wants", "alpha.service"));
+        ASSERT_TRUE(enable_symlink_on_disk(udir, "default.target", ".wants", "beta.service"));
+        ASSERT_TRUE(enable_symlink_on_disk(udir, "default.target", ".wants", "delta.service"));
+        ASSERT_TRUE(!enable_symlink_on_disk(udir, "default.target", ".wants", "gamma.service"));
+
+        manager_free(m);
+        test_rm_rf(udir);
+        test_rm_rf(pdir);
+        free(udir);
+        free(pdir);
+}
+
+/*
+ * The full manager_startup() path, not just apply_enablement(): on a real
+ * first boot (m->first_boot set before startup runs, exactly as main.c's
+ * machine_id_setup() result does it), a preset "enable" gets persisted as a
+ * real symlink on disk, not just an in-memory edge -- the thing that lets a
+ * later, non-first boot see the same decision without presets ever running
+ * again.
+ */
+static void test_first_boot_persists_preset_symlinks(void) {
+        Unit *foo;
+        Manager *m;
+        char *udir, *pdir;
+
+        udir = test_tmpdir_new();
+        pdir = test_tmpdir_new();
+        ASSERT_TRUE(udir && pdir);
+
+        ASSERT_EQ_INT(test_write_file(udir, "default.target", default_target_unit), 0);
+        ASSERT_EQ_INT(test_write_file(udir,
+                                      "foo.service",
+                                      "[Unit]\n[Service]\nExecStart=/bin/true\n[Install]\nWantedBy=default.target\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(pdir, "10-test.preset", "enable foo.service\n"), 0);
+
+        m = manager_for(udir);
+        set_one_preset_dir(m, pdir);
+        manager_set_first_boot(m, true);
+
+        ASSERT_EQ_INT(manager_startup(m, "default.target"), 0);
+
+        foo = manager_get_unit(m, "foo.service");
+        ASSERT_TRUE(foo != NULL);
+        ASSERT_TRUE(foo->enabled);
+        ASSERT_TRUE(enable_symlink_on_disk(udir, "default.target", ".wants", "foo.service"));
+
+        manager_free(m);
+        test_rm_rf(udir);
+        test_rm_rf(pdir);
+        free(udir);
+        free(pdir);
+}
+
+/*
+ * The exact regression this milestone fixes: `systemctl disable foo` (here,
+ * removing the symlink by hand, exactly what that verb does) must stay
+ * disabled across a later boot, even though the preset still says "enable"
+ * -- because a non-first boot never consults presets at all. Before the
+ * fix, manager_apply_presets() ran on every boot and re-enabled foo the
+ * moment its symlink was gone, in memory, every single time.
+ */
+static void test_second_boot_does_not_resurrect_a_disabled_unit(void) {
+        Unit *foo;
+        Manager *m;
+        char *udir, *pdir;
+        char linkpath[PATH_MAX];
+        int n;
+
+        udir = test_tmpdir_new();
+        pdir = test_tmpdir_new();
+        ASSERT_TRUE(udir && pdir);
+
+        ASSERT_EQ_INT(test_write_file(udir, "default.target", default_target_unit), 0);
+        ASSERT_EQ_INT(test_write_file(udir,
+                                      "foo.service",
+                                      "[Unit]\n[Service]\nExecStart=/bin/true\n[Install]\nWantedBy=default.target\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(pdir, "10-test.preset", "enable foo.service\n"), 0);
+
+        /* boot 1: first boot, preset enables foo and persists its symlink */
+        m = manager_for(udir);
+        set_one_preset_dir(m, pdir);
+        manager_set_first_boot(m, true);
+        ASSERT_EQ_INT(manager_startup(m, "default.target"), 0);
+
+        foo = manager_get_unit(m, "foo.service");
+        ASSERT_TRUE(foo && foo->enabled);
+        ASSERT_TRUE(enable_symlink_on_disk(udir, "default.target", ".wants", "foo.service"));
+
+        manager_free(m);
+
+        /* "systemctl disable foo.service": remove exactly the symlink that
+         * verb removes, leaving the preset's own "enable" rule untouched. */
+        n = snprintf(linkpath, sizeof(linkpath), "%s/default.target.wants/foo.service", udir);
+        ASSERT_TRUE(n > 0 && (size_t) n < sizeof(linkpath));
+        ASSERT_EQ_INT(unlink(linkpath), 0);
+        ASSERT_TRUE(!enable_symlink_on_disk(udir, "default.target", ".wants", "foo.service"));
+
+        /* boot 2: a fresh Manager over the same fixture root, NOT first
+         * boot -- presets must not be consulted at all. */
+        m = manager_for(udir);
+        set_one_preset_dir(m, pdir);
+        manager_set_first_boot(m, false);
+        ASSERT_EQ_INT(manager_startup(m, "default.target"), 0);
+
+        foo = manager_get_unit(m, "foo.service");
+        ASSERT_TRUE(foo != NULL);
+        ASSERT_TRUE(!foo->enabled); /* the regression: this used to be true again */
+        ASSERT_TRUE(!enable_symlink_on_disk(udir, "default.target", ".wants", "foo.service"));
 
         manager_free(m);
         test_rm_rf(udir);
@@ -643,6 +789,8 @@ int main(void) {
         test_symlink_enabled_survives_disable_preset();
         test_real_angstrom_pico_preset_parses();
         test_default_target_boots_hand_built_set();
+        test_first_boot_persists_preset_symlinks();
+        test_second_boot_does_not_resurrect_a_disabled_unit();
         test_startup_survives_a_cycle_outside_the_transaction();
 
         printf("test-boot-root: all checks passed\n");

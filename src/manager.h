@@ -174,6 +174,18 @@ struct Manager {
          * legal outcome: returning from main() as PID 1 is a kernel panic. */
         bool is_system;
 
+        /*
+         * Whether /etc/machine-id was missing, empty or "uninitialized" this
+         * boot (main.c's machine_id_setup() call, before manager_new() --
+         * see machine-id-setup.h). False by default, so a test that builds a
+         * Manager directly never applies presets without asking for that
+         * explicitly, matching upstream's own manager_set_first_boot(): the
+         * one thing manager_startup() consults it for is whether to apply
+         * presets at all (unit-enable.h's own header comment says why that
+         * is a once-ever, not every-boot, decision).
+         */
+        bool first_boot;
+
         ManagerObjective objective;
 
         /*
@@ -206,6 +218,11 @@ int manager_set_preset_path(Manager *m, const char * const *path);
 int manager_set_cgroup_root(Manager *m, const char *root);
 int manager_set_runtime_dir(Manager *m, const char *dir);
 int manager_set_watchdog_device(Manager *m, const char *path);
+
+/* Record whether this boot is a first boot (main.c's machine_id_setup()
+ * result) -- see Manager.first_boot above for what that gates. A no-op
+ * setter, not fallible: there is nothing to allocate. */
+void manager_set_first_boot(Manager *m, bool first_boot);
 
 /* Scan every unit_path entry (or just `dir` when non-NULL) for files whose
  * suffix names a known unit type, creating and loading each. 0 or -errno. */
@@ -287,8 +304,10 @@ int manager_dispatch_run_queue(Manager *m);
 /* --- manager-startup.c --- */
 /*
  * The boot sequence: load every unit in the search path, resolve enablement
- * (.wants/.requires directories, then presets for whatever they did not
- * cover), check the ordering graph for cycles, and queue a start job for
+ * (.wants/.requires directories always; presets too, but ONLY when
+ * m->first_boot -- see manager_set_first_boot() and unit-enable.h's own
+ * comment on manager_apply_presets() for why that is a once-ever decision),
+ * check the ordering graph for cycles, and queue a start job for
  * `default_target` (PICO_DEFAULT_TARGET when NULL). 0 or -errno.
  */
 int manager_startup(Manager *m, const char *default_target);

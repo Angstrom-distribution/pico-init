@@ -160,6 +160,8 @@ int main(void) {
         ASSERT_EQ_INT(test_mkdir(cgroup_root, "system.slice"), 0);
         ASSERT_EQ_INT(manager_set_cgroup_root(m, cgroup_root), 0);
 
+        /* a first boot: presets, not symlinks, enable these fixture units */
+        manager_set_first_boot(m, true);
         ASSERT_EQ_INT(manager_startup(m, NULL), 0);
 
         /* --- enablement resolved before anything ran --- */

@@ -14,6 +14,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "manager.h"
 #include "unit-enable.h"
@@ -159,6 +161,69 @@ int unit_install_enablement(Unit *u) {
         u->enabled = true;
 
         return ret;
+}
+
+/* Every directory component of `path` except its own basename, created if
+ * missing -- install.c's mkdir_parents_label(). Shared by both
+ * unit_enable_create_symlink() callers (boot time here, picoctl's own
+ * enable verb), moved here when the second caller needed the exact same
+ * behaviour rather than kept as a picoctl-only static. */
+static int mkdir_parents(const char *path) {
+        char buf[PATH_MAX];
+        size_t len = strlen(path);
+        char *p;
+
+        if (len == 0 || len >= sizeof(buf))
+                return -ENAMETOOLONG;
+        memcpy(buf, path, len + 1);
+
+        for (p = buf + 1; *p; p++) {
+                if (*p != '/')
+                        continue;
+                *p = '\0';
+                if (mkdir(buf, 0755) < 0 && errno != EEXIST)
+                        return -errno;
+                *p = '/';
+        }
+
+        return 0;
+}
+
+int unit_enable_create_symlink(
+                const char *etcdir,
+                const char *target,
+                const char *suffix,
+                const char *unit_id,
+                const char *link_target) {
+        char linkpath[PATH_MAX];
+        char destbuf[PATH_MAX];
+        ssize_t rl;
+        int n, r;
+
+        if (!etcdir || !target || !suffix || !unit_id || !link_target)
+                return -EINVAL;
+
+        n = snprintf(linkpath, sizeof(linkpath), "%s/%s%s/%s", etcdir, target, suffix, unit_id);
+        if (n < 0 || (size_t) n >= sizeof(linkpath))
+                return -ENAMETOOLONG;
+
+        r = mkdir_parents(linkpath);
+        if (r < 0)
+                return r;
+
+        rl = readlink(linkpath, destbuf, sizeof(destbuf) - 1);
+        if (rl >= 0) {
+                destbuf[rl] = '\0';
+                if (strcmp(destbuf, link_target) == 0)
+                        return 0; /* already correct: idempotent, not an error */
+                unlink(linkpath);
+        } else if (errno != ENOENT)
+                unlink(linkpath); /* something else there (e.g. a plain file); force it */
+
+        if (symlink(link_target, linkpath) < 0)
+                return -errno;
+
+        return 1;
 }
 
 /* One *.preset file resolved to the single directory that wins for it (the
@@ -398,6 +463,48 @@ int manager_preset_query(Manager *m, const char *unit_name) {
         return r == 1 ? decision : -ENOENT; /* 0 matches: no rule matched */
 }
 
+/*
+ * Persist a preset-driven enable as real symlinks, one per WantedBy=/
+ * RequiredBy= name, under m->unit_path[0] -- the first, highest-priority
+ * search-path entry, exactly the directory manager.h's own PICO_UNIT_DIR
+ * comment says .wants/.requires always get created under. A failure on one
+ * name is logged and does not stop the rest; it also never undoes the
+ * in-memory enablement unit_install_enablement() already made, since that
+ * decision is correct for this boot regardless of whether it survives to
+ * the next one.
+ */
+static void persist_preset_enablement(Manager *m, Unit *u) {
+        const char *etcdir;
+        size_t i;
+
+        if (!m->unit_path || !m->unit_path[0])
+                return;
+        etcdir = m->unit_path[0];
+
+        for (i = 0; u->wanted_by && u->wanted_by[i]; i++) {
+                int r = unit_enable_create_symlink(etcdir, u->wanted_by[i], ".wants", u->id, u->fragment_path);
+
+                if (r < 0)
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s: persisting preset enablement under %s.wants: %s",
+                                 u->id,
+                                 u->wanted_by[i],
+                                 strerror(-r));
+        }
+
+        for (i = 0; u->required_by && u->required_by[i]; i++) {
+                int r = unit_enable_create_symlink(
+                                etcdir, u->required_by[i], ".requires", u->id, u->fragment_path);
+
+                if (r < 0)
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s: persisting preset enablement under %s.requires: %s",
+                                 u->id,
+                                 u->required_by[i],
+                                 strerror(-r));
+        }
+}
+
 int manager_apply_presets(Manager *m) {
         PresetEntry *entries = NULL;
         size_t n = 0;
@@ -474,6 +581,7 @@ int manager_apply_presets(Manager *m) {
                                 continue;
                         }
                         n_enabled++;
+                        persist_preset_enablement(m, u);
                 }
                 /* r == 1 && decision == 0: disable -- leave u->enabled false */
         }

@@ -20,6 +20,7 @@
 #include "fstab.h"
 #include "gpt-scan.h"
 #include "hostname-setup.h"
+#include "machine-id-setup.h"
 #include "manager.h"
 #include "mount-setup.h"
 #include "root-check.h"
@@ -44,6 +45,7 @@ static _Noreturn void freeze(const char *reason) {
 int main(void) {
         FstabTable fstab = { 0 };
         bool fstab_swap;
+        bool first_boot = false;
         Manager *m = NULL;
         int objective;
         int r;
@@ -204,11 +206,27 @@ int main(void) {
                         pico_log(PICO_LOG_DEBUG, "dps_scan: %d discovered swap partition(s) activated", r);
         }
 
+        /*
+         * First-boot detection, same signal upstream's own log_execution_mode()
+         * uses (src/core/main.c): /etc/machine-id missing, empty, or literally
+         * "uninitialized". After the root check and fstab pass, so the decision
+         * is made against the root filesystem's final, settled mount state
+         * (writable or genuinely read-only), not whatever it was before either
+         * ran; before manager_new(), because manager_startup() below gates
+         * preset application on the result (manager_set_first_boot()) and that
+         * must be known before a single unit is enabled.
+         */
+        r = machine_id_setup(NULL, NULL, &first_boot);
+        if (r < 0)
+                pico_log(PICO_LOG_WARNING, "machine_id_setup: %s", strerror(-r));
+
         r = manager_new(&m);
         if (r < 0) {
                 pico_log(PICO_LOG_ERR, "manager_new: %s", strerror(-r));
                 freeze("could not create the manager");
         }
+
+        manager_set_first_boot(m, first_boot);
 
         /* With C-A-D left enabled the kernel reboots at once, unsynced; this
          * makes it send SIGINT, which the manager turns into an orderly

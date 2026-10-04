@@ -637,6 +637,8 @@ static void test_read_verbs_against_real_boot(void) {
         }
         ASSERT_EQ_INT(manager_set_runtime_dir(m, rtdir), 0);
         use_private_cgroup_root(m, cgroup_root, sizeof(cgroup_root));
+        /* a first boot: presets, not symlinks, enable these fixture units */
+        manager_set_first_boot(m, true);
         ASSERT_EQ_INT(manager_startup(m, NULL), 0);
 
         ASSERT_EQ_INT(pico_timer_add(m->timer, now_monotonic() + 3 * USEC_PER_SEC, stop_the_loop, m, NULL), 0);

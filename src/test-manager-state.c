@@ -219,6 +219,8 @@ static void test_boot_files_match_reality(void) {
         ASSERT_EQ_INT(manager_set_runtime_dir(m, rtdir), 0);
         use_private_cgroup_root(m, "boot", cgroup_root, sizeof(cgroup_root));
 
+        /* a first boot: presets, not symlinks, enable these fixture units */
+        manager_set_first_boot(m, true);
         ASSERT_EQ_INT(manager_startup(m, NULL), 0);
 
         /* manager_state_setup() ran inside manager_startup(): the manager
@@ -516,6 +518,7 @@ static void test_unwritable_runtime_dir_never_fails_boot(void) {
 
         /* ... and manager_startup(), which calls it internally and only
          * logs a warning, must still boot successfully despite that. */
+        manager_set_first_boot(m, true);
         ASSERT_EQ_INT(manager_startup(m, NULL), 0);
         ASSERT_TRUE(m->state == NULL); /* still degraded, not silently recovered */
 
@@ -781,6 +784,7 @@ static void test_job_counters_publish(void) {
         ASSERT_EQ_INT(read_manager_uint(rtdir, "NJobs"), 0);
         ASSERT_EQ_INT(read_manager_uint(rtdir, "NInstalledJobs"), 0);
 
+        manager_set_first_boot(m, true);
         ASSERT_EQ_INT(manager_startup(m, NULL), 0);
 
         /* (a) the boot transaction is installed but not yet run. */
