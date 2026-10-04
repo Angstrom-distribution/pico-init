@@ -311,16 +311,20 @@ static int cmd_list_units(int argc, char *argv[]) {
         if (names && n > 1)
                 qsort(names, n, sizeof(char *), name_cmp);
 
-        printf("%-32s %-8s %-10s %-13s %s\n", "UNIT", "LOAD", "ACTIVE", "SUB", "DESCRIPTION");
+        /* real output_units_list() has a JOB column between SUB and DESCRIPTION
+         * (systemctl-list-units.c table_new()); struct unit_state already
+         * carries job, it was just never shown here. */
+        printf("%-32s %-8s %-10s %-13s %-8s %s\n", "UNIT", "LOAD", "ACTIVE", "SUB", "JOB", "DESCRIPTION");
         for (i = 0; i < n; i++) {
                 struct unit_state st;
 
                 read_unit_state(names[i], &st);
-                printf("%-32s %-8s %-10s %-13s %s\n",
+                printf("%-32s %-8s %-10s %-13s %-8s %s\n",
                        names[i],
                        st.load_state,
                        st.active_state,
                        st.sub_state,
+                       st.job,
                        st.description);
                 free(names[i]);
         }
@@ -553,10 +557,12 @@ static void print_log_line(const LogdEntry *e) {
                 sec = (time_t) (usec / 1000000ULL);
         }
 
-        if (sec > 0 && localtime_r(&sec, &tmv))
-                strftime(timebuf, sizeof(timebuf), "%b %e %H:%M:%S", &tmv);
-        else
-                snprintf(timebuf, sizeof(timebuf), "(no timestamp)");
+        /* real output_timestamp_realtime() skips the entry entirely when no
+         * valid realtime timestamp exists (logs-show.c), never prints a
+         * placeholder in its place. */
+        if (sec <= 0 || !localtime_r(&sec, &tmv))
+                return;
+        strftime(timebuf, sizeof(timebuf), "%b %d %H:%M:%S", &tmv);
 
         printf("%s %s ", timebuf, host);
 
@@ -565,7 +571,7 @@ static void print_log_line(const LogdEntry *e) {
         else if (comm)
                 fwrite(comm->value, 1, comm->value_len, stdout);
         else
-                fputs("-", stdout);
+                fputs("unknown", stdout); /* real's fallback text (logs-show.c), not "-" */
 
         if (pid && !pid->binary) {
                 putchar('[');
@@ -578,7 +584,7 @@ static void print_log_line(const LogdEntry *e) {
         if (msg && !msg->binary)
                 fwrite(msg->value, 1, msg->value_len, stdout);
         else if (msg)
-                fputs("blob data", stdout);
+                printf("[%zu bytes blob data]", msg->value_len); /* real's FORMAT_BYTES() wording (logs-show.c) */
 
         putchar('\n');
 }
@@ -628,27 +634,41 @@ static int cmd_status(int argc, char *argv[]) {
                 if (!st.found) {
                         printf("%s\n", argv[i]);
                         printf("     Loaded: not-found\n");
+                        /* real print_status_info() still runs the full path for a
+                         * not-found unit and prints Active: too (systemctl-show.c). */
+                        printf("     Active: %s (%s)\n", st.active_state, st.sub_state);
                         fprintf(stderr, "Unit %s could not be found.\n", argv[i]);
                         if (worst < 4)
                                 worst = 4;
                         continue;
                 }
 
-                printf("%s - %s\n", argv[i], st.description[0] ? st.description : argv[i]);
+                /* real systemctl only adds "- description" when it differs from
+                 * the unit id itself (systemctl-show.c print_description()). */
+                if (st.description[0] && strcmp(st.description, argv[i]) != 0)
+                        printf("%s - %s\n", argv[i], st.description);
+                else
+                        printf("%s\n", argv[i]);
                 printf("     Loaded: %s (%s; %s)\n",
                        st.load_state,
                        st.fragment_path[0] ? st.fragment_path : "n/a",
                        st.unit_file_state[0] ? st.unit_file_state : "n/a");
-                printf("     Active: %s (%s)\n", st.active_state, st.sub_state);
-
-                if (st.main_pid > 0)
-                        printf("   Main PID: %d\n", st.main_pid);
+                /* Result folds onto the Active: line itself upstream, never a
+                 * separate field (systemctl-show.c print_status_info()). */
                 if (strcmp(st.result, "success") != 0)
-                        printf("     Result: %s\n", st.result);
-                if (st.exec_main_code[0])
-                        printf("  Main Exit: code=%s, status=%d\n", st.exec_main_code, st.exec_main_status);
-                if (st.n_restarts > 0)
-                        printf("  NRestarts: %u\n", st.n_restarts);
+                        printf("     Active: %s (%s) (Result: %s)\n", st.active_state, st.sub_state, st.result);
+                else
+                        printf("     Active: %s (%s)\n", st.active_state, st.sub_state);
+
+                /* exit code/status is a parenthetical on Main PID itself upstream;
+                 * there is no standalone "Main Exit:" field, and NRestarts is a
+                 * bus property never shown in human status output at all. */
+                if (st.main_pid > 0) {
+                        if (st.exec_main_code[0])
+                                printf("   Main PID: %d (code=%s, status=%d)\n", st.main_pid, st.exec_main_code, st.exec_main_status);
+                        else
+                                printf("   Main PID: %d\n", st.main_pid);
+                }
                 if (st.job[0])
                         printf("        Job: %s\n", st.job);
 
@@ -797,6 +817,10 @@ static int create_enable_symlink(const char *target, const char *suffix, Unit *u
         if (symlink(frag, linkpath) < 0)
                 return -errno;
 
+        /* real install_change_dump_success() logs one line per symlink
+         * actually created, naming both paths (src/shared/install.c). */
+        printf("Created symlink '%s' \xe2\x86\x92 '%s'.\n", linkpath, frag);
+
         return 0;
 }
 
@@ -805,7 +829,10 @@ static void remove_enable_symlink(const char *target, const char *suffix, const 
 
         if (enable_symlink_path(target, suffix, unit_id, linkpath, sizeof(linkpath)) < 0)
                 return;
-        unlink(linkpath); /* ENOENT is not an error: nothing to remove */
+        /* real install_change_dump_success() logs "Removed '%s'." per symlink
+         * actually removed (src/shared/install.c); nothing to log if absent. */
+        if (unlink(linkpath) == 0)
+                printf("Removed '%s'.\n", linkpath);
 }
 
 static bool enable_symlink_exists(const char *target, const char *suffix, const char *unit_id) {
@@ -883,8 +910,9 @@ static int cmd_enable(int argc, char *argv[]) {
                 } else if (r < 0) {
                         fprintf(stderr, "Failed to enable unit %s: %s\n", argv[i], strerror(-r));
                         status = 1;
-                } else
-                        printf("Enabled %s.\n", argv[i]);
+                }
+                /* no per-unit summary line: real systemctl's only output here
+                 * is the per-symlink "Created symlink" lines above, if any. */
 
                 manager_free(m);
         }
@@ -912,7 +940,8 @@ static int cmd_disable(int argc, char *argv[]) {
                 }
 
                 do_disable_unit(u);
-                printf("Disabled %s.\n", argv[i]);
+                /* no per-unit summary line: real systemctl's only output here
+                 * is the per-symlink "Removed" lines above, if any. */
 
                 manager_free(m);
         }
@@ -1004,17 +1033,16 @@ static int cmd_preset(int argc, char *argv[]) {
                         continue;
                 }
 
+                /* no per-unit summary line here either: same per-symlink
+                 * "Created symlink"/"Removed" output as enable/disable. */
                 if (decision == 1 || decision == -ENOENT) {
                         r = do_enable_unit(u);
                         if (r < 0 && r != -ENOEXEC) {
                                 fprintf(stderr, "Failed to preset unit %s: %s\n", argv[i], strerror(-r));
                                 status = 1;
-                        } else
-                                printf("Enabled %s (preset).\n", argv[i]);
-                } else {
+                        }
+                } else
                         do_disable_unit(u);
-                        printf("Disabled %s (preset).\n", argv[i]);
-                }
 
                 manager_free(m);
         }
@@ -1232,14 +1260,16 @@ static char *mangle_unit_arg(const char *arg) {
 }
 
 /*
- * reboot/poweroff/halt/shutdown: real systemctl's own mechanism for these,
- * not a new one -- PID 1 already listens for exactly these signals
- * (manager-loop.c's manager_dispatch_signal(): SIGINT -> MANAGER_REBOOT,
- * SIGRTMIN+3/+4 -> MANAGER_POWEROFF, both real systemd's own ctrl-alt-del/
- * shutdown-signal convention), it was simply never reachable from a
- * command. picoctl itself needs no control-socket round trip for this --
- * kill(1, sig) is the whole mechanism, same as real systemd's own
- * reboot(8)/halt(8) fall back to when not run via D-Bus.
+ * reboot/poweroff/halt/shutdown: a deliberate simplification, not what real
+ * systemctl/reboot(8)/halt(8) actually do -- those go logind first, then a
+ * D-Bus StartUnit on halt/poweroff/reboot.target, and only reach a raw
+ * syscall with --force (src/systemctl/systemctl-compat-halt.c). kill(1, sig)
+ * is PID 1's own signal convention (manager-loop.c's manager_dispatch_
+ * signal(): SIGINT -> MANAGER_REBOOT, SIGRTMIN+3/+4 -> MANAGER_POWEROFF,
+ * matching manager.c's target_table), reachable by anyone sending it, not
+ * something systemctl itself calls -- picoctl goes straight there since it
+ * has no logind/D-Bus to call through. No --force/--wtmp-only/--no-wall
+ * flags either: every invocation acts immediately regardless (see usage()).
  *
  * /sbin/reboot, /sbin/poweroff, /sbin/halt and /sbin/shutdown are meant to
  * be ALTERNATIVE-aliased straight at this binary (the recipe's own

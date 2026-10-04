@@ -772,7 +772,9 @@ static void test_read_verbs_against_real_boot(void) {
         RUN_PICOCTL(&res, "--root", root, "status", "console.service");
         ASSERT_TRUE(strstr(res.out, "Active: failed (failed)") != NULL);
         ASSERT_TRUE(strstr(res.out, "Result: signal") != NULL);
-        ASSERT_TRUE(strstr(res.out, "Main Exit: code=killed, status=9") != NULL);
+        /* exit code/status is a parenthetical on Main PID: itself upstream,
+         * never a standalone "Main Exit:" field (systemctl-show.c). */
+        ASSERT_TRUE(strstr(res.out, "(code=killed, status=9)") != NULL);
         ASSERT_EQ_INT(res.exit_code, 3); /* LSB 3: not running */
 
         manager_free(m);
@@ -866,9 +868,13 @@ static void test_status_log_tail(void) {
          * must never appear */
         ASSERT_TRUE(strstr(res.out, "not this unit's line") == NULL);
         ASSERT_TRUE(strstr(res.out, "demo[4242]: hello from demo") != NULL);
-        /* binary-safe MESSAGE prints the blob-data placeholder, never the
-         * raw control byte */
-        ASSERT_TRUE(strstr(res.out, "demo[4242]: blob data") != NULL);
+        /* binary-safe MESSAGE prints the blob-data placeholder (real's
+         * FORMAT_BYTES() wording, byte count included), never the raw
+         * control byte */
+        /* "bad\x01byte"'s \x escape is greedy and swallows the following
+         * hex digit 'b' too (\x01b = 0x1b, ESC), so the literal is 7 bytes
+         * ('b','a','d',ESC,'y','t','e'), not the 8 its spelling suggests. */
+        ASSERT_TRUE(strstr(res.out, "demo[4242]: [7 bytes blob data]") != NULL);
         ASSERT_TRUE(strstr(res.out, "bad\x01byte") == NULL);
 
         /* an image with no logd at all -- no /run/logd whatsoever -- must

@@ -117,10 +117,12 @@ static void print_short(const LogdEntry *e, bool show_all) {
                 sec = (time_t) (usec / 1000000ULL);
         }
 
-        if (sec > 0 && localtime_r(&sec, &tmv))
-                strftime(timebuf, sizeof(timebuf), "%b %e %H:%M:%S", &tmv);
-        else
-                snprintf(timebuf, sizeof(timebuf), "(no timestamp)");
+        /* real output_timestamp_realtime() skips the entry entirely when no
+         * valid realtime timestamp exists (logs-show.c), never prints a
+         * placeholder in its place. */
+        if (sec <= 0 || !localtime_r(&sec, &tmv))
+                return;
+        strftime(timebuf, sizeof(timebuf), "%b %d %H:%M:%S", &tmv);
 
         printf("%s %s ", timebuf, host);
 
@@ -129,7 +131,7 @@ static void print_short(const LogdEntry *e, bool show_all) {
         else if (comm)
                 fwrite(comm->value, 1, comm->value_len, stdout);
         else
-                fputs("-", stdout);
+                fputs("unknown", stdout); /* real's fallback text (logs-show.c), not "-" */
 
         if (pid && !pid->binary) {
                 putchar('[');
@@ -144,7 +146,7 @@ static void print_short(const LogdEntry *e, bool show_all) {
         else if (msg && show_all)
                 print_escaped(msg->value, msg->value_len);
         else if (msg)
-                fputs("blob data", stdout);
+                printf("[%zu bytes blob data]", msg->value_len); /* real's FORMAT_BYTES() wording (logs-show.c) */
 
         putchar('\n');
 }

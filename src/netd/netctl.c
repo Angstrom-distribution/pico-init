@@ -23,10 +23,12 @@
  * status`/`networkctl status IFACE`, close enough to be useful to someone
  * who already knows that tool, but it does not claim fields netd has no way
  * to back honestly: no NetDev/Link File, Driver, QDisc, bridge internals,
- * Activation Policy or Required For Online -- netd tracks none of them.
+ * Activation Policy, Required For Online or Route Domains (networkd's
+ * per-link Domains=~ routing-only domains) -- netd tracks none of them.
  */
 
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <ifaddrs.h>
@@ -267,33 +269,6 @@ static void iface_operational(const char *ifname, char *out, size_t bufsize) {
 
 /* --- status: kernel ground truth + netd's published files -------------- */
 
-static int mask_prefixlen(const struct sockaddr *mask) {
-        int bits = 0;
-
-        if (!mask)
-                return -1;
-
-        if (mask->sa_family == AF_INET) {
-                uint32_t m = ((const struct sockaddr_in *) mask)->sin_addr.s_addr;
-                while (m) {
-                        bits += m & 1;
-                        m >>= 1;
-                }
-        } else if (mask->sa_family == AF_INET6) {
-                const struct sockaddr_in6 *m6 = (const struct sockaddr_in6 *) mask;
-                for (size_t i = 0; i < sizeof m6->sin6_addr.s6_addr; i++) {
-                        unsigned char byte = m6->sin6_addr.s6_addr[i];
-                        while (byte) {
-                                bits += byte & 1;
-                                byte >>= 1;
-                        }
-                }
-        } else
-                return -1;
-
-        return bits;
-}
-
 /*
  * A labeled field whose value may be more than one line -- real networkctl's
  * own table renders every multi-value field (Address, Gateway, DNS, NTP...)
@@ -335,11 +310,11 @@ static void field_print(const char *label, const FieldList *fl) {
                 printf("%*s  %s\n", LABEL_WIDTH, "", fl->v[i]);
 }
 
-static void collect_addr_on_iface(FieldList *fl, const char *ifname, const char *addr, int prefix) {
-        if (prefix >= 0)
-                field_add(fl, "%s/%d on %s", addr, prefix, ifname);
-        else
-                field_add(fl, "%s on %s", addr, ifname);
+/* real dump_addresses() never appends a /prefix -- just the address, plus
+ * " on " FORMAT_IFNAME_FULL() (ifname%ifindex) for system-wide status
+ * (networkctl-dump-util.c). */
+static void collect_addr_on_iface(FieldList *fl, const char *ifname, unsigned ifindex, const char *addr) {
+        field_add(fl, "%s on %s%%%u", addr, ifname, ifindex);
 }
 
 static void status_one(const char *ifname) {
@@ -367,6 +342,11 @@ static void status_one(const char *ifname) {
                 iface_operational(ifname, op, sizeof op);
                 iface_setup_state(ifname, setup, sizeof setup);
                 printf("%*s: %s (%s)\n", LABEL_WIDTH, "State", op, setup);
+                /* real per-link status always has an Online state row right
+                 * after State (networkctl-status-link.c); netd has no separate
+                 * online-state concept, so this is honestly always "unknown",
+                 * matching real's own fallback for the same unknown case. */
+                printf("%*s: %s\n", LABEL_WIDTH, "Online state", "unknown");
         }
 
         printf("%*s: %s\n", LABEL_WIDTH, "Type", type);
@@ -416,12 +396,9 @@ static void status_one(const char *ifname) {
                                          host, sizeof host, NULL, 0, NI_NUMERICHOST) != 0)
                                 continue;
 
-                        int prefix = mask_prefixlen(a->ifa_netmask);
-
-                        if (prefix >= 0)
-                                field_add(&addrs, "%s/%d", host, prefix);
-                        else
-                                field_add(&addrs, "%s", host);
+                        /* real dump_addresses() never appends a /prefix, per-link
+                         * or system-wide (networkctl-dump-util.c). */
+                        field_add(&addrs, "%s", host);
                 }
                 freeifaddrs(all);
         }
@@ -466,6 +443,10 @@ static void status_all(void) {
         if_freenameindex(list);
 
         printf("%*s: %s\n", LABEL_WIDTH, "State", any_routable ? "routable" : any_carrier ? "carrier" : "no-carrier");
+        /* real system_status() always adds Online state right after State
+         * (networkctl-status-system.c); netd has no separate online-state
+         * concept, so this is honestly always "unknown". */
+        printf("%*s: %s\n", LABEL_WIDTH, "Online state", "unknown");
 
         {
                 struct ifaddrs *all, *a;
@@ -484,7 +465,7 @@ static void status_all(void) {
                                                  host, sizeof host, NULL, 0, NI_NUMERICHOST) != 0)
                                         continue;
 
-                                collect_addr_on_iface(&addrs, a->ifa_name, host, mask_prefixlen(a->ifa_netmask));
+                                collect_addr_on_iface(&addrs, a->ifa_name, if_nametoindex(a->ifa_name), host);
                         }
                         freeifaddrs(all);
                 }
@@ -539,6 +520,32 @@ static void status_all(void) {
                 }
         }
         field_print("DNS", &dns);
+
+        /* real system_status() also dumps Search Domains and Route Domains
+         * (networkctl-status-system.c). Search Domains maps cleanly onto
+         * resolv.conf's own "search" directive; Route Domains (per-link
+         * routing-only domains, networkd's Domains=~ syntax) has no netd
+         * equivalent to back honestly, so it stays unclaimed like the other
+         * fields this file's header comment already lists. */
+        {
+                FILE *f = fopen("/etc/resolv.conf", "re");
+                char line[256];
+                FieldList search = { .n = 0 };
+
+                if (f) {
+                        while (fgets(line, sizeof line, f)) {
+                                char tok[256], *save, *w;
+
+                                if (strncmp(line, "search", 6) != 0 || !isspace((unsigned char) line[6]))
+                                        continue;
+                                snprintf(tok, sizeof tok, "%s", line + 6);
+                                for (w = strtok_r(tok, " \t\n", &save); w; w = strtok_r(NULL, " \t\n", &save))
+                                        field_add(&search, "%s", w);
+                        }
+                        fclose(f);
+                }
+                field_print("Search Domains", &search);
+        }
 
         /* NTP: aggregated from every interface's own lease file -- netd has
          * no single system-wide NTP list of its own, each link's DHCP lease
