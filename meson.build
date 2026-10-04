@@ -308,6 +308,15 @@ foreach t : pico_tests
   test(t, exe)
 endforeach
 
+# pico-color's own test: like test-netctl-rtnl/test-netctl-path below, built
+# from only the one file it tests -- no link to pico_init_core, so a bug
+# there can never be masked by (or blamed on) the rest of PID 1.
+test_pico_color_exe = executable(
+  'test-pico-color',
+  ['src/test-pico-color.c', 'src/pico-color.c'] + pico_test_sources,
+)
+test('test-pico-color', test_pico_color_exe)
+
 # pico-unit-lint -- PID 1's own unit parser run over an installed unit tree
 # at build time, printing the degradation record each unit would carry in
 # `picoctl show`. It links pico-init-core so the verdict cannot drift from
