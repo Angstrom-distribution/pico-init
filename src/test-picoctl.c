@@ -1064,6 +1064,154 @@ static void test_is_system_running_fstab(void) {
 }
 
 /*
+ * main()'s getopt_long() pass (picoctl.c picoctl_parse_options()): an
+ * option is global and may sit before, between or after the verb and unit
+ * arguments, repeated options keep the last value, "--" ends option
+ * parsing, both "--opt=value" and "--opt value" work, and an unrecognised
+ * option is a hard failure -- the exact bug a live 'systemctl --no-block
+ * restart X' and 'systemctl is-active X --no-block' hit (picoctl used to
+ * only recognise --root/--version/--help before the verb, and nothing at
+ * all after it).
+ */
+static void test_cli_option_parsing(void) {
+        char *root;
+        char rtdir[PATH_MAX], unitsdir[PATH_MAX + 16];
+        char root_opt[PATH_MAX + 8];
+        struct run_result res;
+
+        root = test_tmpdir_new();
+        ASSERT_TRUE(root != NULL);
+
+        snprintf(rtdir, sizeof(rtdir), "%s%s", root, PICO_RUNTIME_DIR);
+        snprintf(unitsdir, sizeof(unitsdir), "%s/units", rtdir);
+        ASSERT_EQ_INT(fixture_mkdir_p(unitsdir), 0);
+        ASSERT_EQ_INT(test_write_file(unitsdir,
+                                      "demo.service",
+                                      "ActiveState=active\nSubState=running\n"
+                                      "LoadState=loaded\nDescription=Demo\n"),
+                      0);
+
+        /* a global option BEFORE the verb that used to be verb-only
+         * territory ("--no-legend" was only ever scanned out of the
+         * post-verb argv) */
+        RUN_PICOCTL(&res, "--root", root, "--no-legend", "list-units");
+        ASSERT_EQ_INT(res.exit_code, 0);
+        ASSERT_TRUE(strstr(res.out, "UNIT") == NULL);
+        ASSERT_TRUE(strstr(res.out, "demo.service") != NULL);
+
+        /* the exact second live bug: a unit verb's own "--no-block" sitting
+         * AFTER the unit name must not be swallowed as a second unit --
+         * exactly one ActiveState line comes out, not two. */
+        RUN_PICOCTL(&res, "--root", root, "is-active", "demo.service", "--no-block");
+        ASSERT_STREQ(res.out, "active\n");
+        ASSERT_EQ_INT(res.exit_code, 0);
+        ASSERT_TRUE(strchr(res.out, '\n') == strrchr(res.out, '\n')); /* exactly one line */
+
+        /* an option sandwiched BETWEEN two unit arguments: still consumed
+         * as the global option, never counted as a third unit name */
+        RUN_PICOCTL(&res, "--root", root, "is-active", "demo.service", "--no-block", "demo.service");
+        ASSERT_STREQ(res.out, "active\nactive\n");
+        ASSERT_EQ_INT(res.exit_code, 0);
+
+        /* the exact first live bug: an option BEFORE the verb (the shape
+         * stock systemd.bbclass postinsts actually use, e.g. "--no-block
+         * restart X") must not be looked up as if it were the verb itself. */
+        RUN_PICOCTL(&res, "--root", root, "--no-block", "is-active", "demo.service");
+        ASSERT_STREQ(res.out, "active\n");
+        ASSERT_EQ_INT(res.exit_code, 0);
+
+        /* "--root=DIR" (attached), not just the two-token "--root DIR" form
+         * every other test in this file already exercises */
+        snprintf(root_opt, sizeof(root_opt), "--root=%s", root);
+        RUN_PICOCTL(&res, root_opt, "is-active", "demo.service");
+        ASSERT_STREQ(res.out, "active\n");
+        ASSERT_EQ_INT(res.exit_code, 0);
+
+        /* repeated --root: getopt_long keeps the last value, same as real
+         * systemctl would */
+        RUN_PICOCTL(&res, "--root", "/nonexistent-does-not-exist", "--root", root, "list-units");
+        ASSERT_EQ_INT(res.exit_code, 0);
+        ASSERT_TRUE(strstr(res.out, "demo.service") != NULL);
+
+        /* "--" ends option parsing: a *literal* unit named "--no-block"
+         * (never mangled -- mangle_unit_arg() already refuses anything
+         * starting with '-') is looked up and, being unpublished, reads as
+         * not-found/inactive -- it must NOT have been consumed as the
+         * global --no-block option, which would instead leave is-active
+         * with zero unit arguments and fail outright. */
+        RUN_PICOCTL(&res, "--root", root, "is-active", "--", "--no-block");
+        ASSERT_STREQ(res.out, "inactive\n");
+        ASSERT_EQ_INT(res.exit_code, 4);
+
+        /* a bare "--no-block" with no verb at all: still defaults to
+         * list-units, same as no arguments whatsoever */
+        RUN_PICOCTL(&res, "--root", root, "--no-block");
+        ASSERT_EQ_INT(res.exit_code, 0);
+        ASSERT_TRUE(strstr(res.out, "demo.service") != NULL);
+
+        /* an unrecognised option is a hard failure, getopt_long's own
+         * message (stderr, not captured here -- see run_binary()'s own
+         * comment) plus exit 1, never a silent ignore */
+        RUN_PICOCTL(&res, "--this-option-does-not-exist", "list-units");
+        ASSERT_EQ_INT(res.exit_code, 1);
+
+        test_rm_rf(root);
+        free(root);
+}
+
+/*
+ * show's UnitFileState= must come from the same live, on-disk enablement
+ * check is-enabled uses, not from the manager's published state file --
+ * that file only ever reflects enablement as of this unit's *load* time,
+ * and `picoctl disable` never rewrites it (manager-notify.c publishes it
+ * once, at unit_notify() time, not on every enablement change). The
+ * fixture's units/foo.service file is deliberately never rewritten below,
+ * so this fails if "show" ever goes back to trusting it.
+ */
+static void test_show_unit_file_state_live(void) {
+        char *root;
+        char rtdir[PATH_MAX], unitsdir[PATH_MAX + 16];
+        struct run_result res;
+
+        root = test_tmpdir_new();
+        ASSERT_TRUE(root != NULL);
+        make_fixture_root(root);
+
+        snprintf(rtdir, sizeof(rtdir), "%s%s", root, PICO_RUNTIME_DIR);
+        snprintf(unitsdir, sizeof(unitsdir), "%s/units", rtdir);
+        ASSERT_EQ_INT(fixture_mkdir_p(unitsdir), 0);
+        ASSERT_EQ_INT(test_write_file(unitsdir,
+                                      "foo.service",
+                                      "ActiveState=active\nSubState=running\n"
+                                      "LoadState=loaded\nDescription=Foo\n"
+                                      "UnitFileState=enabled\n"),
+                      0);
+
+        RUN_PICOCTL(&res, "--root", root, "enable", "foo.service");
+        ASSERT_EQ_INT(res.exit_code, 0);
+
+        RUN_PICOCTL(&res, "--root", root, "show", "foo.service");
+        ASSERT_EQ_INT(res.exit_code, 0);
+        ASSERT_TRUE(strstr(res.out, "UnitFileState=enabled\n") != NULL);
+
+        /* disable touches only the .wants symlink -- the fixture manager's
+         * own units/foo.service file above is never rewritten, simulating
+         * a disable with no daemon restart in between */
+        RUN_PICOCTL(&res, "--root", root, "disable", "foo.service");
+        ASSERT_EQ_INT(res.exit_code, 0);
+
+        RUN_PICOCTL(&res, "--root", root, "show", "foo.service");
+        ASSERT_EQ_INT(res.exit_code, 0);
+        ASSERT_TRUE(strstr(res.out, "UnitFileState=disabled\n") != NULL);
+        ASSERT_TRUE(strstr(res.out, "UnitFileState=enabled\n") == NULL);
+        /* every other field still comes verbatim from the stale file */
+        ASSERT_TRUE(strstr(res.out, "ActiveState=active\n") != NULL);
+
+        test_rm_rf(root);
+        free(root);
+}
+
+/*
  * `systemctl status` with no unit name shows the manager's own overview
  * (systemctl-show.c show_system_status()), not an error -- the bug this
  * milestone fixes (picoctl used to print "missing unit name" and exit 1).
@@ -1237,6 +1385,8 @@ int main(void) {
         test_read_verbs_against_real_boot();
         test_status_log_tail();
         test_is_system_running_fstab();
+        test_cli_option_parsing();
+        test_show_unit_file_state_live();
         test_status_no_argument_system_overview();
         test_status_colors();
         test_list_units_colors();

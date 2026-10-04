@@ -35,6 +35,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <getopt.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -106,9 +107,30 @@ static void picoctl_notice(const char *fmt, ...) {
         fputc('\n', stderr);
 }
 
-/* --- --root plumbing --- */
+/* systemctl status's own default depth for the embedded log tail (-n/--lines
+ * overrides it, see the getopt_long table below). */
+#define PICOCTL_STATUS_LOG_LINES 10
 
+/* --- global options ---
+ *
+ * One getopt_long() pass over the whole command line, in main(), fills
+ * these in before any verb runs -- matching real systemctl's own single
+ * flat option parser (systemctl_parse_argv()): an option is global, not
+ * tied to the verb it happens to sit next to, so it may appear before,
+ * between or after the verb and unit arguments. Each cmd_*() below reads
+ * the variable it needs directly rather than re-scanning its own argv, the
+ * same split upstream keeps between systemctl_parse_argv() and each verb_*()
+ * function.
+ */
 static const char *arg_root = "";
+static bool arg_no_block = false;
+static bool arg_no_legend = false;
+static bool arg_quiet = false;
+static const char *arg_type = NULL;
+static const char *arg_state = NULL;
+static unsigned arg_lines = PICOCTL_STATUS_LOG_LINES;
+static const char *arg_signal_name = NULL;
+static const char *arg_kill_who = "all";
 
 /* Join arg_root and an absolute suffix (a PICO_* macro, always "/..."). */
 static int path_join(char *buf, size_t bufsize, const char *suffix) {
@@ -246,6 +268,11 @@ static int read_unit_state(const char *unit_id, struct unit_state *st) {
 
 /* --- show: nearly cat --- */
 
+/* Defined below, next to cmd_is_enabled() which it also backs: one
+ * source of truth for "is this unit enabled on disk", read fresh every
+ * call rather than out of the manager's own load-time snapshot. */
+static const char *compute_unit_file_state(const char *unit_id);
+
 static int cmd_show(int argc, char *argv[]) {
         int i;
 
@@ -284,11 +311,22 @@ static int cmd_show(int argc, char *argv[]) {
                 }
 
                 {
-                        char buf[4096];
-                        size_t got;
+                        /* Every field prints byte-for-byte from the
+                         * manager's published file, except UnitFileState:
+                         * that one field is re-derived live, same as
+                         * is-enabled, rather than trusted from the file --
+                         * the file only reflects the enablement state as
+                         * of this unit's *load* time, and a later `picoctl
+                         * disable`/enable never rewrites it. */
+                        char line[1024];
+                        const char *live_ufs = compute_unit_file_state(argv[i]);
 
-                        while ((got = fread(buf, 1, sizeof(buf), f)) > 0)
-                                fwrite(buf, 1, got, stdout);
+                        while (fgets(line, sizeof(line), f)) {
+                                if (strncmp(line, "UnitFileState=", 14) == 0)
+                                        printf("UnitFileState=%s\n", live_ufs);
+                                else
+                                        fputs(line, stdout);
+                        }
                 }
                 fclose(f);
         }
@@ -391,8 +429,11 @@ static int cmd_list_units(int argc, char *argv[]) {
         char **names = NULL;
         size_t n = 0, cap = 0;
         size_t i;
-        bool no_legend = false;
-        const char *type_csv = NULL, *state_csv = NULL;
+        const char *type_csv = arg_type, *state_csv = arg_state;
+
+        /* every option this verb takes is global now, see below */
+        (void) argc;
+        (void) argv;
 
         /*
          * --all/-a is accepted but is a true no-op here, not a pretended
@@ -404,20 +445,12 @@ static int cmd_list_units(int argc, char *argv[]) {
          * pager is a no-op for the same honest reason: there is no pager
          * to ever invoke.
          *
-         * --type=/--state= only, not the separate-token "-t VALUE" form:
-         * main()'s own mangle_unit_arg() runs over every verb's argv
-         * uniformly and would append ".service" to a bare filter value like
-         * "service,target" before this function ever saw it, the same
-         * collision cmd_kill()'s own comment explains for "-s VALUE".
+         * --type/--state come from main()'s getopt_long() pass (arg_type/
+         * arg_state): both the attached "--type=VALUE" and the two-token
+         * "-t VALUE"/"--type VALUE" forms now work, since getopt_long
+         * consumes the value as the option's own argument, before it can
+         * ever reach mangle_unit_arg().
          */
-        for (i = 0; i < (size_t) argc; i++) {
-                if (strcmp(argv[i], "--no-legend") == 0)
-                        no_legend = true;
-                else if (strncmp(argv[i], "--type=", 7) == 0)
-                        type_csv = argv[i] + 7;
-                else if (strncmp(argv[i], "--state=", 8) == 0)
-                        state_csv = argv[i] + 8;
-        }
 
         if (path_join(rt, sizeof(rt), PICO_RUNTIME_DIR) < 0)
                 return 1;
@@ -470,7 +503,7 @@ static int cmd_list_units(int argc, char *argv[]) {
         /* real output_units_list() has a JOB column between SUB and DESCRIPTION
          * (systemctl-list-units.c table_new()); struct unit_state already
          * carries job, it was just never shown here. */
-        if (!no_legend)
+        if (!arg_no_legend)
                 printf("%-32s %-8s %-10s %-13s %-8s %s\n", "UNIT", "LOAD", "ACTIVE", "SUB", "JOB", "DESCRIPTION");
         for (i = 0; i < n; i++) {
                 struct unit_state st;
@@ -673,33 +706,28 @@ static int cmd_is_system_running(int argc, char *argv[]) {
  * running, 4 status unknown (unit never published == not-found here).
  */
 static int cmd_is_state_generic(int argc, char *argv[], const char *want_state, int not_this_state_code) {
-        bool ok = false, not_found = true, quiet = false;
-        int i, n_units = 0;
+        bool ok = false, not_found = true;
+        int i;
 
-        for (i = 0; i < argc; i++)
-                if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0)
-                        quiet = true;
+        /* -q/--quiet is global (arg_quiet, from main()'s getopt_long() pass)
+         * and never reaches this argv any more, so every entry here is a
+         * real unit name. */
+        if (argc == 0) {
+                picoctl_error("picoctl: missing unit name");
+                return 1;
+        }
 
         for (i = 0; i < argc; i++) {
                 struct unit_state st;
 
-                if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0)
-                        continue;
-                n_units++;
-
                 read_unit_state(argv[i], &st);
-                if (!quiet)
+                if (!arg_quiet)
                         printf("%s\n", st.active_state);
 
                 if (st.found)
                         not_found = false;
                 if (strcmp(st.active_state, want_state) == 0)
                         ok = true;
-        }
-
-        if (n_units == 0) {
-                picoctl_error("picoctl: missing unit name");
-                return 1;
         }
 
         if (ok)
@@ -719,23 +747,14 @@ static int cmd_is_active(int argc, char *argv[]) {
  * only for "degraded". Reusing cmd_is_system_running()'s own computation
  * keeps the two from ever being able to disagree about what "degraded"
  * means; -q suppresses the word, never the exit code, same as the per-unit
- * case above.
+ * case above. arg_quiet is global (main()'s getopt_long() pass), so argc
+ * here already counts only real unit names.
  */
 static int cmd_is_failed(int argc, char *argv[]) {
-        bool quiet = false;
-        int i, n_units = 0;
-
-        for (i = 0; i < argc; i++) {
-                if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0)
-                        quiet = true;
-                else
-                        n_units++;
-        }
-
-        if (n_units > 0)
+        if (argc > 0)
                 return cmd_is_state_generic(argc, argv, "failed", 1); /* LSB 1: dead */
 
-        return is_system_running_compute(quiet, NULL, 0);
+        return is_system_running_compute(arg_quiet, NULL, 0);
 }
 
 /* --- status --- */
@@ -955,10 +974,6 @@ static void print_cgroup_procs(const char *unit_id) {
 
 /* --- status: per-unit log tail --- */
 
-/* systemctl status's own default depth; picolog's -n exists for the
- * interactive case, this one is fixed since status has no flag for it. */
-#define PICOCTL_STATUS_LOG_LINES 10
-
 /*
  * journalctl's short format, matching picolog.c's print_short() field for
  * field -- deliberately not shared code (logd-read.h's own header explains
@@ -1041,7 +1056,7 @@ static void print_log_tail(const char *unit_id) {
         if (path_join(rt, sizeof(rt), LOGD_RUNTIME_DIR) < 0)
                 return;
 
-        r = logd_ring_read_filtered(rt, unit_id, PICOCTL_STATUS_LOG_LINES, &ring);
+        r = logd_ring_read_filtered(rt, unit_id, arg_lines, &ring);
         if (r < 0)
                 return;
 
@@ -1724,6 +1739,55 @@ static int cmd_disable(int argc, char *argv[]) {
         return status;
 }
 
+/*
+ * One source of truth for "is this unit enabled on disk", read fresh from
+ * the filesystem every call -- shared by is-enabled's own printed verdict
+ * and, below, cmd_show()'s UnitFileState= field. A unit's published state
+ * file (read_unit_state()'s UnitFileState) only ever reflects what the
+ * manager saw at *load* time and is never updated by a later `picoctl
+ * disable`/enable, so "show" used to keep reporting the unit's state as of
+ * boot forever -- the exact same mistake upstream's own unit_file_state
+ * round-trip to disk (never a live manager cache) never makes.
+ *
+ * Returns one of "masked"/"static"/"enabled"/"disabled"/"not-found" --
+ * always one of these five literals, never NULL.
+ */
+static const char *compute_unit_file_state(const char *unit_id) {
+        Manager *m = NULL;
+        Unit *u = NULL;
+        const char *state;
+        int r;
+
+        /* Checked before load_install_info(): a masked unit fails that call
+         * (its load_state is UNIT_MASKED, never UNIT_LOADED), which would
+         * otherwise read indistinguishably from "not-found". */
+        if (unit_is_masked(unit_id))
+                return "masked";
+
+        r = load_install_info(unit_id, &m, &u);
+        if (r < 0)
+                return "not-found";
+
+        if (!u->wanted_by && !u->required_by)
+                state = "static";
+        else {
+                bool this_enabled = false;
+                size_t j;
+
+                for (j = 0; u->wanted_by && u->wanted_by[j] && !this_enabled; j++)
+                        if (enable_symlink_exists(u->wanted_by[j], ".wants", u->id))
+                                this_enabled = true;
+                for (j = 0; u->required_by && u->required_by[j] && !this_enabled; j++)
+                        if (enable_symlink_exists(u->required_by[j], ".requires", u->id))
+                                this_enabled = true;
+
+                state = this_enabled ? "enabled" : "disabled";
+        }
+
+        manager_free(m);
+        return state;
+}
+
 static int cmd_is_enabled(int argc, char *argv[]) {
         bool enabled = false, not_found = true;
         int i;
@@ -1734,50 +1798,17 @@ static int cmd_is_enabled(int argc, char *argv[]) {
         }
 
         for (i = 0; i < argc; i++) {
-                Manager *m = NULL;
-                Unit *u = NULL;
-                int r;
-                bool this_enabled = false;
+                const char *state = compute_unit_file_state(argv[i]);
 
-                /* Checked before load_install_info(): a masked unit fails
-                 * that call (its load_state is UNIT_MASKED, never UNIT_
-                 * LOADED), which used to read indistinguishably from
-                 * "not-found" here -- wrong, since real is-enabled reports
-                 * "masked" (and exit 1, not 4: the unit is known, just
-                 * disabled by mask, which does not count as "enabled"). */
-                if (unit_is_masked(argv[i])) {
-                        printf("masked\n");
+                printf("%s\n", state);
+
+                if (strcmp(state, "not-found") != 0)
                         not_found = false;
-                        continue;
-                }
-
-                r = load_install_info(argv[i], &m, &u);
-                if (r < 0) {
-                        printf("not-found\n");
-                        continue;
-                }
-                not_found = false;
-
-                if (!u->wanted_by && !u->required_by) {
-                        printf("static\n");
-                        this_enabled = true;
-                } else {
-                        size_t j;
-
-                        for (j = 0; u->wanted_by && u->wanted_by[j] && !this_enabled; j++)
-                                if (enable_symlink_exists(u->wanted_by[j], ".wants", u->id))
-                                        this_enabled = true;
-                        for (j = 0; u->required_by && u->required_by[j] && !this_enabled; j++)
-                                if (enable_symlink_exists(u->required_by[j], ".requires", u->id))
-                                        this_enabled = true;
-
-                        printf("%s\n", this_enabled ? "enabled" : "disabled");
-                }
-
-                if (this_enabled)
+                /* "masked"/"disabled" exit 1, not 4: the unit is known,
+                 * just not enabled (masked counts as known-but-disabled,
+                 * not as "enabled"). */
+                if (strcmp(state, "enabled") == 0 || strcmp(state, "static") == 0)
                         enabled = true;
-
-                manager_free(m);
         }
 
         if (enabled)
@@ -2106,11 +2137,11 @@ static int cmd_list_unit_files(int argc, char *argv[]) {
         char updir[PATH_MAX], pkgdir[PATH_MAX];
         struct unit_file_entry *entries = NULL;
         size_t n = 0, cap = 0, i;
-        bool no_legend = false;
 
-        for (i = 0; i < (size_t) argc; i++)
-                if (strcmp(argv[i], "--no-legend") == 0)
-                        no_legend = true;
+        /* --no-legend comes from main()'s getopt_long() pass (arg_no_legend);
+         * this verb takes no other option, hence argc/argv going unused. */
+        (void) argc;
+        (void) argv;
 
         if (path_join(updir, sizeof(updir), PICO_UNIT_DIR) == 0)
                 collect_unit_files_from(updir, &entries, &n, &cap);
@@ -2120,7 +2151,7 @@ static int cmd_list_unit_files(int argc, char *argv[]) {
         if (entries && n > 1)
                 qsort(entries, n, sizeof(*entries), unit_file_entry_cmp);
 
-        if (!no_legend)
+        if (!arg_no_legend)
                 printf("%-40s %-10s %s\n", "UNIT FILE", "STATE", "PRESET");
 
         for (i = 0; i < n; i++) {
@@ -2175,7 +2206,7 @@ static int cmd_list_unit_files(int argc, char *argv[]) {
                 }
         }
 
-        if (!no_legend)
+        if (!arg_no_legend)
                 printf("\n%zu unit files listed.\n", n);
 
         free(entries);
@@ -2350,18 +2381,15 @@ static void print_verb_failure(const char *verb, const char *unit, const char *r
  * to printf the unit name here, which real systemctl never does.
  */
 static int cmd_verb_generic(int argc, char *argv[], const char *wire_verb, const char *display_verb) {
-        bool no_block = false;
-        bool any_unit = false;
         int i, status = 0;
 
+        /* --no-block is global (arg_no_block, from main()'s getopt_long()
+         * pass) and never reaches this argv any more, so every entry here
+         * is a real unit name. */
         if (argc < 1) {
                 picoctl_error("picoctl %s: missing unit name", display_verb);
                 return 1;
         }
-
-        for (i = 0; i < argc; i++)
-                if (strcmp(argv[i], "--no-block") == 0)
-                        no_block = true;
 
         for (i = 0; i < argc; i++) {
                 char reply[PICOCTL_CTRL_REPLY_MAX];
@@ -2369,11 +2397,7 @@ static int cmd_verb_generic(int argc, char *argv[], const char *wire_verb, const
                 const char *reason;
                 int r;
 
-                if (strcmp(argv[i], "--no-block") == 0)
-                        continue;
-                any_unit = true;
-
-                r = ctrl_roundtrip(wire_verb, argv[i], no_block, reply, sizeof(reply));
+                r = ctrl_roundtrip(wire_verb, argv[i], arg_no_block, reply, sizeof(reply));
                 if (r < 0) {
                         /* A transport-level failure (no control socket at
                          * all, a permission problem, ...): there is no bus
@@ -2402,11 +2426,6 @@ static int cmd_verb_generic(int argc, char *argv[], const char *wire_verb, const
                         print_verb_failure(display_verb, argv[i], reason);
 
                 status = 1;
-        }
-
-        if (!any_unit) {
-                picoctl_error("picoctl %s: missing unit name", display_verb);
-                return 1;
         }
 
         return status;
@@ -2459,13 +2478,11 @@ static int cmd_try_restart_as(int argc, char *argv[], const char *display_verb) 
         if (!active)
                 return 1;
 
+        /* --no-block is global (arg_no_block) and never reaches this argv;
+         * cmd_verb_generic() below reads it itself, so no passthrough is
+         * needed here. */
         for (i = 0; i < argc; i++) {
                 struct unit_state st;
-
-                if (strcmp(argv[i], "--no-block") == 0) {
-                        active[n_active++] = argv[i];
-                        continue;
-                }
 
                 read_unit_state(argv[i], &st);
                 if (strcmp(st.active_state, "active") == 0 || strcmp(st.active_state, "activating") == 0 ||
@@ -2531,13 +2548,12 @@ static int cmd_reload(int argc, char *argv[]) {
                 return 1;
         }
 
-        for (i = 0; i < argc; i++) {
-                if (strcmp(argv[i], "--no-block") == 0)
-                        continue;
+        /* --no-block is global and never reaches this argv; every entry
+         * here is a real unit name. */
+        for (i = 0; i < argc; i++)
                 picoctl_error("Failed to reload %s: Job type reload is not applicable for unit %s.",
                               argv[i],
                               argv[i]);
-        }
 
         return 1;
 }
@@ -2643,7 +2659,10 @@ static int cmd_daemon_reload(int argc, char *argv[]) {
  * takes SIGTERM (upstream's default), SIGKILL, SIGHUP, SIGINT or a bare
  * number -- the signals this project's own units actually get sent
  * (manager-loop.c, service.c); anything else is refused rather than guessed
- * at.
+ * at. Both options are global (arg_signal_name/arg_kill_who, from main()'s
+ * getopt_long() pass): the value is consumed as the option's own argument,
+ * so "-s KILL"/"--signal KILL" now work exactly like "--signal=KILL" --
+ * mangle_unit_arg() never sees it either way.
  */
 static int signal_from_name(const char *s, int *ret) {
         if (strcmp(s, "SIGTERM") == 0 || strcmp(s, "TERM") == 0) {
@@ -2671,31 +2690,17 @@ static int signal_from_name(const char *s, int *ret) {
 
 static int cmd_kill(int argc, char *argv[]) {
         int sig = SIGTERM;
-        bool kill_main_only = false;
+        bool kill_main_only = strcmp(arg_kill_who, "main") == 0;
         int i, status = 0;
-        bool any_unit = false;
 
-        /*
-         * --signal=NAME only, not the two-token "-s NAME" form: main()'s
-         * own unit-name auto-mangling (mangle_unit_arg()) runs over every
-         * verb's argv uniformly and would append ".service" to a bare
-         * signal name like "KILL" before cmd_kill() ever saw it, since
-         * mangle_unit_arg() only skips arguments that already start with
-         * '-' or contain '.' -- true of "--signal=KILL" but not of a
-         * separate "KILL" token. Documented here rather than worked around
-         * by special-casing kill's own argv in main(), which every other
-         * verb shares.
-         */
-        for (i = 0; i < argc; i++) {
-                if (strncmp(argv[i], "--signal=", 9) == 0) {
-                        if (signal_from_name(argv[i] + 9, &sig) < 0) {
-                                picoctl_error("picoctl kill: unknown signal '%s'", argv[i] + 9);
-                                return 1;
-                        }
-                } else if (strcmp(argv[i], "--kill-who=main") == 0)
-                        kill_main_only = true;
-                else if (strcmp(argv[i], "--kill-who=all") == 0)
-                        kill_main_only = false;
+        if (arg_signal_name && signal_from_name(arg_signal_name, &sig) < 0) {
+                picoctl_error("picoctl kill: unknown signal '%s'", arg_signal_name);
+                return 1;
+        }
+
+        if (argc < 1) {
+                picoctl_error("picoctl kill: missing unit name");
+                return 1;
         }
 
         for (i = 0; i < argc; i++) {
@@ -2705,10 +2710,6 @@ static int cmd_kill(int argc, char *argv[]) {
                 FILE *f;
                 char line[32];
                 bool signalled_anything = false;
-
-                if (argv[i][0] == '-' || argv[i][0] == '\0')
-                        continue;
-                any_unit = true;
 
                 read_unit_state(argv[i], &st);
                 if (!st.found) {
@@ -2739,11 +2740,6 @@ static int cmd_kill(int argc, char *argv[]) {
                 /* Nothing running is a harmless no-op upstream too (killing
                  * an empty cgroup signals zero processes, successfully). */
                 (void) signalled_anything;
-        }
-
-        if (!any_unit) {
-                picoctl_error("picoctl kill: missing unit name");
-                return 1;
         }
 
         return status;
@@ -2869,6 +2865,166 @@ static int cmd_shutdown(int argc, char *argv[]) {
         return do_reboot ? cmd_reboot(0, NULL) : cmd_poweroff(0, NULL);
 }
 
+/*
+ * One getopt_long() pass, permuting (the default: no leading '+' in the
+ * optstring, POSIXLY_CORRECT not set), over the *whole* argv -- matching
+ * real systemctl's own systemctl_parse_argv(), which is why an option may
+ * sit before, between or after the verb and unit arguments, "--" ends
+ * option parsing, and both "--opt=value" and "--opt value"/"-o value" work.
+ * Unknown options and missing required arguments get getopt_long's own
+ * stderr message (opterr is left at its default, 1) and exit 1 -- this
+ * never prints a second, redundant diagnostic of its own.
+ *
+ * --system/--user/--global/-H/--host/-M/--machine are accepted here (so
+ * they never fall through to "Unknown command verb") but only --system
+ * actually matches reality: pico-init has exactly one manager, running as
+ * PID 1, with no user instance and no remote/container transport, so the
+ * other five refuse honestly rather than pretend to connect anywhere.
+ * -f/--force and --no-pager/--no-wall are accepted-and-meaningless: real
+ * systemctl's own force/no-wall behaviour for reboot/poweroff/halt/shutdown
+ * only exists in this program via the argv[0] alias dispatch above (see
+ * cmd_shutdown()'s own comment), which never reaches this parser at all;
+ * there is no pager to ever disable either.
+ */
+static int picoctl_parse_options(int argc, char *argv[]) {
+        enum {
+                ARG_VERSION = 0x100,
+                ARG_ROOT,
+                ARG_NO_BLOCK,
+                ARG_NO_LEGEND,
+                ARG_NO_PAGER,
+                ARG_NO_WALL,
+                ARG_STATE,
+                ARG_KILL_WHO,
+                ARG_SYSTEM,
+                ARG_USER,
+                ARG_GLOBAL,
+        };
+        static const struct option options[] = {
+                {      "help",       no_argument, NULL,           'h' },
+                {   "version",       no_argument, NULL,   ARG_VERSION },
+                {      "root", required_argument, NULL,      ARG_ROOT },
+                {  "no-block",       no_argument, NULL,  ARG_NO_BLOCK },
+                { "no-legend",       no_argument, NULL, ARG_NO_LEGEND },
+                {  "no-pager",       no_argument, NULL,  ARG_NO_PAGER },
+                {   "no-wall",       no_argument, NULL,   ARG_NO_WALL },
+                {     "quiet",       no_argument, NULL,           'q' },
+                {       "all",       no_argument, NULL,           'a' },
+                {      "type", required_argument, NULL,           't' },
+                {     "state", required_argument, NULL,     ARG_STATE },
+                {     "lines", required_argument, NULL,           'n' },
+                {    "signal", required_argument, NULL,           's' },
+                {  "kill-who", required_argument, NULL,  ARG_KILL_WHO },
+                { "kill-whom", required_argument, NULL,  ARG_KILL_WHO },
+                {     "force",       no_argument, NULL,           'f' },
+                {    "system",       no_argument, NULL,    ARG_SYSTEM },
+                {      "user",       no_argument, NULL,      ARG_USER },
+                {    "global",       no_argument, NULL,    ARG_GLOBAL },
+                {      "host", required_argument, NULL,           'H' },
+                {   "machine", required_argument, NULL,           'M' },
+                {        NULL,                 0, NULL,             0 },
+        };
+        int c;
+
+        while ((c = getopt_long(argc, argv, "hqat:n:s:H:M:f", options, NULL)) >= 0) {
+                switch (c) {
+                case 'h':
+                        usage();
+                        return 0;
+
+                case ARG_VERSION:
+                        printf("picoctl " PICO_INIT_VERSION_STRING
+                               " (pico-init; not systemd, see picoctl.c)\n");
+                        return 0;
+
+                case ARG_ROOT:
+                        arg_root = optarg;
+                        break;
+
+                case ARG_NO_BLOCK:
+                        arg_no_block = true;
+                        break;
+
+                case ARG_NO_LEGEND:
+                        arg_no_legend = true;
+                        break;
+
+                case ARG_NO_PAGER: /* no pager exists to disable */
+                case ARG_NO_WALL:  /* see this function's own header */
+                case 'f':          /* --force: ditto */
+                        break;
+
+                case 'q':
+                        arg_quiet = true;
+                        break;
+
+                case 'a': /* --all: a true no-op, see cmd_list_units() */
+                        break;
+
+                case 't':
+                        arg_type = optarg;
+                        break;
+
+                case ARG_STATE:
+                        arg_state = optarg;
+                        break;
+
+                case 'n': {
+                        char *end;
+                        unsigned long v;
+
+                        /* strtoul() itself accepts a leading '-' (and wraps
+                         * around); safe_atou()'s own contract upstream does
+                         * not, so reject it explicitly here too. */
+                        errno = 0;
+                        v = strtoul(optarg, &end, 10);
+                        if (optarg[0] == '\0' || optarg[0] == '-' || *end != '\0' || errno != 0) {
+                                picoctl_error("picoctl: invalid --lines value '%s'", optarg);
+                                return 1;
+                        }
+                        arg_lines = (unsigned) v;
+                        break;
+                }
+
+                case 's':
+                        arg_signal_name = optarg;
+                        break;
+
+                case ARG_KILL_WHO:
+                        arg_kill_who = optarg;
+                        break;
+
+                case ARG_SYSTEM: /* already the only mode */
+                        break;
+
+                case ARG_USER:
+                        picoctl_error("Running in user mode is not supported: pico-init has no "
+                                      "per-user service manager.");
+                        return 1;
+
+                case ARG_GLOBAL:
+                        picoctl_error("--global is not supported: pico-init has no per-user "
+                                      "service manager to apply it to.");
+                        return 1;
+
+                case 'H':
+                        picoctl_error("-H/--host is not supported: picoctl has no remote transport.");
+                        return 1;
+
+                case 'M':
+                        picoctl_error("-M/--machine is not supported: picoctl has no container transport.");
+                        return 1;
+
+                case '?':
+                default:
+                        /* getopt_long already printed its own diagnostic. */
+                        return 1;
+                }
+        }
+
+        return -1; /* keep going: optind now points at VERB [UNIT...] */
+}
+
 int main(int argc, char *argv[]) {
         static const struct {
                 const char *name;
@@ -2928,10 +3084,10 @@ int main(int argc, char *argv[]) {
                  */
         };
         const char *prog0;
-        int argi = 1;
+        int argi, rc_opts;
         size_t i;
 
-        /* argv[0] dispatch, before --root/verb parsing: a real reboot(8)/
+        /* argv[0] dispatch, before any option/verb parsing: a real reboot(8)/
          * poweroff(8)/halt(8)/shutdown(8) invocation never passes a verb. */
         prog0 = strrchr(argv[0], '/');
         prog0 = prog0 ? prog0 + 1 : argv[0];
@@ -2944,28 +3100,10 @@ int main(int argc, char *argv[]) {
         if (strcmp(prog0, "shutdown") == 0)
                 return cmd_shutdown(argc - 1, argv + 1);
 
-        while (argi < argc) {
-                if (strcmp(argv[argi], "--root") == 0 && argi + 1 < argc) {
-                        arg_root = argv[argi + 1];
-                        argi += 2;
-                        continue;
-                }
-                if (strncmp(argv[argi], "--root=", 7) == 0) {
-                        arg_root = argv[argi] + 7;
-                        argi += 1;
-                        continue;
-                }
-                if (strcmp(argv[argi], "--version") == 0) {
-                        printf("picoctl " PICO_INIT_VERSION_STRING
-                               " (pico-init; not systemd, see picoctl.c)\n");
-                        return 0;
-                }
-                if (strcmp(argv[argi], "--help") == 0 || strcmp(argv[argi], "-h") == 0) {
-                        usage();
-                        return 0;
-                }
-                break;
-        }
+        rc_opts = picoctl_parse_options(argc, argv);
+        if (rc_opts >= 0)
+                return rc_opts; /* --help/--version, or a parse error */
+        argi = optind;
 
         /* No verb at all: VERB_DEFAULT upstream (systemctl.c's own verb
          * table) is list-units, not an error -- bare `systemctl` lists
