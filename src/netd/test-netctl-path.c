@@ -26,6 +26,10 @@
 #include "../test-util.h"
 #include "netctl-path.h"
 
+/* Fixture paths are short, test-controlled names joined onto PATH_MAX
+ * buffers; gcc at -Os cannot see that and -Werror makes it an error. */
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+
 /* mkdir(), one path component at a time -- test_mkdir() (test-util.h) only
  * ever makes one level under an already-existing parent, and these
  * fixtures are several levels deep. */
