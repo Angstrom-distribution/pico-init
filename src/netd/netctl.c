@@ -22,9 +22,19 @@
  * Output is modelled on real systemd's own `networkctl`/`networkctl
  * status`/`networkctl status IFACE`, close enough to be useful to someone
  * who already knows that tool, but it does not claim fields netd has no way
- * to back honestly: no NetDev/Link File, Driver, QDisc, bridge internals,
- * Activation Policy, Required For Online or Route Domains (networkd's
- * per-link Domains=~ routing-only domains) -- netd tracks none of them.
+ * to back honestly. Driver, Vendor, Model, IPv6 Address Generation Mode and
+ * Number of Queues (Tx/Rx) are real sysfs/procfs reads, same as every other
+ * row below; still missing, because nothing in this tree computes them:
+ * NetDev/Link File (no udev .link matching), Path (ID_PATH is udev's own
+ * topology algorithm, not replicated here), Alternative Names and QDisc
+ * (both rtnetlink-only attributes netd-rtnl.c does not parse and this file
+ * deliberately never opens a netlink socket to get), Activation Policy and
+ * Required For Online (.network directives netd-network.c does not
+ * implement), and Route Domains (networkd's per-link Domains=~ routing-only
+ * domains) -- netd tracks none of them. Offered DHCP leases is omitted too:
+ * it is a DHCP-server-only row, and DhcpServerLease state is kept in memory
+ * only (dhcp-server-lease-internal.h), with nothing published for this file
+ * to read even when a link is running one.
  */
 
 #include <arpa/inet.h>
@@ -267,6 +277,151 @@ static void iface_operational(const char *ifname, char *out, size_t bufsize) {
                 snprintf(out, bufsize, "%s", kstate);
 }
 
+/* --- link classification: Driver, Vendor, Model ------------------------ */
+
+/* /sys/class/net/<if>/device/driver is a symlink to the bound driver's own
+ * sysfs entry; its basename is the driver name. A link with no backing
+ * device (a virtual link) has no "device" symlink at all, so this returns
+ * false rather than guessing. */
+static bool iface_driver(const char *ifname, char *out, size_t bufsize) {
+        char path[128], target[PATH_MAX];
+        ssize_t len;
+        const char *base;
+
+        snprintf(path, sizeof path, "/sys/class/net/%s/device/driver", ifname);
+        len = readlink(path, target, sizeof target - 1);
+        if (len < 0)
+                return false;
+        target[len] = '\0';
+
+        base = strrchr(target, '/');
+        snprintf(out, bufsize, "%s", base ? base + 1 : target);
+        return true;
+}
+
+/* Walks up from /sys/class/net/<if>/device looking for the usb_device node
+ * sysfs itself marks with an "idVendor" file -- net's own "device" symlink
+ * points at the usb_interface node, one or two directories below it,
+ * nesting differently for a USB gadget function than for a discrete
+ * adapter. Bounded to a few levels: a PCI or platform device never has an
+ * idVendor file anywhere above it, and stops there rather than walking to
+ * "/". */
+static bool usb_device_dir(const char *ifname, char *out, size_t bufsize) {
+        char path[128], real[PATH_MAX], probe[PATH_MAX + sizeof "/idVendor"];
+
+        snprintf(path, sizeof path, "/sys/class/net/%s/device", ifname);
+        if (!realpath(path, real))
+                return false;
+
+        for (int i = 0; i < 4; i++) {
+                char *slash;
+
+                snprintf(probe, sizeof probe, "%s/idVendor", real);
+                if (access(probe, F_OK) == 0) {
+                        snprintf(out, bufsize, "%s", real);
+                        return true;
+                }
+
+                slash = strrchr(real, '/');
+                if (!slash || slash == real)
+                        break;
+                *slash = '\0';
+        }
+        return false;
+}
+
+/* manufacturer/product are the USB device's own string descriptors (e.g.
+ * the gadget framework's "Linux Foundation" / "Multifunction Composite
+ * Gadget" defaults) -- real descriptor text read straight from sysfs, not
+ * a hwdb lookup netd has no database for. A device that never set one is
+ * valid USB, not an error: the caller just omits that row. */
+static bool usb_string_attr(const char *ifname, const char *attr, char *out, size_t bufsize) {
+        char dir[PATH_MAX], path[PATH_MAX + 32];
+        FILE *f;
+
+        if (!usb_device_dir(ifname, dir, sizeof dir))
+                return false;
+
+        snprintf(path, sizeof path, "%s/%s", dir, attr);
+        f = fopen(path, "re");
+        if (!f)
+                return false;
+        if (!fgets(out, bufsize, f)) {
+                fclose(f);
+                return false;
+        }
+        fclose(f);
+        out[strcspn(out, "\n")] = '\0';
+        return out[0] != '\0';
+}
+
+/* --- link classification: IPv6 Address Generation Mode, queue counts --- */
+
+/* /proc/sys/net/ipv6/conf/<if>/addr_gen_mode, the kernel's own SLAAC
+ * address-generation mode sysctl (Documentation/networking/ip-sysctl.rst) --
+ * the same numeric values real networkctl's own
+ * ipv6_addr_gen_mode_to_string() maps. */
+static bool iface_addr_gen_mode(const char *ifname, char *out, size_t bufsize) {
+        char path[128];
+        FILE *f;
+        int mode;
+
+        snprintf(path, sizeof path, "/proc/sys/net/ipv6/conf/%s/addr_gen_mode", ifname);
+        f = fopen(path, "re");
+        if (!f)
+                return false;
+        if (fscanf(f, "%d", &mode) != 1) {
+                fclose(f);
+                return false;
+        }
+        fclose(f);
+
+        switch (mode) {
+        case 0:
+                snprintf(out, bufsize, "eui64");
+                return true;
+        case 1:
+                snprintf(out, bufsize, "none");
+                return true;
+        case 2:
+                snprintf(out, bufsize, "stable-privacy");
+                return true;
+        case 3:
+                snprintf(out, bufsize, "random");
+                return true;
+        default:
+                return false;
+        }
+}
+
+/* /sys/class/net/<if>/queues/{rx,tx}-N, one directory per real queue the
+ * kernel allocated for this device -- counted because sysfs has no single
+ * attribute for the count. A link with no queues/ directory at all (some
+ * virtual links) has no truthful answer. */
+static bool iface_queue_counts(const char *ifname, unsigned *rx, unsigned *tx) {
+        char path[128];
+        DIR *d;
+        struct dirent *e;
+
+        *rx = 0;
+        *tx = 0;
+
+        snprintf(path, sizeof path, "/sys/class/net/%s/queues", ifname);
+        d = opendir(path);
+        if (!d)
+                return false;
+
+        while ((e = readdir(d))) {
+                if (strncmp(e->d_name, "rx-", 3) == 0)
+                        (*rx)++;
+                else if (strncmp(e->d_name, "tx-", 3) == 0)
+                        (*tx)++;
+        }
+        closedir(d);
+
+        return *rx > 0 || *tx > 0;
+}
+
 /* --- status: kernel ground truth + netd's published files -------------- */
 
 /*
@@ -352,6 +507,27 @@ static void status_one(const char *ifname) {
         printf("%*s: %s\n", LABEL_WIDTH, "Type", type);
 
         {
+                char drv[64];
+
+                if (iface_driver(ifname, drv, sizeof drv))
+                        printf("%*s: %s\n", LABEL_WIDTH, "Driver", drv);
+        }
+
+        {
+                char vendor[128];
+
+                if (usb_string_attr(ifname, "manufacturer", vendor, sizeof vendor))
+                        printf("%*s: %s\n", LABEL_WIDTH, "Vendor", vendor);
+        }
+
+        {
+                char model[128];
+
+                if (usb_string_attr(ifname, "product", model, sizeof model))
+                        printf("%*s: %s\n", LABEL_WIDTH, "Model", model);
+        }
+
+        {
                 char path[128], mac[64] = "";
                 FILE *f;
 
@@ -380,6 +556,20 @@ static void status_one(const char *ifname) {
                 }
                 if (mtu >= 0)
                         printf("%*s: %ld\n", LABEL_WIDTH, "MTU", mtu);
+        }
+
+        {
+                char genmode[32];
+
+                if (iface_addr_gen_mode(ifname, genmode, sizeof genmode))
+                        printf("%*s: %s\n", LABEL_WIDTH, "IPv6 Address Generation Mode", genmode);
+        }
+
+        {
+                unsigned rx, tx;
+
+                if (iface_queue_counts(ifname, &rx, &tx))
+                        printf("%*s: %u/%u\n", LABEL_WIDTH, "Number of Queues (Tx/Rx)", tx, rx);
         }
 
         if (getifaddrs(&all) == 0) {
