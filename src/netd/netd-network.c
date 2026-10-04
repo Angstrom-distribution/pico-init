@@ -288,6 +288,36 @@ static int config_parse_bool_field(
         return 0;
 }
 
+static int config_parse_lldp(
+                Network *nw, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        bool b;
+
+        if (strcmp(rvalue, "routers-only") == 0)
+                nw->lldp = NETWORK_LLDP_ROUTERS_ONLY;
+        else if (network_parse_bool(rvalue, &b) == 0)
+                nw->lldp = b ? NETWORK_LLDP_YES : NETWORK_LLDP_NO;
+        else
+                pico_log(PICO_LOG_WARNING, "%s:%u: invalid %s= value '%s', ignoring", path, line, lvalue, rvalue);
+        return 0;
+}
+
+static int config_parse_emit_lldp(
+                Network *nw, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        bool b;
+
+        if (strcmp(rvalue, "nearest-bridge") == 0)
+                nw->emit_lldp = NETWORK_EMIT_LLDP_NEAREST_BRIDGE;
+        else if (strcmp(rvalue, "non-tpmr-bridge") == 0)
+                nw->emit_lldp = NETWORK_EMIT_LLDP_NON_TPMR_BRIDGE;
+        else if (strcmp(rvalue, "customer-bridge") == 0)
+                nw->emit_lldp = NETWORK_EMIT_LLDP_CUSTOMER_BRIDGE;
+        else if (network_parse_bool(rvalue, &b) == 0)
+                nw->emit_lldp = b ? NETWORK_EMIT_LLDP_NEAREST_BRIDGE : NETWORK_EMIT_LLDP_NO;
+        else
+                pico_log(PICO_LOG_WARNING, "%s:%u: invalid %s= value '%s', ignoring", path, line, lvalue, rvalue);
+        return 0;
+}
+
 static int config_parse_dhcp_server(
                 Network *nw, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
         return config_parse_bool_field(path, line, lvalue, rvalue, &nw->dhcp_server);
@@ -327,6 +357,8 @@ static const NetworkConfigItem network_config_items[] = {
         { "Network",         "DNS",          config_parse_dns },
         { "Network",         "NTP",          config_parse_ntp },
         { "Network",  "DHCPServer",  config_parse_dhcp_server },
+        { "Network",        "LLDP",         config_parse_lldp },
+        { "Network",    "EmitLLDP",    config_parse_emit_lldp },
         {  "DHCPv4",      "UseDNS",      config_parse_use_dns },
         {  "DHCPv4",      "UseNTP",      config_parse_use_ntp },
         {  "DHCPv4", "UseTimezone", config_parse_use_timezone },

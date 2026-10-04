@@ -9,7 +9,7 @@
  * real files, usb0.network and usb0-server.network; a third real fixture set
  * the plan does not name but production hits regardless --
  * console-base-image.bb's do_systemd_network() heredocs, which use
- * directives outside netd's subset ([IPv6AcceptRA], [Route], LLDP=,
+ * directives outside netd's subset ([IPv6AcceptRA], [Route],
  * RouteMetric=) and are what will actually match the qemu NIC at
  * integration time; the three-directory search path with basename shadowing
  * and lexicographic union ordering; [Match] Name= glob matching, including
@@ -200,7 +200,7 @@ static void test_real_usb0_server_network_parses(void) {
  * §2.5, but what will actually match the qemu NIC at integration time, so a
  * parse failure here would otherwise only be found at boot. Verbatim copies
  * of the three heredocs, exercising directives well outside netd's subset:
- * LLDP=/EmitLLDP=, RouteMetric=, and whole sections ([IPv6AcceptRA], [Route])
+ * RouteMetric=, and whole sections ([IPv6AcceptRA], [Route])
  * netd has no fields for at all.
  */
 static const char *console_10_en_network =
@@ -306,7 +306,7 @@ static const char *tolerant_fixture =
                 "\n"
                 "[Network]\n"
                 "DHCP=yes\n"
-                "LLDP=yes\n" /* not implemented */
+                "LLDP=yes\n"
                 "\n"
                 "[SomeFutureSection]\n"
                 "Whatever=goes-here\n"
@@ -314,6 +314,58 @@ static const char *tolerant_fixture =
                 "[DHCPv4]\n"
                 "UseDNS=no\n"
                 "RouteMetric=10\n"; /* not implemented */
+
+static void test_lldp_directives(void) {
+        static const struct {
+                const char *rx, *tx;
+                NetworkLldp want_rx;
+                NetworkEmitLldp want_tx;
+        } cases[] = {
+                {          "yes",             "yes",          NETWORK_LLDP_YES,  NETWORK_EMIT_LLDP_NEAREST_BRIDGE },
+                {           "no",              "no",           NETWORK_LLDP_NO,              NETWORK_EMIT_LLDP_NO },
+                { "routers-only",  "nearest-bridge", NETWORK_LLDP_ROUTERS_ONLY,  NETWORK_EMIT_LLDP_NEAREST_BRIDGE },
+                {         "true", "non-tpmr-bridge",          NETWORK_LLDP_YES, NETWORK_EMIT_LLDP_NON_TPMR_BRIDGE },
+                {            "0", "customer-bridge",           NETWORK_LLDP_NO, NETWORK_EMIT_LLDP_CUSTOMER_BRIDGE },
+                {        "bogus",           "bogus",           NETWORK_LLDP_NO,              NETWORK_EMIT_LLDP_NO }, /* ignored: the default stays */
+        };
+        char *dir = test_tmpdir_new();
+        size_t i;
+
+        ASSERT_TRUE(dir != NULL);
+        for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+                char body[160], *path;
+                Network *nw = NULL;
+
+                snprintf(body,
+                         sizeof(body),
+                         "[Match]\nName=x\n\n[Network]\nLLDP=%s\nEmitLLDP=%s\n",
+                         cases[i].rx,
+                         cases[i].tx);
+                ASSERT_EQ_INT(test_write_file(dir, "lldp.network", body), 0);
+                path = join_path(dir, "lldp.network");
+                ASSERT_EQ_INT(network_parse_file(path, &nw), 0);
+                ASSERT_EQ_INT(nw->lldp, cases[i].want_rx);
+                ASSERT_EQ_INT(nw->emit_lldp, cases[i].want_tx);
+                network_free(nw);
+                free(path);
+        }
+
+        /* Absent: both off. */
+        {
+                Network *nw = NULL;
+                char *path;
+
+                ASSERT_EQ_INT(test_write_file(dir, "none.network", "[Match]\nName=x\n"), 0);
+                path = join_path(dir, "none.network");
+                ASSERT_EQ_INT(network_parse_file(path, &nw), 0);
+                ASSERT_EQ_INT(nw->lldp, NETWORK_LLDP_NO);
+                ASSERT_EQ_INT(nw->emit_lldp, NETWORK_EMIT_LLDP_NO);
+                network_free(nw);
+                free(path);
+        }
+        test_rm_rf(dir);
+        free(dir);
+}
 
 static void test_unknown_directive_tolerance(void) {
         char *dir, *path;
@@ -488,6 +540,7 @@ int main(void) {
         test_real_usb0_network_parses();
         test_real_usb0_server_network_parses();
         test_console_base_image_fixtures_parse();
+        test_lldp_directives();
         test_unknown_directive_tolerance();
         test_search_path_shadowing_and_order();
         test_missing_search_dir_is_not_an_error();

@@ -56,6 +56,21 @@ typedef enum NetworkDHCP {
         _NETWORK_DHCP_INVALID = -1,
 } NetworkDHCP;
 
+/* LLDP=: receive neighbour announcements; routers-only keeps just infrastructure neighbours. */
+typedef enum NetworkLldp {
+        NETWORK_LLDP_NO,
+        NETWORK_LLDP_YES,
+        NETWORK_LLDP_ROUTERS_ONLY,
+} NetworkLldp;
+
+/* EmitLLDP=: which group address announcements go to. "yes" is the nearest bridge. */
+typedef enum NetworkEmitLldp {
+        NETWORK_EMIT_LLDP_NO,
+        NETWORK_EMIT_LLDP_NEAREST_BRIDGE,
+        NETWORK_EMIT_LLDP_NON_TPMR_BRIDGE,
+        NETWORK_EMIT_LLDP_CUSTOMER_BRIDGE,
+} NetworkEmitLldp;
+
 /* One Address= entry: a CIDR literal, split. */
 typedef struct NetworkAddress {
         struct in_addr address;
@@ -103,6 +118,9 @@ struct Network {
         size_t n_ntp;
 
         bool dhcp_server; /* DHCPServer= */
+
+        NetworkLldp lldp;          /* LLDP= */
+        NetworkEmitLldp emit_lldp; /* EmitLLDP= */
 
         /* --- [DHCPv4] --- */
         bool dhcp_use_dns; /* UseDNS=, default yes */
