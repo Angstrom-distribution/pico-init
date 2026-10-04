@@ -65,8 +65,14 @@
  * oversights: JOB_NOP and job-type collapsing (e0209d83e7), try-restart and
  * reload types, job modes and the destructiveness check, isolate, job
  * timeouts, job garbage collection (only device units are collectable), the
- * Conflicts=/Requisite=/BindsTo=/OnFailure= dependency families, every
+ * Requisite=/BindsTo=/OnFailure= dependency families, every
  * D-Bus/Varlink job object, and serialization across daemon-reload.
+ *
+ * Conflicts= follows current upstream rather than v30: a start or restart
+ * pulls in a stop of every Conflicts=/ConflictedBy= peer
+ * (transaction_add_conflict_deps()), and an activation that bypassed the
+ * transaction stops active peers retroactively (unit_stop_conflicting(),
+ * called from service.c's state change).
  */
 
 #include <errno.h>
@@ -848,6 +854,75 @@ static int transaction_add_stop_deps(Transaction *tx, Unit *u) {
         return 0;
 }
 
+/*
+ * Starting u stops whatever it conflicts with, as upstream's transaction
+ * (transaction.c, the PULL_IN_STOP / PULL_IN_STOP_IGNORED atoms): a
+ * Conflicts= peer's stop matters to the anchor, a ConflictedBy= peer's does
+ * not and a failure there is only logged. No ordering is implied; with an
+ * After=/Before= edge between the two, job_compare() already runs the stop
+ * first.
+ *
+ * A peer this same transaction is starting is turned into a stop in place
+ * when that start does not matter (a Wants= pull-in). When it does matter,
+ * upstream's merge rule decides: both matter, the transaction fails; only
+ * the start matters, the stop is the job that gets dropped. The anchor
+ * itself always matters, so it is never rewritten. Upstream
+ * would then GC the start jobs the peer had already pulled in; pico has no
+ * job GC (step 5), so those stay and simply start on their own, which is
+ * harmless. Termination: the jobs added here are STOPs, and a STOP walks only
+ * transaction_add_stop_deps(), never conflicts, so mutual Conflicts= ends
+ * after one hop.
+ */
+static int transaction_add_conflict_deps(Transaction *tx, Unit *u) {
+        static const UnitDependency deps[] = { UNIT_CONFLICTS, UNIT_CONFLICTED_BY };
+        size_t d, i;
+        int r;
+
+        for (d = 0; d < sizeof(deps) / sizeof(deps[0]); d++) {
+                bool matters = deps[d] == UNIT_CONFLICTS;
+
+                for (i = 0; i < u->n_dependencies[deps[d]]; i++) {
+                        Unit *other = u->dependencies[deps[d]][i];
+                        Job *existing = transaction_find_job(tx, other);
+
+                        if (existing && (existing->type == JOB_START || existing->type == JOB_RESTART)) {
+                                if (existing == tx->anchor_job || existing->matters_to_anchor) {
+                                        pico_log(matters ? PICO_LOG_ERR : PICO_LOG_DEBUG,
+                                                 "%s conflicts with %s, which this transaction also starts",
+                                                 u->id,
+                                                 other->id);
+                                        if (matters)
+                                                return -EDEADLK;
+                                        continue;
+                                }
+
+                                pico_log(PICO_LOG_DEBUG,
+                                         "%s: conflicts with %s, turning its %s job into a stop",
+                                         u->id,
+                                         other->id,
+                                         job_type_to_string(existing->type));
+                                existing->type = JOB_STOP;
+                                if (matters)
+                                        existing->matters_to_anchor = true;
+                                continue;
+                        }
+
+                        r = transaction_add_job_full(tx, JOB_STOP, other, true, matters);
+                        if (r < 0) {
+                                if (matters)
+                                        return r;
+                                pico_log(PICO_LOG_DEBUG,
+                                         "%s: could not queue stop for conflicting %s: %s",
+                                         u->id,
+                                         other->id,
+                                         strerror(-r));
+                        }
+                }
+        }
+
+        return 0;
+}
+
 static int transaction_add_job_full(Transaction *tx, JobType type, Unit *u, bool with_dependencies, bool matters) {
         bool is_anchor;
         Job *existing;
@@ -922,6 +997,27 @@ static int transaction_add_job_full(Transaction *tx, JobType type, Unit *u, bool
          * `systemctl start foo` did (6530407524).
          */
         if (type == JOB_START || type == JOB_RESTART) {
+                /*
+                 * Conflicts first: a later Wants= start of a unit stopped
+                 * here then hits the merge conflict above and is soft-dropped,
+                 * a later Requires= start of it fails hard -- both right. On a
+                 * failure this job leaves the transaction too, mirroring the
+                 * Requires= self-removal in transaction_add_start_deps(): a
+                 * Wants=-pulled unit whose conflict could not be resolved must
+                 * not start alongside the unit it conflicts with. A stop
+                 * already queued for an earlier peer of the same unit stays;
+                 * that needs two Conflicts= targets of one unit both being
+                 * started by the same transaction, and is only a stop.
+                 */
+                r = transaction_add_conflict_deps(tx, u);
+                if (r < 0) {
+                        if (j != tx->anchor_job && !j->installed) {
+                                transaction_detach(tx, j);
+                                job_free(j);
+                        }
+                        return r;
+                }
+
                 r = transaction_add_start_deps(tx, u);
                 if (r < 0)
                         return r;
@@ -1191,10 +1287,11 @@ int transaction_activate(Transaction *tx) {
          *    Done incrementally: matters_to_anchor is propagated along
          *    Requires= at add time, since there is only ever one anchor. */
 
-        /* 2. Minimise impact -- N/A: that step resolves unmergeable job pairs
-         *    for one unit, which needs Conflicts=. With only Requires/Wants and
-         *    a single anchor, a start and a stop for the same unit cannot both
-         *    be pulled in. */
+        /* 2. Minimise impact -- done at add time instead: the one source of
+         *    an unmergeable start/stop pair for one unit is Conflicts=, and
+         *    transaction_add_conflict_deps() resolves each pair as it is
+         *    created (rewrite the non-mattering start, or fail when both
+         *    matter), so none survives to this point. */
 
         /* 3. Drop redundant jobs. */
         transaction_drop_redundant(tx);
@@ -1215,9 +1312,10 @@ int transaction_activate(Transaction *tx) {
                         return -ELOOP;
                 }
 
-                /* 5. Collect garbage -- N/A: with a single anchor and no
-                 *    Conflicts=, a job with nothing pulling it in cannot be
-                 *    created in the first place. */
+                /* 5. Collect garbage -- not implemented. The one way to
+                 *    orphan a job here is a Conflicts= rewrite of a start
+                 *    into a stop, leaving the start jobs it pulled in; they
+                 *    simply start on their own, which is harmless. */
         }
 
         /* 6-7. Merge jobs / collect garbage again -- N/A: merging happens at

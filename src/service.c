@@ -540,6 +540,18 @@ static bool service_start_limit_check(Service *s) {
 
 /* --- the restart decision (B8) --- */
 
+/*
+ * Value by value as upstream's service_shall_restart() (src/core/service.c),
+ * minus RestartPreventExitStatus=/RestartForceExitStatus=, which are not
+ * parsed and degrade visibly. Every value excludes SKIP_CONDITION: a skipped
+ * ExecCondition= would only skip again.
+ *
+ * Known on-abnormal divergence: pico's own setup exit codes (200-222) are
+ * RESOURCES, so on-abnormal restarts on, say, an ExecStart= ENOENT (203),
+ * where upstream calls that EXIT_CODE and does not. The start limit bounds
+ * it, and telling the two apart would mean threading the result's origin
+ * through every enter_* path for one value.
+ */
 static bool service_shall_restart(Service *s, const char **reason) {
         if (s->forbid_restart) {
                 *reason = "manual stop";
@@ -550,8 +562,24 @@ static bool service_shall_restart(Service *s, const char **reason) {
         switch (s->restart) {
         case SERVICE_RESTART_NO:
                 return false;
+        case SERVICE_RESTART_ALWAYS:
+                return s->result != SERVICE_SKIP_CONDITION;
+        case SERVICE_RESTART_ON_SUCCESS:
+                return s->result == SERVICE_SUCCESS;
         case SERVICE_RESTART_ON_FAILURE:
-                return service_result_is_failure(s->result); /* a skip would only skip again */
+                return service_result_is_failure(s->result);
+        case SERVICE_RESTART_ON_ABNORMAL:
+                return service_result_is_failure(s->result) && s->result != SERVICE_FAILURE_EXIT_CODE;
+        case SERVICE_RESTART_ON_WATCHDOG:
+                /* No per-service watchdog exists (manager-watchdog.h), so no
+                 * result is ever a watchdog failure: upstream's own answer
+                 * for a unit without WatchdogSec=, whose degradation is the
+                 * visible marker here. */
+                return false;
+        case SERVICE_RESTART_ON_ABORT:
+                /* pico folds CLD_DUMPED into SIGNAL, so this is upstream's
+                 * SIGNAL-or-CORE_DUMP exactly. */
+                return s->result == SERVICE_FAILURE_SIGNAL;
         default:
                 return false;
         }
@@ -622,6 +650,7 @@ static UnitActiveState service_active_state_of(ServiceState state, bool remain_a
 
 static void service_set_state(Service *s, ServiceState state) {
         UnitActiveState old_active, new_active;
+        bool had_job;
 
         if (s->state == state)
                 return;
@@ -630,7 +659,51 @@ static void service_set_state(Service *s, ServiceState state) {
         s->state = state;
         new_active = service_active_state_of(s->state, s->remain_after_exit);
 
+        /* Sampled before unit_notify(), which may complete and clear the job. */
+        had_job = UNIT(s)->job != NULL;
+
         unit_notify(UNIT(s), old_active, new_active);
+
+        /*
+         * Upstream's retroactive Conflicts= stop (unit.c, on an "unexpected"
+         * activation with no job). Here the one jobless path to activation
+         * is Restart='s DEAD/FAILED -> AUTO_RESTART, which never goes through
+         * a transaction, so this is where a conflicting peer gets stopped.
+         */
+        if (!had_job && (old_active == UNIT_INACTIVE || old_active == UNIT_FAILED) &&
+            (new_active == UNIT_ACTIVATING || new_active == UNIT_ACTIVE))
+                unit_stop_conflicting(UNIT(s));
+}
+
+/*
+ * Undo service-exec.c's step 9a: a tty* unit with User= had its TTYPath=
+ * chowned to that user and chmod 0620 so it could issue VT ioctls; once the
+ * unit is down the terminal goes back to root, as upstream's
+ * exec_context_revert_tty() does. Through an fd, not the path, so the
+ * S_ISCHR check and the chown act on the same inode.
+ */
+static void service_revert_tty(Service *s) {
+        const char *p = s->tty_path ? s->tty_path : PICO_CONSOLE_PATH;
+        struct stat st;
+        int fd;
+
+        if (!service_standard_input_is_tty(s->standard_input) || !s->user)
+                return;
+
+        fd = open(p, O_RDONLY | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
+        if (fd < 0)
+                return;
+
+        if (fstat(fd, &st) == 0 && S_ISCHR(st.st_mode)) {
+                if (fchown(fd, 0, (gid_t) -1) < 0 || fchmod(fd, 0620) < 0)
+                        pico_log(PICO_LOG_DEBUG,
+                                 "%s: could not reset ownership of %s: %s",
+                                 UNIT(s)->id,
+                                 p,
+                                 strerror(errno));
+        }
+
+        close(fd);
 }
 
 static void service_enter_dead(Service *s) {
@@ -639,6 +712,7 @@ static void service_enter_dead(Service *s) {
 
         service_timer_reset(s);
         service_exec_fd_close(s);
+        service_revert_tty(s);
 
         /* B8/a509f0e631: always the real DEAD/FAILED state first, then --
          * and only then -- AUTO_RESTART is even considered. Skipping this
@@ -1186,8 +1260,17 @@ void service_sigchld_event(Service *s, pid_t pid, int code, int status) {
         if (!is_main && !is_control)
                 return; /* not ours */
 
-        clean = (s->type == SERVICE_TYPE_ONESHOT || is_control) ? PICO_EXIT_CLEAN_COMMAND :
-                                                                  PICO_EXIT_CLEAN_DAEMON;
+        /*
+         * Upstream's service_sigchld_event() judges a control process as a
+         * command only when control_command_id != SERVICE_EXEC_START: a
+         * Type=forking ExecStart= parent is judged as a daemon, so its
+         * SIGTERM/SIGINT/SIGHUP/SIGPIPE death is SUCCESS there. Judging it as
+         * a command made Restart=on-failure restart where upstream does not.
+         */
+        clean = (s->type == SERVICE_TYPE_ONESHOT ||
+                 (is_control && !(s->state == SERVICE_EXEC_START && s->type == SERVICE_TYPE_FORKING))) ?
+                        PICO_EXIT_CLEAN_COMMAND :
+                        PICO_EXIT_CLEAN_DAEMON;
 
         if (pico_is_clean_exit(code, status, clean))
                 f = SERVICE_SUCCESS;
@@ -1644,8 +1727,20 @@ int service_verify(Service *s) {
                 return -ENOEXEC;
         }
 
-        /* Type=oneshot + Restart=on-failure is legal in modern systemd
-         * (the old blanket ban is not carried forward) -- nothing to check. */
+        /*
+         * Upstream's service_verify() refuses exactly these two: a oneshot
+         * that restarts on success would rerun forever by design.
+         * Type=oneshot with on-failure and the other values stays legal, as
+         * in modern systemd (the old blanket ban is not carried forward).
+         */
+        if (s->type == SERVICE_TYPE_ONESHOT &&
+            (s->restart == SERVICE_RESTART_ALWAYS || s->restart == SERVICE_RESTART_ON_SUCCESS)) {
+                pico_log(PICO_LOG_ERR,
+                         "%s: Restart=%s is not allowed for Type=oneshot services, refusing to load",
+                         UNIT(s)->id,
+                         service_restart_to_string(s->restart));
+                return -ENOEXEC;
+        }
 
         return 0;
 }
@@ -1686,7 +1781,12 @@ const char *service_state_to_string(ServiceState s) {
 
 static const char * const service_restart_table[_SERVICE_RESTART_MAX] = {
         [SERVICE_RESTART_NO] = "no",
+        [SERVICE_RESTART_ON_SUCCESS] = "on-success",
         [SERVICE_RESTART_ON_FAILURE] = "on-failure",
+        [SERVICE_RESTART_ON_ABNORMAL] = "on-abnormal",
+        [SERVICE_RESTART_ON_WATCHDOG] = "on-watchdog",
+        [SERVICE_RESTART_ON_ABORT] = "on-abort",
+        [SERVICE_RESTART_ALWAYS] = "always",
 };
 
 const char *service_restart_to_string(ServiceRestart r) {
@@ -1769,6 +1869,7 @@ static void service_done(Unit *u) {
         s->user = pico_mfree(s->user);
         s->group = pico_mfree(s->group);
         s->pid_file = pico_mfree(s->pid_file);
+        s->tty_path = pico_mfree(s->tty_path);
         s->status_text = pico_mfree(s->status_text);
 
         /*

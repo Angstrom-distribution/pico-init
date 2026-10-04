@@ -419,6 +419,17 @@ static int config_parse_wants(Unit *u, const char *path, unsigned line, const ch
         return config_parse_unit_deps(u, path, line, UNIT_WANTS, rvalue);
 }
 
+/*
+ * Conflicts= records only the forward edge as written; unit_add_dependency()
+ * adds the ConflictedBy= inverse on the peer. ConflictedBy= is not a
+ * unit-file directive upstream either, so it has no config_items[] row.
+ */
+static int config_parse_conflicts(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        (void) lvalue;
+        return config_parse_unit_deps(u, path, line, UNIT_CONFLICTS, rvalue);
+}
+
 static int config_parse_before(Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
         (void) lvalue;
         return config_parse_unit_deps(u, path, line, UNIT_BEFORE, rvalue);
@@ -633,12 +644,13 @@ static int config_parse_type(Unit *u, const char *path, unsigned line, const cha
 }
 
 /*
- * StandardInput=socket is the one value real Accept=yes consumers actually
- * need (see service.h's ServiceStandardInput comment) -- recognised here so
- * socket.c's socket_instance_refused() (which refuses a connection to any
- * instance that still carries "StandardInput" in its degraded-directives
- * list) stops refusing it. Any other value is left exactly as before: not
- * parsed, falls through to the generic unknown-directive degradation.
+ * StandardInput=socket (oe-core's dropbear@.service) and tty/tty-force/
+ * tty-fail (getty units, oe-core's weston.service) are the values real
+ * consumers need; see service.h's ServiceStandardInput comment. Recognising
+ * one keeps "StandardInput" out of the degraded-directives list, which is
+ * what socket.c's socket_instance_refused() checks -- a tty-stdin Accept=yes
+ * instance is accepted and gets its connection via LISTEN_FDS, as upstream.
+ * Any other value (null, file:, data, ...) still degrades.
  */
 static int config_parse_standard_input(
                 Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
@@ -652,8 +664,61 @@ static int config_parse_standard_input(
                 s->standard_input = SERVICE_STANDARD_INPUT_SOCKET;
                 return 0;
         }
+        if (strcmp(rvalue, "tty") == 0) {
+                s->standard_input = SERVICE_STANDARD_INPUT_TTY;
+                return 0;
+        }
+        if (strcmp(rvalue, "tty-force") == 0) {
+                s->standard_input = SERVICE_STANDARD_INPUT_TTY_FORCE;
+                return 0;
+        }
+        if (strcmp(rvalue, "tty-fail") == 0) {
+                s->standard_input = SERVICE_STANDARD_INPUT_TTY_FAIL;
+                return 0;
+        }
 
         return unit_add_degradation(u, "StandardInput");
+}
+
+/*
+ * TTYPath=: full specifier table, since getty's TTYPath=/dev/%I needs %I's
+ * unescaping. Unlike PIDFile=, a relative value is not anchored anywhere:
+ * upstream's config_parse_unit_path_printf() logs and ignores it, so this
+ * does the same and records the drop. An empty value resets to the
+ * /dev/console default. Only consulted when StandardInput= is tty*.
+ */
+static int config_parse_tty_path(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        Service *s = unit_to_service(u, path, line);
+        char *expanded = NULL;
+        int r;
+        (void) lvalue;
+
+        if (!s)
+                return 0;
+
+        if (!*rvalue) {
+                s->tty_path = pico_mfree(s->tty_path);
+                return 0;
+        }
+
+        r = unit_full_printf(u, rvalue, &expanded);
+        if (r < 0)
+                return r;
+
+        if (expanded[0] != '/') {
+                pico_log(PICO_LOG_WARNING,
+                         "%s:%u: TTYPath=%s is not an absolute path, ignoring",
+                         path,
+                         line,
+                         expanded);
+                pico_mfree(expanded);
+                return unit_add_degradation(u, "TTYPath");
+        }
+
+        pico_mfree(s->tty_path);
+        s->tty_path = expanded;
+        return 0;
 }
 
 /*
@@ -1097,51 +1162,32 @@ static int config_parse_environment_file(
         return r;
 }
 
+/*
+ * All seven upstream Restart= values map exactly; none is approximated, so
+ * none records a degradation. What each one restarts on is decided by
+ * service_shall_restart() (service.c), which follows upstream's
+ * service_shall_restart() value by value. on-watchdog parses but can never
+ * fire, because pico has no per-service watchdog -- WatchdogSec='s own
+ * degradation is the visible marker for that, exactly as upstream treats
+ * on-watchdog on a unit without WatchdogSec=. Type=oneshot with always or
+ * on-success is refused later by service_verify(), not here.
+ */
 static int config_parse_restart(Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
         Service *s = unit_to_service(u, path, line);
+        ServiceRestart r;
         (void) lvalue;
 
         if (!s)
                 return 0;
 
-        if (strcmp(rvalue, "no") == 0)
-                s->restart = SERVICE_RESTART_NO;
-        else if (strcmp(rvalue, "on-failure") == 0)
-                s->restart = SERVICE_RESTART_ON_FAILURE;
-        else if (strcmp(rvalue, "always") == 0 || strcmp(rvalue, "on-success") == 0 ||
-                 strcmp(rvalue, "on-abnormal") == 0 || strcmp(rvalue, "on-abort") == 0 ||
-                 strcmp(rvalue, "on-watchdog") == 0) {
-                char what[32];
+        for (r = 0; r < _SERVICE_RESTART_MAX; r++)
+                if (strcmp(rvalue, service_restart_to_string(r)) == 0) {
+                        s->restart = r;
+                        return 0;
+                }
 
-                /*
-                 * "always" is common enough upstream (and the most likely to
-                 * surprise a unit author expecting a restart) that falling
-                 * all the way back to "no" -- never restart -- would be a
-                 * worse approximation than the nearest value this project
-                 * does implement. The other four recognized values have no
-                 * comparably obvious nearest neighbour, so they keep the
-                 * conservative "no" default; either way, the degradation
-                 * record (picoctl show, pico-unit-lint) is the point: this
-                 * used to be a WARNING only, invisible to both.
-                 */
-                s->restart = strcmp(rvalue, "always") == 0 ? SERVICE_RESTART_ON_FAILURE : SERVICE_RESTART_NO;
-                pico_log(PICO_LOG_WARNING,
-                         "%s:%u: Restart=%s not supported (only 'no'/'on-failure' are), defaulting to '%s'",
-                         path,
-                         line,
-                         rvalue,
-                         s->restart == SERVICE_RESTART_ON_FAILURE ? "on-failure" : "no");
-                snprintf(what, sizeof(what), "Restart=%s", rvalue);
-                (void) unit_add_degradation(u, what);
-        } else {
-                pico_log(PICO_LOG_WARNING,
-                         "%s:%u: Restart=%s not recognized, defaulting to 'no'",
-                         path,
-                         line,
-                         rvalue);
-                s->restart = SERVICE_RESTART_NO;
-        }
-
+        pico_log(PICO_LOG_WARNING, "%s:%u: Restart=%s not recognized, defaulting to 'no'", path, line, rvalue);
+        s->restart = SERVICE_RESTART_NO;
         return 0;
 }
 
@@ -1553,10 +1599,12 @@ static const ConfigItem config_items[] = {
         {    SECTION_UNIT,                    "Wants",                       config_parse_wants },
         {    SECTION_UNIT,                   "Before",                      config_parse_before },
         {    SECTION_UNIT,                    "After",                       config_parse_after },
+        {    SECTION_UNIT,                "Conflicts",                   config_parse_conflicts },
         {    SECTION_UNIT,      "ConditionPathExists",       config_parse_condition_path_exists },
         {    SECTION_UNIT, "ConditionPathIsDirectory", config_parse_condition_path_is_directory },
         { SECTION_SERVICE,                     "Type",                        config_parse_type },
         { SECTION_SERVICE,            "StandardInput",              config_parse_standard_input },
+        { SECTION_SERVICE,                  "TTYPath",                    config_parse_tty_path },
         { SECTION_SERVICE,                "ExecStart",                  config_parse_exec_start },
         { SECTION_SERVICE,             "ExecStartPre",              config_parse_exec_start_pre },
         { SECTION_SERVICE,                 "ExecStop",                   config_parse_exec_stop },

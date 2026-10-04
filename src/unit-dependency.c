@@ -37,6 +37,10 @@ static UnitDependency dependency_inverse(UnitDependency d) {
                 return UNIT_AFTER;
         case UNIT_AFTER:
                 return UNIT_BEFORE;
+        case UNIT_CONFLICTS:
+                return UNIT_CONFLICTED_BY;
+        case UNIT_CONFLICTED_BY:
+                return UNIT_CONFLICTS;
         default:
                 /* Requires/Wants have no inverse slot in this model; the
                  * reverse relation (RequiredBy/WantedBy) is carried as raw
@@ -160,11 +164,14 @@ int unit_dependency_unlink(Unit *u) {
 
         /* Requires=/Wants= have no inverse slot, so a peer holding one was
          * declared by a file that names u: dropping it would rewrite that
-         * unit's graph behind its back. */
+         * unit's graph behind its back. A peer's Conflicts= on u is the same
+         * case -- the peer's own file named u. A peer's ConflictedBy= edge is
+         * only u's own Conflicts= mirrored, so the drop loop below takes it. */
         for (i = 0; i < m->n_units; i++)
                 if (m->units[i] != u &&
                     (unit_has_dependency(m->units[i], UNIT_REQUIRES, u) ||
-                     unit_has_dependency(m->units[i], UNIT_WANTS, u)))
+                     unit_has_dependency(m->units[i], UNIT_WANTS, u) ||
+                     unit_has_dependency(m->units[i], UNIT_CONFLICTS, u)))
                         return -EBUSY;
 
         for (i = 0; i < m->n_units; i++)
@@ -178,6 +185,43 @@ int unit_dependency_unlink(Unit *u) {
         }
 
         return 0;
+}
+
+void unit_stop_conflicting(Unit *u) {
+        static const UnitDependency deps[] = { UNIT_CONFLICTS, UNIT_CONFLICTED_BY };
+        size_t d, i;
+
+        if (!u || !u->manager)
+                return;
+
+        for (d = 0; d < sizeof(deps) / sizeof(deps[0]); d++)
+                for (i = 0; i < u->n_dependencies[deps[d]]; i++) {
+                        Unit *other = u->dependencies[deps[d]][i];
+                        UnitActiveState st = unit_active_state(other);
+                        int r;
+
+                        if (st != UNIT_ACTIVE && st != UNIT_ACTIVATING)
+                                continue;
+
+                        /*
+                         * manager_add_job() only installs and queues; the
+                         * stop runs later from the run queue, so this is
+                         * safe from inside a unit's own state change. The
+                         * stop is an explicit one, so it also sets the
+                         * peer's forbid_restart: a ping-pong between two
+                         * Restart=always units needs an outside trigger
+                         * on every round.
+                         */
+                        r = manager_add_job(u->manager, JOB_STOP, other, NULL);
+                        if (r < 0)
+                                pico_log(PICO_LOG_DEBUG,
+                                         "%s: could not stop conflicting %s: %s",
+                                         u->id,
+                                         other->id,
+                                         strerror(-r));
+                        else
+                                pico_log(PICO_LOG_DEBUG, "%s: stopping conflicting %s", u->id, other->id);
+                }
 }
 
 /* One frame of the explicit DFS stack. */
@@ -303,6 +347,8 @@ static const char * const unit_dependency_table[_UNIT_DEPENDENCY_MAX] = {
         [UNIT_WANTS] = "Wants",
         [UNIT_BEFORE] = "Before",
         [UNIT_AFTER] = "After",
+        [UNIT_CONFLICTS] = "Conflicts",
+        [UNIT_CONFLICTED_BY] = "ConflictedBy",
 };
 
 const char *unit_dependency_to_string(UnitDependency d) {

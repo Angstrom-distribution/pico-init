@@ -45,12 +45,21 @@ typedef enum UnitActiveState {
         _UNIT_ACTIVE_STATE_MAX,
 } UnitActiveState;
 
-/* Before/After are ordering, Requires/Wants are dependency -- distinct concepts */
+/*
+ * Before/After are ordering, Requires/Wants are dependency -- distinct
+ * concepts. Conflicts/ConflictedBy are a third: negative dependency, no
+ * ordering implied. Two slots rather than one symmetric one because only the
+ * forward direction "matters" in a transaction (job.c): a failure to stop a
+ * Conflicts= peer fails the start, one for a ConflictedBy= peer is only
+ * logged, which is upstream's own PULL_IN_STOP / PULL_IN_STOP_IGNORED split.
+ */
 typedef enum UnitDependency {
         UNIT_REQUIRES,
         UNIT_WANTS,
         UNIT_BEFORE,
         UNIT_AFTER,
+        UNIT_CONFLICTS,
+        UNIT_CONFLICTED_BY,
         _UNIT_DEPENDENCY_MAX,
 } UnitDependency;
 
@@ -273,8 +282,9 @@ int unit_reload(Unit *u);
 
 /* --- unit-dependency.c --- */
 /* Record "u has dependency d on other", deduplicating. Also records the inverse
- * relation where one exists in this model (Before <-> After); Requires/Wants
- * have no inverse slot here, so nothing is recorded back for them. */
+ * relation where one exists in this model (Before <-> After, Conflicts <->
+ * ConflictedBy); Requires/Wants have no inverse slot here, so nothing is
+ * recorded back for them. */
 int unit_add_dependency(Unit *u, UnitDependency d, Unit *other);
 
 /* As above, resolving `name` through the manager (loading it if needed). */
@@ -289,8 +299,16 @@ int unit_dependency_detect_cycles(Manager *m);
  * Drop every edge between u and the rest of its manager's table, both
  * directions, so u can then be freed without a peer keeping a dangling
  * Before=/After= back to it. -EBUSY with nothing changed when another unit
- * Requires=/Wants= u.
+ * Requires=/Wants=/Conflicts= u.
  */
 int unit_dependency_unlink(Unit *u);
+
+/*
+ * Queue a JOB_STOP on every Conflicts=/ConflictedBy= peer of u that is
+ * active or activating. For an activation that bypassed the transaction
+ * (no job), which is the only case the transaction's own conflict handling
+ * (job.c) cannot see; failures are logged at DEBUG, never returned.
+ */
+void unit_stop_conflicting(Unit *u);
 
 const char *unit_dependency_to_string(UnitDependency d);

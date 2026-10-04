@@ -330,12 +330,14 @@ static void test_degradation_record(void) {
 }
 
 /*
- * units-degradation-record-holes: Restart=always, a Requires= on a unit type
- * pico has no vtable for, and an unparseable TimeoutStartSec= were each
- * dropped with only a WARNING -- invisible to picoctl show/pico-unit-lint,
- * which read the degradation record, not the log.
+ * units-degradation-record-holes: a Requires= on a unit type pico has no
+ * vtable for, and an unparseable TimeoutStartSec=, were each dropped with
+ * only a WARNING -- invisible to picoctl show/pico-unit-lint, which read the
+ * degradation record, not the log. Restart=always sits in the same unit
+ * file as a sanity check that a fully-implemented value parses straight
+ * through instead of degrading.
  */
-static void test_degradation_record_covers_restart_deps_and_timeouts(void) {
+static void test_degradation_record_covers_deps_and_timeouts(void) {
         Manager *m;
         char *dir;
         char *joined;
@@ -361,14 +363,14 @@ static void test_degradation_record_covers_restart_deps_and_timeouts(void) {
 
         ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
 
-        /* Restart=always falls back to the nearest implemented value
-         * (on-failure), not all the way to "never restart". */
-        ASSERT_EQ_INT(((Service *) u)->restart, SERVICE_RESTART_ON_FAILURE);
+        /* Restart=always is one of the seven fully-implemented values; it
+         * parses straight through, not an approximation. */
+        ASSERT_EQ_INT(((Service *) u)->restart, SERVICE_RESTART_ALWAYS);
         /* An unparseable value leaves the default (90s) untouched. */
         ASSERT_TRUE(((Service *) u)->timeout_start_usec == 90 * USEC_PER_SEC);
 
         joined = unit_degraded_directives_string(u);
-        ASSERT_STREQ(joined, "Requires=.mount Restart=always TimeoutStartSec=");
+        ASSERT_STREQ(joined, "Requires=.mount TimeoutStartSec=");
         free(joined);
 
         manager_free(m);
@@ -1679,7 +1681,7 @@ int main(void) {
         test_service_fields();
         test_unknown_directives_are_tolerated();
         test_degradation_record();
-        test_degradation_record_covers_restart_deps_and_timeouts();
+        test_degradation_record_covers_deps_and_timeouts();
         test_repeated_exec_start_is_recorded();
         test_environment_directives();
         test_malformed_line_skips_only_that_line();

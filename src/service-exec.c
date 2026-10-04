@@ -148,6 +148,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -810,6 +811,10 @@ static void child_attach_cgroup(const struct pico_cgroup *cg) {
  * `exec_fd` is the write end of a Type=exec service's O_CLOEXEC readiness
  * pipe (see service.h), -1 for every other type: kept across the sweep,
  * written at step 11, and closed by a successful execve() itself.
+ * `tty_stdin` (parent-computed from the state the spawning enter_* function
+ * already set) is true when this command gets the StandardInput=tty* terminal
+ * on stdin; false for a tty* unit's ExecStop=/ExecStopPost=, which get it on
+ * stdout/stderr only (step 8).
  */
 static _Noreturn void
                 child_exec(Service *s,
@@ -820,11 +825,14 @@ static _Noreturn void
                            size_t pid_slot,
                            int stdout_fd,
                            int exec_fd,
-                           const ExecCreds *creds) {
+                           const ExecCreds *creds,
+                           bool tty_stdin) {
         char pidbuf[32];
         sigset_t empty;
         int sig, fd;
         long max_fd;
+        bool is_tty = service_standard_input_is_tty(s->standard_input);
+        const char *tty_path = s->tty_path ? s->tty_path : PICO_CONSOLE_PATH;
 
         /* 1. 69339ae9f7: never execve() with a NULL/empty argv[0]. */
         if (!argv || !argv[0] || argv[0][0] == '\0')
@@ -992,6 +1000,46 @@ static _Noreturn void
                         close(cfd);
                 if (stdout_fd >= 0 && stdout_fd > STDERR_FILENO)
                         close(stdout_fd);
+        } else if (is_tty) {
+                /*
+                 * StandardInput=tty*: TTYPath= on all three for the commands
+                 * upstream gives the terminal to (EXEC_APPLY_TTY_STDIN:
+                 * ExecCondition=/ExecStartPre=/ExecStart=); every other
+                 * command gets stdin downgraded to /dev/null and the
+                 * terminal write-only on 1/2, as exec-invoke.c's
+                 * fixup_input()/maybe_inherit_stdout_from_stdin(). stdout
+                 * goes to the terminal rather than logd because upstream's
+                 * StandardOutput= default is inherit when stdin is a tty;
+                 * service_spawn() therefore never makes a logd socket for
+                 * these units, so stdout_fd is -1 here. O_NOCTTY: step 9
+                 * decides about the controlling terminal explicitly.
+                 */
+                int ofd;
+
+                if (tty_stdin) {
+                        fd = open(tty_path, O_RDWR | O_NOCTTY);
+                        if (fd < 0)
+                                _exit(PICO_EXIT_STDIN);
+                        ofd = fd;
+                } else {
+                        fd = open("/dev/null", O_RDONLY | O_NOCTTY);
+                        if (fd < 0)
+                                _exit(PICO_EXIT_STDIN);
+                        ofd = open(tty_path, O_WRONLY | O_NOCTTY);
+                        if (ofd < 0)
+                                _exit(PICO_EXIT_STDOUT);
+                }
+
+                if (dup2(fd, STDIN_FILENO) < 0)
+                        _exit(PICO_EXIT_STDIN);
+                if (dup2(ofd, STDOUT_FILENO) < 0)
+                        _exit(PICO_EXIT_STDOUT);
+                if (dup2(ofd, STDERR_FILENO) < 0)
+                        _exit(PICO_EXIT_STDERR);
+                if (ofd != fd && ofd > STDERR_FILENO)
+                        close(ofd);
+                if (fd > STDERR_FILENO)
+                        close(fd);
         } else {
                 fd = open(PICO_CONSOLE_PATH, O_RDWR | O_NOCTTY);
                 if (fd < 0)
@@ -1036,9 +1084,38 @@ static _Noreturn void
          * failure -- there is simply no job control for this service, and
          * there is no async-signal-safe way to log that here, so it is
          * silently tolerated rather than reported.
+         *
+         * StandardInput= refines that, as upstream's acquire_terminal():
+         * tty-force passes 1, stealing the terminal from another session
+         * (root still holds CAP_SYS_ADMIN here, before step 10); tty-fail
+         * turns a failure into EXIT_STDIN. Plain tty diverges from
+         * upstream, which waits (inotify, ACQUIRE_TERMINAL_WAIT) for the
+         * current controlling process to let go: here it proceeds without
+         * job control instead, because blocking a child indefinitely in
+         * this region, with no way to report why, is worse.
          */
-        if (isatty(STDIN_FILENO) == 1)
-                ioctl(STDIN_FILENO, TIOCSCTTY, 0);
+        if (isatty(STDIN_FILENO) == 1) {
+                int force = s->standard_input == SERVICE_STANDARD_INPUT_TTY_FORCE && tty_stdin;
+
+                if (ioctl(STDIN_FILENO, TIOCSCTTY, force) < 0 &&
+                    s->standard_input == SERVICE_STANDARD_INPUT_TTY_FAIL && tty_stdin)
+                        _exit(PICO_EXIT_STDIN);
+        }
+
+        /*
+         * 9a. A tty* unit with User= needs to own its terminal for the VT
+         * ioctls weston and friends issue: upstream fchmod_and_chown()s it
+         * to 0620 and the user (exec-invoke.c), failing with EXIT_STDIN.
+         * Done here, still as root, on the fd rather than the path so no
+         * rename can redirect it. service_revert_tty() (service.c) hands it
+         * back to root once the unit is dead.
+         */
+        if (is_tty && tty_stdin && creds->set && creds->uid != 0) {
+                if (fchown(STDIN_FILENO, creds->uid, (gid_t) -1) < 0)
+                        _exit(PICO_EXIT_STDIN);
+                if (fchmod(STDIN_FILENO, 0620) < 0)
+                        _exit(PICO_EXIT_STDIN);
+        }
 
         /*
          * 10. User=/Group=: setgroups() -> setgid() -> setuid(), in exactly
@@ -1092,7 +1169,7 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
         size_t pid_slot = 0;
         const char *notify_socket;
         char **file_env = NULL, **expanded_argv = NULL;
-        bool has_unit_env, is_main;
+        bool has_unit_env, is_main, tty_stdin;
         ExecCreds creds;
         int stdout_fd;
         int exec_pipe[2] = { -1, -1 };
@@ -1209,8 +1286,16 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
         /* Every start, not only ExecStart= (plan §3.6: nothing scopes stdout
          * capture to the main command the way LISTEN_FDS is scoped above).
          * Best-effort: -1 on any failure just means "no logd, use the
-         * console" below, never a reason to fail the spawn itself. */
-        stdout_fd = create_stdout_socket(UNIT(s)->id);
+         * console" below, never a reason to fail the spawn itself. Not for
+         * a tty* unit: its stdout follows stdin to the terminal (child_exec()
+         * step 8). */
+        stdout_fd = service_standard_input_is_tty(s->standard_input) ? -1 : create_stdout_socket(UNIT(s)->id);
+
+        /* Every enter_* function sets the state before it spawns, so the
+         * state names the command: upstream's EXEC_APPLY_TTY_STDIN set. */
+        tty_stdin = service_standard_input_is_tty(s->standard_input) &&
+                        (s->state == SERVICE_CONDITION || s->state == SERVICE_START_PRE ||
+                         s->state == SERVICE_EXEC_START);
 
         /* Type=exec's readiness pipe (service.h), for the main command
          * only: ExecStartPre= completes by exiting, not by exec'ing. Both
@@ -1253,7 +1338,8 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
                            pid_slot,
                            stdout_fd,
                            exec_pipe[1],
-                           &creds); /* never returns */
+                           &creds,
+                           tty_stdin); /* never returns */
 
         /* COW: the child already has its own copy of everything argv/envp/
          * creds/stdout_fd point to, made at fork() -- freeing/closing the

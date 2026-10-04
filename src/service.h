@@ -70,18 +70,31 @@ typedef enum ServiceType {
 } ServiceType;
 
 /*
- * StandardInput=. Only the one value a real Accept=yes consumer (oe-core's
- * dropbear@.service) actually needs: the accepted connection duped onto fd
- * 0 (and, matching upstream's own StandardOutput=inherit-from-stdin default
- * for this case, fd 1 too) instead of handed over via LISTEN_FDS. Every
- * other StandardInput= value (tty, file, data, ...) is unparsed and falls
- * through to the generic degraded-directive path, same as before this
- * existed.
+ * StandardInput=, the values real consumers need. socket (oe-core's
+ * dropbear@.service): the accepted connection duped onto fd 0 (and, matching
+ * upstream's own StandardOutput=inherit-from-stdin default for this case,
+ * fd 1 too) instead of handed over via LISTEN_FDS. tty/tty-force/tty-fail
+ * (getty units, oe-core's weston.service): TTYPath= (default /dev/console)
+ * on fds 0-2 for ExecCondition=/ExecStartPre=/ExecStart=, as upstream's
+ * EXEC_APPLY_TTY_STDIN; every other command gets /dev/null stdin and the tty
+ * write-only on 1 and 2. The three differ only in TIOCSCTTY: tty-force
+ * steals the terminal, tty-fail fails the start if it cannot take it, and
+ * plain tty proceeds without job control instead of waiting for the holder
+ * to release it as upstream does (service-exec.c). Every other value (file,
+ * data, ...) falls through to the generic degraded-directive path.
  */
 typedef enum ServiceStandardInput {
         SERVICE_STANDARD_INPUT_NULL, /* default: console, same as today */
         SERVICE_STANDARD_INPUT_SOCKET,
+        SERVICE_STANDARD_INPUT_TTY,
+        SERVICE_STANDARD_INPUT_TTY_FORCE,
+        SERVICE_STANDARD_INPUT_TTY_FAIL,
 } ServiceStandardInput;
+
+static inline bool service_standard_input_is_tty(ServiceStandardInput i) {
+        return i == SERVICE_STANDARD_INPUT_TTY || i == SERVICE_STANDARD_INPUT_TTY_FORCE ||
+                        i == SERVICE_STANDARD_INPUT_TTY_FAIL;
+}
 
 typedef enum ServiceState {
         SERVICE_DEAD,
@@ -100,13 +113,20 @@ typedef enum ServiceState {
         _SERVICE_STATE_MAX,
 } ServiceState;
 
+/* Restart=, in upstream's own enum order. ON_WATCHDOG parses but never
+ * fires: there is no per-service watchdog (see service_shall_restart()). */
 typedef enum ServiceRestart {
         SERVICE_RESTART_NO,
+        SERVICE_RESTART_ON_SUCCESS,
         SERVICE_RESTART_ON_FAILURE,
+        SERVICE_RESTART_ON_ABNORMAL,
+        SERVICE_RESTART_ON_WATCHDOG,
+        SERVICE_RESTART_ON_ABORT,
+        SERVICE_RESTART_ALWAYS,
         _SERVICE_RESTART_MAX,
 } ServiceRestart;
 
-/* Why the service last stopped; drives Restart=on-failure and the job result. */
+/* Why the service last stopped; drives Restart= and the job result. */
 typedef enum ServiceResult {
         SERVICE_SUCCESS,
         SERVICE_FAILURE_RESOURCES,   /* fork/exec/cgroup setup failed */
@@ -133,6 +153,7 @@ typedef struct Service {
         ServiceState state;
         ServiceResult result;
         ServiceStandardInput standard_input; /* StandardInput=, default SERVICE_STANDARD_INPUT_NULL */
+        char *tty_path; /* TTYPath=, absolute, owned; NULL = PICO_CONSOLE_PATH */
 
         /* argv-style NULL-terminated vectors, owned */
         char **exec_start_pre; /* may be NULL */
