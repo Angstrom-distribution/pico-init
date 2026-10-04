@@ -95,7 +95,8 @@ static void test_fixture_basics(void) {
         ASSERT_STREQ(v, "disk");
 
         /* is_initialized is unconditionally true; usec_initialized is
-         * unconditionally -ENODATA -- see device-new.c's own comments. */
+         * -ENODATA for a device with no udev database entry, which this
+         * fixture never has -- see device-new.c's own comments. */
         ASSERT_EQ_INT(sd_device_get_is_initialized(d), 1);
         {
                 uint64_t usec;

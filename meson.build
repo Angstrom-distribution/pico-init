@@ -795,6 +795,7 @@ libsystemd_compat_sources = files(
   # sd_device_new_from_*() constructor, the parent walk), device-attr.c
   # (readlink-/grammar-based identity: subsystem, driver, sysname),
   # device-uevent.c (the property table and its uevent-derived getters),
+  # device-db.c (the /run/udev/data overlay devd writes for input devices),
   # device-property.c (iteration plus the always-empty tag family),
   # device-devlink.c/-sysattr.c/-child.c/-trigger.c (one real mechanism
   # each), device-enumerator.c and device-monitor.c (the two subsystems
@@ -805,6 +806,7 @@ libsystemd_compat_sources = files(
   'src/compat/libsystemd/device-new.c',
   'src/compat/libsystemd/device-attr.c',
   'src/compat/libsystemd/device-uevent.c',
+  'src/compat/libsystemd/device-db.c',
   'src/compat/libsystemd/device-property.c',
   'src/compat/libsystemd/device-devlink.c',
   'src/compat/libsystemd/device-sysattr.c',
@@ -1133,6 +1135,7 @@ test('test-sd-hwdb', test_sd_hwdb_exe)
 libsystemd_compat_device_tests = [
   'test-sd-device-new',
   'test-sd-device-uevent',
+  'test-sd-device-db',
   'test-sd-device-sysattr',
   'test-sd-device-devlink',
   'test-sd-device-enumerator',

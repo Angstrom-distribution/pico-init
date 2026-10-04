@@ -13,19 +13,24 @@
  * libudev/sd-device split by several years), so there is no GPL shape to
  * carry forward either: every function below is a pico-original
  * reimplementation of the documented ABI, backed by real /sys and real
- * netlink, not by a udev database that does not exist on this image.
+ * netlink. The one udev-database read it does (device-db.c) is of entries
+ * devd writes itself, in upstream's on-disk format, reimplemented from that
+ * format alone.
  *
  * The struct layout behind `sd_device` is private (device-internal.h);
  * callers only ever see the opaque pointer, exactly as real libsystemd users
  * do.
  *
  * Coverage is intentionally partial and every gap is a comment at its call
- * site, not a silent omission: pico runs devtmpfs + devd with no udev
- * database, no udev-added ID_* properties, and no tag mechanism, so
- * getters for data that plainly doesn't exist here return the honest
- * "not present" answer (usually -ENOENT or an empty iterator) rather than a
- * fabricated one. See device-monitor.c for the one family that is
- * genuinely deferred to a future sd-event shim.
+ * site, not a silent omission: pico runs devtmpfs + devd, not udevd. devd
+ * writes a real /run/udev/data entry for input devices only, carrying its
+ * input_id classification (ID_INPUT, ID_INPUT_TOUCHSCREEN, ...), and that
+ * reaches every consumer through the property overlay in device-db.c; every
+ * other device has no entry, and there are no other udev-added ID_*
+ * properties and no tag mechanism. Getters for data that plainly doesn't
+ * exist here return the honest "not present" answer (usually -ENOENT or an
+ * empty iterator) rather than a fabricated one. See device-monitor.c for the
+ * one family that is genuinely deferred to a future sd-event shim.
  */
 
 #pragma once

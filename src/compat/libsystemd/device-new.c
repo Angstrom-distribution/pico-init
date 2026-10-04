@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "device-internal.h"
@@ -612,44 +613,81 @@ int sd_device_get_devpath(sd_device *device, const char **ret) {
         return 0;
 }
 
+/* MAJOR, MINOR, IFINDEX as the uevent prints them: digits only. Wider than
+ * the result on purpose, so the range checks below mean something on a
+ * 32-bit board too, where unsigned long and unsigned are the same width. */
+static bool parse_full_ull(const char *s, unsigned long long *ret) {
+        unsigned long long v;
+        char *end;
+
+        if (!s || s[0] < '0' || s[0] > '9')
+                return false;
+
+        errno = 0;
+        v = strtoull(s, &end, 10);
+        if (errno != 0 || *end != '\0')
+                return false;
+
+        *ret = v;
+        return true;
+}
+
+int device_format_id(sd_device *d, char *buf, size_t size) {
+        unsigned long long maj, min, ifindex;
+        const char *subsystem = NULL, *sysname;
+        int k;
+
+        if (!d || !buf || size == 0)
+                return -EINVAL;
+
+        if (parse_full_ull(device_get_property_raw(d, "MAJOR"), &maj) &&
+            parse_full_ull(device_get_property_raw(d, "MINOR"), &min) && maj <= UINT_MAX && min <= UINT_MAX) {
+                /* Classify by subsystem when it resolves; a devnode's own
+                 * type (block vs. char) is what matters, and "not resolvably
+                 * block" defaults to the more general 'c' form -- the same
+                 * lenient default sd_device_new_from_devnum() uses for a
+                 * requested type of 'c'. */
+                (void) sd_device_get_subsystem(d, &subsystem);
+                k = snprintf(buf,
+                             size,
+                             "%c%u:%u",
+                             subsystem && strcmp(subsystem, "block") == 0 ? 'b' : 'c',
+                             (unsigned) maj,
+                             (unsigned) min);
+        } else if (parse_full_ull(device_get_property_raw(d, "IFINDEX"), &ifindex) && ifindex > 0 &&
+                   ifindex <= INT_MAX)
+                k = snprintf(buf, size, "n%d", (int) ifindex);
+        else if (sd_device_get_subsystem(d, &subsystem) >= 0 && sd_device_get_sysname(d, &sysname) >= 0)
+                k = snprintf(buf, size, "+%s:%s", subsystem, sysname);
+        else
+                return -ENOENT;
+
+        if (k < 0 || (size_t) k >= size)
+                return -ENAMETOOLONG;
+
+        return 0;
+}
+
 int sd_device_get_device_id(sd_device *device, const char **ret) {
         char buf[256];
-        dev_t devnum;
-        int ifindex, r;
-        const char *subsystem, *sysname;
+        int r;
 
         if (!device)
                 return -EINVAL;
 
         if (!device->device_id_resolved) {
-                if (sd_device_get_devnum(device, &devnum) >= 0) {
-                        /* Classify by subsystem when it resolves; a
-                         * devnode's own type (block vs. char) is what
-                         * matters, and "not resolvably block" defaults to
-                         * the more general 'c' form -- the same lenient
-                         * default sd_device_new_from_devnum() uses for a
-                         * requested type of 'c'. */
-                        subsystem = NULL;
-                        (void) sd_device_get_subsystem(device, &subsystem);
-                        snprintf(buf,
-                                 sizeof(buf),
-                                 "%c%u:%u",
-                                 subsystem && strcmp(subsystem, "block") == 0 ? 'b' : 'c',
-                                 major(devnum),
-                                 minor(devnum));
+                /* Built first, its result deliberately ignored: a device whose
+                 * properties cannot be read still has a subsystem and a
+                 * sysname, and the last form of the id is built from those. */
+                (void) device_ensure_properties(device);
+
+                r = device_format_id(device, buf, sizeof(buf));
+                if (r < 0)
+                        device->device_id_errno = r;
+                else {
                         device->device_id = strdup(buf);
                         device->device_id_errno = device->device_id ? 0 : -ENOMEM;
-                } else if (sd_device_get_ifindex(device, &ifindex) >= 0) {
-                        snprintf(buf, sizeof(buf), "n%d", ifindex);
-                        device->device_id = strdup(buf);
-                        device->device_id_errno = device->device_id ? 0 : -ENOMEM;
-                } else if ((r = sd_device_get_subsystem(device, &subsystem)) >= 0 &&
-                           sd_device_get_sysname(device, &sysname) >= 0) {
-                        snprintf(buf, sizeof(buf), "+%s:%s", subsystem, sysname);
-                        device->device_id = strdup(buf);
-                        device->device_id_errno = device->device_id ? 0 : -ENOMEM;
-                } else
-                        device->device_id_errno = -ENOENT;
+                }
 
                 device->device_id_resolved = true;
         }
@@ -667,13 +705,14 @@ int sd_device_get_is_initialized(sd_device *device) {
                 return -EINVAL;
 
         /*
-         * "Initialized" means the device manager has finished processing
-         * the device and its node/links are usable. Pico is devtmpfs-only
-         * (no udev, no db): the kernel creates the node synchronously with
-         * the add event, so there is no initialization phase to be
-         * mid-way-through. 1 is the true steady state; 0 would be a
-         * fabricated pending state that a caller polling this in a loop
-         * would wait on forever.
+         * Upstream answers this from the database: no /run/udev/data entry
+         * means udevd has not processed the device yet. Pico has a database
+         * now, but devd writes it for input devices only, so that rule would
+         * call every disk, tty and network interface on the machine
+         * uninitialized -- and a caller polling this in a loop would wait on
+         * them forever. There is no initialization phase to be mid-way
+         * through either: devtmpfs creates the node synchronously with the
+         * add event. 1 is the true steady state for every device.
          */
         return 1;
 }
@@ -682,16 +721,41 @@ int sd_device_get_usec_initialized(sd_device *device, uint64_t *ret) {
         if (!device || !ret)
                 return -EINVAL;
 
-        /* No initialization timestamp is ever recorded (no udev db). This is
-         * the real library's own code for "initialized but no timestamp",
-         * so callers already handle it -- see this family's design note on
-         * why -EBUSY would be the wrong choice here. */
-        return -ENODATA;
+        /* The database's I: record (device-db.c), which devd writes for the
+         * devices it classifies. Every other device has none, and -ENODATA
+         * is the real library's own code for "initialized but no
+         * timestamp", so callers already handle it -- -EBUSY would claim
+         * the device is not initialized at all. */
+        (void) device_ensure_properties(device);
+
+        if (device->usec_initialized == 0)
+                return -ENODATA;
+
+        *ret = device->usec_initialized;
+        return 0;
 }
 
 int sd_device_get_usec_since_initialized(sd_device *device, uint64_t *ret) {
+        struct timespec ts;
+        uint64_t then, now;
+        int r;
+
         if (!device || !ret)
                 return -EINVAL;
 
-        return -ENODATA;
+        r = sd_device_get_usec_initialized(device, &then);
+        if (r < 0)
+                return r;
+
+        /* CLOCK_MONOTONIC, because that is the clock devd writes I: in
+         * (now_monotonic()), as upstream udevd does. */
+        if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0)
+                return -errno;
+
+        now = (uint64_t) ts.tv_sec * UINT64_C(1000000) + (uint64_t) ts.tv_nsec / UINT64_C(1000);
+        if (now < then)
+                return -EIO;
+
+        *ret = now - then;
+        return 0;
 }

@@ -2,11 +2,12 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The property table (uevent file or monitor env, plus synthesized keys)
- * and every getter that reads out of it: DEVTYPE, MAJOR/MINOR, IFINDEX,
- * DEVNAME, DISKSEQ. ACTION/SEQNUM/SYNTH_UUID are set directly by the
- * monitor/trigger paths rather than read back out of the table -- see
- * device-internal.h's struct comment -- but are added to the table too, so
+ * The property table (uevent file or monitor env, the udev database
+ * overlay from device-db.c, plus synthesized keys) and every getter that
+ * reads out of it: DEVTYPE, MAJOR/MINOR, IFINDEX, DEVNAME, DISKSEQ.
+ * ACTION/SEQNUM/SYNTH_UUID are set directly by the monitor/trigger paths
+ * rather than read back out of the table -- see device-internal.h's struct
+ * comment -- but are added to the table too, so
  * sd_device_get_property_first()/_next() shows them.
  */
 
@@ -137,6 +138,38 @@ int device_add_property(sd_device *d, const char *key, const char *value) {
         return 0;
 }
 
+int device_set_property(sd_device *d, const char *key, const char *value) {
+        size_t i;
+        char *v;
+
+        for (i = 0; i < d->n_properties; i++)
+                if (strcmp(d->properties[i].key, key) == 0)
+                        break;
+
+        if (i == d->n_properties)
+                return value && value[0] != '\0' ? device_add_property(d, key, value) : 0;
+
+        if (!value || value[0] == '\0') {
+                free(d->properties[i].key);
+                free(d->properties[i].value);
+                memmove(&d->properties[i],
+                        &d->properties[i + 1],
+                        (d->n_properties - i - 1) * sizeof(d->properties[0]));
+                d->n_properties--;
+                return 0;
+        }
+
+        /* In place, so property iteration order is unchanged -- what an
+         * ordered-hashmap replace upstream does too. */
+        v = strdup(value);
+        if (!v)
+                return -ENOMEM;
+
+        free(d->properties[i].value);
+        d->properties[i].value = v;
+        return 0;
+}
+
 int device_set_monitor_properties(sd_device *d, const char * const *keys, const char * const *values, size_t n) {
         size_t i;
         int r;
@@ -212,6 +245,14 @@ int device_ensure_properties(sd_device *d) {
                         d->properties_built = true;
                         return r;
                 }
+
+                /* The udev database after the uevent file and before the
+                 * synthesized keys: upstream's own order, where an E: record
+                 * replaces the uevent's value and the synthesized keys below
+                 * only fill what neither had. The result is ignored -- a
+                 * database that cannot be read is no database, never a
+                 * property lookup that fails. */
+                (void) device_read_db(d);
         }
         /* no_uevent_file: nothing to read (subsystem pseudo-device).
          * from_monitor: device_set_monitor_properties() already populated

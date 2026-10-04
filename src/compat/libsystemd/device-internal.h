@@ -109,6 +109,12 @@ struct sd_device {
         char *devname; /* "/dev/..."-prefixed, cached from the DEVNAME property */
         bool devname_resolved;
 
+        /* The udev database overlay (device-db.c), read at most once, from
+         * inside device_ensure_properties() -- never for a monitor device. */
+        bool db_loaded;
+        uint64_t usec_initialized; /* the I: record; 0 when there was none */
+        unsigned database_version; /* the V: record; 0 when there was none */
+
         sd_device *parent;
         bool parent_resolved;
         int parent_errno;
@@ -250,6 +256,17 @@ sd_device *device_new_bare(void); /* zeroed, n_ref = 1, everything else unset; N
  */
 int device_new_from_devpath_bare(sd_device **ret, const char *devpath);
 
+/*
+ * The device-id grammar -- b<maj>:<min>, c<maj>:<min>, n<ifindex>,
+ * +<subsystem>:<sysname> -- from whatever the property table holds right now.
+ * sd_device_get_device_id() is this plus caching; device-db.c needs it from
+ * INSIDE device_ensure_properties(), where sd_device_get_devnum() would
+ * re-enter the build it is part of, so this reads MAJOR/MINOR/IFINDEX with
+ * device_get_property_raw() only and never builds the table itself. 0,
+ * -ENOENT, or -ENAMETOOLONG.
+ */
+int device_format_id(sd_device *d, char *buf, size_t size);
+
 /* --- device-uevent.c --- */
 
 /* Build d->properties if not already built: base (uevent file, or the
@@ -263,6 +280,12 @@ int device_ensure_properties(sd_device *d);
  * appended unconditionally after the base table without overwriting a real
  * value the base table already had. 0 or -ENOMEM. */
 int device_add_property(sd_device *d, const char *key, const char *value);
+
+/* Replace-or-append: the one setter with replace semantics, for the udev
+ * database overlay, whose E: records override the uevent's value of the same
+ * key the way upstream's do. An existing key keeps its position; a NULL or
+ * empty `value` removes the key. 0 or -ENOMEM. */
+int device_set_property(sd_device *d, const char *key, const char *value);
 
 /* Overlay a monitor message's properties as the device's base table
  * (device-monitor.c), before device_ensure_properties() adds the
@@ -280,6 +303,22 @@ sd_device_action_t device_action_from_string(const char *s);
  * sd-id128 shim yet to borrow this from (see sd-device.h's stand-in typedef). */
 void device_id128_to_uuid_string(sd_id128_t id, char s[37]);
 int device_id128_from_uuid_string(const char *s, sd_id128_t *ret); /* 0 or -EINVAL */
+
+/* --- device-db.c --- */
+
+/* "/run/udev/data" in production; settable for tests, the same shape as
+ * device_set_sys_root_for_tests(). NULL restores the default. */
+const char *device_udev_db_root(void);
+void device_set_udev_db_root_for_tests(const char *root);
+
+/*
+ * Overlay the device's /run/udev/data/<device-id> entry, if any, onto its
+ * property table: E: records replace or remove, I: sets usec_initialized and
+ * USEC_INITIALIZED, V: sets database_version. Once per device, and never for
+ * a monitor device or a subsystem pseudo-device. A missing or unreadable
+ * entry is no entry. 0, or -ENOMEM.
+ */
+int device_read_db(sd_device *d);
 
 /* --- device-devlink.c --- */
 

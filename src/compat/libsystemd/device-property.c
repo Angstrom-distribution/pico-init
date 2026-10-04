@@ -3,9 +3,10 @@
 
 /*
  * Property iteration and lookup, plus the tag family. Pico has no tag
- * mechanism at all (no TAG+= in devd, no db to record one in), so the tag
- * set is genuinely empty rather than stubbed -- see sd-device.h's design
- * note; these are the correct answers, not placeholders.
+ * mechanism at all: devd has no TAG+=, and the udev database entries it does
+ * write (device-db.c) carry no G:/Q: records, so the tag set is genuinely
+ * empty rather than stubbed -- see sd-device.h's design note; these are the
+ * correct answers, not placeholders.
  */
 
 #include "sd-device.h"
