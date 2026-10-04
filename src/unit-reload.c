@@ -115,8 +115,8 @@ static void unit_swap_directives(Unit *u, Unit *fresh) {
 static void service_swap_directives(Service *s, Service *fresh) {
         SWAP_FIELD(s->type, fresh->type);
         SWAP_FIELD(s->exec_start_pre, fresh->exec_start_pre);
+        SWAP_FIELD(s->n_exec_start_pre, fresh->n_exec_start_pre);
         SWAP_FIELD(s->exec_start, fresh->exec_start);
-        SWAP_FIELD(s->exec_start_pre_ignore, fresh->exec_start_pre_ignore);
         SWAP_FIELD(s->exec_start_ignore, fresh->exec_start_ignore);
         SWAP_FIELD(s->exec_stop, fresh->exec_stop);
         SWAP_FIELD(s->n_exec_stop, fresh->n_exec_stop);

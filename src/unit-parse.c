@@ -988,36 +988,7 @@ static int config_parse_exec_start(
         return 0;
 }
 
-static int config_parse_exec_start_pre(
-                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
-        Service *s = unit_to_service(u, path, line);
-        char **argv = NULL;
-        bool ignore = false;
-        int r;
-
-        if (!s)
-                return 0;
-
-        r = parse_exec_line(u, path, line, lvalue, rvalue, &argv, &ignore);
-        if (r < 0)
-                return 0;
-
-        if (s->exec_start_pre) {
-                pico_log(PICO_LOG_DEBUG,
-                         "%s:%u: multiple ExecStartPre= not supported, replacing "
-                         "previous value",
-                         path,
-                         line);
-                (void) unit_add_degradation(u, "ExecStartPre=multiple");
-        }
-
-        s->exec_start_pre = pico_strv_free(s->exec_start_pre);
-        s->exec_start_pre = argv;
-        s->exec_start_pre_ignore = ignore;
-        return 0;
-}
-
-/* Upstream's list semantics, unlike the two above: every ExecStop= line
+/* Upstream's list semantics, unlike ExecStart= above: every ExecStop= line
  * appends, and an empty one resets whatever came before it. */
 static int config_parse_exec_stop(
                 Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
@@ -1087,6 +1058,16 @@ static int
         *list = cmds;
         (*n)++;
         return 0;
+}
+
+static int config_parse_exec_start_pre(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        Service *s = unit_to_service(u, path, line);
+
+        if (!s)
+                return 0;
+
+        return parse_exec_list(u, path, line, lvalue, rvalue, &s->exec_start_pre, &s->n_exec_start_pre);
 }
 
 static int config_parse_exec_condition(

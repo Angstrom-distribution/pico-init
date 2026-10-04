@@ -403,6 +403,109 @@ static void test_exec_start_pre_dash_ignores_failure(void) {
         free(dir);
 }
 
+/* The unit text is built from a temp dir path of unknown length; the buffers
+ * are far larger than any real path, which -Wformat-truncation cannot know. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+
+/* Reads a whole small file into a static buffer; "" when it does not exist. */
+static const char *slurp(const char *path) {
+        static char buf[256];
+        FILE *f = fopen(path, "r");
+        size_t n = 0;
+
+        if (f) {
+                n = fread(buf, 1, sizeof(buf) - 1, f);
+                fclose(f);
+        }
+        buf[n] = '\0';
+        return buf;
+}
+
+/*
+ * Every ExecStartPre= line runs, in file order, before ExecStart=; a "-"
+ * line that fails is skipped over and the chain carries on. systemd does the
+ * same; a unit shipping `mkdir` then a second step used to lose the first.
+ */
+static void test_exec_start_pre_runs_every_line_in_order(void) {
+        Manager *m;
+        Service *s;
+        char *dir;
+        char out[512], unit[1536];
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        snprintf(out, sizeof out, "%s/order", dir);
+        snprintf(unit,
+                 sizeof unit,
+                 "[Unit]\nDescription=pre-order\n"
+                 "[Service]\nType=oneshot\n"
+                 "ExecStartPre=/bin/sh -c \"echo one >> %s\"\n"
+                 "ExecStartPre=/bin/sh -c \"echo two >> %s\"\n"
+                 "ExecStartPre=-/bin/false\n"
+                 "ExecStartPre=/bin/sh -c \"echo three >> %s\"\n"
+                 "ExecStart=/bin/sh -c \"echo start >> %s\"\n",
+                 out,
+                 out,
+                 out,
+                 out);
+
+        m = manager_for(dir);
+        s = load_service(m, dir, "pre-order.service", unit);
+        ASSERT_EQ_INT(s->n_exec_start_pre, 4);
+
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        ASSERT_EQ_INT(s->state, SERVICE_START_PRE);
+        ASSERT_TRUE(drive_until(m, service_settled_done, s, 2000));
+
+        ASSERT_EQ_INT(s->state, SERVICE_DEAD);
+        ASSERT_EQ_INT(s->result, SERVICE_SUCCESS);
+        ASSERT_STREQ(slurp(out), "one\ntwo\nthree\nstart\n");
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* The first failing line without "-" ends the chain: later lines and ExecStart= never run. */
+static void test_exec_start_pre_failure_stops_the_chain(void) {
+        Manager *m;
+        Service *s;
+        char *dir;
+        char out[512], unit[1536];
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        snprintf(out, sizeof out, "%s/stop", dir);
+        snprintf(unit,
+                 sizeof unit,
+                 "[Unit]\nDescription=pre-stop\n"
+                 "[Service]\nType=oneshot\n"
+                 "ExecStartPre=/bin/sh -c \"echo one >> %s\"\n"
+                 "ExecStartPre=/bin/false\n"
+                 "ExecStartPre=/bin/sh -c \"echo two >> %s\"\n"
+                 "ExecStart=/bin/sh -c \"echo start >> %s\"\n",
+                 out,
+                 out,
+                 out);
+
+        m = manager_for(dir);
+        s = load_service(m, dir, "pre-stop.service", unit);
+
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, s, 2000));
+
+        ASSERT_EQ_INT(s->state, SERVICE_FAILED);
+        ASSERT_EQ_INT(s->result, SERVICE_FAILURE_EXIT_CODE);
+        ASSERT_STREQ(slurp(out), "one\n");
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+#pragma GCC diagnostic pop
+
 static void test_remain_after_exit(void) {
         Manager *m;
         Service *s;
@@ -3138,6 +3241,8 @@ int main(void) {
         test_lifecycle_simple();
         test_oneshot_completes_only_on_exit();
         test_exec_start_pre_dash_ignores_failure();
+        test_exec_start_pre_runs_every_line_in_order();
+        test_exec_start_pre_failure_stops_the_chain();
         test_remain_after_exit();
         test_b2_signal_amnesty_differs_by_type();
         test_start_timeout();

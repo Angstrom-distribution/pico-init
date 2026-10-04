@@ -976,16 +976,11 @@ static void service_enter_start(Service *s) {
                 service_enter_running(s);
 }
 
-static void service_enter_start_pre(Service *s) {
+/* Spawns ExecStartPre= line exec_start_pre_idx as the control process. */
+static void service_run_exec_start_pre(Service *s) {
         int r;
 
-        service_timer_reset(s);
-        service_kill_stale_cgroup_members(s); /* B11: before START_PRE */
-
-        service_set_state(s, SERVICE_START_PRE);
-        service_arm_timeout(s, s->timeout_start_usec, service_timer_start_timeout);
-
-        r = service_spawn(s, s->exec_start_pre, &s->control_pid);
+        r = service_spawn(s, s->exec_start_pre[s->exec_start_pre_idx].argv, &s->control_pid);
         if (r < 0) {
                 pico_log(PICO_LOG_ERR, "%s: failed to spawn ExecStartPre=: %s", UNIT(s)->id, strerror(-r));
                 if (s->result == SERVICE_SUCCESS)
@@ -994,8 +989,19 @@ static void service_enter_start_pre(Service *s) {
         }
 }
 
+static void service_enter_start_pre(Service *s) {
+        service_timer_reset(s);
+        service_kill_stale_cgroup_members(s); /* B11: before START_PRE */
+
+        service_set_state(s, SERVICE_START_PRE);
+        service_arm_timeout(s, s->timeout_start_usec, service_timer_start_timeout);
+
+        s->exec_start_pre_idx = 0;
+        service_run_exec_start_pre(s);
+}
+
 static void service_enter_start_pre_or_start(Service *s) {
-        if (s->exec_start_pre)
+        if (s->n_exec_start_pre > 0)
                 service_enter_start_pre(s);
         else
                 service_enter_start(s);
@@ -1209,11 +1215,13 @@ static const char *service_command_name(Service *s, bool is_control) {
         return "ExecStart"; /* Type=forking's parent */
 }
 
-/* The "-" flag of the ExecCondition=/ExecStopPost= line now running as the
- * control process. */
+/* The "-" flag of the ExecCondition=/ExecStartPre=/ExecStopPost= line now
+ * running as the control process. */
 static bool service_list_command_ignore(Service *s) {
         if (s->state == SERVICE_CONDITION)
                 return s->exec_condition[s->exec_condition_idx].ignore;
+        if (s->state == SERVICE_START_PRE && s->exec_start_pre_idx < s->n_exec_start_pre)
+                return s->exec_start_pre[s->exec_start_pre_idx].ignore;
         if (s->state == SERVICE_STOP_POST && s->exec_stop_post_idx < s->n_exec_stop_post)
                 return s->exec_stop_post[s->exec_stop_post_idx].ignore;
         return false;
@@ -1300,8 +1308,7 @@ void service_sigchld_event(Service *s, pid_t pid, int code, int status) {
          * daemon), main otherwise.
          */
         if (f != SERVICE_SUCCESS &&
-            ((is_control && s->state == SERVICE_START_PRE && s->exec_start_pre_ignore) ||
-             (is_control && s->state == SERVICE_EXEC_START && s->type == SERVICE_TYPE_FORKING &&
+            ((is_control && s->state == SERVICE_EXEC_START && s->type == SERVICE_TYPE_FORKING &&
               s->exec_start_ignore) ||
              (is_control && s->state == SERVICE_EXEC_STOP && s->exec_stop[s->exec_stop_idx].ignore) ||
              (is_control && service_list_command_ignore(s)) || (is_main && s->exec_start_ignore))) {
@@ -1374,6 +1381,14 @@ void service_sigchld_event(Service *s, pid_t pid, int code, int status) {
                         }
                 } else if (s->state == SERVICE_START_PRE) {
                         s->control_pid = 0;
+                        /* The next line only after a success (or a "-" line,
+                         * which is a success by now); a failure ends the
+                         * chain and the start unwinds. */
+                        if (f == SERVICE_SUCCESS && s->exec_start_pre_idx + 1 < s->n_exec_start_pre) {
+                                s->exec_start_pre_idx++;
+                                service_run_exec_start_pre(s);
+                                return;
+                        }
                         if (f == SERVICE_SUCCESS)
                                 service_enter_start(s);
                         else
@@ -1710,7 +1725,7 @@ int service_verify(Service *s) {
                 return -ENOEXEC;
         }
 
-        if (s->exec_start_pre && !exec_line_is_valid(s->exec_start_pre)) {
+        if (!exec_commands_are_valid(s->exec_start_pre, s->n_exec_start_pre)) {
                 pico_log(PICO_LOG_ERR, "%s: invalid ExecStartPre=, refusing to load", UNIT(s)->id);
                 return -ENOEXEC;
         }
@@ -1862,7 +1877,7 @@ static void service_done(Unit *u) {
         Service *s = SERVICE(u);
 
         s->exec_start = pico_strv_free(s->exec_start);
-        s->exec_start_pre = pico_strv_free(s->exec_start_pre);
+        service_exec_commands_free(&s->exec_start_pre, &s->n_exec_start_pre);
         service_exec_stop_clear(s);
         service_exec_commands_free(&s->exec_condition, &s->n_exec_condition);
         service_exec_commands_free(&s->exec_stop_post, &s->n_exec_stop_post);

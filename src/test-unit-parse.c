@@ -113,10 +113,10 @@ static void test_service_fields(void) {
         ASSERT_EQ_INT(s->type, SERVICE_TYPE_ONESHOT);
         ASSERT_TRUE(s->remain_after_exit);
 
-        ASSERT_TRUE(s->exec_start_pre != NULL);
-        ASSERT_STREQ(s->exec_start_pre[0], "/bin/true");
-        ASSERT_STREQ(s->exec_start_pre[1], "--pre");
-        ASSERT_TRUE(s->exec_start_pre[2] == NULL);
+        ASSERT_EQ_INT(s->n_exec_start_pre, 1);
+        ASSERT_STREQ(s->exec_start_pre[0].argv[0], "/bin/true");
+        ASSERT_STREQ(s->exec_start_pre[0].argv[1], "--pre");
+        ASSERT_TRUE(s->exec_start_pre[0].argv[2] == NULL);
 
         ASSERT_TRUE(s->exec_start != NULL);
         ASSERT_STREQ(s->exec_start[0], "/bin/echo");
@@ -209,8 +209,7 @@ static void test_unknown_directives_are_tolerated(void) {
 
 /*
  * The degradation record on a directive-rich real-world shape: the value-
- * level drops (a triggering condition, an ExecStart= modifier, a second
- * ExecStartPre=) are recorded under name=qualifier, repeats collapse, and a
+ * level drops (a triggering condition, an ExecStart= modifier) are recorded under name=qualifier, repeats collapse, and a
  * unit pico-init honours in full carries no record at all.
  */
 static void test_degradation_record(void) {
@@ -292,23 +291,27 @@ static void test_degradation_record(void) {
         ASSERT_EQ_INT(((Service *) u)->n_exec_stop, 1);
         ASSERT_STREQ(((Service *) u)->exec_stop[0].argv[1], "--stop");
 
-        ASSERT_EQ_INT(u->n_degraded_directives, 5);
+        /* Both ExecStartPre= lines are kept, in order, not degraded. */
+        ASSERT_EQ_INT(((Service *) u)->n_exec_start_pre, 2);
+        ASSERT_STREQ(((Service *) u)->exec_start_pre[0].argv[1], "one");
+        ASSERT_STREQ(((Service *) u)->exec_start_pre[1].argv[1], "two");
+
+        ASSERT_EQ_INT(u->n_degraded_directives, 4);
         ASSERT_STREQ(u->degraded_directives[0], "ConditionPathExists=|");
-        ASSERT_STREQ(u->degraded_directives[1], "ExecStartPre=multiple");
-        ASSERT_STREQ(u->degraded_directives[2], "ExecStart=@");
-        ASSERT_STREQ(u->degraded_directives[3], "ExecReload");
-        ASSERT_STREQ(u->degraded_directives[4], "Alias");
-        ASSERT_TRUE(u->degraded_directives[5] == NULL);
+        ASSERT_STREQ(u->degraded_directives[1], "ExecStart=@");
+        ASSERT_STREQ(u->degraded_directives[2], "ExecReload");
+        ASSERT_STREQ(u->degraded_directives[3], "Alias");
+        ASSERT_TRUE(u->degraded_directives[4] == NULL);
 
         joined = unit_degraded_directives_string(u);
         ASSERT_STREQ(joined,
-                     "ConditionPathExists=| ExecStartPre=multiple "
+                     "ConditionPathExists=| "
                      "ExecStart=@ ExecReload Alias");
         free(joined);
 
         /* a second identical drop is not a second entry */
         ASSERT_EQ_INT(unit_add_degradation(u, "Alias"), 0);
-        ASSERT_EQ_INT(u->n_degraded_directives, 5);
+        ASSERT_EQ_INT(u->n_degraded_directives, 4);
 
         ASSERT_EQ_INT(clean->load_state, UNIT_LOADED);
         ASSERT_EQ_INT(clean->n_degraded_directives, 0);
@@ -641,9 +644,10 @@ static void test_comment_inside_continuation_is_skipped(void) {
         /* A genuinely blank line still ends a continuation: ExecStartPre=
          * stops at "a", and the bare "b" on its own line is a malformed
          * line (no '='), not part of the command. */
-        ASSERT_STREQ(s->exec_start_pre[0], "/bin/true");
-        ASSERT_STREQ(s->exec_start_pre[1], "a");
-        ASSERT_TRUE(s->exec_start_pre[2] == NULL);
+        ASSERT_EQ_INT(s->n_exec_start_pre, 1);
+        ASSERT_STREQ(s->exec_start_pre[0].argv[0], "/bin/true");
+        ASSERT_STREQ(s->exec_start_pre[0].argv[1], "a");
+        ASSERT_TRUE(s->exec_start_pre[0].argv[2] == NULL);
 
         manager_free(m);
         test_rm_rf(dir);
@@ -657,6 +661,57 @@ static void test_comment_inside_continuation_is_skipped(void) {
  * in the code claiming it was rejected -- a dead check. Asserting the
  * rejection is what keeps that from regressing back into a value nobody wrote.
  */
+static void test_exec_start_pre_list_and_reset(void) {
+        Manager *m;
+        Service *s;
+        char *dir;
+        Unit *u;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "pre.service",
+                                      "[Service]\n"
+                                      "ExecStartPre=/bin/one\n"
+                                      "ExecStartPre=-/bin/two arg\n"
+                                      "ExecStart=/bin/true\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "reset.service",
+                                      "[Service]\n"
+                                      "ExecStartPre=/bin/one\n"
+                                      "ExecStartPre=\n"
+                                      "ExecStartPre=/bin/three\n"
+                                      "ExecStart=/bin/true\n"),
+                      0);
+
+        m = manager_for(dir);
+        ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+
+        u = manager_get_unit(m, "pre.service");
+        ASSERT_TRUE(u != NULL);
+        s = (Service *) u;
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        ASSERT_EQ_INT(s->n_exec_start_pre, 2);
+        ASSERT_STREQ(s->exec_start_pre[0].argv[0], "/bin/one");
+        ASSERT_EQ_INT(s->exec_start_pre[0].ignore, false);
+        ASSERT_STREQ(s->exec_start_pre[1].argv[0], "/bin/two");
+        ASSERT_STREQ(s->exec_start_pre[1].argv[1], "arg");
+        ASSERT_EQ_INT(s->exec_start_pre[1].ignore, true);
+        ASSERT_EQ_INT(u->n_degraded_directives, 0);
+
+        /* An empty ExecStartPre= forgets everything before it, as upstream. */
+        u = manager_get_unit(m, "reset.service");
+        ASSERT_TRUE(u != NULL);
+        s = (Service *) u;
+        ASSERT_EQ_INT(s->n_exec_start_pre, 1);
+        ASSERT_STREQ(s->exec_start_pre[0].argv[0], "/bin/three");
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 static void test_quoting_and_trailing_garbage(void) {
         Service *s;
         Manager *m;
@@ -1544,15 +1599,15 @@ static void test_exec_dash_prefix_sets_ignore(void) {
         u = load_one(m, "dash.service");
         ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
         s = (Service *) u;
-        ASSERT_EQ_INT(s->exec_start_pre_ignore, true);
+        ASSERT_EQ_INT(s->exec_start_pre[0].ignore, true);
         ASSERT_EQ_INT(s->exec_start_ignore, false);
-        ASSERT_STREQ(s->exec_start_pre[0], "/bin/false");
+        ASSERT_STREQ(s->exec_start_pre[0].argv[0], "/bin/false");
 
         u = load_one(m, "nodash.service");
         ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
         s = (Service *) u;
         ASSERT_EQ_INT(s->exec_start_ignore, false);
-        ASSERT_EQ_INT(s->exec_start_pre_ignore, false);
+        ASSERT_EQ_INT(s->n_exec_start_pre, 0);
 
         manager_free(m);
         test_rm_rf(dir);
@@ -1953,6 +2008,7 @@ int main(void) {
         test_bom_comments_and_continuations();
         test_comment_inside_continuation_is_skipped();
         test_quoting_and_trailing_garbage();
+        test_exec_start_pre_list_and_reset();
         test_invalid_dependency_names_are_rejected();
         test_huge_requires_line_does_not_crash();
         test_conditions_are_parsed();

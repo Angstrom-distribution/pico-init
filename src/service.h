@@ -156,12 +156,10 @@ typedef struct Service {
         char *tty_path;                      /* TTYPath=, absolute, owned; NULL = PICO_CONSOLE_PATH */
 
         /* argv-style NULL-terminated vectors, owned */
-        char **exec_start_pre; /* may be NULL */
         char **exec_start;
 
-        /* "-" prefix on the ExecStart=/ExecStartPre= line above: a nonzero
-         * exit is not a failure (v30 ExecCommand.ignore, load-fragment.c). */
-        bool exec_start_pre_ignore;
+        /* "-" prefix on the ExecStart= line above: a nonzero exit is not a
+         * failure (v30 ExecCommand.ignore, load-fragment.c). */
         bool exec_start_ignore;
 
         /*
@@ -186,6 +184,15 @@ typedef struct Service {
         ServiceExecCommand *exec_condition;
         unsigned n_exec_condition;
         unsigned exec_condition_idx;
+
+        /*
+         * ExecStartPre=, same list shape: every line runs in file order as
+         * the control process, each with its own "-" flag; the first one that
+         * fails (and is not marked "-") ends the chain and fails the start.
+         */
+        ServiceExecCommand *exec_start_pre;
+        unsigned n_exec_start_pre;
+        unsigned exec_start_pre_idx;
         ServiceExecCommand *exec_stop_post;
         unsigned n_exec_stop_post;
         unsigned exec_stop_post_idx;
