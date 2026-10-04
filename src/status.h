@@ -49,6 +49,23 @@
 #define ANSI_NORMAL "\x1B[0m"
 #define ANSI_GREEN "\x1B[0;32m"
 #define ANSI_HIGHLIGHT "\x1B[0;1;39m"
+#define ANSI_HIGHLIGHT_RED "\x1B[0;1;31m"
+
+/*
+ * systemd's real ANSI_HIGHLIGHT_YELLOW is a 256-colour sequence
+ * (ANSI_HIGHLIGHT_KHAKI3, "\x1B[0;1;38:5:185m") substituted in because the
+ * plain 16-colour bold yellow "is currently not displayed well by some
+ * terminals" -- but that substitution is only safe alongside the ColorMode
+ * negotiation (src/basic/ansi-color.h) that falls back to
+ * ANSI_HIGHLIGHT_YELLOW_FALLBACK, byte for byte the value used here, on a
+ * terminal that cannot do 256 colours. console_colors_enabled() below has no
+ * such negotiation -- on or off is the whole of it -- so sending the
+ * 256-colour form unconditionally would risk exactly the broken-escape
+ * output upstream's own fallback exists to avoid, on the serial consoles
+ * this project's boot messages mostly go to. The fallback is therefore the
+ * only one of the two that is correct here.
+ */
+#define ANSI_HIGHLIGHT_YELLOW "\x1B[0;1;33m"
 
 /*
  * The status word for a job that succeeded, verbatim from systemd's
@@ -68,6 +85,22 @@
 #define STATUS_COLOR_OK ANSI_GREEN
 
 /*
+ * The remaining three words systemd's job_done_messages[] (src/core/job.c)
+ * actually prints to the console, same six columns, same table's colours.
+ * JOB_CANCELED has no word there and gets none here either; this project's
+ * JobResult has no counterpart for JOB_SKIPPED/JOB_COLLECTED/JOB_INVALID/etc,
+ * so there is nothing to suppress for them beyond simply not printing.
+ */
+#define STATUS_WORD_FAILED "FAILED"
+#define STATUS_COLOR_FAILED ANSI_HIGHLIGHT_RED
+
+#define STATUS_WORD_TIMEOUT " TIME "
+#define STATUS_COLOR_TIMEOUT ANSI_HIGHLIGHT_RED
+
+#define STATUS_WORD_DEPENDENCY "DEPEND"
+#define STATUS_COLOR_DEPENDENCY ANSI_HIGHLIGHT_YELLOW
+
+/*
  * Start writing to /dev/console. Opt-in, exactly like pico_log_to_kmsg() and
  * for the same reason: this code is linked into every test binary and into
  * picoctl, and none of them has any business writing to the machine's
@@ -78,6 +111,25 @@
  * it execs as PID 1.
  */
 void status_enable(void);
+
+/*
+ * Test seam. A test binary must not call status_enable() -- that opens the
+ * real console, exactly the thing it is not allowed to do -- but job.c's own
+ * tests need to see the bytes job_finish_full() hands to status_printf() for
+ * each JobResult, and status_printf() only composes a line, it does not
+ * return one. This redirects status_write() into `buf` (size `size`)
+ * instead of a console fd, with `color` standing in for what
+ * console_colors_enabled() would otherwise decide, so both renderings are
+ * reachable from a test. Each call appends, so the lines from more than one
+ * status_printf() (a failed start's word line plus its hint line) land in
+ * `buf` in order, exactly as a real console would show them.
+ *
+ * status_set_test_sink(NULL, 0, false) turns it back off. Until a test calls
+ * this, it is inert and status_fd stays -1: no path through status_printf()
+ * or status_welcome() touches a real fd any differently than before this
+ * existed.
+ */
+void status_set_test_sink(char *buf, size_t size, bool color);
 
 /*
  * Print one status line: "[<word>] <message>", or just "<message>" when

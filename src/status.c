@@ -21,6 +21,11 @@
 static int status_fd = -1;
 static bool status_color = false;
 
+/* Test seam; see status_set_test_sink() in status.h. NULL (the default)
+ * means disabled, and status_write() below never looks at the other two. */
+static char *test_sink_buf = NULL;
+static size_t test_sink_size = 0;
+
 /*
  * Colour unless the console says it is a dumb terminal. That is the whole of
  * systemd's own console rule: dev_console_colors_enabled()
@@ -50,11 +55,35 @@ void status_enable(void) {
         status_color = console_colors_enabled();
 }
 
+void status_set_test_sink(char *buf, size_t size, bool color) {
+        test_sink_buf = buf;
+        test_sink_size = size;
+        status_color = color;
+
+        if (buf && size > 0)
+                buf[0] = '\0';
+}
+
 /* One write() for one line, for the reason pico_log_internal() spells out:
  * a line-oriented destination should not have to reassemble what was meant
  * to be a single record. */
 static void status_write(const char *buf, size_t n) {
-        if (status_fd < 0 || n == 0)
+        if (n == 0)
+                return;
+
+        if (test_sink_buf) {
+                size_t have = strlen(test_sink_buf);
+
+                /* Drop the line rather than tear a partial one onto the end
+                 * -- a test that overflows its own buffer wants a visibly
+                 * short result, not a corrupted one. */
+                if (have + n < test_sink_size)
+                        /* n + 1: status_format_line() always NUL-terminates at buf[n]. */
+                        memcpy(test_sink_buf + have, buf, n + 1);
+                return;
+        }
+
+        if (status_fd < 0)
                 return;
 
         /* Not `(void) write(...)`: a void cast does not suppress
@@ -98,7 +127,7 @@ void status_printf(const char *word, const char *color, const char *format, ...)
         va_list ap;
         size_t n;
 
-        if (status_fd < 0)
+        if (status_fd < 0 && !test_sink_buf)
                 return;
 
         va_start(ap, format);
@@ -183,7 +212,7 @@ void status_welcome(const char *path) {
         char line[1024];
         size_t n;
 
-        if (status_fd < 0)
+        if (status_fd < 0 && !test_sink_buf)
                 return;
 
         n = status_welcome_line(line, sizeof(line), path, status_color);

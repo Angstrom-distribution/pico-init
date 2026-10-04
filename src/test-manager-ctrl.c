@@ -376,6 +376,30 @@ static void test_start_failing_unit_replies_with_real_result(void) {
         ctrl_fixture_teardown(&f);
 }
 
+/* A unit whose Requires= dependency fails to start finishes its own job as
+ * "dependency", not "failed": upstream's JOB_DEPENDENCY, which picoctl turns
+ * into "A dependency job for X failed." */
+static void test_start_with_failed_dependency_replies_dependency(void) {
+        struct ctrl_fixture f;
+
+        ctrl_fixture_setup(&f);
+        ASSERT_EQ_INT(test_write_file(f.unitdir,
+                                      "broken.service",
+                                      "[Unit]\n[Service]\nType=oneshot\n"
+                                      "ExecStart=/nonexistent/does-not-exist\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(f.unitdir,
+                                      "needs-broken.service",
+                                      "[Unit]\nRequires=broken.service\nAfter=broken.service\n"
+                                      "[Service]\nType=oneshot\nExecStart=/bin/true\n"),
+                      0);
+        ctrl_fixture_boot(&f);
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 start needs-broken.service", "err dependency\n", 400);
+
+        ctrl_fixture_teardown(&f);
+}
+
 /* A successful Type=oneshot without RemainAfterExit= ends INACTIVE, never
  * ACTIVE; the deferred reply must still arrive, as "ok done". */
 static void test_start_oneshot_replies_done(void) {
@@ -1017,6 +1041,7 @@ static void test_start_template_is_refused(void) {
 int main(void) {
         test_start_stop_restart_active_and_inactive();
         test_start_failing_unit_replies_with_real_result();
+        test_start_with_failed_dependency_replies_dependency();
         test_start_oneshot_replies_done();
         test_stop_and_restart_ending_failed_reply_done();
         test_start_while_stopping_waits();

@@ -158,6 +158,55 @@ static void test_status_line(void) {
 }
 
 /*
+ * The three remaining words job.c's console output can print, byte for byte
+ * against upstream's job_done_messages[] (src/core/job.c), colour on and
+ * off. DEPEND is the one of the three that is NOT bold red upstream -- it is
+ * ANSI_HIGHLIGHT_YELLOW there, despite FAILED and TIME being
+ * ANSI_HIGHLIGHT_RED -- so this is also the test that would fail if that
+ * were ever "simplified" to red for consistency.
+ */
+static void test_status_line_failed_timeout_dependency(void) {
+        char buf[256];
+        size_t n;
+
+        n = status_format_line(
+                        buf, sizeof(buf), STATUS_WORD_FAILED, STATUS_COLOR_FAILED, "Failed to start Console.");
+        ASSERT_STREQ(buf, "[\x1B[0;1;31mFAILED\x1B[0m] Failed to start Console.\n");
+        ASSERT_EQ_INT(n, strlen(buf));
+
+        n = status_format_line(buf, sizeof(buf), STATUS_WORD_FAILED, NULL, "Failed to start Console.");
+        ASSERT_STREQ(buf, "[FAILED] Failed to start Console.\n");
+        ASSERT_EQ_INT(n, strlen(buf));
+
+        n = status_format_line(
+                        buf,
+                        sizeof(buf),
+                        STATUS_WORD_TIMEOUT,
+                        STATUS_COLOR_TIMEOUT,
+                        "Timed out starting Console.");
+        ASSERT_STREQ(buf, "[\x1B[0;1;31m TIME \x1B[0m] Timed out starting Console.\n");
+        ASSERT_EQ_INT(n, strlen(buf));
+
+        n = status_format_line(buf, sizeof(buf), STATUS_WORD_TIMEOUT, NULL, "Timed out starting Console.");
+        ASSERT_STREQ(buf, "[ TIME ] Timed out starting Console.\n");
+        ASSERT_EQ_INT(n, strlen(buf));
+
+        n = status_format_line(
+                        buf,
+                        sizeof(buf),
+                        STATUS_WORD_DEPENDENCY,
+                        STATUS_COLOR_DEPENDENCY,
+                        "Dependency failed for Console.");
+        ASSERT_STREQ(buf, "[\x1B[0;1;33mDEPEND\x1B[0m] Dependency failed for Console.\n");
+        ASSERT_EQ_INT(n, strlen(buf));
+
+        n = status_format_line(
+                        buf, sizeof(buf), STATUS_WORD_DEPENDENCY, NULL, "Dependency failed for Console.");
+        ASSERT_STREQ(buf, "[DEPEND] Dependency failed for Console.\n");
+        ASSERT_EQ_INT(n, strlen(buf));
+}
+
+/*
  * A line longer than the buffer must not lose its newline: two truncated
  * lines without one would run together into a single console row, which
  * misreports what happened rather than merely shortening it.
@@ -272,6 +321,7 @@ int main(void) {
         test_os_release_lookup();
         test_os_release_missing_file();
         test_status_line();
+        test_status_line_failed_timeout_dependency();
         test_status_line_truncated();
         test_welcome();
         test_welcome_ansi_color();

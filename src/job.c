@@ -576,39 +576,109 @@ int job_finish_full(Job *j, JobResult result, bool recursive) {
 
         /*
          * The console's own progress line, systemd's "[  OK  ] Started foo."
-         * The log record above stays exactly as it was: upstream emits both
-         * too, and they are read by different people at different times (see
-         * status.h).
+         * and its less happy relatives. The log record above stays exactly
+         * as it was: upstream emits both too, and they are read by different
+         * people at different times (see status.h).
          *
-         * Start jobs, successful ones, only. A stop job's line is upstream's
-         * "Stopped foo.", which belongs to a shutdown sequence this manager
-         * does not print yet, and a failure wants the red "FAILED" word and
-         * the "See 'picoctl status ...'" follow-up that goes with it rather
-         * than a green tick bolted onto this branch. A restart reaches this
-         * function twice, but its first pass was converted into a start above
-         * and left through `finish`, so the line is printed once -- when the
-         * unit is actually back up.
-         *
-         * The verb follows the unit type, the way upstream's per-type
-         * finished_start_job[JOB_DONE] formats do: "Reached target %s."
-         * (src/core/target.c), "Listening on %s." (src/core/socket.c), and
-         * the generic "Started %s." (src/core/job.c) for the rest. The name
-         * is Description= where the unit has one and its id otherwise, which
-         * is what unit_status_string() resolves to by default upstream.
-         *
-         * A unit skipped by an unmet condition never started, so it gets no line at
-         * all -- unit.c already logged which condition and why.
+         * One line (occasionally two) per JobType x JobResult combination
+         * upstream's job_emit_done_message() and job_done_messages[]
+         * (src/core/job.c) actually send to the console; nothing for any
+         * other combination, which is what upstream does for JOB_CANCELED
+         * (no word in that table) and is also all there is to do for a
+         * JobResult this project's smaller enum has no counterpart for
+         * (upstream's JOB_SKIPPED/JOB_COLLECTED/JOB_INVALID/...). A restart
+         * reaches this function twice, but its first pass was converted into
+         * a start above and left through `finish`, so only the second pass
+         * -- JOB_START or, if the stop half itself failed, JOB_STOP's table
+         * (upstream shares one table between the two; see below) -- ever
+         * gets here.
          */
-        if (j->type == JOB_START && result == JOB_DONE && u->condition_result) {
-                const char *verb = u->type == UNIT_TARGET ? "Reached target" :
-                                u->type == UNIT_SOCKET    ? "Listening on" :
-                                                            "Started";
+        if (j->type == JOB_START) {
+                const char *name = u->description ? u->description : u->id;
 
-                status_printf(STATUS_WORD_OK,
-                              STATUS_COLOR_OK,
-                              "%s %s.",
-                              verb,
-                              u->description ? u->description : u->id);
+                switch (result) {
+                case JOB_DONE:
+                        /*
+                         * A unit skipped by an unmet condition never started,
+                         * so it gets no line at all -- unit.c already logged
+                         * which condition and why.
+                         *
+                         * The verb otherwise follows the unit type, the way
+                         * upstream's per-type finished_start_job[JOB_DONE]
+                         * formats do: "Reached target %s." (src/core/target.c),
+                         * "Listening on %s." (src/core/socket.c), and the
+                         * generic "Started %s." (src/core/job.c) for the rest.
+                         */
+                        if (u->condition_result) {
+                                const char *verb = u->type == UNIT_TARGET ? "Reached target" :
+                                                u->type == UNIT_SOCKET    ? "Listening on" :
+                                                                            "Started";
+
+                                status_printf(STATUS_WORD_OK, STATUS_COLOR_OK, "%s %s.", verb, name);
+                        }
+                        break;
+
+                case JOB_FAILED:
+                        status_printf(STATUS_WORD_FAILED, STATUS_COLOR_FAILED, "Failed to start %s.", name);
+
+                        /*
+                         * The follow-up hint, upstream's job_emit_done_message()
+                         * again: plain text, no bracket word, and only for this
+                         * one combination (JOB_START + JOB_FAILED) -- upstream's
+                         * own `if (t == JOB_START && result == JOB_FAILED)`
+                         * guard, not a general "every failure gets a hint" rule.
+                         * The name in it is always the unit id, never
+                         * Description=, matching upstream's use of u->id rather
+                         * than ident there. The tool is named systemctl, as upstream
+                         * prints it: picoctl is installed under that name here.
+                         * Upstream shell-quotes the id for its shell hint;
+                         * unit ids need no quoting.
+                         */
+                        status_printf(NULL, NULL, "See 'systemctl status %s' for details.", u->id);
+                        break;
+
+                case JOB_TIMEOUT:
+                        status_printf(STATUS_WORD_TIMEOUT, STATUS_COLOR_TIMEOUT, "Timed out starting %s.", name);
+                        break;
+
+                case JOB_DEPENDENCY:
+                        status_printf(STATUS_WORD_DEPENDENCY,
+                                      STATUS_COLOR_DEPENDENCY,
+                                      "Dependency failed for %s.",
+                                      name);
+                        break;
+
+                default:
+                        /* JOB_CANCELED: upstream prints nothing for it either. */
+                        break;
+                }
+        } else if (j->type == JOB_STOP || j->type == JOB_RESTART) {
+                /*
+                 * Upstream's generic_finished_stop_job[] (src/core/job.c) is
+                 * shared between JOB_STOP and JOB_RESTART -- `case JOB_STOP:
+                 * case JOB_RESTART: return generic_finished_stop_job;` -- and
+                 * only ever reached here for JOB_RESTART when its stop half
+                 * itself failed, since a successful one was converted into a
+                 * start above before reaching this point.
+                 */
+                const char *name = u->description ? u->description : u->id;
+
+                switch (result) {
+                case JOB_DONE:
+                        status_printf(STATUS_WORD_OK, STATUS_COLOR_OK, "Stopped %s.", name);
+                        break;
+
+                case JOB_FAILED:
+                        /* Upstream's actual string, not the shorter "Failed to
+                         * stop" a START failure gets -- the job table
+                         * (job_done_message_format()) spells these two
+                         * differently on purpose. */
+                        status_printf(STATUS_WORD_FAILED, STATUS_COLOR_FAILED, "Stopped %s with error.", name);
+                        break;
+
+                default:
+                        break;
+                }
         }
 
         /* The default target's start job ending, either way, is when the boot
@@ -643,9 +713,17 @@ int job_finish_full(Job *j, JobResult result, bool recursive) {
          * the transaction (563ba9ea6e, 1abc85b8d0). Only a failed start
          * means a requirement is missing (v30 job_finish_and_invalidate());
          * a restart that failed in its stop half is not one.
+         *
+         * JOB_DEPENDENCY, not this job's own `result`: upstream's job.h is
+         * explicit that JOB_DEPENDENCY means "a required dependency job did
+         * not result in JOB_DONE", which is exactly what every job this
+         * reaches is -- `u` itself already got its own real result (JOB_FAILED,
+         * JOB_TIMEOUT, ...) from the call above/elsewhere. Passing `result`
+         * through unchanged used to relabel a dependent's job with a result
+         * that was never its own.
          */
         if (result != JOB_DONE && recursive && type == JOB_START)
-                job_propagate_failure(m, u, JOB_FAILED);
+                job_propagate_failure(m, u, JOB_DEPENDENCY);
 
 finish:
         /*
@@ -695,10 +773,8 @@ const char *job_state_to_string(JobState s) {
 }
 
 static const char * const job_result_table[_JOB_RESULT_MAX] = {
-        [JOB_DONE] = "done",
-        [JOB_FAILED] = "failed",
-        [JOB_CANCELED] = "canceled",
-        [JOB_TIMEOUT] = "timeout",
+        [JOB_DONE] = "done",       [JOB_FAILED] = "failed",         [JOB_CANCELED] = "canceled",
+        [JOB_TIMEOUT] = "timeout", [JOB_DEPENDENCY] = "dependency",
 };
 
 const char *job_result_to_string(JobResult r) {

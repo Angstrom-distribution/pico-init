@@ -25,6 +25,7 @@
 #include "job.h"
 #include "manager.h"
 #include "service.h"
+#include "status.h"
 #include "test-util.h"
 #include "timer.h"
 #include "unit.h"
@@ -1327,6 +1328,247 @@ static void test_alias_boot_runs_ordered_oneshot(void) {
         free(rt);
 }
 
+/*
+ * --- console status lines ---
+ *
+ * job_finish_full()'s console output, captured through status.h's test
+ * seam (status_set_test_sink()) rather than written anywhere: see
+ * test-status.c for why the bytes matter, and status.h's own comment on
+ * status_set_test_sink() for why this is the one place a test may turn
+ * status_printf() on at all.
+ *
+ * Colour is left off (status_set_test_sink(..., false)) in every case here
+ * -- the escape sequences themselves are test-status.c's job
+ * (test_status_line_failed_timeout_dependency()); what these tests are
+ * actually proving is which JobType x JobResult combinations job.c chooses
+ * to print at all, and with which word and wording, which is exactly as
+ * readable without the SGR noise.
+ */
+
+/*
+ * A real start failure -- ExecStart= pointing nowhere -- produces both the
+ * FAILED line and its "See 'systemctl status ...'" follow-up, upstream's
+ * job_emit_done_message() pair for JOB_START + JOB_FAILED (src/core/job.c).
+ */
+static void test_status_console_start_failed_prints_failed_and_hint(void) {
+        char cgroup_root[PATH_MAX];
+        char sink[512];
+        Manager *m;
+        char *dir;
+        Unit *c;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "c.service",
+                                      "[Service]\nType=oneshot\nExecStart=/nonexistent/pico-init-test\n"),
+                      0);
+
+        m = manager_for(dir);
+        use_private_cgroup_root(m, "failed-console", cgroup_root, sizeof(cgroup_root));
+        ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+
+        c = manager_get_unit(m, "c.service");
+        ASSERT_TRUE(c != NULL);
+
+        status_set_test_sink(sink, sizeof(sink), false);
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, c, NULL), 0);
+        ASSERT_TRUE(drive_until_idle(m, 300));
+
+        ASSERT_EQ_INT(unit_active_state(c), UNIT_FAILED);
+        ASSERT_STREQ(sink,
+                     "[FAILED] Failed to start c.service.\nSee 'systemctl status c.service' for details.\n");
+
+        status_set_test_sink(NULL, 0, false);
+        manager_free(m);
+        free_private_cgroup_root(cgroup_root);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * JOB_TIMEOUT has no producer anywhere in this tree yet -- service.c arms
+ * real start/stop timers (service_arm_timeout()), but nothing downstream of
+ * them finishes a job as JOB_TIMEOUT rather than the generic JOB_FAILED a
+ * plain unit_notify(..., UNIT_FAILED) produces. Wiring that up is a separate
+ * piece of work; this calls job_finish_full() directly with the result a
+ * real timeout would eventually report, which is enough to prove
+ * job_finish_full()'s own console rendering for it -- the thing this task is
+ * actually about -- without pretending a timeout mechanism exists.
+ */
+static void test_status_console_start_timeout_prints_time(void) {
+        char sink[256];
+        Manager *m;
+        char *dir;
+        Unit *a;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        ASSERT_EQ_INT(test_write_file(dir, "a.target", "[Unit]\nDescription=A\n"), 0);
+
+        m = manager_for(dir);
+        ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+
+        a = manager_get_unit(m, "a.target");
+        ASSERT_TRUE(a != NULL);
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, a, NULL), 0);
+        ASSERT_TRUE(a->job != NULL && a->job->type == JOB_START);
+
+        status_set_test_sink(sink, sizeof(sink), false);
+        ASSERT_EQ_INT(job_finish_full(a->job, JOB_TIMEOUT, true), 0);
+
+        ASSERT_STREQ(sink, "[ TIME ] Timed out starting A.\n");
+
+        status_set_test_sink(NULL, 0, false);
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * The same Requires= chain as test_requires_failure_propagates_transitively():
+ * c fails outright (JOB_FAILED, its own console line already covered above),
+ * and job_propagate_failure() must report b and a as JOB_DEPENDENCY, not a
+ * second and third JOB_FAILED -- upstream's job.h: JOB_DEPENDENCY is "a
+ * required dependency job did not result in JOB_DONE", which is what
+ * actually happened to both of them.
+ */
+static void test_status_console_dependency_failure_prints_depend(void) {
+        char cgroup_root[PATH_MAX];
+        char sink[1024];
+        Manager *m;
+        char *dir;
+        Unit *a, *b, *c;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "c.service",
+                                      "[Service]\nType=oneshot\nExecStart=/nonexistent/pico-init-test\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir, "b.target", "[Unit]\nRequires=c.service\nAfter=c.service\n"), 0);
+        ASSERT_EQ_INT(test_write_file(dir, "a.target", "[Unit]\nRequires=b.target\nAfter=b.target\n"), 0);
+
+        m = manager_for(dir);
+        use_private_cgroup_root(m, "depend-console", cgroup_root, sizeof(cgroup_root));
+        ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+
+        a = manager_get_unit(m, "a.target");
+        b = manager_get_unit(m, "b.target");
+        c = manager_get_unit(m, "c.service");
+        ASSERT_TRUE(a != NULL && b != NULL && c != NULL);
+
+        status_set_test_sink(sink, sizeof(sink), false);
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, a, NULL), 0);
+        ASSERT_TRUE(drive_until_idle(m, 300));
+
+        ASSERT_EQ_INT(unit_active_state(c), UNIT_FAILED);
+        ASSERT_EQ_INT(unit_active_state(b), UNIT_INACTIVE);
+        ASSERT_EQ_INT(unit_active_state(a), UNIT_INACTIVE);
+
+        /* c's own FAILED+hint pair is exercised above; here only that b and a
+         * each got exactly one DEPEND line, and neither got a FAILED one. */
+        ASSERT_TRUE(strstr(sink, "[DEPEND] Dependency failed for b.target.\n") != NULL);
+        ASSERT_TRUE(strstr(sink, "[DEPEND] Dependency failed for a.target.\n") != NULL);
+        ASSERT_TRUE(strstr(sink, "Dependency failed for c.service.") == NULL);
+        ASSERT_TRUE(strstr(sink, "[FAILED] Failed to start b.target.") == NULL);
+        ASSERT_TRUE(strstr(sink, "[FAILED] Failed to start a.target.") == NULL);
+
+        status_set_test_sink(NULL, 0, false);
+        manager_free(m);
+        free_private_cgroup_root(cgroup_root);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * A plain stop on an active unit prints upstream's generic_finished_stop_job
+ * [JOB_DONE] ("Stopped %s.") -- the OK word again, but the stop-job wording,
+ * never printed before this task.
+ */
+static void test_status_console_stop_prints_ok(void) {
+        char sink[256];
+        Manager *m;
+        char *dir;
+        Unit *a;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        ASSERT_EQ_INT(test_write_file(dir, "a.target", "[Unit]\nDescription=A\n"), 0);
+
+        m = manager_for(dir);
+        ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+
+        a = manager_get_unit(m, "a.target");
+        ASSERT_TRUE(a != NULL);
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, a, NULL), 0);
+        manager_dispatch_run_queue(m);
+        ASSERT_EQ_INT(unit_active_state(a), UNIT_ACTIVE);
+
+        /* Only the stop's own line is under test. */
+        status_set_test_sink(sink, sizeof(sink), false);
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_STOP, a, NULL), 0);
+        manager_dispatch_run_queue(m);
+
+        ASSERT_EQ_INT(unit_active_state(a), UNIT_INACTIVE);
+        ASSERT_TRUE(a->job == NULL);
+        ASSERT_STREQ(sink, "[  OK  ] Stopped A.\n");
+
+        status_set_test_sink(NULL, 0, false);
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * The existing rule carries over unchanged: a unit skipped by an unmet
+ * condition still finishes its job as JOB_DONE (test_condition_skipped_
+ * job_completes_done() above), but never started, so it must print nothing
+ * at all -- not even the OK line a successful start gets.
+ */
+static void test_status_console_condition_skip_prints_nothing(void) {
+        char sink[256];
+        Manager *m;
+        char *dir;
+        Unit *b;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "b.target",
+                                      "[Unit]\nDescription=B\nConditionPathExists=/nonexistent/pico-init-test\n"),
+                      0);
+
+        m = manager_for(dir);
+        ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+
+        b = manager_get_unit(m, "b.target");
+        ASSERT_TRUE(b != NULL);
+
+        status_set_test_sink(sink, sizeof(sink), false);
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, b, NULL), 0);
+        manager_dispatch_run_queue(m);
+
+        ASSERT_EQ_INT(unit_active_state(b), UNIT_INACTIVE);
+        ASSERT_TRUE(!b->condition_result);
+        ASSERT_TRUE(b->job == NULL);
+        ASSERT_STREQ(sink, "");
+
+        status_set_test_sink(NULL, 0, false);
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
         test_oneshot_start_job_finishes();
         test_alias_boot_runs_ordered_oneshot();
@@ -1349,6 +1591,11 @@ int main(void) {
         test_redundant_job_dropped();
         test_condition_skipped_job_completes_done();
         test_negated_condition_inverts_result();
+        test_status_console_start_failed_prints_failed_and_hint();
+        test_status_console_start_timeout_prints_time();
+        test_status_console_dependency_failure_prints_depend();
+        test_status_console_stop_prints_ok();
+        test_status_console_condition_skip_prints_nothing();
 
         printf("test-job: all checks passed\n");
         return 0;

@@ -852,6 +852,9 @@ void manager_ctrl_notify_job_finished(Job *j, JobResult result) {
         case JOB_TIMEOUT:
                 line = "err timeout\n";
                 break;
+        case JOB_DEPENDENCY:
+                line = "err dependency\n";
+                break;
         default:
                 line = "err unknown\n";
                 break;

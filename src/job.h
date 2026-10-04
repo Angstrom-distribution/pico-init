@@ -39,6 +39,8 @@ typedef enum JobResult {
         JOB_FAILED,
         JOB_CANCELED,
         JOB_TIMEOUT,
+        JOB_DEPENDENCY, /* a required dependency job did not result in JOB_DONE, byte for byte systemd's
+                         * own src/core/job.h comment for the same value */
         _JOB_RESULT_MAX,
         _JOB_RESULT_INVALID =
                         -1, /* a fresh job has no result yet; don't let 0 (JOB_DONE) mean that by accident */
