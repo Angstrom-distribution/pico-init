@@ -448,6 +448,10 @@ netctl_exe = executable(
     'src/netd/netctl-rtnl.c',
     'src/netd/netctl-path.c',
     'src/netd/netd-rtnl-core.c',
+    # Shared ANSI colour helper (pico-color.h): on/off rules and escape
+    # sequences mirroring real networkctl's. Not part of pico-init-core, so
+    # listed directly here like netctl's other own sources.
+    'src/pico-color.c',
   ],
   include_directories: netd_includes,
   install: true,
@@ -518,6 +522,16 @@ test_netctl_path_exe = executable(
   include_directories: netd_includes,
 )
 test('test-netctl-path', test_netctl_path_exe)
+
+# netctl's colour output: netctl.c's own colour helpers are file-local
+# statics with no header, so this runs the real built `netctl` binary as a
+# subprocess instead (test-picoctl.c's own pattern) -- no link to netctl.c,
+# netctl-rtnl.c or netctl-path.c at all.
+test_netctl_color_exe = executable(
+  'test-netctl-color',
+  ['src/netd/test-netctl-color.c'] + pico_test_sources,
+)
+test('test-netctl-color', test_netctl_color_exe)
 
 # ---------------------------------------------------------------------------
 # devd -- the device hotplug daemon (plans/31, Part 2, milestone H1). A third

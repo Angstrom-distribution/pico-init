@@ -65,6 +65,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include "../pico-color.h"
 #include "netctl-path.h"
 #include "netctl-rtnl.h"
 
@@ -400,6 +401,85 @@ static bool usb_string_attr(const char *ifname, const char *attr, char *out, siz
 #define FIELD_MAX 16
 #define FIELD_VAL_LEN 160
 
+/*
+ * --- colour: mirrors real networkctl's own rules exactly -----------------
+ *
+ * operational_state_to_color()/setup_state_to_color()/online_state_to_color()
+ * (src/network/networkctl-util.c, systemd main as of commit
+ * 4c63532c28094aeba6dccc5afb9690e02fd98d66, 2026-10-04) -- same checks,
+ * reproduced byte-for-byte; pico-color.h's accessors already carry the
+ * exact upstream ANSI_* literals and the colours_enabled() on/off
+ * decision, so these only pick which accessor applies.
+ */
+
+static void operational_color(const char *ifname, const char *state, const char **on, const char **off) {
+        if (strcmp(state, "routable") == 0 || strcmp(state, "enslaved") == 0 ||
+            (ifname && strcmp(ifname, "lo") == 0 && strcmp(state, "carrier") == 0)) {
+                *on = pico_ansi_highlight_green();
+                *off = pico_ansi_normal();
+        } else if (strcmp(state, "degraded") == 0) {
+                *on = pico_ansi_highlight_yellow();
+                *off = pico_ansi_normal();
+        } else {
+                *on = "";
+                *off = "";
+        }
+}
+
+static void setup_color(const char *state, const char **on, const char **off) {
+        if (strcmp(state, "configured") == 0) {
+                *on = pico_ansi_highlight_green();
+                *off = pico_ansi_normal();
+        } else if (strcmp(state, "configuring") == 0) {
+                *on = pico_ansi_highlight_yellow();
+                *off = pico_ansi_normal();
+        } else if (strcmp(state, "failed") == 0 || strcmp(state, "linger") == 0) {
+                *on = pico_ansi_highlight_red();
+                *off = pico_ansi_normal();
+        } else {
+                *on = "";
+                *off = "";
+        }
+}
+
+static void online_color(const char *state, const char **on, const char **off) {
+        if (strcmp(state, "online") == 0) {
+                *on = pico_ansi_highlight_green();
+                *off = pico_ansi_normal();
+        } else if (strcmp(state, "partial") == 0) {
+                *on = pico_ansi_highlight_yellow();
+                *off = pico_ansi_normal();
+        } else {
+                *on = "";
+                *off = "";
+        }
+}
+
+/*
+ * ANSI_BRIGHT_BLUE ("\x1B[0;94m") -- real networkctl's per-link/system
+ * status table colours every field label this way by default
+ * (src/shared/format-table.c's table_data_color(): any TABLE_FIELD cell
+ * with no colour of its own gets ansi_bright_blue(); networkctl-status-
+ * link.c/-status-system.c never override it for any field they add). Not
+ * one of pico-color.h's own accessors -- that set was built from the
+ * explicit ansi_*() call sites in networkctl-util.c/-status-{link,system}.c,
+ * and this is format-table.c's own implicit default, never an explicit
+ * call in either of those -- so it is reproduced locally here rather than
+ * adding an accessor there, per this change's own file scope.
+ */
+static const char *field_label_color(void) {
+        return pico_colors_enabled() ? "\x1B[0;94m" : "";
+}
+
+/* "%*s: %s\n" with the label (and its trailing colon) coloured the way
+ * every field label in real networkctl's vertical status table is --
+ * pico_ansi_normal()/field_label_color() both already collapse to "" when
+ * colours are off, so this stays byte-identical to the old plain printf
+ * in that case. */
+static void print_field_plain(const char *label, const char *value) {
+        printf("%s%*s:%s %s\n", field_label_color(), LABEL_WIDTH, label, pico_ansi_normal(), value);
+}
+
 typedef struct {
         char v[FIELD_MAX][FIELD_VAL_LEN];
         int n;
@@ -423,7 +503,7 @@ static void field_print(const char *label, const FieldList *fl) {
         if (fl->n == 0)
                 return;
 
-        printf("%*s: %s\n", LABEL_WIDTH, label, fl->v[0]);
+        print_field_plain(label, fl->v[0]);
         for (int i = 1; i < fl->n; i++)
                 printf("%*s  %s\n", LABEL_WIDTH, "", fl->v[i]);
 }
@@ -539,22 +619,51 @@ static void status_one(const char *ifname) {
          */
         (void) netctl_rtnl_get_link(ifname, &info);
 
-        printf("\xe2\x97\x8f %u: %s\n", idx, ifname); /* U+25CF BLACK CIRCLE */
-
-        if (iface_network_file(ifname, buf, sizeof buf))
-                printf("%*s: %s\n", LABEL_WIDTH, "Network File", buf);
-
         {
+                /* Real networkctl's bullet (the very first line) is coloured
+                 * the same as the State row's operational half
+                 * (operational_state_to_color()) further down, so both are
+                 * computed once here, up front, and reused for the State
+                 * row below rather than re-derived. */
                 char op[32], setup[32];
+                const char *on_op, *off_op, *on_setup, *off_setup, *on_online, *off_online;
 
                 iface_operational(ifname, op, sizeof op);
                 iface_setup_state(ifname, setup, sizeof setup);
-                printf("%*s: %s (%s)\n", LABEL_WIDTH, "State", op, setup);
+                operational_color(ifname, op, &on_op, &off_op);
+                setup_color(setup, &on_setup, &off_setup);
+
+                printf("%s\xe2\x97\x8f%s %u: %s\n", on_op, off_op, idx, ifname); /* U+25CF BLACK CIRCLE */
+
+                if (iface_network_file(ifname, buf, sizeof buf))
+                        print_field_plain("Network File", buf);
+
+                printf("%s%*s:%s %s%s%s (%s%s%s)\n",
+                       field_label_color(),
+                       LABEL_WIDTH,
+                       "State",
+                       pico_ansi_normal(),
+                       on_op,
+                       op,
+                       off_op,
+                       on_setup,
+                       setup,
+                       off_setup);
                 /* real per-link status always has an Online state row right
                  * after State (networkctl-status-link.c); netd has no separate
                  * online-state concept, so this is honestly always "unknown",
-                 * matching real's own fallback for the same unknown case. */
-                printf("%*s: %s\n", LABEL_WIDTH, "Online state", "unknown");
+                 * matching real's own fallback for the same unknown case --
+                 * online_state_to_color() leaves an "unknown" value plain,
+                 * same as here. */
+                online_color("unknown", &on_online, &off_online);
+                printf("%s%*s:%s %s%s%s\n",
+                       field_label_color(),
+                       LABEL_WIDTH,
+                       "Online state",
+                       pico_ansi_normal(),
+                       on_online,
+                       "unknown",
+                       off_online);
         }
 
         {
@@ -576,35 +685,35 @@ static void status_one(const char *ifname) {
                 else
                         type = "other";
 
-                printf("%*s: %s\n", LABEL_WIDTH, "Type", type);
+                print_field_plain("Type", type);
         }
 
         {
                 char pathid[256];
 
                 if (iface_path_id(ifname, pathid, sizeof pathid))
-                        printf("%*s: %s\n", LABEL_WIDTH, "Path", pathid);
+                        print_field_plain("Path", pathid);
         }
 
         {
                 char drv[64];
 
                 if (iface_driver(ifname, drv, sizeof drv))
-                        printf("%*s: %s\n", LABEL_WIDTH, "Driver", drv);
+                        print_field_plain("Driver", drv);
         }
 
         {
                 char vendor[128];
 
                 if (usb_string_attr(ifname, "manufacturer", vendor, sizeof vendor))
-                        printf("%*s: %s\n", LABEL_WIDTH, "Vendor", vendor);
+                        print_field_plain("Vendor", vendor);
         }
 
         {
                 char model[128];
 
                 if (usb_string_attr(ifname, "product", model, sizeof model))
-                        printf("%*s: %s\n", LABEL_WIDTH, "Model", model);
+                        print_field_plain("Model", model);
         }
 
         {
@@ -628,18 +737,18 @@ static void status_one(const char *ifname) {
                         fclose(f);
                 }
                 if (mac[0] != '\0')
-                        printf("%*s: %s\n", LABEL_WIDTH, "Hardware Address", mac);
+                        print_field_plain("Hardware Address", mac);
         }
 
         if (info.has_mtu) {
                 char mtubuf[64];
 
                 format_mtu(&info, mtubuf, sizeof mtubuf);
-                printf("%*s: %s\n", LABEL_WIDTH, "MTU", mtubuf);
+                print_field_plain("MTU", mtubuf);
         }
 
         if (info.qdisc)
-                printf("%*s: %s\n", LABEL_WIDTH, "QDisc", info.qdisc);
+                print_field_plain("QDisc", info.qdisc);
 
         if (info.has_addr_gen_mode) {
                 static const char * const names[] = {
@@ -654,14 +763,17 @@ static void status_one(const char *ifname) {
                  * (Documentation/networking/ip-sysctl.rst); an out-of-range
                  * value is omitted rather than guessed. */
                 if (info.addr_gen_mode < sizeof names / sizeof names[0])
-                        printf("%*s: %s\n",
-                               LABEL_WIDTH,
-                               "IPv6 Address Generation Mode",
-                               names[info.addr_gen_mode]);
+                        print_field_plain("IPv6 Address Generation Mode", names[info.addr_gen_mode]);
         }
 
         if (info.has_queues)
-                printf("%*s: %u/%u\n", LABEL_WIDTH, "Number of Queues (Tx/Rx)", info.tx_queues, info.rx_queues);
+                printf("%s%*s:%s %u/%u\n",
+                       field_label_color(),
+                       LABEL_WIDTH,
+                       "Number of Queues (Tx/Rx)",
+                       pico_ansi_normal(),
+                       info.tx_queues,
+                       info.rx_queues);
 
         if (getifaddrs(&all) == 0) {
                 for (a = all; a; a = a->ifa_next) {
@@ -703,13 +815,13 @@ static void status_all(void) {
                 return;
         }
 
-        printf("\xe2\x97\x8f Interfaces: ");
-        for (i = list; i->if_name; i++) {
-                printf("%s%u", first ? "" : ", ", i->if_index);
-                first = false;
-        }
-        printf("\n");
-
+        /*
+         * The aggregate state has to be known before the bullet is printed
+         * (real system_status() colours its own bullet the same as the
+         * State row, operational_state_to_color() with no particular
+         * ifname -- networkctl-status-system.c), so this loop now runs
+         * ahead of the interface-list printing loop below it.
+         */
         for (i = list; i->if_name; i++) {
                 char op[32];
 
@@ -719,18 +831,51 @@ static void status_all(void) {
                 else if (strcmp(op, "carrier") == 0)
                         any_carrier = true;
         }
-        if_freenameindex(list);
 
-        printf("%*s: %s\n",
-               LABEL_WIDTH,
-               "State",
-               any_routable                ? "routable" :
-                               any_carrier ? "carrier" :
-                                             "no-carrier");
-        /* real system_status() always adds Online state right after State
-         * (networkctl-status-system.c); netd has no separate online-state
-         * concept, so this is honestly always "unknown". */
-        printf("%*s: %s\n", LABEL_WIDTH, "Online state", "unknown");
+        {
+                const char *state_word;
+                const char *on_op, *off_op, *on_online, *off_online;
+
+                if (any_routable)
+                        state_word = "routable";
+                else if (any_carrier)
+                        state_word = "carrier";
+                else
+                        state_word = "no-carrier";
+
+                operational_color(NULL, state_word, &on_op, &off_op);
+
+                printf("%s\xe2\x97\x8f%s Interfaces: ", on_op, off_op);
+                for (i = list; i->if_name; i++) {
+                        printf("%s%u", first ? "" : ", ", i->if_index);
+                        first = false;
+                }
+                printf("\n");
+                if_freenameindex(list);
+
+                printf("%s%*s:%s %s%s%s\n",
+                       field_label_color(),
+                       LABEL_WIDTH,
+                       "State",
+                       pico_ansi_normal(),
+                       on_op,
+                       state_word,
+                       off_op);
+                /* real system_status() always adds Online state right after
+                 * State (networkctl-status-system.c); netd has no separate
+                 * online-state concept, so this is honestly always
+                 * "unknown" -- online_state_to_color() leaves that plain,
+                 * same as here. */
+                online_color("unknown", &on_online, &off_online);
+                printf("%s%*s:%s %s%s%s\n",
+                       field_label_color(),
+                       LABEL_WIDTH,
+                       "Online state",
+                       pico_ansi_normal(),
+                       on_online,
+                       "unknown",
+                       off_online);
+        }
 
         {
                 struct ifaddrs *all, *a;
@@ -845,13 +990,30 @@ static int cmd_list(void) {
                 return 1;
         }
 
+        /* Column headers are never coloured -- real networkctl's own table
+         * header row has no TABLE_FIELD/colour of its own either. */
         printf("IDX LINK     TYPE     OPERATIONAL SETUP\n");
         for (i = list; i->if_name; i++) {
                 char op[32], setup[32];
+                const char *on_op, *off_op, *on_setup, *off_setup;
 
                 iface_operational(i->if_name, op, sizeof op);
                 iface_setup_state(i->if_name, setup, sizeof setup);
-                printf("%3u %-8s %-8s %-11s %s\n", i->if_index, i->if_name, iface_type(i->if_name), op, setup);
+                operational_color(i->if_name, op, &on_op, &off_op);
+                setup_color(setup, &on_setup, &off_setup);
+                /* %-11s applies to `op` itself -- the colour escapes around
+                 * it add no visible width, so the column stays aligned
+                 * exactly like the uncoloured case. */
+                printf("%3u %-8s %-8s %s%-11s%s %s%s%s\n",
+                       i->if_index,
+                       i->if_name,
+                       iface_type(i->if_name),
+                       on_op,
+                       op,
+                       off_op,
+                       on_setup,
+                       setup,
+                       off_setup);
                 n++;
         }
 
