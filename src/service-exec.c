@@ -595,14 +595,14 @@ static int create_stdout_socket(const char *unit_id) {
 }
 
 /*
- * User=/Group= (plans/30 R6): the integers that cross fork(). Resolved by
- * exec_creds_resolve() in the PARENT -- getpwnam()/getgrnam()/getgrouplist()
- * go through NSS, allocate, and are nowhere near async-signal-safe -- and
- * applied by child_exec() at step 10, which reads nothing but these.
- * `groups` is malloc'd here and freed by the parent after fork(); the child
- * sees it through its copy-on-write mapping, same as argv and cg->path.
- * `set` is false when the unit names neither directive, in which case the
- * child never touches its ids at all.
+ * User=/Group=/SupplementaryGroups= (plans/30 R6): the integers that cross
+ * fork(). Resolved by exec_creds_resolve() in the PARENT --
+ * getpwnam()/getgrnam()/getgrouplist() go through NSS, allocate, and are
+ * nowhere near async-signal-safe -- and applied by child_exec() at step 10,
+ * which reads nothing but these. `groups` is malloc'd here and freed by the
+ * parent after fork(); the child sees it through its copy-on-write mapping,
+ * same as argv and cg->path. `set` is false when the unit names none of the
+ * three directives, in which case the child never touches its ids at all.
  */
 typedef struct ExecCreds {
         bool set;
@@ -636,25 +636,67 @@ static bool parse_id(const char *v, unsigned long *ret) {
 }
 
 /*
+ * Resolves a SupplementaryGroups= entry (name or numeric gid, same shape
+ * convention parse_id()/getgrnam() already use above for Group=) to a gid_t.
+ * 0 on success, -ESRCH for a named group that does not exist (logged here,
+ * with the name) -- matching the existing User=/Group= failure mode exactly,
+ * per upstream's own get_group_creds(): an unresolvable name fails the spawn,
+ * never silently drops the entry.
+ */
+static int supplementary_group_to_gid(Service *s, const char *tok, gid_t *ret) {
+        unsigned long id;
+        struct group *gr;
+
+        if (parse_id(tok, &id)) {
+                *ret = (gid_t) id;
+                return 0;
+        }
+
+        errno = 0;
+        gr = getgrnam(tok);
+        if (!gr) {
+                pico_log(PICO_LOG_ERR,
+                         "%s: SupplementaryGroups=%s: no such group%s%s",
+                         UNIT(s)->id,
+                         tok,
+                         errno ? ": " : "",
+                         errno ? strerror(errno) : "");
+                return -ESRCH;
+        }
+        *ret = gr->gr_gid;
+        return 0;
+}
+
+/*
  * Group= alone keeps the caller's uid and changes only the gid; User= alone
- * takes the account's primary group; both set, Group= wins. The
- * supplementary list is the account's full membership from the group
- * database, initgroups(3)-style, computed against the FINAL gid exactly as
- * systemd's own exec path does -- so a Group= override is in the list and
- * the passwd primary group is not, unless the database says so. A numeric
- * User= with no passwd entry still resolves (its own number as gid, no
- * membership to look up), matching systemd. 0 on success, -ESRCH when a
- * named account does not exist (logged here, with the name), -ENOMEM.
+ * takes the account's primary group; both set, Group= wins; NEITHER set
+ * keeps both the caller's uid AND gid (added for SupplementaryGroups=-only
+ * units like picowl.service, which sets no User=/Group= at all -- see
+ * upstream's own get_supplementary_groups()/enforce_groups(), called
+ * unconditionally in exec-invoke.c regardless of whether User=/Group= were
+ * given). The supplementary list starts as the account's full membership
+ * from the group database, initgroups(3)-style, computed against the FINAL
+ * gid exactly as systemd's own exec path does -- so a Group= override is in
+ * the list and the passwd primary group is not, unless the database says
+ * so -- or just [gid] with no User= (a numeric User= with no passwd entry
+ * behaves the same way: its own number as gid, no membership to look up).
+ * SupplementaryGroups= entries are then appended on top of that base list,
+ * never a replacement for it (upstream's enforce_groups() does the same:
+ * initgroups()/[gid] first, SupplementaryGroups= second). 0 on success,
+ * -ESRCH when a named account or group does not exist (logged here, with the
+ * name), -E2BIG past NGROUPS_MAX, -ENOMEM.
  */
 static int exec_creds_resolve(Service *s, ExecCreds *c) {
         const char *pw_name = NULL;
         struct passwd *pw = NULL;
         unsigned long id;
         gid_t group_gid = 0;
+        long ngroups_max;
+        char **it;
 
         memset(c, 0, sizeof(*c));
 
-        if (!s->user && !s->group)
+        if (!s->user && !s->group && !s->supplementary_groups)
                 return 0;
         c->set = true;
 
@@ -706,6 +748,8 @@ static int exec_creds_resolve(Service *s, ExecCreds *c) {
 
         if (s->group)
                 c->gid = group_gid;
+        else if (!s->user)
+                c->gid = getegid(); /* neither directive: keep the caller's own gid too */
 
         if (pw_name) {
                 int tries, n = 0;
@@ -743,6 +787,33 @@ static int exec_creds_resolve(Service *s, ExecCreds *c) {
                         return -ENOMEM;
                 c->groups[0] = c->gid;
                 c->n_groups = 1;
+        }
+
+        /*
+         * SupplementaryGroups=: appended on top of the base list above,
+         * never replacing it (see this function's own header comment).
+         * NGROUPS_MAX is the kernel's own setgroups(2) ceiling -- checked
+         * here so a too-long list fails the spawn with a clear -E2BIG
+         * instead of setgroups() itself failing with EINVAL deep inside
+         * child_exec(), where there is no channel to say why.
+         */
+        ngroups_max = sysconf(_SC_NGROUPS_MAX);
+        for (it = s->supplementary_groups; it && *it; it++) {
+                gid_t gid, *g;
+                int r;
+
+                if (ngroups_max > 0 && c->n_groups >= ngroups_max)
+                        return -E2BIG;
+
+                r = supplementary_group_to_gid(s, *it, &gid);
+                if (r < 0)
+                        return r;
+
+                g = realloc(c->groups, (size_t) (c->n_groups + 1) * sizeof(gid_t));
+                if (!g)
+                        return -ENOMEM;
+                c->groups = g;
+                c->groups[c->n_groups++] = gid;
         }
 
         return 0;
@@ -785,6 +856,64 @@ static void child_attach_cgroup(const struct pico_cgroup *cg) {
         }
 
         close(fd);
+}
+
+/*
+ * Bare (slash-free) ExecStart=/ExecStop=/... name resolution (systemd since
+ * v239, 7c891d53b "load-fragment: when parsing paths for Exec*=, be more
+ * liberal" + exec-invoke.c's find_executable_full()): search a fixed
+ * directory list for `name`, matching upstream's DEFAULT_PATH_WITH_FULL_SBIN
+ * order (src/basic/path-util.c's default_PATH()/dir_is_split()) -- this
+ * project's distro conf forces usrmerge with /usr/sbin kept separate from
+ * /usr/bin (conf/distro/include/init-manager-pico-init.inc), i.e. exactly
+ * upstream's "split sbin" case, always, so a static list is correct and
+ * needs none of upstream's own runtime inode_same() detection between the
+ * three possible layouts. Deliberately NOT searched: $PATH / the unit's own
+ * Environment=PATH= (upstream's find_executable_full() call from
+ * exec-invoke.c passes use_path_envvar=false for exactly this reason: PID1
+ * must not let a unit's environment redirect what it execs) and
+ * ExecSearchPath= (not a directive this MVP has a field for).
+ *
+ * Deliberately a stat()+access() probe per candidate rather than upstream's
+ * open-and-check-execute-bit-via-the-open-fd (open_and_check_executable()):
+ * both stat() and access() are on POSIX's async-signal-safe list, and this
+ * function runs in the region child_exec()'s own header forbids malloc in --
+ * `buf` is the caller's stack buffer, nothing here allocates. A directory
+ * (or other non-regular match, S_ISREG) does not stop the search, matching
+ * upstream's own open_and_check_executable()+fd_verify_regular() behavior:
+ * only a real, executable, regular file ends it. Writes the candidate into
+ * `buf` (size `bufsize`, always NUL-terminated on the 0 return) and returns
+ * 0 on a match, -1 when nothing in the list matches (ENOENT-equivalent) --
+ * the caller falls back to execve()ing the bare name itself in that case,
+ * which fails exactly the way a missing absolute path already does today
+ * (see child_exec() step 11's own comment).
+ */
+static int find_in_default_path(const char *name, char *buf, size_t bufsize) {
+        static const char * const dirs[] = {
+                "/usr/local/sbin",
+                "/usr/local/bin",
+                "/usr/sbin",
+                "/usr/bin",
+        };
+        size_t i;
+
+        for (i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+                struct stat st;
+                int n = snprintf(buf, bufsize, "%s/%s", dirs[i], name);
+
+                if (n < 0 || (size_t) n >= bufsize)
+                        continue; /* name too long for this prefix; try the next */
+                if (stat(buf, &st) < 0)
+                        continue;
+                if (!S_ISREG(st.st_mode))
+                        continue; /* a directory etc: keep searching, as upstream does */
+                if (access(buf, X_OK) < 0)
+                        continue;
+
+                return 0;
+        }
+
+        return -1;
 }
 
 /*
@@ -1118,13 +1247,18 @@ static _Noreturn void
         }
 
         /*
-         * 10. User=/Group=: setgroups() -> setgid() -> setuid(), in exactly
-         * that order -- once the uid is unprivileged the first two are no
-         * longer permitted, so the reverse order silently keeps root's
-         * groups (the classic privilege-retention bug). Placed after the
-         * cgroup attach (7) and the console open (8), both of which may
-         * need the privilege being given up here. Fatal: a unit that asked
-         * to drop privilege must never run with more than it asked for.
+         * 10. User=/Group=/SupplementaryGroups=: setgroups() -> setgid() ->
+         * setuid(), in exactly that order -- once the uid is unprivileged
+         * the first two are no longer permitted, so the reverse order
+         * silently keeps root's groups (the classic privilege-retention
+         * bug). creds->set covers all three directives, including
+         * SupplementaryGroups= alone with neither User= nor Group= given
+         * (picowl.service's own shape): setgid()/setuid() then just
+         * reassert this process's own current ids, a no-op but a harmless
+         * one. Placed after the cgroup attach (7) and the console open (8),
+         * both of which may need the privilege being given up here. Fatal:
+         * a unit that asked to drop privilege, or to add a supplementary
+         * group, must never run with more or less than it asked for.
          */
         if (creds->set) {
                 if (setgroups((size_t) creds->n_groups, creds->groups) < 0)
@@ -1140,19 +1274,38 @@ static _Noreturn void
          * NULL exactly when service_spawn() had nothing to add to or remove
          * from the inherited `environ`, which is then used unchanged.
          *
+         * Bare (slash-free) argv[0]: resolved against find_in_default_path()
+         * above into `exec_path`, a stack buffer -- argv[0] ITSELF stays the
+         * original bare name (upstream's own cosmetic choice too: a `ps`
+         * listing shows "seatd", not "/usr/bin/seatd"), only the execve()
+         * target changes. Parser-accepted-but-unresolvable (find_in_default_
+         * path() returns -1) falls back to execve()ing argv[0] unchanged:
+         * with no '/' in it, execve() resolves that relative to this
+         * process's cwd (always "/" here), which essentially never matches,
+         * so it fails with ENOENT the exact same way an absolute missing
+         * path already does -- no separate failure path needed.
+         *
          * Type=exec (upstream's exec_fd, exec-invoke.c): a 1 goes down the
          * pipe right before execve(), a 0 right after a failed one. Success
          * never writes the 0 -- O_CLOEXEC closes the pipe, and that EOF
          * after the 1 is the parent's signal. A failed write is not fatal:
          * the parent then sees EOF with nothing before it and lets SIGCHLD
          * decide, which is the pre-exec verdict anyway. */
-        if (exec_fd >= 0) {
-                const uint8_t hot = 1;
+        {
+                const char *exec_path = argv[0];
+                char resolved[PATH_MAX];
 
-                (void) !write(exec_fd, &hot, sizeof(hot));
+                if (argv[0][0] != '/' && find_in_default_path(argv[0], resolved, sizeof(resolved)) == 0)
+                        exec_path = resolved;
+
+                if (exec_fd >= 0) {
+                        const uint8_t hot = 1;
+
+                        (void) !write(exec_fd, &hot, sizeof(hot));
+                }
+
+                execve(exec_path, argv, envp ? envp : environ);
         }
-
-        execve(argv[0], argv, envp ? envp : environ);
 
         if (exec_fd >= 0) {
                 const uint8_t cold = 0;

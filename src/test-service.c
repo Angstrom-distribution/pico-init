@@ -1172,6 +1172,108 @@ static bool wait_for_ids(pid_t pid, uid_t want_uid, gid_t want_gid, char *groups
 }
 
 /*
+ * wait_for_ids() alone races SupplementaryGroups=-only units (no User=/
+ * Group=, root keeps uid/gid 0/0): setgroups()/setgid()/setuid() in
+ * child_exec() step 10 are then all no-ops on uid/gid, so the very first
+ * read already matches want_uid/want_gid, before setgroups() has actually
+ * run. Poll until the target gid shows up in Groups: too.
+ */
+static bool wait_for_ids_and_group(
+                pid_t pid, uid_t want_uid, gid_t want_gid, gid_t want_in_groups, char *groups, size_t groups_len) {
+        int tries;
+
+        for (tries = 0; tries < 2000; tries++) {
+                uid_t uid;
+                gid_t gid;
+
+                if (!read_proc_ids(pid, &uid, &gid, groups, groups_len))
+                        return false;
+                if (uid == want_uid && gid == want_gid && groups_line_has(groups, want_in_groups))
+                        return true;
+                test_sleep_ms(1);
+        }
+        return false;
+}
+
+/*
+ * find_in_default_path() (service-exec.c, systemd since v239): a bare
+ * ExecStart= name really execve()s via the search path, not relative to
+ * this process's cwd -- proven by actually running it, not just by the
+ * parser accepting the directive (test_bare_exec_name_is_accepted() in
+ * test-unit-parse.c covers that half). 'true' is chosen because it ships at
+ * /usr/bin/true on every Linux this project tests on (oe-core's own
+ * usrmerge included) and exits 0 doing nothing, so a wrong resolution --
+ * execve() failing ENOENT on "true" relative to cwd, which is always "/"
+ * here -- is unambiguous: SERVICE_FAILED, never a false pass from some
+ * unrelated file that happens to be named "true" in the cwd.
+ */
+static void test_bare_exec_name_resolves_via_search_path(void) {
+        Manager *m;
+        Service *s;
+        char *dir;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        s = load_service(
+                        m,
+                        dir,
+                        "bareexec.service",
+                        "[Unit]\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=true\n");
+        ASSERT_STREQ(s->exec_start[0], "true"); /* kept bare -- see unit-parse.c */
+
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        ASSERT_TRUE(reap_for(s, 3000));
+
+        ASSERT_EQ_INT(s->state, SERVICE_EXITED);
+        ASSERT_EQ_INT(s->result, SERVICE_SUCCESS);
+        ASSERT_EQ_INT(s->main_exit_code, CLD_EXITED);
+        ASSERT_EQ_INT(s->main_exit_status, 0);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * The failure half of the same mechanism: a bare name that is not anywhere
+ * in find_in_default_path()'s list must fail exactly the way an absolute
+ * missing path already does (PICO_EXIT_EXEC via a failed execve()), not
+ * some earlier, different-shaped failure -- see service-exec.c's own
+ * comment on child_exec() step 11 for why no special-case code exists for
+ * this at all.
+ */
+static void test_bare_exec_name_not_found_fails_like_missing_absolute(void) {
+        Manager *m;
+        Service *s;
+        char *dir;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        s = load_service(
+                        m,
+                        dir,
+                        "bareexec-missing.service",
+                        "[Unit]\n[Service]\nType=simple\nExecStart=pico-no-such-binary-5f\n");
+
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        ASSERT_EQ_INT(s->state, SERVICE_RUNNING); /* forked; the child fails on its own */
+        ASSERT_TRUE(reap_for(s, 3000));
+
+        ASSERT_EQ_INT(s->state, SERVICE_FAILED);
+        ASSERT_EQ_INT(s->result, SERVICE_FAILURE_RESOURCES); /* PICO_EXIT_EXEC, our setup, not the workload */
+        ASSERT_EQ_INT(s->main_exit_code, CLD_EXITED);
+        ASSERT_EQ_INT(s->main_exit_status, PICO_EXIT_EXEC);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
  * §9.2's acceptance test: a unit with User=/Group= naming real unprivileged
  * accounts actually runs as those ids, proven by the kernel's own
  * /proc/<pid>/status for the exec'd /bin/sleep, and root's supplementary
@@ -1328,6 +1430,136 @@ static void test_user_unknown_fails_start_cleanly(void) {
         ASSERT_EQ_INT(s->result, SERVICE_FAILURE_RESOURCES);
         ASSERT_EQ_INT(s->main_pid, 0);
         ASSERT_EQ_INT(s->control_pid, 0);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * SupplementaryGroups= (plans/30 R6 extension, upstream's
+ * get_supplementary_groups()/enforce_groups()): a name or a numeric gid is
+ * appended to the exec'd process's group list, independent of User=/Group=
+ * -- picowl.service's own real shape (SupplementaryGroups=video, no
+ * User=/Group= at all). Proven the same way test_user_group_drops_privilege()
+ * above proves User=/Group=: a real /proc/<pid>/status Groups: line.
+ */
+static void test_supplementary_groups_applied(void) {
+        Manager *m;
+        Service *s;
+        char *dir;
+        char groups[256];
+        struct group *gr;
+        struct passwd *pw;
+        gid_t daemon_gid;
+        uid_t want_uid;
+        gid_t want_gid;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        gr = getgrnam("daemon");
+        ASSERT_TRUE(gr != NULL);
+        daemon_gid = gr->gr_gid;
+
+        /* SupplementaryGroups=<name> alone, no User=/Group=: real uid/gid
+         * untouched (this process's own), the named group added on top. */
+        s = load_service(
+                        m,
+                        dir,
+                        "suppgroups.service",
+                        "[Unit]\n[Service]\nType=simple\nSupplementaryGroups=daemon\n"
+                        "ExecStart=/bin/sleep 100\n");
+        ASSERT_TRUE(s->supplementary_groups != NULL);
+        ASSERT_STREQ(s->supplementary_groups[0], "daemon");
+
+        if (getuid() != 0) {
+                printf("test-service: not root, checking the fatal-drop path instead\n");
+
+                ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+                ASSERT_EQ_INT(s->state, SERVICE_RUNNING); /* forked; the child fails on its own */
+                ASSERT_TRUE(reap_for(s, 3000));
+
+                ASSERT_EQ_INT(s->state, SERVICE_FAILED);
+                ASSERT_EQ_INT(s->result, SERVICE_FAILURE_RESOURCES); /* PICO_EXIT_GROUP, ours */
+                ASSERT_EQ_INT(s->main_exit_code, CLD_EXITED);
+                ASSERT_EQ_INT(s->main_exit_status, PICO_EXIT_GROUP);
+
+                manager_free(m);
+                test_rm_rf(dir);
+                free(dir);
+                return;
+        }
+
+        want_uid = geteuid();
+        want_gid = getegid();
+
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        ASSERT_EQ_INT(s->state, SERVICE_RUNNING);
+        ASSERT_TRUE(s->main_pid > 0);
+        /* want_uid/want_gid are this process's own (no User=/Group=), so
+         * they never change -- wait_for_ids() would match instantly,
+         * before setgroups() runs. Wait for the group too. */
+        ASSERT_TRUE(wait_for_ids_and_group(
+                        s->main_pid, want_uid, want_gid, daemon_gid, groups, sizeof(groups)));
+        ASSERT_TRUE(groups_line_has(groups, daemon_gid));
+        ASSERT_EQ_INT(unit_stop(UNIT(s)), 0);
+        ASSERT_TRUE(reap_for(s, 3000));
+        ASSERT_EQ_INT(s->state, SERVICE_DEAD);
+
+        /* Numeric form, combined with User=: the account's own membership
+         * (initgroups-style, from exec_creds_resolve()'s base list) stays in
+         * the group list, SupplementaryGroups= just adds to it. */
+        pw = getpwnam("nobody");
+        ASSERT_TRUE(pw != NULL);
+        {
+                char unit[256];
+
+                snprintf(unit,
+                         sizeof(unit),
+                         "[Unit]\n[Service]\nType=simple\nUser=nobody\nSupplementaryGroups=%lu\n"
+                         "ExecStart=/bin/sleep 100\n",
+                         (unsigned long) daemon_gid);
+                s = load_service(m, dir, "suppgroups-numeric.service", unit);
+        }
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        ASSERT_TRUE(s->main_pid > 0);
+        ASSERT_TRUE(wait_for_ids(s->main_pid, pw->pw_uid, pw->pw_gid, groups, sizeof(groups)));
+        ASSERT_TRUE(groups_line_has(groups, daemon_gid));
+        ASSERT_EQ_INT(unit_stop(UNIT(s)), 0);
+        ASSERT_TRUE(reap_for(s, 3000));
+        ASSERT_EQ_INT(s->state, SERVICE_DEAD);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* An unknown group name in SupplementaryGroups= fails the start cleanly, the
+ * same resources-failure shape test_user_unknown_fails_start_cleanly() above
+ * proves for an unknown User=/Group=: nothing is forked, FAILED/RESOURCES. */
+static void test_supplementary_groups_unknown_fails_cleanly(void) {
+        Manager *m;
+        Service *s;
+        char *dir;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        s = load_service(
+                        m,
+                        dir,
+                        "nosuppgroup.service",
+                        "[Unit]\n[Service]\nType=simple\n"
+                        "SupplementaryGroups=pico-no-such-group-5f\n"
+                        "ExecStart=/bin/sleep 100\n");
+        ASSERT_EQ_INT(UNIT(s)->load_state, UNIT_LOADED); /* an unknown group is not a load error */
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        ASSERT_EQ_INT(s->state, SERVICE_FAILED);
+        ASSERT_EQ_INT(s->result, SERVICE_FAILURE_RESOURCES);
+        ASSERT_EQ_INT(s->main_pid, 0);
 
         manager_free(m);
         test_rm_rf(dir);
@@ -2921,8 +3153,12 @@ int main(void) {
         test_b9_service_verify_refuses_no_execstart();
         test_b1_zero_timeout_means_infinity();
         test_condition_skips_start_without_failing();
+        test_bare_exec_name_resolves_via_search_path();
+        test_bare_exec_name_not_found_fails_like_missing_absolute();
         test_user_group_drops_privilege();
         test_user_unknown_fails_start_cleanly();
+        test_supplementary_groups_applied();
+        test_supplementary_groups_unknown_fails_cleanly();
         test_exec_completes_only_after_execve();
         test_exec_failed_execve_never_active();
         test_notify_ready_gates_activation();

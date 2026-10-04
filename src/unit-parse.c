@@ -206,19 +206,22 @@ static int
         if (r < 0)
                 return r;
 
-        if (word[0] != '/') {
+        /*
+         * c853953658's template, updated to match modern systemd (since
+         * v239, 7c891d53b "load-fragment: when parsing paths for Exec*=, be
+         * more liberal"): a bare filename (no '/' at all) is also accepted
+         * here and resolved against the search path at exec time
+         * (service-exec.c's find_in_default_path()) -- only a RELATIVE path
+         * that still contains a '/' ("foo/bar") is rejected, since neither
+         * this parser nor the exec-time lookup has anything to resolve it
+         * against. pico_exec_path_is_valid() is the shared (parse-time and
+         * service_verify()'s re-check) test for the whole absolute-or-bare
+         * rule, including the trailing-'/' (directory) and "."/".." cases.
+         */
+        if (!pico_exec_path_is_valid(word)) {
                 pico_log(PICO_LOG_WARNING,
-                         "%s:%u: %s= path '%s' is not absolute, ignoring",
-                         path,
-                         line,
-                         lvalue,
-                         word);
-                free(word);
-                return -EINVAL;
-        }
-        if (word[strlen(word) - 1] == '/') {
-                pico_log(PICO_LOG_WARNING,
-                         "%s:%u: %s= path '%s' is a directory, ignoring",
+                         "%s:%u: %s= path '%s' is neither an absolute path nor a plain "
+                         "executable name, ignoring",
                          path,
                          line,
                          lvalue,
@@ -833,17 +836,32 @@ static int config_parse_guess_main_pid(
 }
 
 /*
+ * Shape-only check shared by User=/Group= and SupplementaryGroups=: no
+ * control character, no ':' (/etc/passwd's own field separator, never legal
+ * inside a name) and no '/' (a name is never a path). Whether the account or
+ * group actually EXISTS is a start-time question (NSS, or the user database
+ * simply not being loaded yet) -- answering it here would make the unit
+ * tree's load order depend on it, which upstream also does not do at parse
+ * time (config_parse_user_group_strv_compat()'s own valid_user_group_name()
+ * is a syntax check, not an existence one).
+ */
+static bool user_group_token_is_valid(const char *p) {
+        for (; *p; p++)
+                if ((unsigned char) *p <= ' ' || *p == 0x7f || *p == ':' || *p == '/')
+                        return false;
+
+        return true;
+}
+
+/*
  * User=/Group=: kept as written (a name or a numeric id) and resolved at
- * every spawn, in the parent (service-exec.c). Only the shape is checked
- * here: whether the account exists is a start-time question, and answering
- * it at load would make the unit tree's load order depend on the user
- * database. An empty value resets to unset, as in systemd.
+ * every spawn, in the parent (service-exec.c). An empty value resets to
+ * unset, as in systemd.
  */
 static int config_parse_user_group(
                 Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
         Service *s = unit_to_service(u, path, line);
         char **field;
-        const char *p;
         char *copy;
 
         if (!s)
@@ -856,16 +874,10 @@ static int config_parse_user_group(
                 return 0;
         }
 
-        for (p = rvalue; *p; p++)
-                if ((unsigned char) *p <= ' ' || *p == 0x7f || *p == ':' || *p == '/') {
-                        pico_log(PICO_LOG_WARNING,
-                                 "%s:%u: invalid %s= value '%s', ignoring",
-                                 path,
-                                 line,
-                                 lvalue,
-                                 rvalue);
-                        return 0;
-                }
+        if (!user_group_token_is_valid(rvalue)) {
+                pico_log(PICO_LOG_WARNING, "%s:%u: invalid %s= value '%s', ignoring", path, line, lvalue, rvalue);
+                return 0;
+        }
 
         copy = pico_strdup(rvalue);
         if (!copy)
@@ -873,6 +885,70 @@ static int config_parse_user_group(
 
         pico_mfree(*field);
         *field = copy;
+        return 0;
+}
+
+/*
+ * SupplementaryGroups=: a whitespace-separated list of names/numeric gids,
+ * %-expanded per word like Environment= above, each checked with the same
+ * shape rule as User=/Group= (a bad token is skipped with a warning, not a
+ * reason to reject the whole line -- matching this file's own Environment=
+ * precedent rather than upstream's reject-the-whole-directive one, since
+ * nothing here needs config_parse_user_group_strv_compat()'s ENOEXEC
+ * strictness). Accumulates across repeated lines, matching upstream;
+ * resolution (name-or-numeric -> gid_t, combined with User=/Group=) happens
+ * at spawn time in exec_creds_resolve() (service-exec.c). An empty rvalue
+ * resets the whole list, the same precedent as Environment=.
+ */
+static int config_parse_supplementary_groups(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        Service *s = unit_to_service(u, path, line);
+        const char *p = rvalue;
+        char *word;
+        int r;
+
+        (void) lvalue;
+
+        if (!s)
+                return 0;
+
+        if (rvalue[0] == '\0') {
+                s->supplementary_groups = pico_strv_free(s->supplementary_groups);
+                return 0;
+        }
+
+        for (;;) {
+                r = pico_extract_first_word(&p, &word);
+                if (r < 0) {
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s:%u: malformed quoting in SupplementaryGroups=, ignoring",
+                                 path,
+                                 line);
+                        return 0;
+                }
+                if (r == 0)
+                        break;
+
+                r = expand_word(u, &word);
+                if (r < 0)
+                        return r;
+
+                if (!user_group_token_is_valid(word)) {
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s:%u: invalid SupplementaryGroups= entry '%s', ignoring",
+                                 path,
+                                 line,
+                                 word);
+                        free(word);
+                        continue;
+                }
+
+                r = pico_strv_extend(&s->supplementary_groups, word);
+                free(word);
+                if (r < 0)
+                        return r;
+        }
+
         return 0;
 }
 
@@ -1620,6 +1696,7 @@ static const ConfigItem config_items[] = {
         { SECTION_SERVICE,           "TimeoutStopSec",            config_parse_timeout_stop_sec },
         { SECTION_SERVICE,                     "User",                  config_parse_user_group },
         { SECTION_SERVICE,                    "Group",                  config_parse_user_group },
+        { SECTION_SERVICE,      "SupplementaryGroups",        config_parse_supplementary_groups },
         { SECTION_SERVICE,                  "PIDFile",                    config_parse_pid_file },
         { SECTION_SERVICE,             "GuessMainPID",              config_parse_guess_main_pid },
         {  SECTION_SOCKET,             "ListenStream",               config_parse_listen_stream },

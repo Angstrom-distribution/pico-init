@@ -211,6 +211,20 @@ typedef struct Service {
         char *user;
         char *group;
 
+        /*
+         * SupplementaryGroups=: each entry a name or a numeric gid, same
+         * shape rule as User=/Group= above, owned, NULL when unset.
+         * Accumulates across repeated directive lines (upstream's
+         * config_parse_user_group_strv_compat()); an empty value resets it.
+         * Applied TOGETHER with User=/Group= in exec_creds_resolve()
+         * (service-exec.c): appended on top of whatever that function
+         * already put in ExecCreds.groups (the account's own membership when
+         * User= resolved to a real passwd entry, or just the final gid
+         * otherwise) -- never a replacement for it, matching upstream's own
+         * get_supplementary_groups()/enforce_groups().
+         */
+        char **supplementary_groups;
+
         pid_t main_pid;    /* ExecStart= process, 0 when none; forking: the daemon left behind */
         pid_t control_pid; /* ExecCondition=/ExecStartPre=/ExecStop=/ExecStopPost= process, or
                             * forking's ExecStart= parent; 0 when none */

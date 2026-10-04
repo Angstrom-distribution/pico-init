@@ -17,6 +17,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h> /* NAME_MAX, for pico_exec_path_is_valid() */
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -144,6 +145,25 @@ char *pico_strdup(const char *s) {
 void *pico_mfree(void *p) {
         free(p);
         return NULL;
+}
+
+bool pico_exec_path_is_valid(const char *p) {
+        size_t len;
+
+        if (!p || !*p)
+                return false;
+
+        if (p[0] == '/')
+                return p[strlen(p) - 1] != '/'; /* absolute, not a directory */
+
+        if (strchr(p, '/'))
+                return false; /* relative WITH a slash: neither case applies */
+
+        if (strcmp(p, ".") == 0 || strcmp(p, "..") == 0)
+                return false;
+
+        len = strlen(p);
+        return len <= NAME_MAX;
 }
 
 int pico_strv_extend(char ***strv, const char *value) {

@@ -1678,12 +1678,15 @@ static bool exec_line_is_valid(char * const *argv) {
         /* 69339ae9f7: never let a unit load with an ExecStart= that would
          * reach execve() with a NULL or empty argv[0] -- the CVE-2021-4034
          * (PwnKit) primitive, and no PAM/seccomp/namespaces stand between
-         * pico-init and it. The parser already rejects a non-absolute path
+         * pico-init and it. The parser already rejects anything that is
+         * neither an absolute path nor a bare (slash-free) executable name
          * for anything it actually stores (see unit-parse.c's
-         * parse_exec_line()); what it cannot catch is a unit that never sets
-         * ExecStart= at all, leaving this NULL.
+         * parse_exec_line() and pico_exec_path_is_valid()); what it cannot
+         * catch is a unit that never sets ExecStart= at all, leaving this
+         * NULL. Re-checking the same rule here, rather than trusting the
+         * parser alone, is the belt-and-braces this function has always been.
          */
-        return argv && argv[0] && argv[0][0] == '/';
+        return argv && argv[0] && pico_exec_path_is_valid(argv[0]);
 }
 
 static bool exec_commands_are_valid(const ServiceExecCommand *cmds, unsigned n) {
@@ -1868,6 +1871,7 @@ static void service_done(Unit *u) {
         s->environment_files = pico_strv_free(s->environment_files);
         s->user = pico_mfree(s->user);
         s->group = pico_mfree(s->group);
+        s->supplementary_groups = pico_strv_free(s->supplementary_groups);
         s->pid_file = pico_mfree(s->pid_file);
         s->tty_path = pico_mfree(s->tty_path);
         s->status_text = pico_mfree(s->status_text);

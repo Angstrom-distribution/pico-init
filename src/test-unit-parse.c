@@ -1677,6 +1677,229 @@ static void test_exec_condition_stop_post_reload_lines(void) {
         free(dir);
 }
 
+/*
+ * systemd since v239 (7c891d53b "load-fragment: when parsing paths for
+ * Exec*=, be more liberal"): a bare (slash-free) executable name is valid in
+ * ExecStart= and friends, resolved against the search path at exec time
+ * (service-exec.c's find_in_default_path()) rather than rejected here. The
+ * real-world motivation is oe-core's own seatd.service, which ships exactly
+ * this shape (see test_shipped_seatd_and_picowl_units_load() below).
+ */
+static void test_bare_exec_name_is_accepted(void) {
+        Manager *m;
+        char *dir;
+        Unit *u;
+        Service *s;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir, "bare.service", "[Service]\nExecStart=seatd -g seat\n"), 0);
+
+        m = manager_for(dir);
+        u = load_one(m, "bare.service");
+        s = (Service *) u;
+
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        ASSERT_TRUE(s->exec_start != NULL);
+        ASSERT_STREQ(s->exec_start[0], "seatd"); /* kept bare -- not resolved at parse time */
+        ASSERT_STREQ(s->exec_start[1], "-g");
+        ASSERT_STREQ(s->exec_start[2], "seat");
+        ASSERT_TRUE(s->exec_start[3] == NULL);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * The other half of the same rule: a RELATIVE path that still contains a
+ * '/' ("foo/bar") is neither absolute nor a bare filename, so it stays
+ * rejected -- nothing (not this parser, not the exec-time lookup) has
+ * anything to resolve it against. With no other ExecStart= line, the unit
+ * ends up with none at all, which service_verify() refuses exactly as
+ * test_b9 in test-service.c proves for a unit that never set ExecStart=.
+ */
+static void test_relative_exec_path_with_slash_is_rejected(void) {
+        Manager *m;
+        char *dir;
+        Unit *u;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir, "relative.service", "[Service]\nExecStart=foo/bar\n"), 0);
+
+        m = manager_for(dir);
+        u = load_one(m, "relative.service");
+
+        ASSERT_EQ_INT(u->load_state, UNIT_ERROR); /* refused, not silently loaded with no ExecStart= */
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * SupplementaryGroups=: names and numeric gids in the same directive,
+ * accumulating across repeated lines (upstream's own
+ * config_parse_user_group_strv_compat() semantics), and a bad token (here,
+ * one with an embedded '/') skipped with a warning rather than rejecting the
+ * whole line -- this file's own Environment= precedent, not upstream's
+ * reject-the-directive one (see config_parse_supplementary_groups()'s own
+ * comment in unit-parse.c for why). Actually resolving/applying the list is
+ * service-exec.c's job (test_supplementary_groups_applied() in
+ * test-service.c); this is parse-time only.
+ */
+static void test_supplementary_groups_parsed(void) {
+        Manager *m;
+        char *dir;
+        Unit *u;
+        Service *s;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "suppgroups.service",
+                                      "[Service]\n"
+                                      "ExecStart=/bin/true\n"
+                                      "SupplementaryGroups=video 1000\n"
+                                      "SupplementaryGroups=daemon not/valid\n"),
+                      0);
+
+        m = manager_for(dir);
+        u = load_one(m, "suppgroups.service");
+        s = (Service *) u;
+
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        ASSERT_TRUE(s->supplementary_groups != NULL);
+        ASSERT_STREQ(s->supplementary_groups[0], "video");
+        ASSERT_STREQ(s->supplementary_groups[1], "1000");
+        ASSERT_STREQ(s->supplementary_groups[2], "daemon"); /* accumulated from the second line */
+        ASSERT_TRUE(s->supplementary_groups[3] == NULL);    /* "not/valid" skipped, not stored */
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * The two real-world gaps both start from (plans/30 R6 extension): the
+ * stock oe-core seatd.service and picowl.service, as actually shipped
+ * (directive lines only, verbatim -- no license header, no comments this
+ * file's own scanner doesn't already have dedicated coverage for). Both
+ * carry a long run of directives pico-init has no field for at all
+ * (ProtectHome=, CapabilityBoundingSet=, DeviceAllow=, ...): the point of
+ * this test is that none of that stops either unit from loading with a
+ * valid ExecStart=, which service_verify() would otherwise refuse (see
+ * test_b9_service_verify_refuses_no_execstart() in test-service.c).
+ */
+static void test_shipped_seatd_and_picowl_units_load(void) {
+        Manager *m;
+        char *dir;
+        Unit *u;
+        Service *s;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "seatd.service",
+                                      "[Unit]\n"
+                                      "Description=Seat management daemon\n"
+                                      "Documentation=man:seatd(1)\n"
+                                      "\n"
+                                      "[Service]\n"
+                                      "Type=simple\n"
+                                      "ExecStart=seatd -g seat\n"
+                                      "Restart=always\n"
+                                      "RestartSec=1\n"
+                                      "ProtectHome=true\n"
+                                      "ProtectSystem=strict\n"
+                                      "ProtectKernelTunables=true\n"
+                                      "ProtectControlGroups=true\n"
+                                      "PrivateTmp=true\n"
+                                      "ProtectProc=invisible\n"
+                                      "ProcSubset=pid\n"
+                                      "UMask=0077\n"
+                                      "NoNewPrivileges=true\n"
+                                      "RestrictSUIDSGID=true\n"
+                                      "PrivateNetwork=true\n"
+                                      "IPAddressDeny=any\n"
+                                      "SystemCallFilter=@system-service\n"
+                                      "SystemCallFilter=~@resources\n"
+                                      "SystemCallErrorNumber=EPERM\n"
+                                      "SystemCallArchitectures=native\n"
+                                      "ProtectKernelLogs=true\n"
+                                      "ProtectKernelModules=true\n"
+                                      "LockPersonality=true\n"
+                                      "RestrictNamespaces=true\n"
+                                      "CapabilityBoundingSet=CAP_SYS_ADMIN CAP_CHOWN CAP_SYS_TTY_CONFIG CAP_DAC_OVERRIDE\n"
+                                      "RestrictAddressFamilies=AF_UNIX\n"
+                                      "RestrictRealtime=true\n"
+                                      "MemoryDenyWriteExecute=true\n"
+                                      "ProtectClock=true\n"
+                                      "ProtectHostname=true\n"
+                                      "DevicePolicy=strict\n"
+                                      "DeviceAllow=char-/dev/console rw\n"
+                                      "DeviceAllow=char-drm rw\n"
+                                      "DeviceAllow=char-input rw\n"
+                                      "DeviceAllow=char-tty rw\n"
+                                      "DeviceAllow=/dev/null rw\n"
+                                      "\n"
+                                      "[Install]\n"
+                                      "WantedBy=multi-user.target\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "picowl.service",
+                                      "[Unit]\n"
+                                      "Description=picowl Wayland compositor\n"
+                                      "After=systemd-user-sessions.service seatd.service\n"
+                                      "Wants=seatd.service\n"
+                                      "Conflicts=getty@tty1.service\n"
+                                      "After=getty@tty1.service\n"
+                                      "\n"
+                                      "[Service]\n"
+                                      "Type=simple\n"
+                                      "Environment=XDG_RUNTIME_DIR=/run/picowl\n"
+                                      "ExecStartPre=/bin/mkdir -p -m 0700 /run/picowl\n"
+                                      "ExecStart=/usr/bin/picowl\n"
+                                      "Restart=on-failure\n"
+                                      "RestartSec=3\n"
+                                      "SupplementaryGroups=video\n"
+                                      "TTYPath=/dev/tty1\n"
+                                      "StandardInput=tty\n"
+                                      "\n"
+                                      "[Install]\n"
+                                      "WantedBy=graphical.target\n"),
+                      0);
+
+        m = manager_for(dir);
+
+        u = load_one(m, "seatd.service");
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        s = (Service *) u;
+        ASSERT_TRUE(s->exec_start != NULL);
+        ASSERT_STREQ(s->exec_start[0], "seatd");
+        ASSERT_STREQ(s->exec_start[1], "-g");
+        ASSERT_STREQ(s->exec_start[2], "seat");
+
+        u = load_one(m, "picowl.service");
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        s = (Service *) u;
+        ASSERT_TRUE(s->exec_start != NULL);
+        ASSERT_STREQ(s->exec_start[0], "/usr/bin/picowl");
+        ASSERT_TRUE(s->supplementary_groups != NULL);
+        ASSERT_STREQ(s->supplementary_groups[0], "video");
+        ASSERT_TRUE(s->user == NULL); /* picowl's real shape: no User=/Group= at all */
+        ASSERT_TRUE(s->group == NULL);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
         test_service_fields();
         test_unknown_directives_are_tolerated();
@@ -1709,6 +1932,10 @@ int main(void) {
         test_exec_dash_prefix_sets_ignore();
         test_exec_stop_lines();
         test_exec_condition_stop_post_reload_lines();
+        test_bare_exec_name_is_accepted();
+        test_relative_exec_path_with_slash_is_rejected();
+        test_supplementary_groups_parsed();
+        test_shipped_seatd_and_picowl_units_load();
 
         printf("test-unit-parse: all checks passed\n");
         return 0;

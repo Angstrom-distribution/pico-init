@@ -68,6 +68,18 @@ char *pico_strdup(const char *s);
 /* free(p) and return NULL, for `x = pico_mfree(x)` */
 void *pico_mfree(void *p);
 
+/*
+ * True for an absolute path (starting '/', not ending '/') OR a bare
+ * filename with no '/' at all (not "", ".", ".." -- matches systemd's own
+ * filename_or_absolute_path_is_valid()/filename_is_valid(), src/basic/
+ * path-util.{c,h}). A relative path WITH a slash ("foo/bar") is rejected
+ * either way: it is neither absolute nor a single path component, and
+ * nothing in Exec*=/exec-time lookup knows what to resolve it against.
+ * Shared by unit-parse.c (parse-time) and service.c (service_verify()'s
+ * belt-and-braces re-check) so the two can never drift apart.
+ */
+bool pico_exec_path_is_valid(const char *p);
+
 /* NULL-terminated string vectors (argv-style) */
 int pico_strv_extend(char ***strv, const char *value); /* 0 or -ENOMEM */
 char **pico_strv_free(char **strv);                    /* frees elements + vector, returns NULL */
