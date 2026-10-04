@@ -209,8 +209,8 @@ static void test_unknown_directives_are_tolerated(void) {
 
 /*
  * The degradation record on a directive-rich real-world shape: the value-
- * level drops (a triggering condition, an ExecStart= modifier) are recorded under name=qualifier, repeats collapse, and a
- * unit pico-init honours in full carries no record at all.
+ * level drops (a triggering condition, an ExecStart= modifier) are recorded under name=qualifier, repeats
+ * collapse, and a unit pico-init honours in full carries no record at all.
  */
 static void test_degradation_record(void) {
         Manager *m;
