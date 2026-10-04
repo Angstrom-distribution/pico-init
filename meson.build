@@ -91,6 +91,9 @@ pico_init_core_sources = files(
   'src/manager-startup.c',
   'src/mount-setup.c',
   'src/hostname-setup.c',
+  # The wall clock across reboots on a board with a dead RTC: /etc/timestamp
+  # restored first thing, saved periodically and at shutdown.
+  'src/clock-persist.c',
   # First-boot detection and /etc/machine-id fill-in (main.c's early boot
   # sequence, and the signal manager-startup.c gates preset application on).
   'src/machine-id-setup.c',
@@ -223,6 +226,8 @@ pico_tests = [
   # inside a private mount namespace), beside the manager-startup.c tests
   # whose first-boot gating this feeds.
   'test-machine-id-setup',
+  # /etc/timestamp parsing, the forward-only decision and the atomic save.
+  'test-clock-persist',
   # test-service is registered further down, after the shared libsystemd
   # its Type=notify helper links.
   'test-timer-cgroup',

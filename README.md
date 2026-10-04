@@ -48,7 +48,12 @@ implementation experience as each subsystem landed. Summary:
   the real binary journal format) plus a slim `journalctl`-equivalent
   reader; no rate-limiting, sealing, or remote forwarding.
 - **Time**: an integrated minimal SNTP client with a DHCP option 100/101
-  hook inside `netd`.
+  hook inside `netd`. For boards whose RTC is dead or reset by a reboot,
+  PID1 keeps the wall clock roughly right on its own: it restores
+  `/etc/timestamp` (the OpenEmbedded file, `YYYYMMDDHHMMSS` UTC) before any
+  service starts, saves it two minutes after boot, every ten minutes and
+  at shutdown, and only ever moves the clock forward, to the largest of the
+  saved time, the file's mtime and a build epoch. NTP corrects the rest.
 - **systemd compatibility**: `libsystemd-compat`, a real/honest-failure/
   no-op shim over the public `sd-*` API surface (`sd-daemon`, `sd-event`,
   `sd-id128`, `sd-journal`, `sd-bus`/`sd-login`/`sd-hwdb`, `sd-device`/

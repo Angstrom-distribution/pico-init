@@ -14,8 +14,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/reboot.h>
+#include <time.h>
 #include <unistd.h>
 
+#include "clock-persist.h"
 #include "fstab-mount.h"
 #include "fstab.h"
 #include "gpt-scan.h"
@@ -40,6 +42,37 @@ static _Noreturn void freeze(const char *reason) {
 
         for (;;)
                 pause();
+}
+
+/*
+ * The periodic half of clock-persist.h: the first save two minutes in, after
+ * netd has had time to correct the clock from NTP, then every
+ * CLOCK_PERSIST_INTERVAL_SEC. A battery pull skips the shutdown save, so this
+ * bounds how stale the file can be. Failures (a read-only root) are quiet.
+ */
+#define CLOCK_PERSIST_FIRST_SAVE_SEC 120
+
+static void clock_save_tick(void *userdata, usec_t now) {
+        Manager *m = userdata;
+        int r;
+
+        r = clock_persist_save(CLOCK_PERSIST_FILE, (int64_t) time(NULL));
+        if (r < 0)
+                pico_log(PICO_LOG_DEBUG, "clock save: %s", strerror(-r));
+
+        (void) pico_timer_add(
+                        m->timer,
+                        usec_add(now, (usec_t) CLOCK_PERSIST_INTERVAL_SEC * USEC_PER_SEC),
+                        clock_save_tick,
+                        m,
+                        NULL);
+}
+
+static void clock_save_final(void) {
+        int r = clock_persist_save(CLOCK_PERSIST_FILE, (int64_t) time(NULL));
+
+        if (r < 0)
+                pico_log(PICO_LOG_WARNING, "clock save: %s", strerror(-r));
 }
 
 int main(void) {
@@ -90,6 +123,19 @@ int main(void) {
         r = hostname_setup();
         if (r < 0)
                 pico_log(PICO_LOG_WARNING, "hostname_setup: %s", strerror(-r));
+
+        /*
+         * Before anything that timestamps: the RTC on the boards this runs on
+         * is dead or reset by a reboot, so the clock starts in 1970 and every
+         * early log line, fsck and certificate check would see that. Moved
+         * forward from /etc/timestamp, its mtime and the build epoch, never
+         * backwards; netd's NTP sync corrects it later.
+         */
+        r = clock_persist_restore(CLOCK_PERSIST_FILE, (int64_t) time(NULL), clock_persist_set_realtime);
+        if (r > 0)
+                pico_log(PICO_LOG_INFO, "clock set forward from " CLOCK_PERSIST_FILE);
+        else if (r < 0)
+                pico_log(PICO_LOG_WARNING, "clock restore: %s", strerror(-r));
 
         /* Needs the /proc that mount_setup() just made, and must land before
          * the first service exists to write into a log socket. */
@@ -228,6 +274,13 @@ int main(void) {
 
         manager_set_first_boot(m, first_boot);
 
+        (void) pico_timer_add(
+                        m->timer,
+                        usec_add(now_monotonic(), (usec_t) CLOCK_PERSIST_FIRST_SAVE_SEC * USEC_PER_SEC),
+                        clock_save_tick,
+                        m,
+                        NULL);
+
         /* With C-A-D left enabled the kernel reboots at once, unsynced; this
          * makes it send SIGINT, which the manager turns into an orderly
          * reboot (v30 src/manager.c enable_special_signals()). After
@@ -256,12 +309,14 @@ int main(void) {
         switch ((ManagerObjective) objective) {
         case MANAGER_REBOOT:
                 pico_log(PICO_LOG_INFO, "rebooting");
+                clock_save_final();
                 sync();
                 reboot(RB_AUTOBOOT);
                 freeze("reboot() returned");
 
         case MANAGER_POWEROFF:
                 pico_log(PICO_LOG_INFO, "powering off");
+                clock_save_final();
                 sync();
                 reboot(RB_POWER_OFF);
                 freeze("reboot(RB_POWER_OFF) returned");
