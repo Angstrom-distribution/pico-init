@@ -39,6 +39,8 @@
 #include <string.h>
 #include <unistd.h>
 
+static void path_id_append(char *buf, size_t bufsize, size_t *len, const char *s);
+
 /*
  * The "subsystem" symlink's basename at one /sys/devices/... directory --
  * every component of that physical path is itself a device node with its
@@ -59,7 +61,12 @@ static const char *path_id_classify(const char *devdir, char *buf, size_t bufsiz
         target[len] = '\0';
 
         base = strrchr(target, '/');
-        snprintf(buf, bufsize, "%s", base ? base + 1 : target);
+        buf[0] = '\0';
+        {
+                size_t n = 0;
+
+                path_id_append(buf, bufsize, &n, base ? base + 1 : target);
+        }
         return buf;
 }
 
@@ -137,7 +144,9 @@ bool path_id_from_devpath(const char *devpath_real, char *out, size_t bufsize) {
                                 path_id_append(result, sizeof result, &n, merged);
 
                                 found_any = true;
-                                snprintf(last_subsys, sizeof last_subsys, "%s", subsys);
+                                last_subsys[0] = '\0';
+                                n = 0;
+                                path_id_append(last_subsys, sizeof last_subsys, &n, subsys);
                         }
                         /* else: consecutive same-subsystem ancestor, collapse. */
                 } else

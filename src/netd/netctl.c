@@ -291,6 +291,17 @@ static void iface_operational(const char *ifname, char *out, size_t bufsize) {
 
 /* --- link classification: Driver, Vendor, Model ------------------------ */
 
+/* Truncating copy that gcc can see is bounded: snprintf("%s") from a
+ * PATH_MAX buffer trips -Wformat-truncation at -Os with -Werror. */
+static void copy_clamped(char *dst, size_t dstsize, const char *src) {
+        size_t n = strlen(src);
+
+        if (n >= dstsize)
+                n = dstsize - 1;
+        memcpy(dst, src, n);
+        dst[n] = '\0';
+}
+
 /* /sys/class/net/<if>/device/driver is a symlink to the bound driver's own
  * sysfs entry; its basename is the driver name. A link with no backing
  * device (a virtual link) has no "device" symlink at all, so this returns
@@ -307,7 +318,7 @@ static bool iface_driver(const char *ifname, char *out, size_t bufsize) {
         target[len] = '\0';
 
         base = strrchr(target, '/');
-        snprintf(out, bufsize, "%s", base ? base + 1 : target);
+        copy_clamped(out, bufsize, base ? base + 1 : target);
         return true;
 }
 
