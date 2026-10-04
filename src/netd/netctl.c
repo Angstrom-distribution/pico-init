@@ -429,10 +429,21 @@ static void field_print(const char *label, const FieldList *fl) {
 }
 
 /* real dump_addresses() never appends a /prefix -- just the address, plus
- * " on " FORMAT_IFNAME_FULL() (ifname%ifindex) for system-wide status
- * (networkctl-dump-util.c). */
-static void collect_addr_on_iface(FieldList *fl, const char *ifname, unsigned ifindex, const char *addr) {
-        field_add(fl, "%s on %s%%%u", addr, ifname, ifindex);
+ * " on " and the interface name for system-wide status
+ * (networkctl-dump-util.c). FORMAT_IFNAME_FULL()'s "%<ifindex>" form is only
+ * its fallback when the name cannot be resolved. */
+static void collect_addr_on_iface(FieldList *fl, const char *ifname, const char *addr) {
+        field_add(fl, "%s on %s", addr, ifname);
+}
+
+/* inet_ntop(), not getnameinfo(): getnameinfo() appends "%<ifname>" to a
+ * link-local IPv6 address, while real networkctl prints the bare address
+ * (IN_ADDR_TO_STRING()). */
+static bool ifaddr_to_string(const struct sockaddr *sa, char *buf, size_t len) {
+        if (sa->sa_family == AF_INET)
+                return inet_ntop(AF_INET, &((const struct sockaddr_in *) sa)->sin_addr, buf, len) != NULL;
+
+        return inet_ntop(AF_INET6, &((const struct sockaddr_in6 *) sa)->sin6_addr, buf, len) != NULL;
 }
 
 /*
@@ -660,14 +671,7 @@ static void status_one(const char *ifname) {
                                 continue;
                         if (a->ifa_addr->sa_family != AF_INET && a->ifa_addr->sa_family != AF_INET6)
                                 continue;
-                        if (getnameinfo(a->ifa_addr,
-                                        a->ifa_addr->sa_family == AF_INET ? sizeof(struct sockaddr_in) :
-                                                                            sizeof(struct sockaddr_in6),
-                                        host,
-                                        sizeof host,
-                                        NULL,
-                                        0,
-                                        NI_NUMERICHOST) != 0)
+                        if (!ifaddr_to_string(a->ifa_addr, host, sizeof host))
                                 continue;
 
                         /* real dump_addresses() never appends a /prefix, per-link
@@ -739,18 +743,10 @@ static void status_all(void) {
                                         continue;
                                 if (a->ifa_addr->sa_family != AF_INET && a->ifa_addr->sa_family != AF_INET6)
                                         continue;
-                                if (getnameinfo(a->ifa_addr,
-                                                a->ifa_addr->sa_family == AF_INET ?
-                                                                sizeof(struct sockaddr_in) :
-                                                                sizeof(struct sockaddr_in6),
-                                                host,
-                                                sizeof host,
-                                                NULL,
-                                                0,
-                                                NI_NUMERICHOST) != 0)
+                                if (!ifaddr_to_string(a->ifa_addr, host, sizeof host))
                                         continue;
 
-                                collect_addr_on_iface(&addrs, a->ifa_name, if_nametoindex(a->ifa_name), host);
+                                collect_addr_on_iface(&addrs, a->ifa_name, host);
                         }
                         freeifaddrs(all);
                 }
