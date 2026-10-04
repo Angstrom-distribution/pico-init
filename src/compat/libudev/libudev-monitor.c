@@ -2,38 +2,40 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * udev_monitor, interim form: a real monitor object that never delivers
- * an event. Live uevent subscription through this API is roadmap work,
- * not a permanent limitation, and the interim shape is dictated by a real
- * consumer: libusb creates its monitor inside libusb_init(), and a NULL
- * from udev_monitor_new_from_netlink() fails initialisation outright --
- * no USB at all, not merely no hotplug. A monitor that succeeds and stays
- * silent is, to any correct consumer, a system on which nothing is ever
- * plugged in; the API carries no promise that events arrive.
+ * udev_monitor over sd_device_monitor: a thin wrapper, the same shape every
+ * other libudev-*.c has over its sd-device counterpart. The real work --
+ * the group-1 NETLINK_KOBJECT_UEVENT socket, bind, receive, and every
+ * filter -- lives in sd_device_monitor_new()/_receive() et al.
+ * (device-monitor.c); this file only translates libudev's calling
+ * convention (NULL+errno, not a negative return) onto it and wraps a
+ * received sd_device with libudev_device_new().
  *
- * The fd is a NETLINK_KOBJECT_UEVENT socket with no group membership, so
- * the kernel never delivers to it and poll() never reports it readable,
- * while fcntl()/setsockopt() behave as consumers expect of a real one.
- * Turning this into the real thing is joining group 1 and receiving
- * through sd_device_monitor_receive(); no consumer-visible shape changes.
+ * "kernel" and "udev" are both wired to the same group-1 socket: nothing on
+ * this image ever writes to group 2 (udev's own rebroadcast, which does not
+ * exist without udevd), so a consumer asking for "udev" -- libusb_init()
+ * does, see below -- gets the only real uevent source there is rather than
+ * a permanently silent one. test-libudev-monitor.c already pinned the two
+ * names as equivalent while this was still a stub; that pin now holds for
+ * the real reason instead of by construction.
+ *
+ * NULL from udev_monitor_new_from_netlink() is a real failure now (ENOMEM,
+ * or no uevent netlink in this kernel/sandbox) rather than a fabricated
+ * fd: a consumer that correctly treats NULL as "no USB/hotplug at all"
+ * (libusb_init() does) should see that only when it is actually true.
  */
 
 #include "libudev.h"
 
 #include <errno.h>
-#include <linux/netlink.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/eventfd.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
 #include "libudev-internal.h"
 
 struct udev_monitor {
         struct udev *udev;
         unsigned n_ref;
-        int fd;
+        sd_device_monitor *monitor;
 };
 
 static void *fail_errno(int e) {
@@ -43,28 +45,24 @@ static void *fail_errno(int e) {
 
 struct udev_monitor *udev_monitor_new_from_netlink(struct udev *udev, const char *name) {
         struct udev_monitor *m;
-        int fd;
+        sd_device_monitor *sdm;
+        int r;
 
         if (name && strcmp(name, "udev") != 0 && strcmp(name, "kernel") != 0)
                 return fail_errno(EINVAL);
 
-        fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, NETLINK_KOBJECT_UEVENT);
-        if (fd < 0) {
-                /* A kernel or sandbox without uevent netlink: an eventfd
-                 * with a zero counter is equally never readable. */
-                fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-                if (fd < 0)
-                        return fail_errno(errno);
-        }
+        r = sd_device_monitor_new(&sdm);
+        if (r < 0)
+                return fail_errno(-r);
 
         m = calloc(1, sizeof(*m));
         if (!m) {
-                (void) close(fd);
+                sd_device_monitor_unref(sdm);
                 return fail_errno(ENOMEM);
         }
         m->n_ref = 1;
         m->udev = udev;
-        m->fd = fd;
+        m->monitor = sdm;
         return m;
 }
 
@@ -80,7 +78,7 @@ struct udev_monitor *udev_monitor_unref(struct udev_monitor *udev_monitor) {
                 return NULL;
         if (--udev_monitor->n_ref > 0)
                 return NULL;
-        (void) close(udev_monitor->fd);
+        sd_device_monitor_unref(udev_monitor->monitor);
         free(udev_monitor);
         return NULL;
 }
@@ -94,56 +92,65 @@ struct udev *udev_monitor_get_udev(struct udev_monitor *udev_monitor) {
 int udev_monitor_get_fd(struct udev_monitor *udev_monitor) {
         if (!udev_monitor)
                 return -EINVAL;
-        return udev_monitor->fd;
+        return sd_device_monitor_get_fd(udev_monitor->monitor);
 }
 
 int udev_monitor_enable_receiving(struct udev_monitor *udev_monitor) {
         if (!udev_monitor)
                 return -EINVAL;
+        /* The socket is already bound and joined to group 1 by
+         * sd_device_monitor_new(); there is no separate kernel BPF filter
+         * install step here (device-monitor.c's own filter_update() is a
+         * no-op for the same reason), so there is nothing left to enable. */
         return 0;
 }
 
 int udev_monitor_set_receive_buffer_size(struct udev_monitor *udev_monitor, int size) {
-        if (!udev_monitor)
+        if (!udev_monitor || size < 0)
                 return -EINVAL;
-
-        if (setsockopt(udev_monitor->fd, SOL_SOCKET, SO_RCVBUFFORCE, &size, sizeof(size)) == 0)
-                return 0;
-        if (setsockopt(udev_monitor->fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size)) == 0)
-                return 0;
-        return errno == ENOTSOCK ? 0 : -errno;
+        return sd_device_monitor_set_receive_buffer_size(udev_monitor->monitor, (size_t) size);
 }
 
 struct udev_device *udev_monitor_receive_device(struct udev_monitor *udev_monitor) {
+        sd_device *dev = NULL;
+        struct udev_device *wrapped;
+        int r;
+
         if (!udev_monitor)
                 return fail_errno(EINVAL);
-        /* Nothing is ever queued: the same answer a real non-blocking
-         * monitor gives between events. */
-        return fail_errno(EAGAIN);
+
+        r = sd_device_monitor_receive(udev_monitor->monitor, &dev);
+        if (r < 0)
+                return fail_errno(-r);
+
+        /* libudev_device_new() takes its own reference; drop the one
+         * sd_device_monitor_receive() handed us either way. */
+        wrapped = libudev_device_new(udev_monitor->udev, dev);
+        sd_device_unref(dev);
+        return wrapped;
 }
 
 int udev_monitor_filter_add_match_subsystem_devtype(
                 struct udev_monitor *udev_monitor, const char *subsystem, const char *devtype) {
-        (void) devtype;
         if (!udev_monitor || !subsystem)
                 return -EINVAL;
-        return 0;
+        return sd_device_monitor_filter_add_match_subsystem_devtype(udev_monitor->monitor, subsystem, devtype);
 }
 
 int udev_monitor_filter_add_match_tag(struct udev_monitor *udev_monitor, const char *tag) {
         if (!udev_monitor || !tag)
                 return -EINVAL;
-        return 0;
+        return sd_device_monitor_filter_add_match_tag(udev_monitor->monitor, tag);
 }
 
 int udev_monitor_filter_update(struct udev_monitor *udev_monitor) {
         if (!udev_monitor)
                 return -EINVAL;
-        return 0;
+        return sd_device_monitor_filter_update(udev_monitor->monitor);
 }
 
 int udev_monitor_filter_remove(struct udev_monitor *udev_monitor) {
         if (!udev_monitor)
                 return -EINVAL;
-        return 0;
+        return sd_device_monitor_filter_remove(udev_monitor->monitor);
 }

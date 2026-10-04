@@ -25,11 +25,15 @@
  * Also observed on that real kernel, and load-bearing for the parser: a
  * uevent's body repeats ACTION= and DEVPATH= from the header line, and a
  * synthetic-uuid-capable kernel always sends SYNTH_UUID=, "0" when the
- * event was not synthesized with one. Neither is special-cased away here
- * -- device_add_property()'s first-write-wins rule makes the header-parsed
- * ACTION/DEVPATH the ones that stick, and device_id128_from_uuid_string()
- * simply fails to parse "0" as a 36-character uuid, which is exactly
- * "no synthetic uuid on this event".
+ * event was not synthesized with one. The header-parsed copies go straight
+ * onto the struct (dev->action, the devpath device_new_from_devpath_bare()
+ * was given) rather than into the property table; the body's own ACTION=/
+ * DEVPATH= are what land in the table, via the ordinary KEY=VALUE loop
+ * below, and device_ensure_properties()'s later synthesis of ACTION from
+ * dev->action is therefore always a first-write-wins no-op in practice --
+ * the two copies agree, since the kernel sends them that way.
+ * device_id128_from_uuid_string() simply fails to parse "0" as a
+ * 36-character uuid, which is exactly "no synthetic uuid on this event".
  */
 
 /* struct ucred/SCM_CREDENTIALS are glibc extensions gated behind
@@ -362,6 +366,38 @@ int sd_device_monitor_filter_remove(sd_device_monitor *m) {
         return 0;
 }
 
+/*
+ * A remove event's sysfs directory is routinely already gone by match
+ * time (device-internal.h's struct comment), so sd_device_get_subsystem()/
+ * _get_devtype() -- both readlink-/uevent-file-based -- would wrongly
+ * reject it. A monitor device already has the message's own SUBSYSTEM=/
+ * DEVTYPE= in its property table from parse_and_build(), independent of
+ * sysfs, so read that directly instead for a from_monitor device.
+ */
+static int monitor_get_subsystem(sd_device *dev, const char **ret) {
+        if (dev->from_monitor) {
+                const char *v = device_get_property_raw(dev, "SUBSYSTEM");
+
+                if (!v)
+                        return -ENOENT;
+                *ret = v;
+                return 0;
+        }
+        return sd_device_get_subsystem(dev, ret);
+}
+
+static int monitor_get_devtype(sd_device *dev, const char **ret) {
+        if (dev->from_monitor) {
+                const char *v = device_get_property_raw(dev, "DEVTYPE");
+
+                if (!v)
+                        return -ENOENT;
+                *ret = v;
+                return 0;
+        }
+        return sd_device_get_devtype(dev, ret);
+}
+
 bool device_monitor_filter_matches(sd_device_monitor *m, sd_device *dev) {
         size_t i;
 
@@ -369,13 +405,13 @@ bool device_monitor_filter_matches(sd_device_monitor *m, sd_device *dev) {
                 const char *subsystem = NULL, *devtype;
                 bool any = false;
 
-                (void) sd_device_get_subsystem(dev, &subsystem);
+                (void) monitor_get_subsystem(dev, &subsystem);
 
                 for (i = 0; i < m->n_subsystem_devtype && !any; i++) {
                         if (!subsystem || strcmp(subsystem, m->subsystem_devtype[i].subsystem) != 0)
                                 continue;
                         if (m->subsystem_devtype[i].devtype &&
-                            (sd_device_get_devtype(dev, &devtype) < 0 ||
+                            (monitor_get_devtype(dev, &devtype) < 0 ||
                              strcmp(devtype, m->subsystem_devtype[i].devtype) != 0))
                                 continue;
                         any = true;
@@ -387,6 +423,9 @@ bool device_monitor_filter_matches(sd_device_monitor *m, sd_device *dev) {
         if (m->n_tags > 0)
                 return false;
 
+        /* sysattr matches still read real sysfs (device-sysattr.c): honestly
+         * unavailable (treated as "no value") for a remove event whose
+         * directory is already gone, same as any other getter on it. */
         for (i = 0; i < m->n_sysattr_matches; i++) {
                 const char *v;
                 bool has = sd_device_get_sysattr_value(dev, m->sysattr_matches[i].sysattr, &v) >= 0;
@@ -427,7 +466,12 @@ static int parse_and_build(const char *buf, size_t n, sd_device **ret) {
         const char *seqnum_s, *uuid_s;
         int r;
 
-        if (n == 0)
+        /* devd-uevent.c's own guard: every field below is read as a C
+         * string, so the buffer must end in a NUL for that to be safe.
+         * Reachable only in theory -- sd_device_monitor_receive()'s root-
+         * credential check already runs first -- but cheap enough to keep
+         * as defense in depth. */
+        if (n == 0 || buf[n - 1] != '\0')
                 return -EINVAL;
 
         at = memchr(buf, '@', n);
