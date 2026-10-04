@@ -37,6 +37,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,9 +53,58 @@
 #include "logd-read.h"
 #include "logd.h"
 #include "manager.h"
+#include "pico-color.h"
 #include "status.h"
 #include "unit-enable.h"
 #include "unit.h"
+
+/* --- colour helpers ---
+ *
+ * Every accessor below (pico_ansi_*()) returns "" when colours are off, so
+ * every call site that uses them degrades to today's exact plain-text bytes
+ * with no branching of its own -- same contract pico-color.h documents for
+ * netctl/picolog.
+ *
+ * picoctl_error()/picoctl_notice() mirror real systemctl's own stderr
+ * colouring, which comes from systemd's shared logging backend
+ * (write_to_console(), src/basic/log.c): the colour wraps the rendered
+ * message text only, reset *before* the line's own trailing newline, which
+ * is itself never coloured. get_log_colors() (src/basic/terminal-util.c)
+ * maps LOG_ERR (every "Failed to ..."/"... could not be found."/"Unknown
+ * command verb" style message systemctl itself prints on a hard failure,
+ * via log_error()/log_error_errno()) to ansi_highlight_red(), and LOG_NOTICE
+ * (verb_enable()'s own "no installation config" explanation, via
+ * log_notice()) to the plain ansi_highlight() bold/white, not red -- it is
+ * not a failure. install.c's own per-symlink "Created symlink .../"Removed
+ * ..." lines are log_info(), which get_log_colors() leaves uncoloured
+ * (LOG_INFO falls in neither the NOTICE-or-brighter nor the DEBUG-or-dimmer
+ * bucket) -- picoctl already prints those plain, so they need no helper and
+ * are deliberately left alone here.
+ */
+static void picoctl_error(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void picoctl_notice(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
+static void picoctl_error(const char *fmt, ...) {
+        va_list ap;
+
+        fputs(pico_ansi_highlight_red(), stderr);
+        va_start(ap, fmt);
+        vfprintf(stderr, fmt, ap);
+        va_end(ap);
+        fputs(pico_ansi_normal(), stderr);
+        fputc('\n', stderr);
+}
+
+static void picoctl_notice(const char *fmt, ...) {
+        va_list ap;
+
+        fputs(pico_ansi_highlight(), stderr);
+        va_start(ap, fmt);
+        vfprintf(stderr, fmt, ap);
+        va_end(ap);
+        fputs(pico_ansi_normal(), stderr);
+        fputc('\n', stderr);
+}
 
 /* --- --root plumbing --- */
 
@@ -200,7 +250,7 @@ static int cmd_show(int argc, char *argv[]) {
         int i;
 
         if (argc < 1) {
-                fprintf(stderr, "picoctl show: missing unit name\n");
+                picoctl_error("picoctl show: missing unit name");
                 return 1;
         }
 
@@ -281,6 +331,58 @@ static bool csv_contains(const char *csv, const char *word) {
         return false;
 }
 
+/*
+ * output_units_list()'s own per-field colouring (systemctl-list-units.c),
+ * minus the glyph/underline columns picoctl's flat printf table has no
+ * equivalent of: on_loaded colours LOAD, on_active colours both UNIT and
+ * ACTIVE, on_sub colours SUB. A failed unit always wins outright (overrides
+ * load_state's own colour); otherwise load_state and active_state are each
+ * decided independently, exactly as upstream computes on_loaded/on_active
+ * before ever combining them.
+ */
+static void list_units_row_colors(
+                const char *unit_id,
+                const char *load_state,
+                const char *active_state,
+                const char *sub_state,
+                const char **on_loaded,
+                const char **off_loaded,
+                const char **on_active,
+                const char **off_active,
+                const char **on_sub,
+                const char **off_sub) {
+        const char *normal = pico_ansi_normal();
+        const char *suffix;
+
+        *on_loaded = *off_loaded = *on_active = *off_active = *on_sub = *off_sub = "";
+
+        if (strcmp(load_state, "not-found") == 0)
+                *on_loaded = pico_ansi_highlight_yellow();
+        else if (strcmp(load_state, "error") == 0 || strcmp(load_state, "masked") == 0)
+                *on_loaded = pico_ansi_highlight_red();
+        if ((*on_loaded)[0])
+                *off_loaded = normal;
+
+        if (strcmp(active_state, "failed") == 0)
+                *on_active = pico_ansi_highlight_red();
+        else if (strcmp(active_state, "activating") == 0 || strcmp(active_state, "deactivating") == 0 ||
+                 strcmp(active_state, "reloading") == 0 || strcmp(active_state, "refreshing") == 0)
+                *on_active = pico_ansi_highlight();
+        else if (strcmp(active_state, "inactive") == 0)
+                *on_active = pico_ansi_grey();
+        *on_sub = *on_active;
+        if ((*on_active)[0])
+                *off_active = *off_sub = normal;
+
+        /* "greyed-out exited service" special case: only when active_state
+         * itself left SUB uncoloured above. */
+        suffix = unit_type_suffix(unit_id);
+        if (!(*on_sub)[0] && suffix && strcmp(suffix, "service") == 0 && strcmp(sub_state, "exited") == 0) {
+                *on_sub = pico_ansi_grey();
+                *off_sub = normal;
+        }
+}
+
 static int cmd_list_units(int argc, char *argv[]) {
         char rt[PATH_MAX];
         char unitsdir[PATH_MAX + 16];
@@ -323,7 +425,7 @@ static int cmd_list_units(int argc, char *argv[]) {
 
         d = opendir(unitsdir);
         if (!d) {
-                fprintf(stderr, "picoctl: no published state at %s: %s\n", unitsdir, strerror(errno));
+                picoctl_error("picoctl: no published state at %s: %s", unitsdir, strerror(errno));
                 return 1;
         }
 
@@ -387,13 +489,37 @@ static int cmd_list_units(int argc, char *argv[]) {
                         continue;
                 }
 
-                printf("%-32s %-8s %-10s %-13s %-8s %s\n",
-                       names[i],
-                       st.load_state,
-                       st.active_state,
-                       st.sub_state,
-                       st.job,
-                       st.description);
+                {
+                        const char *on_loaded, *off_loaded, *on_active, *off_active, *on_sub, *off_sub;
+
+                        list_units_row_colors(
+                                        names[i],
+                                        st.load_state,
+                                        st.active_state,
+                                        st.sub_state,
+                                        &on_loaded,
+                                        &off_loaded,
+                                        &on_active,
+                                        &off_active,
+                                        &on_sub,
+                                        &off_sub);
+
+                        printf("%s%-32s%s %s%-8s%s %s%-10s%s %s%-13s%s %-8s %s\n",
+                               on_active,
+                               names[i],
+                               off_active,
+                               on_loaded,
+                               st.load_state,
+                               off_loaded,
+                               on_active,
+                               st.active_state,
+                               off_active,
+                               on_sub,
+                               st.sub_state,
+                               off_sub,
+                               st.job,
+                               st.description);
+                }
                 free(names[i]);
         }
         free(names);
@@ -572,7 +698,7 @@ static int cmd_is_state_generic(int argc, char *argv[], const char *want_state, 
         }
 
         if (n_units == 0) {
-                fprintf(stderr, "picoctl: missing unit name\n");
+                picoctl_error("picoctl: missing unit name");
                 return 1;
         }
 
@@ -1033,6 +1159,44 @@ static void print_since_row(time_t boot) {
 }
 
 /*
+ * format_active_state()/format_enable_state() (systemctl-show.c): the
+ * colour bracketing one state word, on both ends -- off is always
+ * ANSI_NORMAL when on is non-empty, and both are "" together when the state
+ * does not match any coloured case, so a plain-mode call site never has to
+ * special-case "no colour" itself.
+ */
+static void active_state_colors(const char *active_state, const char **on, const char **off) {
+        if (strcmp(active_state, "failed") == 0) {
+                *on = pico_ansi_highlight_red();
+                *off = pico_ansi_normal();
+        } else if (strcmp(active_state, "active") == 0 || strcmp(active_state, "reloading") == 0 ||
+                   strcmp(active_state, "refreshing") == 0) {
+                *on = pico_ansi_highlight_green();
+                *off = pico_ansi_normal();
+        } else
+                *on = *off = "";
+}
+
+static void load_state_colors(const char *load_state, const char **on, const char **off) {
+        if (strcmp(load_state, "error") == 0 || strcmp(load_state, "not-found") == 0) {
+                *on = pico_ansi_highlight_red();
+                *off = pico_ansi_normal();
+        } else
+                *on = *off = "";
+}
+
+static void enable_state_colors(const char *enable_state, const char **on, const char **off) {
+        if (strcmp(enable_state, "disabled") == 0) {
+                *on = pico_ansi_highlight_yellow();
+                *off = pico_ansi_normal();
+        } else if (strcmp(enable_state, "enabled") == 0) {
+                *on = pico_ansi_highlight_green();
+                *off = pico_ansi_normal();
+        } else
+                *on = *off = "";
+}
+
+/*
  * systemctl-show.c's show_system_status(): the manager overview real
  * `systemctl status` (no unit, no filter) prints. Every row below has a
  * TRUE source -- the manager's own published state, /proc, or uname/
@@ -1064,14 +1228,25 @@ static void print_system_status(void) {
                 snprintf(hostname, sizeof(hostname), "(none)");
         hostname[sizeof(hostname) - 1] = '\0';
 
-        /* glyph-util.c's GLYPH_BLACK_CIRCLE, UTF8("●"); its state-coloured
-         * variant is the colour change this is deliberately leaving for
-         * later (status.h's own header explains why one callsite, not two,
-         * matters here). */
-        printf("\xe2\x97\x8f %s\n", hostname);
-
+        /* show_system_status()'s own bullet/State colouring (systemctl-show.c):
+         * red for degraded, green for running, yellow for anything else
+         * (picoctl's own "starting"/"offline") -- computed from the word
+         * itself, so the bullet and the State: row can never disagree. */
         is_system_running_compute(/* quiet= */ true, word, sizeof(word));
-        printf("    State: %s\n", word);
+        {
+                const char *on, *off = pico_ansi_normal();
+
+                if (strcmp(word, "degraded") == 0)
+                        on = pico_ansi_highlight_red();
+                else if (strcmp(word, "running") == 0)
+                        on = pico_ansi_highlight_green();
+                else
+                        on = pico_ansi_highlight_yellow();
+
+                /* glyph-util.c's GLYPH_BLACK_CIRCLE, UTF8("●"). */
+                printf("%s\xe2\x97\x8f%s %s\n", on, off, hostname);
+                printf("    State: %s%s%s\n", on, word, off);
+        }
 
         /* Only printed once a manager has actually published something --
          * an offline system has no truthful loaded/queued count, not a "0"
@@ -1132,12 +1307,17 @@ static int cmd_status(int argc, char *argv[]) {
                 read_unit_state(argv[i], &st);
 
                 if (!st.found) {
+                        const char *load_on, *load_off, *active_on, *active_off;
+
+                        load_state_colors("not-found", &load_on, &load_off);
+                        active_state_colors(st.active_state, &active_on, &active_off);
+
                         printf("%s\n", argv[i]);
-                        printf("     Loaded: not-found\n");
+                        printf("     Loaded: %snot-found%s\n", load_on, load_off);
                         /* real print_status_info() still runs the full path for a
                          * not-found unit and prints Active: too (systemctl-show.c). */
-                        printf("     Active: %s (%s)\n", st.active_state, st.sub_state);
-                        fprintf(stderr, "Unit %s could not be found.\n", argv[i]);
+                        printf("     Active: %s%s (%s)%s\n", active_on, st.active_state, st.sub_state, active_off);
+                        picoctl_error("Unit %s could not be found.", argv[i]);
                         if (worst < 4)
                                 worst = 4;
                         continue;
@@ -1149,16 +1329,44 @@ static int cmd_status(int argc, char *argv[]) {
                         printf("%s - %s\n", argv[i], st.description);
                 else
                         printf("%s\n", argv[i]);
-                printf("     Loaded: %s (%s; %s)\n",
-                       st.load_state,
-                       st.fragment_path[0] ? st.fragment_path : "n/a",
-                       st.unit_file_state[0] ? st.unit_file_state : "n/a");
+                {
+                        const char *load_on, *load_off, *enable_on, *enable_off;
+                        const char *ufs = st.unit_file_state[0] ? st.unit_file_state : "n/a";
+
+                        load_state_colors(st.load_state, &load_on, &load_off);
+                        enable_state_colors(ufs, &enable_on, &enable_off);
+
+                        printf("     Loaded: %s%s%s (%s; %s%s%s)\n",
+                               load_on,
+                               st.load_state,
+                               load_off,
+                               st.fragment_path[0] ? st.fragment_path : "n/a",
+                               enable_on,
+                               ufs,
+                               enable_off);
+                }
+
                 /* Result folds onto the Active: line itself upstream, never a
                  * separate field (systemctl-show.c print_status_info()). */
-                if (strcmp(st.result, "success") != 0)
-                        printf("     Active: %s (%s) (Result: %s)\n", st.active_state, st.sub_state, st.result);
-                else
-                        printf("     Active: %s (%s)\n", st.active_state, st.sub_state);
+                {
+                        const char *active_on, *active_off;
+
+                        active_state_colors(st.active_state, &active_on, &active_off);
+
+                        if (strcmp(st.result, "success") != 0)
+                                printf("     Active: %s%s (%s)%s (Result: %s)\n",
+                                       active_on,
+                                       st.active_state,
+                                       st.sub_state,
+                                       active_off,
+                                       st.result);
+                        else
+                                printf("     Active: %s%s (%s)%s\n",
+                                       active_on,
+                                       st.active_state,
+                                       st.sub_state,
+                                       active_off);
+                }
 
                 /* exit code/status is a parenthetical on Main PID itself upstream;
                  * there is no standalone "Main Exit:" field, and NRestarts is a
@@ -1227,20 +1435,22 @@ static bool unit_is_masked(const char *unit_id) {
  * and creates no symlinks, it just explains why nothing happened.
  */
 static void print_no_install_info_notice(void) {
-        fprintf(stderr,
-                "The unit files have no installation config (WantedBy=, RequiredBy=, UpheldBy=,\n"
-                "Also=, or Alias= settings in the [Install] section, and DefaultInstance= for\n"
-                "template units). This means they are not meant to be enabled or disabled using systemctl.\n"
-                " \n"
-                "Possible reasons for having these kinds of units are:\n"
-                "\xe2\x80\xa2 A unit may be statically enabled by being symlinked from another unit's\n"
-                "  .wants/, .requires/, or .upholds/ directory.\n"
-                "\xe2\x80\xa2 A unit's purpose may be to act as a helper for some other unit which has\n"
-                "  a requirement dependency on it.\n"
-                "\xe2\x80\xa2 A unit may be started when needed via activation (socket, path, timer,\n"
-                "  D-Bus, udev, scripted systemctl call, ...).\n"
-                "\xe2\x80\xa2 In case of template units, the unit is meant to be enabled with some\n"
-                "  instance name specified.\n");
+        /* LOG_NOTICE, not LOG_ERR -- picoctl_notice() (bold/white), not
+         * picoctl_error() (red): see this function's own header comment,
+         * this is current systemd's explanation, not a failure. */
+        picoctl_notice("The unit files have no installation config (WantedBy=, RequiredBy=, UpheldBy=,\n"
+                       "Also=, or Alias= settings in the [Install] section, and DefaultInstance= for\n"
+                       "template units). This means they are not meant to be enabled or disabled using systemctl.\n"
+                       " \n"
+                       "Possible reasons for having these kinds of units are:\n"
+                       "\xe2\x80\xa2 A unit may be statically enabled by being symlinked from another unit's\n"
+                       "  .wants/, .requires/, or .upholds/ directory.\n"
+                       "\xe2\x80\xa2 A unit's purpose may be to act as a helper for some other unit which has\n"
+                       "  a requirement dependency on it.\n"
+                       "\xe2\x80\xa2 A unit may be started when needed via activation (socket, path, timer,\n"
+                       "  D-Bus, udev, scripted systemctl call, ...).\n"
+                       "\xe2\x80\xa2 In case of template units, the unit is meant to be enabled with some\n"
+                       "  instance name specified.");
 }
 
 /*
@@ -1411,7 +1621,7 @@ static int cmd_enable(int argc, char *argv[]) {
         int i, status = 0;
 
         if (argc < 1) {
-                fprintf(stderr, "picoctl enable: missing unit name\n");
+                picoctl_error("picoctl enable: missing unit name");
                 return 1;
         }
 
@@ -1421,7 +1631,7 @@ static int cmd_enable(int argc, char *argv[]) {
                 int r = load_install_info(argv[i], &m, &u);
 
                 if (r < 0) {
-                        fprintf(stderr, "Failed to enable unit, unit %s does not exist.\n", argv[i]);
+                        picoctl_error("Failed to enable unit, unit %s does not exist.", argv[i]);
                         status = 1;
                         continue;
                 }
@@ -1433,7 +1643,7 @@ static int cmd_enable(int argc, char *argv[]) {
                          * explain and move on, exit 0. */
                         print_no_install_info_notice();
                 } else if (r < 0) {
-                        fprintf(stderr, "Failed to enable unit %s: %s\n", argv[i], strerror(-r));
+                        picoctl_error("Failed to enable unit %s: %s", argv[i], strerror(-r));
                         status = 1;
                 }
                 /* no per-unit summary line: real systemctl's only output here
@@ -1452,7 +1662,7 @@ static int cmd_reenable(int argc, char *argv[]) {
         int i, status = 0;
 
         if (argc < 1) {
-                fprintf(stderr, "picoctl reenable: missing unit name\n");
+                picoctl_error("picoctl reenable: missing unit name");
                 return 1;
         }
 
@@ -1462,7 +1672,7 @@ static int cmd_reenable(int argc, char *argv[]) {
                 int r = load_install_info(argv[i], &m, &u);
 
                 if (r < 0) {
-                        fprintf(stderr, "Failed to enable unit, unit %s does not exist.\n", argv[i]);
+                        picoctl_error("Failed to enable unit, unit %s does not exist.", argv[i]);
                         status = 1;
                         continue;
                 }
@@ -1472,7 +1682,7 @@ static int cmd_reenable(int argc, char *argv[]) {
                 if (r == -ENOEXEC)
                         print_no_install_info_notice();
                 else if (r < 0) {
-                        fprintf(stderr, "Failed to enable unit %s: %s\n", argv[i], strerror(-r));
+                        picoctl_error("Failed to enable unit %s: %s", argv[i], strerror(-r));
                         status = 1;
                 }
 
@@ -1486,7 +1696,7 @@ static int cmd_disable(int argc, char *argv[]) {
         int i, status = 0;
 
         if (argc < 1) {
-                fprintf(stderr, "picoctl disable: missing unit name\n");
+                picoctl_error("picoctl disable: missing unit name");
                 return 1;
         }
 
@@ -1496,7 +1706,7 @@ static int cmd_disable(int argc, char *argv[]) {
                 int r = load_install_info(argv[i], &m, &u);
 
                 if (r < 0) {
-                        fprintf(stderr, "Failed to disable unit, unit %s does not exist.\n", argv[i]);
+                        picoctl_error("Failed to disable unit, unit %s does not exist.", argv[i]);
                         status = 1;
                         continue;
                 }
@@ -1519,7 +1729,7 @@ static int cmd_is_enabled(int argc, char *argv[]) {
         int i;
 
         if (argc < 1) {
-                fprintf(stderr, "picoctl is-enabled: missing unit name\n");
+                picoctl_error("picoctl is-enabled: missing unit name");
                 return 1;
         }
 
@@ -1587,7 +1797,7 @@ static int cmd_preset(int argc, char *argv[]) {
         int i, status = 0;
 
         if (argc < 1) {
-                fprintf(stderr, "picoctl preset: missing unit name\n");
+                picoctl_error("picoctl preset: missing unit name");
                 return 1;
         }
 
@@ -1598,14 +1808,14 @@ static int cmd_preset(int argc, char *argv[]) {
                 int decision;
 
                 if (r < 0) {
-                        fprintf(stderr, "Failed to preset unit, unit %s does not exist.\n", argv[i]);
+                        picoctl_error("Failed to preset unit, unit %s does not exist.", argv[i]);
                         status = 1;
                         continue;
                 }
 
                 decision = manager_preset_query(m, u->id);
                 if (decision < 0 && decision != -ENOENT) {
-                        fprintf(stderr, "Failed to query preset for %s: %s\n", argv[i], strerror(-decision));
+                        picoctl_error("Failed to query preset for %s: %s", argv[i], strerror(-decision));
                         status = 1;
                         manager_free(m);
                         continue;
@@ -1618,7 +1828,7 @@ static int cmd_preset(int argc, char *argv[]) {
                         if (r == -ENOEXEC)
                                 print_no_install_info_notice(); /* same non-error notice as enable */
                         else if (r < 0) {
-                                fprintf(stderr, "Failed to preset unit %s: %s\n", argv[i], strerror(-r));
+                                picoctl_error("Failed to preset unit %s: %s", argv[i], strerror(-r));
                                 status = 1;
                         }
                 } else
@@ -1646,7 +1856,7 @@ static int cmd_mask(int argc, char *argv[]) {
         int i, status = 0;
 
         if (argc < 1) {
-                fprintf(stderr, "picoctl mask: missing unit name\n");
+                picoctl_error("picoctl mask: missing unit name");
                 return 1;
         }
 
@@ -1655,7 +1865,7 @@ static int cmd_mask(int argc, char *argv[]) {
                 int r;
 
                 if (!unit_name_is_valid(argv[i])) {
-                        fprintf(stderr, "Failed to mask unit: Invalid unit name \"%s\".\n", argv[i]);
+                        picoctl_error("Failed to mask unit: Invalid unit name \"%s\".", argv[i]);
                         status = 1;
                         continue;
                 }
@@ -1667,7 +1877,7 @@ static int cmd_mask(int argc, char *argv[]) {
 
                 r = unit_enable_create_symlink(etcdir, "", "", argv[i], "/dev/null");
                 if (r < 0) {
-                        fprintf(stderr, "Failed to mask unit %s: %s\n", argv[i], strerror(-r));
+                        picoctl_error("Failed to mask unit %s: %s", argv[i], strerror(-r));
                         status = 1;
                         continue;
                 }
@@ -1694,7 +1904,7 @@ static int cmd_unmask(int argc, char *argv[]) {
         int i, status = 0;
 
         if (argc < 1) {
-                fprintf(stderr, "picoctl unmask: missing unit name\n");
+                picoctl_error("picoctl unmask: missing unit name");
                 return 1;
         }
 
@@ -1714,7 +1924,7 @@ static int cmd_unmask(int argc, char *argv[]) {
                 if (unlink(linkpath) == 0)
                         printf("Removed '%s'.\n", linkpath); /* install_change_dump_success()'s own wording */
                 else {
-                        fprintf(stderr, "Failed to unmask unit %s: %s\n", argv[i], strerror(errno));
+                        picoctl_error("Failed to unmask unit %s: %s", argv[i], strerror(errno));
                         status = 1;
                 }
         }
@@ -1740,7 +1950,7 @@ static int cmd_cat(int argc, char *argv[]) {
         int i, status = 0;
 
         if (argc < 1) {
-                fprintf(stderr, "picoctl cat: missing unit name\n");
+                picoctl_error("picoctl cat: missing unit name");
                 return 1;
         }
 
@@ -1764,7 +1974,7 @@ static int cmd_cat(int argc, char *argv[]) {
 
                 r = load_install_info(argv[i], &m, &u);
                 if (r < 0) {
-                        fprintf(stderr, "Failed to cat unit: Unit %s not found.\n", argv[i]);
+                        picoctl_error("Failed to cat unit: Unit %s not found.", argv[i]);
                         status = 1;
                         continue;
                 }
@@ -1851,6 +2061,47 @@ static void collect_unit_files_from(const char *dir, struct unit_file_entry **en
  * only for "disabled" (the one state a preset rule could still flip,
  * matching show_preset_for_state() upstream); every other row prints "-".
  */
+/*
+ * output_unit_file_list()'s own STATE/PRESET colouring (systemctl-list-
+ * unit-files.c), minus the underline-at-a-type-boundary case picoctl's flat
+ * printf table has no equivalent of (on_unit_color there defaults to that
+ * underline, never a real colour, when a state matches neither branch --
+ * i.e. picoctl's "static"): masked/disabled/bad red, enabled green.
+ * PRESET's own colour (preset_action_to_color()) only applies when a preset
+ * verdict is actually shown (picoctl prints one only for "disabled", same
+ * as show_preset_for_state()); the literal "-" shown for every other state
+ * is upstream's TABLE_EMPTY cell rendered through its ersatz-dash string,
+ * grey either way (upstream's own underline/no-underline grey fallback).
+ */
+static void list_unit_files_colors(
+                const char *state,
+                const char *preset,
+                const char **on_state,
+                const char **off_state,
+                const char **on_preset,
+                const char **off_preset) {
+        const char *normal = pico_ansi_normal();
+
+        *on_state = *off_state = *on_preset = *off_preset = "";
+
+        if (strcmp(state, "masked") == 0 || strcmp(state, "disabled") == 0 || strcmp(state, "bad") == 0)
+                *on_state = pico_ansi_highlight_red();
+        else if (strcmp(state, "enabled") == 0)
+                *on_state = pico_ansi_highlight_green();
+        if ((*on_state)[0])
+                *off_state = normal;
+
+        if (strcmp(state, "disabled") == 0) {
+                if (strcmp(preset, "enabled") == 0)
+                        *on_preset = pico_ansi_highlight_green();
+                else if (strcmp(preset, "disabled") == 0)
+                        *on_preset = pico_ansi_highlight_red();
+        } else
+                *on_preset = pico_ansi_grey();
+        if ((*on_preset)[0])
+                *off_preset = normal;
+}
+
 static int cmd_list_unit_files(int argc, char *argv[]) {
         char updir[PATH_MAX], pkgdir[PATH_MAX];
         struct unit_file_entry *entries = NULL;
@@ -1908,7 +2159,20 @@ static int cmd_list_unit_files(int argc, char *argv[]) {
                 } else
                         state = "bad";
 
-                printf("%-40s %-10s %s\n", entries[i].name, state, preset);
+                {
+                        const char *on_state, *off_state, *on_preset, *off_preset;
+
+                        list_unit_files_colors(state, preset, &on_state, &off_state, &on_preset, &off_preset);
+
+                        printf("%-40s %s%-10s%s %s%s%s\n",
+                               entries[i].name,
+                               on_state,
+                               state,
+                               off_state,
+                               on_preset,
+                               preset,
+                               off_preset);
+                }
         }
 
         if (!no_legend)
@@ -2041,20 +2305,18 @@ static void print_job_failed(const char *unit) {
         read_unit_state(unit, &st);
         expl = job_failure_explanation(st.result);
         if (expl)
-                fprintf(stderr,
-                        "Job for %s failed because %s.\n"
-                        "See \"systemctl status %s\" and \"journalctl -xeu %s\" for details.\n",
-                        unit,
-                        expl,
-                        unit,
-                        unit);
+                picoctl_error("Job for %s failed because %s.\n"
+                              "See \"systemctl status %s\" and \"journalctl -xeu %s\" for details.",
+                              unit,
+                              expl,
+                              unit,
+                              unit);
         else
-                fprintf(stderr,
-                        "Job for %s failed.\n"
-                        "See \"systemctl status %s\" and \"journalctl -xeu %s\" for details.\n",
-                        unit,
-                        unit,
-                        unit);
+                picoctl_error("Job for %s failed.\n"
+                              "See \"systemctl status %s\" and \"journalctl -xeu %s\" for details.",
+                              unit,
+                              unit,
+                              unit);
 }
 
 /*
@@ -2068,9 +2330,9 @@ static void print_job_failed(const char *unit) {
  */
 static void print_verb_failure(const char *verb, const char *unit, const char *reason) {
         if (strcmp(reason, "no-such-unit") == 0)
-                fprintf(stderr, "Failed to %s %s: Unit %s not found.\n", verb, unit, unit);
+                picoctl_error("Failed to %s %s: Unit %s not found.", verb, unit, unit);
         else
-                fprintf(stderr, "Failed to %s %s: %s\n", verb, unit, reason);
+                picoctl_error("Failed to %s %s: %s", verb, unit, reason);
 }
 
 /*
@@ -2093,7 +2355,7 @@ static int cmd_verb_generic(int argc, char *argv[], const char *wire_verb, const
         int i, status = 0;
 
         if (argc < 1) {
-                fprintf(stderr, "picoctl %s: missing unit name\n", display_verb);
+                picoctl_error("picoctl %s: missing unit name", display_verb);
                 return 1;
         }
 
@@ -2117,7 +2379,7 @@ static int cmd_verb_generic(int argc, char *argv[], const char *wire_verb, const
                          * all, a permission problem, ...): there is no bus
                          * call to have failed, so this is picoctl's own
                          * honest wording, not a claimed upstream quote. */
-                        fprintf(stderr, "Failed to %s %s: %s\n", display_verb, argv[i], strerror(-r));
+                        picoctl_error("Failed to %s %s: %s", display_verb, argv[i], strerror(-r));
                         status = 1;
                         continue;
                 }
@@ -2131,9 +2393,9 @@ static int cmd_verb_generic(int argc, char *argv[], const char *wire_verb, const
                 reason = strncmp(reply, "err ", 4) == 0 ? reply + 4 : reply;
 
                 if (strcmp(reason, "canceled") == 0)
-                        fprintf(stderr, "Job for %s canceled.\n", argv[i]);
+                        picoctl_error("Job for %s canceled.", argv[i]);
                 else if (strcmp(reason, "timeout") == 0)
-                        fprintf(stderr, "Job for %s timed out.\n", argv[i]);
+                        picoctl_error("Job for %s timed out.", argv[i]);
                 else if (strcmp(reason, "failed") == 0)
                         print_job_failed(argv[i]);
                 else
@@ -2143,7 +2405,7 @@ static int cmd_verb_generic(int argc, char *argv[], const char *wire_verb, const
         }
 
         if (!any_unit) {
-                fprintf(stderr, "picoctl %s: missing unit name\n", display_verb);
+                picoctl_error("picoctl %s: missing unit name", display_verb);
                 return 1;
         }
 
@@ -2189,7 +2451,7 @@ static int cmd_try_restart_as(int argc, char *argv[], const char *display_verb) 
         int i, n_active = 0, rc;
 
         if (argc < 1) {
-                fprintf(stderr, "picoctl %s: missing unit name\n", display_verb);
+                picoctl_error("picoctl %s: missing unit name", display_verb);
                 return 1;
         }
 
@@ -2265,17 +2527,16 @@ static int cmd_reload(int argc, char *argv[]) {
         int i;
 
         if (argc < 1) {
-                fprintf(stderr, "picoctl reload: missing unit name\n");
+                picoctl_error("picoctl reload: missing unit name");
                 return 1;
         }
 
         for (i = 0; i < argc; i++) {
                 if (strcmp(argv[i], "--no-block") == 0)
                         continue;
-                fprintf(stderr,
-                        "Failed to reload %s: Job type reload is not applicable for unit %s.\n",
-                        argv[i],
-                        argv[i]);
+                picoctl_error("Failed to reload %s: Job type reload is not applicable for unit %s.",
+                              argv[i],
+                              argv[i]);
         }
 
         return 1;
@@ -2285,7 +2546,7 @@ static int cmd_reset_failed(int argc, char *argv[]) {
         int i, status = 0;
 
         if (argc < 1) {
-                fprintf(stderr, "picoctl reset-failed: missing unit name\n");
+                picoctl_error("picoctl reset-failed: missing unit name");
                 return 1;
         }
 
@@ -2295,7 +2556,7 @@ static int cmd_reset_failed(int argc, char *argv[]) {
                 int r = ctrl_roundtrip("reset-failed", argv[i], false, reply, sizeof(reply));
 
                 if (r < 0) {
-                        fprintf(stderr, "Failed to reset failed state of unit %s: %s\n", argv[i], strerror(-r));
+                        picoctl_error("Failed to reset failed state of unit %s: %s", argv[i], strerror(-r));
                         status = 1;
                         continue;
                 }
@@ -2306,10 +2567,9 @@ static int cmd_reset_failed(int argc, char *argv[]) {
                 nl = strchr(reply, '\n');
                 if (nl)
                         *nl = '\0';
-                fprintf(stderr,
-                        "Failed to reset failed state of unit %s: %s\n",
-                        argv[i],
-                        strncmp(reply, "err ", 4) == 0 ? reply + 4 : reply);
+                picoctl_error("Failed to reset failed state of unit %s: %s",
+                              argv[i],
+                              strncmp(reply, "err ", 4) == 0 ? reply + 4 : reply);
                 status = 1;
         }
 
@@ -2333,19 +2593,19 @@ static int cmd_daemon_reload(int argc, char *argv[]) {
 
         (void) argv;
         if (argc > 0) {
-                fprintf(stderr, "picoctl: daemon-reload takes no arguments\n");
+                picoctl_error("picoctl: daemon-reload takes no arguments");
                 return 1;
         }
 
         fd = ctrl_connect();
         if (fd < 0) {
-                fprintf(stderr, "Reload daemon failed: %s\n", strerror(-fd));
+                picoctl_error("Reload daemon failed: %s", strerror(-fd));
                 return 1;
         }
 
         r = send(fd, line, sizeof(line) - 1, MSG_NOSIGNAL);
         if (r < 0) {
-                fprintf(stderr, "Reload daemon failed: %s\n", strerror(errno));
+                picoctl_error("Reload daemon failed: %s", strerror(errno));
                 close(fd);
                 return 1;
         }
@@ -2353,7 +2613,7 @@ static int cmd_daemon_reload(int argc, char *argv[]) {
         r = recv(fd, reply, sizeof(reply) - 1, 0);
         close(fd);
         if (r < 0) {
-                fprintf(stderr, "Reload daemon failed: %s\n", strerror(errno));
+                picoctl_error("Reload daemon failed: %s", strerror(errno));
                 return 1;
         }
         reply[r] = '\0';
@@ -2367,7 +2627,7 @@ static int cmd_daemon_reload(int argc, char *argv[]) {
                 if (nl)
                         *nl = '\0';
         }
-        fprintf(stderr, "Reload daemon failed: %s\n", strncmp(reply, "err ", 4) == 0 ? reply + 4 : reply);
+        picoctl_error("Reload daemon failed: %s", strncmp(reply, "err ", 4) == 0 ? reply + 4 : reply);
         return 1;
 }
 
@@ -2429,7 +2689,7 @@ static int cmd_kill(int argc, char *argv[]) {
         for (i = 0; i < argc; i++) {
                 if (strncmp(argv[i], "--signal=", 9) == 0) {
                         if (signal_from_name(argv[i] + 9, &sig) < 0) {
-                                fprintf(stderr, "picoctl kill: unknown signal '%s'\n", argv[i] + 9);
+                                picoctl_error("picoctl kill: unknown signal '%s'", argv[i] + 9);
                                 return 1;
                         }
                 } else if (strcmp(argv[i], "--kill-who=main") == 0)
@@ -2452,7 +2712,7 @@ static int cmd_kill(int argc, char *argv[]) {
 
                 read_unit_state(argv[i], &st);
                 if (!st.found) {
-                        fprintf(stderr, "Failed to kill unit %s: Unit %s not loaded.\n", argv[i], argv[i]);
+                        picoctl_error("Failed to kill unit %s: Unit %s not loaded.", argv[i], argv[i]);
                         status = 1;
                         continue;
                 }
@@ -2482,7 +2742,7 @@ static int cmd_kill(int argc, char *argv[]) {
         }
 
         if (!any_unit) {
-                fprintf(stderr, "picoctl kill: missing unit name\n");
+                picoctl_error("picoctl kill: missing unit name");
                 return 1;
         }
 
@@ -2557,7 +2817,7 @@ static char *mangle_unit_arg(const char *arg) {
  */
 static int send_pid1_signal(int sig, const char *what) {
         if (kill(1, sig) < 0) {
-                fprintf(stderr, "picoctl: %s: kill(1, %d): %s\n", what, sig, strerror(errno));
+                picoctl_error("picoctl: %s: kill(1, %d): %s", what, sig, strerror(errno));
                 return 1;
         }
         return 0;
@@ -2600,9 +2860,8 @@ static int cmd_shutdown(int argc, char *argv[]) {
                 else if (strcmp(argv[i], "now") == 0)
                         continue;
                 else {
-                        fprintf(stderr,
-                                "picoctl: shutdown: no scheduler or wall message here, only "
-                                "'shutdown [-r|-h|-P] [now]'\n");
+                        picoctl_error("picoctl: shutdown: no scheduler or wall message here, only "
+                                      "'shutdown [-r|-h|-P] [now]'");
                         return 1;
                 }
         }
@@ -2743,6 +3002,6 @@ int main(int argc, char *argv[]) {
         /* Exact upstream wording and exit code (src/shared/verbs.c
          * dispatch_verb()): "Unknown command verb 'X'.", no usage dump --
          * real systemctl does not print its help text on a typo either. */
-        fprintf(stderr, "Unknown command verb '%s'.\n", argv[argi]);
+        picoctl_error("Unknown command verb '%s'.", argv[argi]);
         return 1;
 }

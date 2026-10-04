@@ -1100,6 +1100,134 @@ static void test_status_no_argument_system_overview(void) {
         free(root);
 }
 
+/* --- test: colouring, forced on via SYSTEMD_COLORS=true ---
+ *
+ * The literal byte sequences below are deliberately re-typed from pico-
+ * color.c's own PICO_ANSI_* #defines rather than #include-ing that header:
+ * this test is the thing that would catch an accidental change to those
+ * literals breaking real systemctl-compatibility, so it must not share the
+ * one definition it is checking.
+ *
+ * RUN_PICOCTL's pipe (run_binary()) makes picoctl's own stdout a non-tty,
+ * which is normally "colours off" -- these tests force colours on the one
+ * way that overrides tty detection entirely (pico_colors_enabled()'s own
+ * $SYSTEMD_COLORS=true branch), the same override real systemctl honours.
+ */
+#define TEST_ANSI_NORMAL "\x1B[0m"
+#define TEST_ANSI_HIGHLIGHT_RED "\x1B[0;1;31m"
+#define TEST_ANSI_HIGHLIGHT_GREEN "\x1B[0;1;32m"
+
+/*
+ * status <unit>: active (green Active: line), failed (red Active: line,
+ * with the Result parenthetical left outside -- hence plain -- the colour),
+ * and inactive (format_active_state()'s own "else" case: no colour for
+ * inactive, not even with colours forced on -- the negative half of this
+ * test matters as much as the positive two).
+ */
+static void test_status_colors(void) {
+        char *root;
+        char rtdir[PATH_MAX], unitsdir[PATH_MAX + 16];
+        struct run_result res;
+
+        root = test_tmpdir_new();
+        ASSERT_TRUE(root != NULL);
+
+        snprintf(rtdir, sizeof(rtdir), "%s%s", root, PICO_RUNTIME_DIR);
+        snprintf(unitsdir, sizeof(unitsdir), "%s/units", rtdir);
+        ASSERT_EQ_INT(fixture_mkdir_p(unitsdir), 0);
+
+        ASSERT_EQ_INT(test_write_file(unitsdir,
+                                      "active.service",
+                                      "ActiveState=active\nSubState=running\nLoadState=loaded\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(unitsdir,
+                                      "failed.service",
+                                      "ActiveState=failed\nSubState=failed\nResult=exit-code\nLoadState=loaded\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(unitsdir,
+                                      "inactive.service",
+                                      "ActiveState=inactive\nSubState=dead\nLoadState=loaded\n"),
+                      0);
+
+        setenv("SYSTEMD_COLORS", "true", 1);
+
+        RUN_PICOCTL(&res, "--root", root, "status", "active.service");
+        ASSERT_EQ_INT(res.exit_code, 0);
+        ASSERT_TRUE(strstr(res.out,
+                           "     Active: " TEST_ANSI_HIGHLIGHT_GREEN "active (running)" TEST_ANSI_NORMAL
+                           "\n") != NULL);
+
+        RUN_PICOCTL(&res, "--root", root, "status", "failed.service");
+        ASSERT_EQ_INT(res.exit_code, 3); /* LSB "not running", same as unforced */
+        ASSERT_TRUE(strstr(res.out,
+                           "     Active: " TEST_ANSI_HIGHLIGHT_RED "failed (failed)" TEST_ANSI_NORMAL
+                           " (Result: exit-code)\n") != NULL);
+
+        RUN_PICOCTL(&res, "--root", root, "status", "inactive.service");
+        ASSERT_EQ_INT(res.exit_code, 3);
+        ASSERT_TRUE(strstr(res.out, "     Active: inactive (dead)\n") != NULL);
+        /* the negative case: forcing colours on must not invent one for a
+         * state upstream's own format_active_state() leaves plain */
+        ASSERT_TRUE(strstr(res.out, "\x1B[") == NULL);
+
+        unsetenv("SYSTEMD_COLORS");
+
+        test_rm_rf(root);
+        free(root);
+}
+
+/*
+ * list-units: one row, failed -- on_active (red) wraps both the UNIT and
+ * ACTIVE columns, on_sub (red too, failed's own case) wraps SUB; LOAD stays
+ * plain ("loaded" is not one of list_units_row_colors()'s coloured
+ * load_state values). Built with the exact field widths cmd_list_units()
+ * itself prints with, so a width regression there would also fail this.
+ */
+static void test_list_units_colors(void) {
+        char *root;
+        char rtdir[PATH_MAX], unitsdir[PATH_MAX + 16];
+        struct run_result res;
+        char expected_row[256];
+
+        root = test_tmpdir_new();
+        ASSERT_TRUE(root != NULL);
+
+        snprintf(rtdir, sizeof(rtdir), "%s%s", root, PICO_RUNTIME_DIR);
+        snprintf(unitsdir, sizeof(unitsdir), "%s/units", rtdir);
+        ASSERT_EQ_INT(fixture_mkdir_p(unitsdir), 0);
+        ASSERT_EQ_INT(test_write_file(unitsdir,
+                                      "demo.service",
+                                      "ActiveState=failed\nSubState=failed\nLoadState=loaded\nDescription=Demo\n"),
+                      0);
+
+        snprintf(expected_row,
+                 sizeof(expected_row),
+                 "%s%-32s%s %-8s %s%-10s%s %s%-13s%s %-8s %s\n",
+                 TEST_ANSI_HIGHLIGHT_RED,
+                 "demo.service",
+                 TEST_ANSI_NORMAL,
+                 "loaded",
+                 TEST_ANSI_HIGHLIGHT_RED,
+                 "failed",
+                 TEST_ANSI_NORMAL,
+                 TEST_ANSI_HIGHLIGHT_RED,
+                 "failed",
+                 TEST_ANSI_NORMAL,
+                 "",
+                 "Demo");
+
+        setenv("SYSTEMD_COLORS", "true", 1);
+
+        RUN_PICOCTL(&res, "--root", root, "list-units");
+        ASSERT_EQ_INT(res.exit_code, 0);
+        ASSERT_TRUE(strstr(res.out, expected_row) != NULL);
+
+        unsetenv("SYSTEMD_COLORS");
+
+        test_rm_rf(root);
+        free(root);
+}
+
 int main(void) {
         test_enable_disable_is_enabled();
         test_preset();
@@ -1110,6 +1238,8 @@ int main(void) {
         test_status_log_tail();
         test_is_system_running_fstab();
         test_status_no_argument_system_overview();
+        test_status_colors();
+        test_list_units_colors();
         /* Last: it exit(77)s on a host without systemctl, and a SKIP must not
          * hide the in-process checks above. */
         test_oracle_symlinks_byte_identical();

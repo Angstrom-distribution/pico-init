@@ -815,7 +815,12 @@ endforeach
 # ---------------------------------------------------------------------------
 picoctl_exe = executable(
   'picoctl',
-  'src/picoctl.c',
+  [
+    'src/picoctl.c',
+    # Shared ANSI colour helper (pico-color.h), mirroring real systemctl's
+    # on/off rules and escape sequences.
+    'src/pico-color.c',
+  ],
   include_directories: [logd_includes, libsystemd_compat_includes],
   link_with: [pico_init_core, logd_core],
   install: true,
