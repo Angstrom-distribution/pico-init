@@ -585,6 +585,19 @@ static void test_netns_dhcp_end_to_end(void) {
         run_shell("ip -4 addr show dev dhcpc0 | grep -qE '10\\.253\\.0\\.[0-9]+/24'");
         run_shell("! ip -4 addr show dev dhcpc0 | grep -q '10\\.253\\.0\\.1/24'");
 
+        /*
+         * A reload (SIGHUP, `networkctl reload`) must not throw the lease's
+         * address away: DHCP=yes with no Address= used to make the
+         * "no static address wanted" branch delete it, and nothing brought it
+         * back, so every reload left the link without IPv4.
+         */
+        ASSERT_TRUE(netd_reload(n) == 0);
+        client_link = netd_find_link_by_name(n, "dhcpc0");
+        ASSERT_TRUE(client_link != NULL);
+        ASSERT_TRUE(client_link->lease != NULL);
+        ASSERT_TRUE(client_link->address_configured);
+        run_shell("ip -4 addr show dev dhcpc0 | grep -qE '10\\.253\\.0\\.[0-9]+/24'");
+
         run_ip("link del dhcps0");
         netd_free(n);
         test_rm_rf(tmp);

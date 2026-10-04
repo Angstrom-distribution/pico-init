@@ -359,6 +359,16 @@ static int apply_static_address(Link *l, const Network *nw) {
                 if (!l->address_configured)
                         return 0;
 
+                /*
+                 * No Address= does not mean no address: with DHCP= still on,
+                 * the one in the kernel is the lease's, and a reload must
+                 * leave it alone (the lease and its client stay, see
+                 * link_configure_impl()) instead of deleting an address
+                 * nothing will bring back until the next renewal.
+                 */
+                if (l->lease && network_dhcp4_enabled(nw))
+                        return 0;
+
                 r = address_del_idempotent(n->rtnl, l->ifindex, &l->address, l->prefixlen);
                 if (r < 0)
                         return r;
@@ -391,6 +401,10 @@ static int apply_static_gateway(Link *l, const Network *nw) {
 
         if (!nw->gateway_set) {
                 if (!l->gateway_configured)
+                        return 0;
+
+                /* Same as the address: with a lease held, this is its router. */
+                if (l->lease && network_dhcp4_enabled(nw))
                         return 0;
 
                 r = route_del_default_idempotent(n->rtnl, l->ifindex, &l->gateway, link_route_metric(l));
