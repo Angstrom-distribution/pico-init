@@ -22,20 +22,51 @@
  * about to be freed. It is also what stops unit_free() from unlinking the
  * live unit's published state file, which is named after the same id.
  *
+ * manager_reload() -- the real daemon-reload, whether reached via SIGHUP or
+ * the picoctl daemon-reload ctrl verb (manager-ctrl.c) -- is more than the
+ * per-unit swap above: a unit file dropped into the search path since boot
+ * (or since the last reload) must become a known, loadable unit, and a
+ * .wants/.requires symlink added or removed since then must take effect,
+ * exactly as it would at the next boot. So it also, in order: (1) re-reads
+ * every already-loaded unit's own fragment (unit_reload(), above); (2) runs
+ * manager_load_units(m, NULL) again, the same whole-search-path fragment
+ * scan manager_startup() runs once at boot, so a new fragment becomes a
+ * graph node; (3) re-runs unit_add_wants_requires_dirs() for every loaded
+ * unit, so a symlink that did not exist at boot (or at the previous reload)
+ * is picked up -- safe to repeat: unit_add_dependency() dedupes, so re-
+ * adding an edge that is already there is a no-op. None of this starts
+ * anything: a newly known or newly enabled unit is not queued, matching
+ * upstream daemon-reload exactly -- it only becomes startable, not started.
+ *
+ * Deliberately NOT re-run: manager_apply_presets(). Real `systemctl daemon-
+ * reload` never touches presets either -- that is what `systemctl preset`
+ * is for -- and this project's own manager_startup() only ever calls
+ * manager_apply_presets() once, on m->first_boot (see unit-enable.h's own
+ * comment on why that is a once-ever decision, not a per-boot one).
+ * Re-running it from every reload would re-open a decision this project has
+ * deliberately chosen to make exactly once; a unit discovered here with no
+ * symlink pointing at it becomes known and loadable, same as at boot, but
+ * stays undecided until something explicit (`picoctl enable`/`preset`)
+ * decides it -- exactly the real systemd behavior for a reload.
+ *
  * Not re-read, deliberately:
- *  - Requires=/Wants=/Before=/After=. The graph stores an edge a unit
- *    declared and the inverse a neighbour's Before=/After= put there in the
- *    same slot, so dropping "this unit's own" edges cannot be done without
- *    also dropping edges other files still declare. Edges stay as loaded.
+ *  - Requires=/Wants=/Before=/After= *declared in a changed unit's own
+ *    fragment*. The graph stores an edge a unit declared and the inverse a
+ *    neighbour's Before=/After= put there in the same slot, so dropping
+ *    "this unit's own" edges cannot be done without also dropping edges
+ *    other files still declare. Edges stay as loaded. (A .wants/.requires
+ *    *symlink*, by contrast, is re-scanned every reload -- see above.)
  *  - Socket units. Their Listen*= lines are bound fds the paired service may
  *    hold right now; re-reading them means rebinding, which is not a reload.
  *  - A unit with a job or a control process in flight. Swapping a command
  *    list or Type= under a start or stop that is still walking the old one
  *    is how a reload restarts or kills something by accident; such a unit is
- *    skipped with a warning and picks the change up on the next SIGHUP.
+ *    skipped with a warning and picks the change up on the next reload.
  *  - Drop-in directories, which unit-load.c does not read yet either.
- *  - Load-state transitions. A unit whose file is now gone, masked or
- *    invalid keeps its current configuration and gets a warning.
+ *  - Load-state transitions on an already-loaded unit. A unit whose file is
+ *    now gone, masked or invalid keeps its current configuration and gets a
+ *    warning -- but a unit not loaded at all yet is exactly what step (2)
+ *    above newly loads.
  */
 
 #include <errno.h>
@@ -45,6 +76,7 @@
 #include "manager-state.h"
 #include "manager.h"
 #include "service.h"
+#include "unit-enable.h"
 #include "unit.h"
 #include "util.h"
 
@@ -189,6 +221,7 @@ int unit_reload(Unit *u) {
 int manager_reload(Manager *m) {
         size_t i;
         int n = 0;
+        int r;
 
         if (!m)
                 return -EINVAL;
@@ -196,11 +229,43 @@ int manager_reload(Manager *m) {
         /*
          * Indexing rather than a saved count: unit_reload() never loads or
          * frees a unit, but reading m->n_units each time keeps that an
-         * observed property of the loop rather than an assumption.
+         * observed property of the loop rather than an assumption. `n`
+         * counts only THIS step, by design -- it is the "how many unit
+         * files actually changed" number the log line (and test-unit-
+         * reload.c) reports; the discovery/rescan/preset steps below never
+         * add to it, since nothing they do is a reload of an existing unit.
          */
         for (i = 0; i < m->n_units; i++)
                 if (unit_reload(m->units[i]) > 0)
                         n++;
+
+        /* Newly-added unit files become known (manager_startup()'s own
+         * step 1, re-run). */
+        r = manager_load_units(m, NULL);
+        if (r < 0)
+                pico_log(PICO_LOG_WARNING, "daemon-reload: loading new units: %s", strerror(-r));
+
+        /* Every .wants/.requires symlink, old or new, re-scanned against
+         * every currently-loaded unit (manager_startup()'s own step 3,
+         * re-run) -- idempotent, so re-finding an edge that already exists
+         * costs nothing. Indexed and re-reading m->n_units for the same
+         * reason manager_startup() does: a scan can itself load a unit a
+         * symlink names, appending to and reallocating m->units. */
+        for (i = 0; i < m->n_units; i++) {
+                Unit *u = m->units[i];
+
+                if (u->load_state != UNIT_LOADED)
+                        continue;
+
+                r = unit_add_wants_requires_dirs(u);
+                if (r < 0)
+                        pico_log(PICO_LOG_WARNING, "%s: scanning .wants/.requires: %s", u->id, strerror(-r));
+        }
+
+        /* Presets are deliberately NOT re-applied here -- see this file's
+         * own header. A unit discovered above with no symlink naming it is
+         * now known and loadable, same as at boot, but stays undecided
+         * until something explicit (`picoctl enable`/`preset`) decides it. */
 
         pico_log(PICO_LOG_INFO,
                  "Reloaded %d unit%s; dependencies and socket units unchanged until reboot",

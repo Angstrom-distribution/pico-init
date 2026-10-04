@@ -300,9 +300,13 @@ static void test_reload_busy_service_is_skipped(void) {
 }
 
 /*
- * Dependency edges stay exactly as loaded, in both directions, and a unit
- * named only by the new file is not loaded: the reload parse has no manager
- * to resolve it through. Other directives in the same file still update.
+ * Dependency edges stay exactly as loaded, in both directions: the per-unit
+ * reload parse has no manager to resolve a.service's new After=c.service
+ * through, so that edge is never added, even though manager_reload()'s own
+ * full-rescan steps (unit-reload.c) separately load c.service itself as a
+ * new, otherwise-unrelated unit -- exactly as a real `systemctl daemon-
+ * reload` makes a new unit file known without acting on it. Other
+ * directives in the same file still update.
  */
 static void test_reload_leaves_dependency_edges(void) {
         Manager *m;
@@ -347,7 +351,17 @@ static void test_reload_leaves_dependency_edges(void) {
         ASSERT_TRUE(unit_has_dependency(a, UNIT_AFTER, b));
         ASSERT_EQ_INT(b->n_dependencies[UNIT_BEFORE], 1);
         ASSERT_TRUE(unit_has_dependency(b, UNIT_BEFORE, a));
-        ASSERT_TRUE(manager_get_unit(m, "c.service") == NULL);
+
+        /* c.service is now a known unit (the full-reload fragment rescan),
+         * but a's own After=c.service edge was never added -- unrelated to
+         * whether c.service itself got loaded. */
+        {
+                Unit *c = manager_get_unit(m, "c.service");
+
+                ASSERT_TRUE(c != NULL);
+                ASSERT_EQ_INT(c->load_state, UNIT_LOADED);
+                ASSERT_TRUE(!unit_has_dependency(a, UNIT_AFTER, c));
+        }
 
         manager_free(m);
         test_rm_rf(dir);
@@ -386,6 +400,54 @@ static void test_reload_target(void) {
         free(dir);
 }
 
+/*
+ * The daemon-reload requirement manager_reload() grew for the picoctl ctrl
+ * verb (manager-ctrl.c): a unit file dropped into the search path after
+ * "boot" becomes a known, loaded unit, and a .wants/ symlink added after
+ * boot is picked up -- both without starting anything, matching real
+ * `systemctl daemon-reload` exactly.
+ */
+static void test_reload_discovers_new_unit_and_wants_symlink(void) {
+        Manager *m;
+        char *dir;
+        Unit *t;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        ASSERT_EQ_INT(test_write_file(dir, "x.target", "[Unit]\nDescription=X\n"), 0);
+
+        m = manager_for(dir);
+        t = loaded_unit(m, "x.target");
+        ASSERT_TRUE(manager_get_unit(m, "d.service") == NULL);
+
+        /* A unit file that did not exist at "boot", plus a .wants/ symlink
+         * naming it -- both added after the fact, the same as an operator
+         * dropping a new unit into /etc/systemd/system before reloading. */
+        ASSERT_EQ_INT(test_write_file(dir, "d.service", "[Service]\nExecStart=/bin/true\n"), 0);
+        ASSERT_EQ_INT(test_mkdir(dir, "x.target.wants"), 0);
+        ASSERT_EQ_INT(test_symlink(dir, "x.target.wants/d.service", "../d.service"), 0);
+
+        /* unit_reload() reports 1 for any successful re-parse, whether or
+         * not the file's content actually changed (test_reload_target()'s
+         * own assertion makes the same point) -- so this counts x.target's
+         * own reload, not d.service, which is freshly LOADED afterwards,
+         * never "reloaded". */
+        ASSERT_EQ_INT(manager_reload(m), 1);
+
+        {
+                Unit *d = manager_get_unit(m, "d.service");
+
+                ASSERT_TRUE(d != NULL);
+                ASSERT_EQ_INT(d->load_state, UNIT_LOADED);
+                ASSERT_TRUE(unit_has_dependency(t, UNIT_WANTS, d));
+                ASSERT_TRUE(d->enabled);
+        }
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
         test_reload_updates_running_service();
         test_reload_invalid_file_keeps_old();
@@ -393,6 +455,7 @@ int main(void) {
         test_reload_busy_service_is_skipped();
         test_reload_leaves_dependency_edges();
         test_reload_target();
+        test_reload_discovers_new_unit_and_wants_symlink();
 
         printf("test-unit-reload: all checks passed\n");
         return 0;

@@ -34,6 +34,12 @@
  * (draining the listen backlog) and immediately rejected with
  * "err too-many-connections" rather than tracked. Once a shutdown is pending,
  * start/restart are refused with "err shutting-down".
+ *
+ * daemon-reload is the one verb with no <unit> token at all ("PICO1
+ * daemon-reload"): a direct, synchronous call into manager_reload() (unit-
+ * reload.c), answered immediately. Real `systemctl daemon-reload` is
+ * synchronous too (it returns once the manager has re-read unit files), and
+ * there is no job engine step to ever defer this one onto.
  */
 
 /* accept4()/SOCK_SEQPACKET/struct ucred/MSG_TRUNC-on-a-UNIX-socket are
@@ -234,6 +240,7 @@ typedef enum {
         CTRL_VERB_STOP,
         CTRL_VERB_RESTART,
         CTRL_VERB_RESET_FAILED,
+        CTRL_VERB_DAEMON_RELOAD,
         _CTRL_VERB_INVALID,
 } CtrlVerb;
 
@@ -246,6 +253,8 @@ static CtrlVerb ctrl_verb_parse(const struct ctrl_word *w) {
                 return CTRL_VERB_RESTART;
         if (ctrl_word_is(w, "reset-failed"))
                 return CTRL_VERB_RESET_FAILED;
+        if (ctrl_word_is(w, "daemon-reload"))
+                return CTRL_VERB_DAEMON_RELOAD;
 
         return _CTRL_VERB_INVALID;
 }
@@ -271,11 +280,13 @@ struct ctrl_request {
 
 /*
  * Parse exactly "PICO1 <verb> <unit>" or "...<unit> --no-block" out of
- * buf[0..len). NULL on success (with *out filled); a short static reason
- * string on any grammar violation. Never allocates: `buf` is the caller's
- * fixed on-stack buffer, out->unit is a fixed on-stack field sized off
- * UNIT_NAME_MAX, and unit_name_is_valid() is the same validator every other
- * unit-name-carrying path in this project already uses.
+ * buf[0..len) -- or, for daemon-reload alone, "PICO1 daemon-reload" with no
+ * third token at all, since there is no unit to name. NULL on success (with
+ * *out filled); a short static reason string on any grammar violation.
+ * Never allocates: `buf` is the caller's fixed on-stack buffer, out->unit is
+ * a fixed on-stack field sized off UNIT_NAME_MAX, and unit_name_is_valid()
+ * is the same validator every other unit-name-carrying path in this project
+ * already uses.
  */
 static const char *ctrl_parse_request(const char *buf, size_t len, struct ctrl_request *out) {
         const char *p = buf, *end = buf + len;
@@ -289,6 +300,11 @@ static const char *ctrl_parse_request(const char *buf, size_t len, struct ctrl_r
         out->verb = ctrl_verb_parse(&w);
         if (out->verb == _CTRL_VERB_INVALID)
                 return "unknown-verb";
+
+        out->unit[0] = '\0';
+        out->no_block = false;
+        if (out->verb == CTRL_VERB_DAEMON_RELOAD)
+                return p < end ? "malformed" : NULL; /* no unit, no --no-block */
 
         if (!ctrl_next_word(&p, end, &w))
                 return "missing-unit";
@@ -393,6 +409,22 @@ static void ctrl_handle_request(struct ctrl_conn *conn, const char *buf, size_t 
         err = ctrl_parse_request(buf, len, &req);
         if (err) {
                 ctrl_send_err(conn->fd, err);
+                ctrl_conn_free(conn);
+                return;
+        }
+
+        /* No unit, no job, nothing to defer: answered on the spot, exactly
+         * like reset-failed, just with manager_reload() as the action. */
+        if (req.verb == CTRL_VERB_DAEMON_RELOAD) {
+                int r = manager_reload(ctrl->manager);
+
+                if (r < 0) {
+                        char line[96];
+
+                        snprintf(line, sizeof(line), "err reload-failed: %s\n", strerror(-r));
+                        ctrl_send_line(conn->fd, line);
+                } else
+                        ctrl_send_line(conn->fd, "ok\n");
                 ctrl_conn_free(conn);
                 return;
         }

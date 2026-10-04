@@ -59,7 +59,9 @@ const LogdReadField *logd_entry_field(const LogdEntry *e, const char *name);
 bool logd_field_equals(const LogdReadField *f, const char *s);
 
 /* logd_entry_field(e, "_SYSTEMD_UNIT") equals `unit`; `unit` == NULL always
- * matches (no filter). */
+ * matches (no filter). A bare `unit` with no suffix pico-init has a unit
+ * type for (.service/.socket/.target) is mangled to `unit`.service first,
+ * the same default unit_name_mangle() applies for systemctl/journalctl. */
 bool logd_entry_matches_unit(const LogdEntry *e, const char *unit);
 
 /* logd_entry_field(e, "PRIORITY") parses as a syslog priority <=

@@ -417,9 +417,15 @@ static void test_enable_disable_is_enabled(void) {
                 ASSERT_TRUE(lstat(p2, &st) < 0);
         }
 
-        /* enabling a unit with no [Install] section fails cleanly */
+        /* enabling a unit with no [Install] section is NOT a failure in
+         * current upstream (verb_enable()'s own carries_install_info == 0
+         * case, systemctl-enable.c): it succeeds, exit 0, and only explains
+         * why on stderr (not captured by RUN_PICOCTL, by design -- see its
+         * own header). picoctl used to treat this as exit 1, matching only
+         * a much older systemd; this is the real behavior bug this verb
+         * audit found. */
         RUN_PICOCTL(&res, "--root", root, "enable", "static.service");
-        ASSERT_EQ_INT(res.exit_code, 1);
+        ASSERT_EQ_INT(res.exit_code, 0);
 
         /* a genuinely missing unit fails, both verbs */
         RUN_PICOCTL(&res, "--root", root, "enable", "nonexistent.service");
@@ -475,6 +481,104 @@ static void test_preset_default_enable(void) {
 
         RUN_PICOCTL(&res, "--root", root, "is-enabled", "foo.service");
         ASSERT_STREQ(res.out, "enabled\n");
+
+        test_rm_rf(root);
+        free(root);
+}
+
+/*
+ * mask/unmask: a /dev/null symlink directly in PICO_UNIT_DIR, is-enabled
+ * reporting "masked" rather than conflating it with "not-found", and `cat`
+ * giving upstream's own "is a mask" line rather than trying to cat
+ * /dev/null as a unit file.
+ */
+static void test_mask_unmask(void) {
+        char *root = test_tmpdir_new();
+        char linkpath[PATH_MAX];
+        struct run_result res;
+
+        ASSERT_TRUE(root != NULL);
+        make_fixture_root(root);
+
+        RUN_PICOCTL(&res, "--root", root, "mask", "foo.service");
+        ASSERT_EQ_INT(res.exit_code, 0);
+
+        snprintf(linkpath, sizeof(linkpath), "%s%s/foo.service", root, PICO_UNIT_DIR);
+        {
+                char target[32];
+                ssize_t rl = readlink(linkpath, target, sizeof(target) - 1);
+
+                ASSERT_TRUE(rl > 0);
+                target[rl] = '\0';
+                ASSERT_STREQ(target, "/dev/null");
+        }
+
+        RUN_PICOCTL(&res, "--root", root, "is-enabled", "foo.service");
+        ASSERT_STREQ(res.out, "masked\n");
+        ASSERT_EQ_INT(res.exit_code, 1);
+
+        RUN_PICOCTL(&res, "--root", root, "cat", "foo.service");
+        ASSERT_TRUE(strstr(res.out, "is a mask.") != NULL);
+        ASSERT_EQ_INT(res.exit_code, 0);
+
+        /* idempotent: masking an already-masked unit is still success */
+        RUN_PICOCTL(&res, "--root", root, "mask", "foo.service");
+        ASSERT_EQ_INT(res.exit_code, 0);
+
+        RUN_PICOCTL(&res, "--root", root, "unmask", "foo.service");
+        ASSERT_EQ_INT(res.exit_code, 0);
+        {
+                struct stat st;
+
+                ASSERT_TRUE(lstat(linkpath, &st) < 0); /* symlink really gone */
+        }
+
+        RUN_PICOCTL(&res, "--root", root, "is-enabled", "foo.service");
+        ASSERT_STREQ(res.out, "disabled\n"); /* back to its real [Install] state */
+
+        /* unmasking an already-unmasked unit is still success */
+        RUN_PICOCTL(&res, "--root", root, "unmask", "foo.service");
+        ASSERT_EQ_INT(res.exit_code, 0);
+
+        /* `cat` on an ordinary unit: upstream's exact "# /path" header */
+        RUN_PICOCTL(&res, "--root", root, "cat", "foo.service");
+        ASSERT_TRUE(strstr(res.out, "# ") != NULL);
+        ASSERT_TRUE(strstr(res.out, "ExecStart=/bin/sleep 100") != NULL);
+        ASSERT_EQ_INT(res.exit_code, 0);
+
+        test_rm_rf(root);
+        free(root);
+}
+
+/* list-unit-files: every fixture unit present, STATE reflecting mask and
+ * [Install] data, and the "%d unit files listed." footer. */
+static void test_list_unit_files(void) {
+        char *root = test_tmpdir_new();
+        struct run_result res;
+
+        ASSERT_TRUE(root != NULL);
+        make_fixture_root(root);
+
+        RUN_PICOCTL(&res, "--root", root, "mask", "bar.service");
+        ASSERT_EQ_INT(res.exit_code, 0);
+
+        RUN_PICOCTL(&res, "--root", root, "list-unit-files");
+        ASSERT_EQ_INT(res.exit_code, 0);
+        ASSERT_TRUE(strstr(res.out, "UNIT FILE") != NULL); /* header */
+        ASSERT_TRUE(strstr(res.out, "foo.service") != NULL);
+        ASSERT_TRUE(strstr(res.out, "static.service") != NULL);
+        {
+                char *bar_line = strstr(res.out, "bar.service");
+
+                ASSERT_TRUE(bar_line != NULL);
+                ASSERT_TRUE(strstr(bar_line, "masked") != NULL);
+        }
+        ASSERT_TRUE(strstr(res.out, "unit files listed.") != NULL);
+
+        RUN_PICOCTL(&res, "--root", root, "list-unit-files", "--no-legend");
+        ASSERT_TRUE(strstr(res.out, "UNIT FILE") == NULL);
+        ASSERT_TRUE(strstr(res.out, "unit files listed.") == NULL);
+        ASSERT_TRUE(strstr(res.out, "foo.service") != NULL);
 
         test_rm_rf(root);
         free(root);
@@ -963,6 +1067,8 @@ int main(void) {
         test_enable_disable_is_enabled();
         test_preset();
         test_preset_default_enable();
+        test_mask_unmask();
+        test_list_unit_files();
         test_read_verbs_against_real_boot();
         test_status_log_tail();
         test_is_system_running_fstab();

@@ -336,11 +336,47 @@ bool logd_field_equals(const LogdReadField *f, const char *s) {
         return f->value_len == s_len && memcmp(f->value, s, s_len) == 0;
 }
 
+/* Upstream mangles a bare -u argument the same way systemctl does
+ * (unit_name_mangle(), default suffix ".service", src/basic/unit-name.c) --
+ * a name already ending in a suffix pico-init actually has a unit type for
+ * is left alone, anything else gets ".service" appended. Without this,
+ * `journalctl -u picowl` silently matched nothing against a real
+ * _SYSTEMD_UNIT=picowl.service entry. */
+static bool unit_has_known_suffix(const char *unit, size_t len) {
+        static const char * const suffixes[] = { ".service", ".socket", ".target" };
+
+        for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
+                size_t slen = strlen(suffixes[i]);
+
+                if (len > slen && memcmp(unit + len - slen, suffixes[i], slen) == 0)
+                        return true;
+        }
+
+        return false;
+}
+
 bool logd_entry_matches_unit(const LogdEntry *e, const char *unit) {
+        const LogdReadField *f;
+        size_t len;
+        char mangled[256];
+
         if (!unit)
                 return true;
 
-        return logd_field_equals(logd_entry_field(e, "_SYSTEMD_UNIT"), unit);
+        f = logd_entry_field(e, "_SYSTEMD_UNIT");
+        len = strlen(unit);
+
+        if (unit_has_known_suffix(unit, len))
+                return logd_field_equals(f, unit);
+
+        /* bare name: mangle the same way systemctl/journalctl do, falling
+         * back to an exact (un-mangled) comparison if it would overflow the
+         * stack buffer rather than mis-happily truncating the match */
+        if (len + strlen(".service") >= sizeof(mangled))
+                return logd_field_equals(f, unit);
+
+        snprintf(mangled, sizeof(mangled), "%s.service", unit);
+        return logd_field_equals(f, mangled);
 }
 
 bool logd_entry_matches_priority(const LogdEntry *e, int max_priority) {

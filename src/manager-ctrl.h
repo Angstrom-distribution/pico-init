@@ -10,15 +10,17 @@
  * but the listener and every accepted connection each get their own io
  * source on the manager's own m->event, at EVENT_PRIORITY_CTRL (manager.h).
  *
- * It carries exactly what nothing else can: start/stop/restart (which need
- * manager_add_job()) and reset-failed. Every read verb stays on the state
- * files (manager-state.h), daemon-reload stays SIGHUP, and reboot/poweroff
- * stay on the existing signals -- all three keep working when the socket or
- * the loop is wedged, which is the point.
+ * It carries what nothing else can: start/stop/restart (which need
+ * manager_add_job()), reset-failed, and daemon-reload (manager_reload(),
+ * also still reachable via SIGHUP for compatibility -- see unit-reload.c).
+ * Every read verb stays on the state files (manager-state.h), and
+ * reboot/poweroff stay on the existing signals -- both keep working when
+ * the socket or the loop is wedged, which is the point.
  *
  * Replies for start/stop/restart are DEFERRED until the job finishes, so
  * picoctl's exit code reports the real job result rather than mere
- * enqueueing (systemctl's own default wait behaviour).
+ * enqueueing (systemctl's own default wait behaviour). reset-failed and
+ * daemon-reload have no job to wait on and always reply immediately.
  */
 
 #pragma once

@@ -138,7 +138,7 @@ pico_init_core_sources = files(
   'src/unit-load.c',
   'src/conf-scan.c',
   'src/unit-parse.c',
-  # SIGHUP's daemon-reload: re-parse each loaded fragment into a scratch
+  # daemon-reload (SIGHUP or the picoctl ctrl verb): re-parse each loaded fragment into a scratch
   # unit, swap the directive values in only if it parsed cleanly.
   'src/unit-reload.c',
   'src/unit-dependency.c',

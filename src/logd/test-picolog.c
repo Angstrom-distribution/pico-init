@@ -154,6 +154,13 @@ static void test_reader_predicates(void) {
         ASSERT_TRUE(logd_entry_matches_unit(e0, NULL));            /* no filter matches anything */
         ASSERT_TRUE(!logd_entry_matches_unit(e2, "netd.service")); /* kernel entry has no _SYSTEMD_UNIT at all */
 
+        /* bare name mangling: `-u netd` must match _SYSTEMD_UNIT=netd.service,
+         * the same way systemctl/journalctl mangle an unsuffixed argument --
+         * this was the live-device bug (`journalctl -u picowl` found nothing). */
+        ASSERT_TRUE(logd_entry_matches_unit(e0, "netd"));
+        ASSERT_TRUE(!logd_entry_matches_unit(e0, "eudev"));
+        ASSERT_TRUE(!logd_entry_matches_unit(e0, "netd.socket")); /* known suffix, not mangled, no match */
+
         ASSERT_TRUE(logd_entry_matches_priority(e1, 4));  /* err(3) <= warning(4) */
         ASSERT_TRUE(!logd_entry_matches_priority(e0, 4)); /* info(6) > warning(4) */
 
@@ -430,6 +437,15 @@ static void test_cli_short_format_and_filters(void) {
         ASSERT_TRUE(strstr(out, "foo\nbar") == NULL);  /* the raw bytes never reach the default output */
 
         r = run_picolog_capture(picolog_path, "-u netd.service", out, sizeof(out), NULL);
+        ASSERT_EQ_INT(r, 0);
+        ASSERT_TRUE(strstr(out, "hello from netd") != NULL);
+        ASSERT_TRUE(strstr(out, "urgent warning") == NULL);
+        ASSERT_TRUE(strstr(out, "kernel booted") == NULL);
+
+        /* bare "-u netd" (no .service) must behave identically -- the
+         * live-device regression this fixes was exactly this invocation
+         * returning nothing against a real _SYSTEMD_UNIT=picowl.service entry. */
+        r = run_picolog_capture(picolog_path, "-u netd", out, sizeof(out), NULL);
         ASSERT_EQ_INT(r, 0);
         ASSERT_TRUE(strstr(out, "hello from netd") != NULL);
         ASSERT_TRUE(strstr(out, "urgent warning") == NULL);

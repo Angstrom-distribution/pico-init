@@ -571,6 +571,49 @@ static void test_reset_failed(void) {
         ctrl_fixture_teardown(&f);
 }
 
+/*
+ * daemon-reload (manager-ctrl.c's own addition for the picoctl verb):
+ * synchronous, no unit token, and -- the actual point of this test --
+ * drives manager_reload()'s full-rescan extension (unit-reload.c) through
+ * the real wire, not just unit-reload.c's own in-process test: a unit file
+ * dropped in after boot, plus a .wants/ symlink naming it, both take effect
+ * from one "PICO1 daemon-reload" round trip.
+ */
+static void test_daemon_reload(void) {
+        struct ctrl_fixture f;
+
+        ctrl_fixture_setup(&f);
+        ctrl_fixture_boot(&f);
+
+        ASSERT_TRUE(manager_get_unit(f.m, "newcomer.service") == NULL);
+
+        ASSERT_EQ_INT(test_write_file(f.unitdir, "newcomer.service", "[Service]\nExecStart=/bin/true\n"), 0);
+        ASSERT_EQ_INT(test_mkdir(f.unitdir, "default.target.wants"), 0);
+        ASSERT_EQ_INT(test_symlink(f.unitdir, "default.target.wants/newcomer.service", "../newcomer.service"),
+                      0);
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 daemon-reload", "ok\n", 100);
+
+        {
+                Unit *newcomer = manager_get_unit(f.m, "newcomer.service");
+                Unit *target = manager_get_unit(f.m, "default.target");
+
+                ASSERT_TRUE(newcomer != NULL);
+                ASSERT_EQ_INT(newcomer->load_state, UNIT_LOADED);
+                ASSERT_TRUE(target != NULL);
+                ASSERT_TRUE(unit_has_dependency(target, UNIT_WANTS, newcomer));
+                /* Known and enabled, but never started -- a daemon-reload
+                 * makes a unit startable, it does not start it. */
+                ASSERT_EQ_INT(unit_active_state(newcomer), UNIT_INACTIVE);
+        }
+
+        /* A grammar daemon-reload never carries -- there is no unit to
+         * name, so a stray token after the verb is simply malformed. */
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 daemon-reload extra.service", "err malformed\n", 100);
+
+        ctrl_fixture_teardown(&f);
+}
+
 /* --no-block replies the instant the job is enqueued, distinguishably from
  * the blocking path's "ok done" -- proving this is not just a fast blocking
  * reply is exactly why the two use different reply text. */
@@ -979,6 +1022,7 @@ int main(void) {
         test_start_while_stopping_waits();
         test_start_refused_while_shutting_down();
         test_reset_failed();
+        test_daemon_reload();
         test_no_block_replies_immediately();
         test_early_disconnect_leaks_nothing();
         test_displaced_job_gets_canceled_reply();
