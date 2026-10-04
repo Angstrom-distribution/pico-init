@@ -2422,6 +2422,9 @@ static int cmd_verb_generic(int argc, char *argv[], const char *wire_verb, const
                         picoctl_error("Job for %s timed out.", argv[i]);
                 else if (strcmp(reason, "failed") == 0)
                         print_job_failed(argv[i]);
+                else if (strcmp(reason, "dependency") == 0)
+                        picoctl_error("A dependency job for %s failed. See 'journalctl -xe' for details.",
+                                      argv[i]);
                 else
                         print_verb_failure(display_verb, argv[i], reason);
 
