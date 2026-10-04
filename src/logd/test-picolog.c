@@ -429,6 +429,7 @@ static void test_cli_short_format_and_filters(void) {
 
         r = run_picolog_capture(picolog_path, "", out, sizeof(out), NULL);
         ASSERT_EQ_INT(r, 0);
+        ASSERT_TRUE(strchr(out, '\x1B') == NULL); /* no tty, no colour: byte-identical to before */
         ASSERT_TRUE(strstr(out, "netd[42]: hello from netd") != NULL);
         ASSERT_TRUE(strstr(out, "eudev: urgent warning") !=
                     NULL); /* no _PID on this fixture entry -> no [pid] */
@@ -525,6 +526,72 @@ static void test_cli_export_passthrough(void) {
         printf("test-picolog: -o export is a true byte-for-byte passthrough of the on-disk entry\n");
 }
 
+static void build_color_fixture_ring(const char *dir) {
+        LogdWriter *w;
+
+        ASSERT_EQ_INT(logd_writer_new(&w), 0);
+        ASSERT_EQ_INT(logd_writer_set_runtime_dir(w, dir), 0);
+        ASSERT_EQ_INT(logd_writer_set_boot_id(w, TEST_BOOT_ID), 0);
+        ASSERT_EQ_INT(logd_writer_open(w), 0);
+
+        {
+                LogdField f[] = {
+                        {  "MESSAGE", "disk failure", strlen("disk failure") },
+                        { "PRIORITY",            "3",                      1 }, /* err */
+                };
+                ASSERT_EQ_INT(logd_writer_append(w, f, sizeof(f) / sizeof(f[0])), 0);
+        }
+        {
+                LogdField f[] = {
+                        {  "MESSAGE", "low battery", strlen("low battery") },
+                        { "PRIORITY",           "4",                     1 }, /* warning */
+                };
+                ASSERT_EQ_INT(logd_writer_append(w, f, sizeof(f) / sizeof(f[0])), 0);
+        }
+        {
+                LogdField f[] = {
+                        {  "MESSAGE", "link is up", strlen("link is up") },
+                        { "PRIORITY",          "5",                    1 }, /* notice  */
+                };
+                ASSERT_EQ_INT(logd_writer_append(w, f, sizeof(f) / sizeof(f[0])), 0);
+        }
+
+        logd_writer_free(w);
+}
+
+/* SYSTEMD_COLORS=true forces colour on even though popen()'s pipe isn't a
+ * tty (pico-color.h's documented priority order) -- real get_log_colors()'s
+ * mapping (terminal-util.c): err red, warning yellow, notice highlighted,
+ * wrapped exactly around the message text and nothing else on the line. */
+static void test_cli_color_priority_escapes(void) {
+        char picolog_path[4096];
+        char *dir = test_tmpdir_new();
+        char out[65536];
+        int r;
+
+        ASSERT_TRUE(dir != NULL);
+        ASSERT_TRUE(find_picolog(picolog_path, sizeof(picolog_path)));
+        build_color_fixture_ring(dir);
+        setenv("LOGD_RUNTIME_DIR", dir, 1);
+        setenv("SYSTEMD_COLORS", "true", 1);
+
+        r = run_picolog_capture(picolog_path, "", out, sizeof(out), NULL);
+        ASSERT_EQ_INT(r, 0);
+
+        /* err (priority 3): ANSI_HIGHLIGHT_RED .. ANSI_NORMAL */
+        ASSERT_TRUE(strstr(out, "\x1B[0;1;31mdisk failure\x1B[0m") != NULL);
+        /* warning (priority 4): ANSI_HIGHLIGHT_YELLOW (== ANSI_HIGHLIGHT_KHAKI3) .. ANSI_NORMAL */
+        ASSERT_TRUE(strstr(out, "\x1B[0;1;38:5:185mlow battery\x1B[0m") != NULL);
+        /* notice (priority 5): ANSI_HIGHLIGHT .. ANSI_NORMAL */
+        ASSERT_TRUE(strstr(out, "\x1B[0;1;39mlink is up\x1B[0m") != NULL);
+
+        unsetenv("SYSTEMD_COLORS");
+        unsetenv("LOGD_RUNTIME_DIR");
+        test_rm_rf(dir);
+        free(dir);
+        printf("test-picolog: SYSTEMD_COLORS=true colours err/warning/notice with upstream's own escapes\n");
+}
+
 static void test_cli_invalid_priority_rejected(void) {
         char picolog_path[4096];
         char out[4096];
@@ -545,6 +612,7 @@ int main(void) {
         test_follow_across_rotation();
         test_cli_short_format_and_filters();
         test_cli_export_passthrough();
+        test_cli_color_priority_escapes();
         test_cli_invalid_priority_rejected();
 
         printf("test-picolog: all cases passed\n");

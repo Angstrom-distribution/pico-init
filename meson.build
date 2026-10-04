@@ -757,7 +757,12 @@ logd_exe = executable(
 # operation and an ordinary user on a booted board should be able to run it.
 picolog_exe = executable(
   'picolog',
-  'src/logd/picolog.c',
+  [
+    'src/logd/picolog.c',
+    # Shared ANSI colour helper (pico-color.h), mirroring real journalctl's
+    # on/off rules and escape sequences.
+    'src/pico-color.c',
+  ],
   include_directories: logd_includes,
   link_whole: logd_core,
   link_with: pico_init_core,

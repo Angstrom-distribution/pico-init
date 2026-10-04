@@ -29,6 +29,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "../pico-color.h"
 #include "logd.h"
 
 typedef enum {
@@ -66,6 +67,55 @@ static int parse_priority(const char *s) {
         return -1;
 }
 
+/*
+ * --- colour: mirrors real journalctl's own rules exactly ------------------
+ *
+ * get_log_colors() (src/basic/terminal-util.c, systemd main as of commit
+ * 4c63532c28094aeba6dccc5afb9690e02fd98d66, 2026-10-04), the priority-based
+ * on/off wrap logs-show.c's output_short()/print_multiline() apply to the
+ * message text. Upstream also returns a third "highlight" colour for
+ * --grep's matched substring; picolog has no --grep, so only on/off exist
+ * here. Upstream's LOG_INFO case falls through with on/off left at the
+ * caller's "" pre-init -- i.e. no colour -- reproduced the same way below.
+ *
+ * Only the message text is wrapped: real output_short() never colours the
+ * timestamp/hostname/identifier/pid columns either (those are plain in
+ * every "-o short*" mode; only "-o verbose" underlines the timestamp and
+ * greys the cursor, a mode picolog doesn't implement).
+ */
+static void log_colors_for(int priority, const char **on, const char **off) {
+        if (priority <= 3) { /* LOG_EMERG..LOG_ERR */
+                *on = pico_ansi_highlight_red();
+                *off = pico_ansi_normal();
+        } else if (priority == 4) { /* LOG_WARNING */
+                *on = pico_ansi_highlight_yellow();
+                *off = pico_ansi_normal();
+        } else if (priority == 5) { /* LOG_NOTICE */
+                *on = pico_ansi_highlight();
+                *off = pico_ansi_normal();
+        } else if (priority >= 7) { /* LOG_DEBUG */
+                *on = pico_ansi_grey();
+                *off = pico_ansi_normal();
+        } else { /* LOG_INFO (6): no colour */
+                *on = "";
+                *off = "";
+        }
+}
+
+/* Same default (LOG_INFO) and same single-digit-only parse real
+ * output_short() uses for its own PRIORITY= field (logs-show.c:
+ * "priority_len == 1 && *priority >= '0' && *priority <= '7'") -- a
+ * missing or malformed field never colours a line red/grey by accident. */
+static int entry_priority(const LogdEntry *e) {
+        const LogdReadField *f = logd_entry_field(e, "PRIORITY");
+        const unsigned char *v = f ? f->value : NULL;
+
+        if (f && !f->binary && f->value_len == 1 && v[0] >= '0' && v[0] <= '7')
+                return v[0] - '0';
+
+        return 6; /* LOG_INFO */
+}
+
 static void hostname_buf(char *buf, size_t len) {
         if (gethostname(buf, len) < 0 || buf[0] == '\0')
                 snprintf(buf, len, "(none)"); /* this board's own observed hostname when unset, plan Status */
@@ -100,12 +150,14 @@ static void print_short(const LogdEntry *e, bool show_all) {
         const LogdReadField *ident = logd_entry_field(e, "SYSLOG_IDENTIFIER");
         const LogdReadField *comm = logd_entry_field(e, "_COMM");
         const LogdReadField *pid = logd_entry_field(e, "_PID");
+        const char *color_on, *color_off;
         char host[256];
         char timebuf[32];
         struct tm tmv;
         time_t sec = 0;
 
         hostname_buf(host, sizeof(host));
+        log_colors_for(entry_priority(e), &color_on, &color_off);
 
         if (rt && !rt->binary && rt->value_len > 0 && rt->value_len < 24) {
                 char numbuf[24];
@@ -141,11 +193,21 @@ static void print_short(const LogdEntry *e, bool show_all) {
 
         fputs(": ", stdout);
 
-        if (msg && !msg->binary)
+        /* Coloured like real print_multiline(): wrapped on/off around the
+         * message text, for both the plain-printable case and -a's raw-byte
+         * case (upstream's OUTPUT_SHOW_ALL still runs print_multiline, so
+         * still colours). The blob-data placeholder is upstream's own
+         * unconditional plain fprintf() outside that wrap -- never coloured,
+         * with or without -a. */
+        if (msg && !msg->binary) {
+                fputs(color_on, stdout);
                 fwrite(msg->value, 1, msg->value_len, stdout);
-        else if (msg && show_all)
+                fputs(color_off, stdout);
+        } else if (msg && show_all) {
+                fputs(color_on, stdout);
                 print_escaped(msg->value, msg->value_len);
-        else if (msg)
+                fputs(color_off, stdout);
+        } else if (msg)
                 printf("[%zu bytes blob data]",
                        msg->value_len); /* real's FORMAT_BYTES() wording (logs-show.c) */
 
