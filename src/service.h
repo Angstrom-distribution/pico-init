@@ -153,7 +153,7 @@ typedef struct Service {
         ServiceState state;
         ServiceResult result;
         ServiceStandardInput standard_input; /* StandardInput=, default SERVICE_STANDARD_INPUT_NULL */
-        char *tty_path; /* TTYPath=, absolute, owned; NULL = PICO_CONSOLE_PATH */
+        char *tty_path;                      /* TTYPath=, absolute, owned; NULL = PICO_CONSOLE_PATH */
 
         /* argv-style NULL-terminated vectors, owned */
         char **exec_start_pre; /* may be NULL */

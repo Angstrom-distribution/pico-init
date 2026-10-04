@@ -343,12 +343,8 @@ finish:
 }
 
 static const char * const unit_dependency_table[_UNIT_DEPENDENCY_MAX] = {
-        [UNIT_REQUIRES] = "Requires",
-        [UNIT_WANTS] = "Wants",
-        [UNIT_BEFORE] = "Before",
-        [UNIT_AFTER] = "After",
-        [UNIT_CONFLICTS] = "Conflicts",
-        [UNIT_CONFLICTED_BY] = "ConflictedBy",
+        [UNIT_REQUIRES] = "Requires", [UNIT_WANTS] = "Wants",         [UNIT_BEFORE] = "Before",
+        [UNIT_AFTER] = "After",       [UNIT_CONFLICTS] = "Conflicts", [UNIT_CONFLICTED_BY] = "ConflictedBy",
 };
 
 const char *unit_dependency_to_string(UnitDependency d) {
