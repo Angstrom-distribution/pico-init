@@ -43,7 +43,10 @@ implementation experience as each subsystem landed. Summary:
 - **cgroups**: v2 (unified), matching every modern kernel default.
 - **Networking**: a minimal from-scratch `netd` speaking `.network`-file
   syntax, built on lifted `sd-dhcp`/`sd-netlink` source rather than
-  hand-rolled DHCP or the whole of modern `systemd-networkd`.
+  hand-rolled DHCP or the whole of modern `systemd-networkd`. `netd` also
+  speaks LLDP: `LLDP=` listens for neighbours and `EmitLLDP=` announces
+  this host, with a bounded neighbour table per link and a strict frame
+  parser; `networkctl lldp` lists what was heard.
 - **Logging**: `logd`, a from-scratch syslog/journal-analogue daemon (not
   the real binary journal format) plus a slim `journalctl`-equivalent
   reader; no rate-limiting, sealing, or remote forwarding.
