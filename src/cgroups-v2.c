@@ -381,6 +381,30 @@ static void cgroup_reset_stale(const char *path) {
         (void) cgroup_v2_disable_controllers(path, NULL);
 }
 
+bool cgroup_v2_subgroup_name_valid(const char *name) {
+        if (!name || name[0] == '\0' || strlen(name) > 64)
+                return false;
+        if (name[0] == '.' || name[0] == '_' || strncmp(name, "cgroup.", 7) == 0)
+                return false;
+        return strchr(name, '/') == NULL;
+}
+
+int cgroup_v2_make_subgroup(const char *parent, const char *name, char *buf, size_t size) {
+        int n;
+
+        if (!parent || !name || !buf)
+                return -EINVAL;
+
+        n = snprintf(buf, size, "%s/%s", parent, name);
+        if (n < 0 || (size_t) n >= size)
+                return -ENAMETOOLONG;
+
+        if (mkdir(buf, 0755) < 0 && errno != EEXIST)
+                return -errno;
+
+        return 0;
+}
+
 int cgroup_v2_delegate_to(const char *path, uid_t uid, gid_t gid) {
         static const char * const files[] = { "cgroup.procs", "cgroup.subtree_control", "cgroup.threads" };
         size_t i;
@@ -659,6 +683,22 @@ int cgroup_v2_get_pids(struct pico_cgroup *cg, pid_t *pids, size_t max, size_t *
 
         *ret_n = c.n;
         return 0;
+}
+
+int cgroup_v2_get_pids_in(const char *dir, pid_t *pids, size_t max, size_t *ret_n) {
+        struct pico_cgroup cg = { .procs_fd = -1, .events_fd = -1, .kill_fd = -1 };
+        int r;
+
+        if (!dir)
+                return -EINVAL;
+
+        cg.procs_fd = open_ctrl_file(dir, "cgroup.procs", O_RDONLY);
+        if (cg.procs_fd < 0)
+                return cg.procs_fd;
+
+        r = cgroup_v2_get_pids(&cg, pids, max, ret_n);
+        close(cg.procs_fd);
+        return r;
 }
 
 struct signal_ctx {

@@ -322,6 +322,7 @@ static void publish_unit_file(Unit *u) {
                 "Job=%s\n"
                 "Delegate=%s\n"
                 "DelegateControllers=%s\n"
+                "DelegateSubgroup=%s\n"
                 "Degraded-Directives=%s\n"
                 "%s",
                 unit_active_state_to_string(unit_active_state(u)),
@@ -342,6 +343,7 @@ static void publish_unit_file(Unit *u) {
                 job_buf,
                 s && s->delegate ? "yes" : "no",
                 delegate_buf,
+                s && s->delegate_subgroup ? s->delegate_subgroup : "",
                 degraded ? degraded : "",
                 notify_buf);
         pico_mfree(degraded);

@@ -86,6 +86,7 @@
 #include <string.h>
 #include <strings.h> /* strcasecmp, for the boolean spellings */
 
+#include "cgroups-v2.h"
 #include "conf-scan.h"
 #include "manager.h"
 #include "service.h"
@@ -904,6 +905,38 @@ static int config_parse_delegate(
 
         s->delegate = true;
         s->delegate_controllers = mask;
+        return 0;
+}
+
+static int config_parse_delegate_subgroup(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        Service *s = unit_to_service(u, path, line);
+        char *copy;
+        (void) lvalue;
+
+        if (!s)
+                return 0;
+
+        if (rvalue[0] == '\0') {
+                s->delegate_subgroup = pico_mfree(s->delegate_subgroup);
+                return 0;
+        }
+
+        if (!cgroup_v2_subgroup_name_valid(rvalue)) {
+                pico_log(PICO_LOG_WARNING,
+                         "%s:%u: invalid DelegateSubgroup= value '%s', ignoring",
+                         path,
+                         line,
+                         rvalue);
+                return 0;
+        }
+
+        copy = pico_strdup(rvalue);
+        if (!copy)
+                return -ENOMEM;
+
+        free(s->delegate_subgroup);
+        s->delegate_subgroup = copy;
         return 0;
 }
 
@@ -1770,6 +1803,7 @@ static const ConfigItem config_items[] = {
         { SECTION_SERVICE,               "RestartSec",                 config_parse_restart_sec },
         { SECTION_SERVICE,          "RemainAfterExit",           config_parse_remain_after_exit },
         { SECTION_SERVICE,                 "Delegate",                    config_parse_delegate },
+        { SECTION_SERVICE,         "DelegateSubgroup",           config_parse_delegate_subgroup },
         { SECTION_SERVICE,          "TimeoutStartSec",           config_parse_timeout_start_sec },
         { SECTION_SERVICE,           "TimeoutStopSec",            config_parse_timeout_stop_sec },
         { SECTION_SERVICE,                     "User",                  config_parse_user_group },

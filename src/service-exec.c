@@ -829,19 +829,19 @@ static void exec_creds_free(ExecCreds *c) {
  * Reopens the unit's cgroup.procs by path rather than reusing any fd the
  * parent had open for it: everything this process inherited is closed in
  * the fd sweep before this runs (see child_exec() step 5), so there is
- * nothing to keep a list of in the first place. cg->path is a valid
- * copy-on-write pointer into the parent's heap; strings survive fork() even
+ * nothing to keep a list of in the first place. dir is a valid
+ * copy-on-write pointer into the parent's memory; strings survive fork() even
  * though live fds do not.
  */
-static void child_attach_cgroup(const struct pico_cgroup *cg) {
+static void child_attach_cgroup(const char *dir) {
         char path[PATH_MAX];
         char buf[32];
         int fd, n;
 
-        if (!cg || !cg->path)
+        if (!dir)
                 return;
 
-        n = snprintf(path, sizeof(path), "%s/cgroup.procs", cg->path);
+        n = snprintf(path, sizeof(path), "%s/cgroup.procs", dir);
         if (n < 0 || (size_t) n >= sizeof(path))
                 _exit(PICO_EXIT_CGROUP);
 
@@ -955,7 +955,8 @@ static _Noreturn void
                            int stdout_fd,
                            int exec_fd,
                            const ExecCreds *creds,
-                           bool tty_stdin) {
+                           bool tty_stdin,
+                           const char *cgroup_dir) {
         char pidbuf[32];
         sigset_t empty;
         int sig, fd;
@@ -1095,8 +1096,8 @@ static _Noreturn void
 
         /* 7. Attach to the unit's cgroup, if service.c managed to set one up
          * (cgroup setup is best-effort there -- see service_ensure_cgroup()). */
-        if (s->cgroup)
-                child_attach_cgroup(s->cgroup);
+        if (cgroup_dir)
+                child_attach_cgroup(cgroup_dir);
 
         /*
          * 8. StandardInput=socket: the accepted connection replaces the
@@ -1363,6 +1364,8 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
         char **file_env = NULL, **expanded_argv = NULL;
         bool has_unit_env, is_main, tty_stdin;
         ExecCreds creds;
+        char subgroup_path[PATH_MAX];
+        const char *cgroup_dir = NULL;
         int stdout_fd;
         int exec_pipe[2] = { -1, -1 };
         pid_t pid;
@@ -1404,6 +1407,35 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
                                  s->cgroup->path,
                                  (unsigned) creds.uid,
                                  strerror(-dr));
+        }
+
+        /* DelegateSubgroup=: the main process goes into <unit cgroup>/<name>, every other process
+         * of the unit into <unit cgroup>/.control, so the unit cgroup itself stays empty and the
+         * service may enable controllers in it. A subgroup that cannot be made falls back to the
+         * unit cgroup. */
+        if (s->cgroup) {
+                cgroup_dir = s->cgroup->path;
+
+                if (s->delegate && s->delegate_subgroup) {
+                        int sr = cgroup_v2_make_subgroup(
+                                        s->cgroup->path,
+                                        is_main ? s->delegate_subgroup : CGROUP_CONTROL_SUBGROUP,
+                                        subgroup_path,
+                                        sizeof(subgroup_path));
+
+                        if (sr < 0) {
+                                pico_log(PICO_LOG_WARNING,
+                                         "%s: DelegateSubgroup=: cannot create %s under %s: %s",
+                                         UNIT(s)->id,
+                                         is_main ? s->delegate_subgroup : CGROUP_CONTROL_SUBGROUP,
+                                         s->cgroup->path,
+                                         strerror(-sr));
+                        } else {
+                                cgroup_dir = subgroup_path;
+                                if (is_main && creds.set && creds.uid != 0 && creds.uid != (uid_t) -1)
+                                        (void) cgroup_v2_delegate_to(subgroup_path, creds.uid, creds.gid);
+                        }
+                }
         }
 
         /* Same placement reasoning: a required EnvironmentFile= that cannot
@@ -1549,7 +1581,8 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
                            stdout_fd,
                            exec_pipe[1],
                            &creds,
-                           tty_stdin); /* never returns */
+                           tty_stdin,
+                           cgroup_dir); /* never returns */
 
         /* COW: the child already has its own copy of everything argv/envp/
          * creds/stdout_fd point to, made at fork() -- freeing/closing the

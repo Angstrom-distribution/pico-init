@@ -163,5 +163,26 @@ int cgroup_v2_remove_tree(const char *path);
  */
 int cgroup_v2_delegate_to(const char *path, uid_t uid, gid_t gid);
 
+/* The cgroup the manager puts a unit's control processes in when a
+ * DelegateSubgroup= is set, so the unit cgroup itself holds no process. */
+#define CGROUP_CONTROL_SUBGROUP ".control"
+
+/*
+ * True for a name DelegateSubgroup= may use: one path component that the
+ * kernel's own files cannot collide with (systemd's rule: no leading '.' or
+ * '_', no "cgroup." prefix, no '/', not empty).
+ */
+bool cgroup_v2_subgroup_name_valid(const char *name);
+
+/*
+ * mkdir <parent>/<name> (an existing one is fine) and copy the path to buf.
+ * `name` is not checked here: callers pass CGROUP_CONTROL_SUBGROUP or a name
+ * cgroup_v2_subgroup_name_valid() accepted. 0 or -errno.
+ */
+int cgroup_v2_make_subgroup(const char *parent, const char *name, char *buf, size_t size);
+
+/* cgroup_v2_get_pids() for the cgroup directory `dir`, without a struct pico_cgroup. */
+int cgroup_v2_get_pids_in(const char *dir, pid_t *pids, size_t max, size_t *ret_n);
+
 /* Close fds, remove the cgroup directory and any empty cgroups below it, free. Returns NULL. */
 struct pico_cgroup *cgroup_v2_free(struct pico_cgroup *cg);

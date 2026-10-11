@@ -352,6 +352,47 @@ static void test_real_hierarchy(void) {
         ASSERT_TRUE(stat(path, &st) < 0 && errno == ENOENT);
 }
 
+/* DelegateSubgroup= names, the subgroup mkdir and pid listing by directory. */
+static void test_subgroup(void) {
+        char *dir;
+        char path[PATH_MAX];
+        char tiny[8], tiny2[PATH_MAX];
+        pid_t pids[4];
+        size_t n = 99;
+        struct stat st;
+
+        ASSERT_TRUE(cgroup_v2_subgroup_name_valid("main"));
+        ASSERT_TRUE(cgroup_v2_subgroup_name_valid("init.scope"));
+        ASSERT_TRUE(!cgroup_v2_subgroup_name_valid(NULL));
+        ASSERT_TRUE(!cgroup_v2_subgroup_name_valid(""));
+        ASSERT_TRUE(!cgroup_v2_subgroup_name_valid("."));
+        ASSERT_TRUE(!cgroup_v2_subgroup_name_valid(".control"));
+        ASSERT_TRUE(!cgroup_v2_subgroup_name_valid("_x"));
+        ASSERT_TRUE(!cgroup_v2_subgroup_name_valid("a/b"));
+        ASSERT_TRUE(!cgroup_v2_subgroup_name_valid("cgroup.procs"));
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(cgroup_v2_make_subgroup(dir, "main", path, sizeof(path)), 0);
+        ASSERT_TRUE(stat(path, &st) == 0 && S_ISDIR(st.st_mode));
+        ASSERT_EQ_INT(cgroup_v2_make_subgroup(dir, "main", path, sizeof(path)), 0); /* again: fine */
+        ASSERT_EQ_INT(cgroup_v2_make_subgroup(dir, "main", tiny, sizeof(tiny)), -ENAMETOOLONG);
+        ASSERT_EQ_INT(cgroup_v2_make_subgroup("/nonexistent-pico", "main", tiny2, sizeof(tiny2)), -ENOENT);
+
+        ASSERT_EQ_INT(cgroup_v2_get_pids_in(path, pids, 4, &n), -ENOENT); /* no cgroup.procs */
+        ASSERT_EQ_INT(test_write_file(path, "cgroup.procs", "11\n22\n"), 0);
+        ASSERT_EQ_INT(cgroup_v2_get_pids_in(path, pids, 4, &n), 0);
+        ASSERT_EQ_INT((int) n, 2);
+        ASSERT_EQ_INT((int) pids[0], 11);
+        ASSERT_EQ_INT((int) pids[1], 22);
+        ASSERT_EQ_INT(cgroup_v2_get_pids_in(path, pids, 1, &n), 0); /* more than fit: n is the full count */
+        ASSERT_EQ_INT((int) n, 2);
+
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
         test_enable();
         test_disable();
@@ -359,6 +400,7 @@ int main(void) {
         test_remove_below();
         test_stale_unit_cgroup();
         test_delegate_to();
+        test_subgroup();
         test_real_hierarchy();
         printf("test-cgroup-delegate: all checks passed\n");
         return 0;

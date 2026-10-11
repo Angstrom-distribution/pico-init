@@ -177,6 +177,7 @@ static const char *console_service =
                 "Type=simple\n"
                 "ExecStart=/bin/sleep 300\n"
                 "Delegate=pids cpu\n"
+                "DelegateSubgroup=main\n"
                 "\n"
                 "[Install]\n"
                 "WantedBy=default.target\n";
@@ -289,6 +290,29 @@ static void test_boot_files_match_reality(void) {
         ASSERT_STREQ(val, "yes");
         ASSERT_EQ_INT(read_property(rtdir, "console.service", "DelegateControllers", val, sizeof(val)), 0);
         ASSERT_STREQ(val, "cpu pids");
+        ASSERT_EQ_INT(read_property(rtdir, "console.service", "DelegateSubgroup", val, sizeof(val)), 0);
+        ASSERT_STREQ(val, "main");
+        ASSERT_EQ_INT(read_property(rtdir, "sysinit.service", "DelegateSubgroup", val, sizeof(val)), 0);
+        ASSERT_STREQ(val, "");
+        /* the main process is in <unit cgroup>/main and the unit cgroup itself is empty */
+        {
+                char procs[PATH_MAX + 128], want[32];
+                FILE *pf;
+
+                snprintf(procs, sizeof(procs), "%s/system.slice/console.service/main/cgroup.procs", cgroup_root);
+                pf = fopen(procs, "re");
+                ASSERT_TRUE(pf != NULL);
+                ASSERT_TRUE(fgets(val, sizeof(val), pf) != NULL);
+                fclose(pf);
+                snprintf(want, sizeof(want), "%d\n", (int) SERVICE(console)->main_pid);
+                ASSERT_STREQ(val, want);
+
+                snprintf(procs, sizeof(procs), "%s/system.slice/console.service/cgroup.procs", cgroup_root);
+                pf = fopen(procs, "re");
+                ASSERT_TRUE(pf != NULL);
+                ASSERT_TRUE(fgets(val, sizeof(val), pf) == NULL);
+                fclose(pf);
+        }
         ASSERT_EQ_INT(read_property(rtdir, "sysinit.service", "Delegate", val, sizeof(val)), 0);
         ASSERT_STREQ(val, "no");
         ASSERT_EQ_INT(read_property(rtdir, "sysinit.service", "DelegateControllers", val, sizeof(val)), 0);

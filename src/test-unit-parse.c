@@ -1777,6 +1777,50 @@ static void test_delegate(void) {
 }
 
 /*
+ * DelegateSubgroup= takes one cgroup path component; a bad name is ignored
+ * with a warning and the earlier value stays, an empty one clears it.
+ */
+static void test_delegate_subgroup(void) {
+        Manager *m;
+        char *dir;
+        Service *s;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "sub.service",
+                                      "[Service]\nExecStart=/bin/true\nDelegate=yes\nDelegateSubgroup=main\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "bad.service",
+                                      "[Service]\nExecStart=/bin/true\nDelegateSubgroup=main\nDelegateSubgroup=a/b\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "clear.service",
+                                      "[Service]\nExecStart=/bin/true\nDelegateSubgroup=main\nDelegateSubgroup=\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir, "none.service", "[Service]\nExecStart=/bin/true\n"), 0);
+
+        m = manager_for(dir);
+
+        s = (Service *) load_one(m, "sub.service");
+        ASSERT_TRUE(s->delegate_subgroup != NULL);
+        ASSERT_STREQ(s->delegate_subgroup, "main");
+        ASSERT_EQ_INT(UNIT(s)->n_degraded_directives, 0);
+        s = (Service *) load_one(m, "bad.service");
+        ASSERT_STREQ(s->delegate_subgroup, "main");
+        s = (Service *) load_one(m, "clear.service");
+        ASSERT_TRUE(s->delegate_subgroup == NULL);
+        s = (Service *) load_one(m, "none.service");
+        ASSERT_TRUE(s->delegate_subgroup == NULL);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
  * ExecStop= goes through ExecStart='s own parse_exec_line(), so the prefix
  * rules are the same ones: '-' glued to the path is kept per line, '-'
  * separated from it by whitespace is refused, and the modifiers pico-init
@@ -2192,6 +2236,7 @@ int main(void) {
         test_forking_directives();
         test_exec_dash_prefix_sets_ignore();
         test_delegate();
+        test_delegate_subgroup();
         test_exec_stop_lines();
         test_exec_condition_stop_post_reload_lines();
         test_bare_exec_name_is_accepted();

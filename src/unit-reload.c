@@ -137,6 +137,7 @@ static void service_swap_directives(Service *s, Service *fresh) {
         SWAP_FIELD(s->remain_after_exit, fresh->remain_after_exit);
         SWAP_FIELD(s->delegate, fresh->delegate);
         SWAP_FIELD(s->delegate_controllers, fresh->delegate_controllers);
+        SWAP_FIELD(s->delegate_subgroup, fresh->delegate_subgroup);
         SWAP_FIELD(s->restart, fresh->restart);
         SWAP_FIELD(s->restart_usec, fresh->restart_usec);
         SWAP_FIELD(s->timeout_start_usec, fresh->timeout_start_usec);

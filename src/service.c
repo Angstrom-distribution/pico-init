@@ -346,6 +346,29 @@ static int service_cgroup_populated(Service *s) {
 
 /* --- Type=forking: locating the main pid once the parent has exited --- */
 
+/* The unit's processes: its own cgroup.procs plus the DelegateSubgroup=, where
+ * the main process lives. As cgroup_v2_get_pids(): *ret_n may exceed max. */
+static int service_get_pids(Service *s, pid_t *pids, size_t max, size_t *ret_n) {
+        char dir[PATH_MAX];
+        size_t n1 = 0, n2 = 0, used;
+        int r;
+
+        r = cgroup_v2_get_pids(s->cgroup, pids, max, &n1);
+        if (r < 0)
+                return r;
+
+        if (s->delegate && s->delegate_subgroup &&
+            snprintf(dir, sizeof(dir), "%s/%s", s->cgroup->path, s->delegate_subgroup) < (int) sizeof(dir)) {
+                used = n1 < max ? n1 : max;
+                /* a subgroup that is not there yet or any more has no members */
+                if (cgroup_v2_get_pids_in(dir, pids + used, max - used, &n2) < 0)
+                        n2 = 0;
+        }
+
+        *ret_n = n1 + n2;
+        return 0;
+}
+
 /* True when pid is listed in the unit's own cgroup.procs. A cgroup that
  * could not be created (service_ensure_cgroup() failed, logged there) has
  * no membership to check against, and then the answer is "unknown", which
@@ -357,7 +380,7 @@ static bool service_pid_in_cgroup(Service *s, pid_t pid) {
         if (!s->cgroup)
                 return false;
 
-        if (cgroup_v2_get_pids(s->cgroup, pids, sizeof(pids) / sizeof(pids[0]), &n) < 0)
+        if (service_get_pids(s, pids, sizeof(pids) / sizeof(pids[0]), &n) < 0)
                 return false;
 
         for (i = 0; i < n && i < sizeof(pids) / sizeof(pids[0]); i++)
@@ -457,7 +480,7 @@ static int service_search_main_pid(Service *s) {
         if (!s->guess_main_pid || !s->cgroup)
                 return -ENOENT;
 
-        if (cgroup_v2_get_pids(s->cgroup, pids, sizeof(pids) / sizeof(pids[0]), &n) < 0)
+        if (service_get_pids(s, pids, sizeof(pids) / sizeof(pids[0]), &n) < 0)
                 return -ENOENT;
 
         if (n > sizeof(pids) / sizeof(pids[0]))
@@ -753,7 +776,7 @@ static void service_signal_cgroup_rest(Service *s, int sig) {
         pid_t pids[64];
         size_t n = 0, i;
 
-        if (!s->cgroup || cgroup_v2_get_pids(s->cgroup, pids, sizeof(pids) / sizeof(pids[0]), &n) < 0)
+        if (!s->cgroup || service_get_pids(s, pids, sizeof(pids) / sizeof(pids[0]), &n) < 0)
                 return;
 
         if (n > sizeof(pids) / sizeof(pids[0])) {
@@ -1930,6 +1953,7 @@ static void service_done(Unit *u) {
         s->group = pico_mfree(s->group);
         s->supplementary_groups = pico_strv_free(s->supplementary_groups);
         s->pid_file = pico_mfree(s->pid_file);
+        s->delegate_subgroup = pico_mfree(s->delegate_subgroup);
         s->tty_path = pico_mfree(s->tty_path);
         s->status_text = pico_mfree(s->status_text);
 
