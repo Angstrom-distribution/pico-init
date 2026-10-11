@@ -219,7 +219,7 @@
           and udev_monitor delivers real uevents; the cgroup queries of
           sd-login are answered from /proc.
 
-        * Functions without a mechanism behind them return an honest error
+        * Functions without a mechanism behind them return an error
           rather than a fake success: sd-bus never connects, there is no
           hwdb, and the logind queries report no sessions or seats.
 
