@@ -190,7 +190,7 @@ LGPL-2.1-or-later. Every file carries an SPDX identifier or is covered by
 [`LICENSES/`](LICENSES/). The DHCPv4 code under `src/netd/dhcp/`, the SNTP
 and time code in `src/netd/`, and the vendored systemd symbol and
 `pkg-config` files are LGPL-2.1-or-later; `siphash24` is CC0-1.0 and
-`sparse-endian.h` is MIT.
+`sparse-endian.h` is MIT. The iPAQ drawing in `docs/demo.svg` is CC-BY-SA-4.0.
 
 ## Contributing and security
 
