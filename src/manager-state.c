@@ -232,6 +232,7 @@ static void publish_unit_file(Unit *u) {
         char notify_buf[192] = "";
         char *degraded;
         char delegate_buf[64];
+        char kill_buf[128];
         Service *s = NULL;
         FILE *f;
         int n;
@@ -298,6 +299,15 @@ static void publish_unit_file(Unit *u) {
 
         /* Delegate=/DelegateControllers=: systemctl show's pair; the controller
          * list is empty unless the unit named some. */
+        kill_buf[0] = '\0';
+        if (s)
+                snprintf(kill_buf,
+                         sizeof(kill_buf),
+                         "KillMode=%s\nKillSignal=%d\nSendSIGKILL=%s\nSendSIGHUP=%s\n",
+                         kill_mode_to_string(s->kill_mode),
+                         s->kill_signal,
+                         s->send_sigkill ? "yes" : "no",
+                         s->send_sighup ? "yes" : "no");
         delegate_buf[0] = '\0';
         if (s && s->delegate)
                 service_delegate_controllers_to_string(
@@ -319,6 +329,7 @@ static void publish_unit_file(Unit *u) {
                 "Delegate=%s\n"
                 "DelegateControllers=%s\n"
                 "DelegateSubgroup=%s\n"
+                "%s"
                 "Degraded-Directives=%s\n"
                 "%s",
                 unit_active_state_to_string(unit_active_state(u)),
@@ -340,6 +351,7 @@ static void publish_unit_file(Unit *u) {
                 s && s->delegate ? "yes" : "no",
                 delegate_buf,
                 s && s->delegate_subgroup ? s->delegate_subgroup : "",
+                kill_buf,
                 degraded ? degraded : "",
                 notify_buf);
         pico_mfree(degraded);

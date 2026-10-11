@@ -246,12 +246,28 @@ static void service_arm_timeout(Service *s, usec_t timeout, pico_timer_callback_
 
 /* --- cgroup helpers --- */
 
+static void service_signal_cgroup_rest(Service *s, int sig);
+
+/* control-group and mixed signal the cgroup's other members; process and none
+ * leave them alone, as upstream's unit_kill_context(). */
+static bool service_signals_cgroup(const Service *s) {
+        return s->kill_mode == KILL_CONTROL_GROUP || s->kill_mode == KILL_MIXED;
+}
+
 static void service_kill_stale_cgroup_members(Service *s) {
         if (!s->cgroup)
                 return;
 
         if (cgroup_v2_is_empty(s->cgroup) == 1)
                 return;
+
+        if (!service_signals_cgroup(s)) {
+                pico_log(PICO_LOG_WARNING,
+                         "%s: left-over processes in the cgroup, leaving them (KillMode=%s)",
+                         UNIT(s)->id,
+                         kill_mode_to_string(s->kill_mode));
+                return;
+        }
 
         /* 8f53a7b8ea: leftovers from a previous run, or anything
          * ExecStartPre= itself leaked, must never survive into this run. */
@@ -278,8 +294,19 @@ static void service_reap_cgroup_remainder(Service *s) {
                 return;
         }
 
+        if (!service_signals_cgroup(s)) {
+                pico_log(PICO_LOG_INFO,
+                         "%s: main process exited, leaving the remainder of its cgroup (KillMode=%s)",
+                         UNIT(s)->id,
+                         kill_mode_to_string(s->kill_mode));
+                return;
+        }
+
         pico_log(PICO_LOG_INFO, "%s: main process exited, killing the remainder of its cgroup", UNIT(s)->id);
-        cgroup_v2_kill(s->cgroup);
+        if (s->send_sigkill)
+                cgroup_v2_kill(s->cgroup);
+        else
+                service_signal_cgroup_rest(s, s->kill_signal);
 }
 
 static int service_ensure_cgroup(Service *s) {
@@ -332,6 +359,26 @@ static int service_cgroup_populated(Service *s) {
                 return 0;
 
         return cgroup_v2_is_empty(s->cgroup) == 0 ? 1 : 0;
+}
+
+/* service_cgroup_populated() for the stop phases: a unit that leaves the rest
+ * of its cgroup alone has nothing to wait for there. */
+static int service_cgroup_wait(Service *s) {
+        return service_signals_cgroup(s) ? service_cgroup_populated(s) : 0;
+}
+
+/* KillMode=mixed: the main process got the stop signal, and once it is gone
+ * the rest of the cgroup gets SIGKILL. */
+static void service_mixed_final_kill(Service *s) {
+        if (s->kill_mode == KILL_MIXED && s->send_sigkill && service_cgroup_populated(s) == 1)
+                cgroup_v2_kill(s->cgroup);
+}
+
+/* The stop signal for one process, followed by SIGHUP under SendSIGHUP=. */
+static void service_signal_pid(Service *s, pid_t pid) {
+        (void) kill(pid, s->kill_signal);
+        if (s->send_sighup && s->kill_signal != SIGHUP)
+                (void) kill(pid, SIGHUP);
 }
 
 /* --- Type=forking: locating the main pid once the parent has exited --- */
@@ -821,24 +868,37 @@ static void service_enter_stop(Service *s) {
                  * SIGKILL) finish it. Otherwise skip SERVICE_STOP entirely
                  * rather than arm a timeout for a death that already
                  * happened (or never started at all: a failed fork). */
-                if (service_cgroup_populated(s) == 0) {
+                if (service_cgroup_wait(s) == 0) {
+                        service_enter_stop_post(s);
+                        return;
+                }
+
+                /* mixed signals only the main and control processes, and
+                 * there are none: straight on to its SIGKILL step. */
+                if (s->kill_mode == KILL_MIXED && !s->send_sigkill) {
                         service_enter_stop_post(s);
                         return;
                 }
 
                 service_set_state(s, SERVICE_STOP);
-                cgroup_v2_signal(s->cgroup, SIGTERM);
+                if (s->kill_mode == KILL_MIXED)
+                        cgroup_v2_kill(s->cgroup);
+                else
+                        cgroup_v2_signal(s->cgroup, s->kill_signal);
                 service_arm_timeout(s, s->timeout_stop_usec, service_timer_stop_timeout);
                 return;
         }
 
         service_set_state(s, SERVICE_STOP);
 
-        if (mp > 0)
-                kill(s->main_pid, SIGTERM);
-        if (cp > 0)
-                kill(s->control_pid, SIGTERM);
-        service_signal_cgroup_rest(s, SIGTERM);
+        if (s->kill_mode != KILL_NONE) {
+                if (mp > 0)
+                        service_signal_pid(s, s->main_pid);
+                if (cp > 0)
+                        service_signal_pid(s, s->control_pid);
+                if (s->kill_mode == KILL_CONTROL_GROUP)
+                        service_signal_cgroup_rest(s, s->kill_signal);
+        }
 
         service_arm_timeout(s, s->timeout_stop_usec, service_timer_stop_timeout);
 }
@@ -1431,14 +1491,16 @@ void service_sigchld_event(Service *s, pid_t pid, int code, int status) {
                                          "%s: ExecStopPost= command %s failed",
                                          UNIT(s)->id,
                                          s->exec_stop_post[s->exec_stop_post_idx].argv[0]);
-                        service_signal_cgroup_rest(s, SIGKILL);
+                        if (service_signals_cgroup(s) && s->send_sigkill)
+                                service_signal_cgroup_rest(s, SIGKILL);
                         s->control_pid = 0;
                         service_enter_dead(s);
                 } else if (s->state == SERVICE_STOP && main_pid_good(s) == 0) {
                         s->control_pid = 0;
+                        service_mixed_final_kill(s);
                         /* The rest of the cgroup was signalled too: its
                          * cgroup-empty event, or the stop timeout, ends it. */
-                        if (service_cgroup_populated(s) == 0)
+                        if (service_cgroup_wait(s) == 0)
                                 service_enter_stop_post(s);
                 } else
                         s->control_pid = 0;
@@ -1480,9 +1542,11 @@ void service_sigchld_event(Service *s, pid_t pid, int code, int status) {
                 break;
 
         case SERVICE_STOP:
+                if (control_pid_good(s) == 0)
+                        service_mixed_final_kill(s);
                 /* Not dead while the rest of the cgroup is still exiting:
                  * its cgroup-empty event, or the stop timeout, ends it. */
-                if (control_pid_good(s) == 0 && service_cgroup_populated(s) == 0)
+                if (control_pid_good(s) == 0 && service_cgroup_wait(s) == 0)
                         service_enter_stop_post(s);
                 break;
 
@@ -1613,11 +1677,24 @@ static void service_timer_stop_timeout(void *userdata, usec_t now) {
         if (s->result == SERVICE_SUCCESS)
                 s->result = SERVICE_FAILURE_TIMEOUT;
 
-        if (s->cgroup)
+        if (s->kill_mode == KILL_NONE || !s->send_sigkill) {
+                /* Nothing may be killed: give up on the processes instead. */
+                pico_log(PICO_LOG_WARNING,
+                         "%s: not escalating (KillMode=%s, SendSIGKILL=%s), leaving the processes",
+                         UNIT(s)->id,
+                         kill_mode_to_string(s->kill_mode),
+                         s->send_sigkill ? "yes" : "no");
+                s->main_pid = 0;
+                s->control_pid = 0;
+                service_enter_stop_post(s);
+                return;
+        }
+
+        if (s->cgroup && service_signals_cgroup(s))
                 cgroup_v2_kill(s->cgroup);
         else {
-                /* No cgroup to sweep with: escalate directly on whichever
-                 * pid we still hold. */
+                /* No cgroup to sweep with, or KillMode=process: escalate
+                 * directly on whichever pid we still hold. */
                 if (main_pid_good(s) > 0)
                         kill(s->main_pid, SIGKILL);
                 if (control_pid_good(s) > 0)
@@ -1650,7 +1727,7 @@ static void service_timer_stop_post_timeout(void *userdata, usec_t now) {
          * line's SIGCHLD neither continues it nor counts as '-'-ignorable. */
         s->exec_stop_post_idx = s->n_exec_stop_post;
 
-        if (s->cgroup)
+        if (s->cgroup && service_signals_cgroup(s))
                 cgroup_v2_kill(s->cgroup);
         else if (control_pid_good(s) > 0)
                 kill(s->control_pid, SIGKILL);
@@ -1790,6 +1867,20 @@ static const char * const service_restart_table[_SERVICE_RESTART_MAX] = {
         [SERVICE_RESTART_ALWAYS] = "always",
 };
 
+static const char * const kill_mode_table[_KILL_MODE_MAX] = {
+        [KILL_CONTROL_GROUP] = "control-group",
+        [KILL_MIXED] = "mixed",
+        [KILL_PROCESS] = "process",
+        [KILL_NONE] = "none",
+};
+
+const char *kill_mode_to_string(KillMode m) {
+        if (m < 0 || m >= _KILL_MODE_MAX)
+                return "invalid";
+
+        return kill_mode_table[m];
+}
+
 const char *service_restart_to_string(ServiceRestart r) {
         if (r < 0 || r >= _SERVICE_RESTART_MAX)
                 return "invalid";
@@ -1890,6 +1981,9 @@ static void service_init(Unit *u) {
         s->start_limit_burst = PICO_START_LIMIT_BURST;
         s->exec_fd = -1;
         s->guess_main_pid = true; /* GuessMainPID= defaults to yes */
+        s->kill_mode = KILL_CONTROL_GROUP;
+        s->kill_signal = SIGTERM;
+        s->send_sigkill = true;
 }
 
 /*
@@ -1934,6 +2028,11 @@ static void service_done(Unit *u) {
         if (s->cgroup && s->cgroup->events_source)
                 s->cgroup->events_source = sd_event_source_disable_unref(s->cgroup->events_source);
 
+        /* Processes left running in it (KillMode=process or none) must not
+         * block removal of the unit: the manager keeps the bare cgroup. */
+        if (s->cgroup && cgroup_v2_is_empty(s->cgroup) == 0 && u->manager &&
+            manager_adopt_cgroup(u->manager, s->cgroup) == 0)
+                s->cgroup = NULL;
         s->cgroup = cgroup_v2_free(s->cgroup);
 }
 

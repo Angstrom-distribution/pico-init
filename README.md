@@ -72,7 +72,8 @@ Directives that are honoured:
   `RestartSec=`, `RemainAfterExit=`, `TimeoutStartSec=`,
   `TimeoutStopSec=`, `StandardInput=` (`socket`, `tty`, `tty-force`,
   `tty-fail`), `TTYPath=`, `StandardOutput=`/`StandardError=` (`inherit`,
-  `journal`, `syslog`, `null`), `Delegate=`, `DelegateSubgroup=`.
+  `journal`, `syslog`, `null`), `Delegate=`, `DelegateSubgroup=`, `KillMode=`,
+  `KillSignal=`, `SendSIGHUP=`, `SendSIGKILL=`.
 - `[Socket]`: `ListenStream=`, `ListenDatagram=`, `Service=`, `Accept=`,
   `SocketMode=`, `Backlog=`, `MaxConnections=`.
 - `[Install]`: `WantedBy=`, `RequiredBy=`.
@@ -107,6 +108,12 @@ unit cgroup holds no process and the service can enable controllers in it.
 Child cgroups are removed depth-first when the unit stops, and a stale,
 empty unit cgroup is reset before the next start. `picoctl show` prints
 `Delegate=`, `DelegateControllers=` and `DelegateSubgroup=`.
+
+`KillMode=process` and `none` leave the rest of a unit's cgroup running when
+its main process exits or the unit stops, which is how a login through a
+socket-activated `dropbear@` keeps `screen` and `tmux` alive. Such a cgroup
+is kept until its processes exit, and at reboot and poweroff everything left
+gets SIGTERM, then SIGKILL.
 
 ## Networking and time
 

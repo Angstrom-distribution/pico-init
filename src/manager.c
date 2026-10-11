@@ -15,6 +15,7 @@
 #include <sys/prctl.h>
 #include <unistd.h>
 
+#include "cgroups-v2.h"
 #include "manager-ctrl.h"
 #include "manager-notify.h"
 #include "manager-state.h"
@@ -23,6 +24,11 @@
 #include "sd-event.h"
 #include "service.h"
 #include "unit-name.h"
+
+struct pico_cgroup_orphan {
+        struct pico_cgroup *cg;
+        struct pico_cgroup_orphan *next;
+};
 
 static const char * const default_unit_path[] = {
         PICO_UNIT_DIR,
@@ -258,6 +264,18 @@ Manager *manager_free(Manager *m) {
                 unit_free(m->units[i]);
         free(m->units);
 
+        /* units are gone, so every cgroup they handed over is on the list */
+        if (m->orphan_timer)
+                pico_timer_cancel(m->timer, m->orphan_timer);
+        m->orphan_timer = NULL;
+        while (m->orphan_cgroups) {
+                struct pico_cgroup_orphan *o = m->orphan_cgroups;
+
+                m->orphan_cgroups = o->next;
+                cgroup_v2_free(o->cg);
+                free(o);
+        }
+
         m->unit_path = pico_strv_free(m->unit_path);
         m->preset_path = pico_strv_free(m->preset_path);
         m->cgroup_root = pico_mfree(m->cgroup_root);
@@ -409,6 +427,85 @@ void manager_enqueue_cgroup_empty(Manager *m, Unit *u) {
          * second unit queueing before the first has been popped). */
         if (m->cgroup_empty_source)
                 sd_event_source_set_enabled(m->cgroup_empty_source, SD_EVENT_ONESHOT);
+}
+
+/* An orphaned cgroup is checked this often; the interval is only how long an
+ * emptied directory lingers. */
+#define PICO_ORPHAN_POLL_USEC (30 * USEC_PER_SEC)
+
+static void manager_orphan_timer(void *userdata, usec_t now);
+
+static void manager_arm_orphan_timer(Manager *m) {
+        int r;
+
+        if (m->orphan_timer || !m->orphan_cgroups || !m->timer)
+                return;
+
+        r = pico_timer_add(
+                        m->timer,
+                        usec_add(now_monotonic(), PICO_ORPHAN_POLL_USEC),
+                        manager_orphan_timer,
+                        m,
+                        &m->orphan_timer);
+        if (r < 0)
+                pico_log(PICO_LOG_WARNING, "cannot arm the orphaned cgroup timer: %s", strerror(-r));
+}
+
+void manager_reap_orphan_cgroups(Manager *m) {
+        struct pico_cgroup_orphan **cur;
+
+        if (!m)
+                return;
+
+        for (cur = &m->orphan_cgroups; *cur;) {
+                struct pico_cgroup_orphan *o = *cur;
+
+                /* an error reads as gone: the directory was removed under us */
+                if (cgroup_v2_is_empty(o->cg) == 0) {
+                        cur = &o->next;
+                        continue;
+                }
+
+                *cur = o->next;
+                pico_log(PICO_LOG_INFO, "%s: orphaned cgroup is empty, removing it", o->cg->path);
+                cgroup_v2_free(o->cg);
+                free(o);
+        }
+}
+
+static void manager_orphan_timer(void *userdata, usec_t now) {
+        Manager *m = userdata;
+
+        (void) now;
+        m->orphan_timer = NULL;
+        manager_reap_orphan_cgroups(m);
+        manager_arm_orphan_timer(m);
+}
+
+int manager_adopt_cgroup(Manager *m, struct pico_cgroup *cg) {
+        struct pico_cgroup_orphan *o;
+
+        if (!m || !cg)
+                return -EINVAL;
+
+        o = calloc(1, sizeof(*o));
+        if (!o)
+                return -ENOMEM;
+
+        /* nothing watches it any more: the unit that did is gone */
+        if (cg->events_source)
+                cg->events_source = sd_event_source_disable_unref(cg->events_source);
+        cg->userdata = NULL;
+
+        o->cg = cg;
+        o->next = m->orphan_cgroups;
+        m->orphan_cgroups = o;
+
+        pico_log(PICO_LOG_INFO,
+                 "%s: processes are still running in it, leaving the cgroup until they exit",
+                 cg->path);
+        manager_arm_orphan_timer(m);
+        return 0;
 }
 
 void manager_dequeue_cgroup_empty(Manager *m, Unit *u) {

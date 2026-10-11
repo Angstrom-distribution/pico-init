@@ -64,6 +64,7 @@
 #include "unit.h"
 
 #include <errno.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h> /* snprintf, for the degradation record's name=qualifier form */
 #include <stdlib.h>
@@ -877,6 +878,128 @@ static int config_parse_delegate_subgroup(
 
         free(s->delegate_subgroup);
         s->delegate_subgroup = copy;
+        return 0;
+}
+
+static int config_parse_kill_mode(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        Service *s = unit_to_service(u, path, line);
+        KillMode m;
+        (void) lvalue;
+
+        if (!s)
+                return 0;
+
+        if (rvalue[0] == '\0') {
+                s->kill_mode = KILL_CONTROL_GROUP;
+                return 0;
+        }
+
+        for (m = 0; m < _KILL_MODE_MAX; m++)
+                if (strcmp(rvalue, kill_mode_to_string(m)) == 0) {
+                        s->kill_mode = m;
+                        return 0;
+                }
+
+        pico_log(PICO_LOG_WARNING, "%s:%u: invalid KillMode= value '%s', ignoring", path, line, rvalue);
+        return 0;
+}
+
+/* The standard signals by name, with or without the SIG prefix, or a number. */
+static int parse_signal_name(const char *v) {
+        static const struct {
+                const char *name;
+                int sig;
+        } table[] = {
+                {  "HUP",  SIGHUP },
+                {  "INT",  SIGINT },
+                { "QUIT", SIGQUIT },
+                { "ABRT", SIGABRT },
+                { "KILL", SIGKILL },
+                { "USR1", SIGUSR1 },
+                { "USR2", SIGUSR2 },
+                { "TERM", SIGTERM },
+                { "CONT", SIGCONT },
+                { "STOP", SIGSTOP },
+                { "TSTP", SIGTSTP },
+                { "PIPE", SIGPIPE },
+                { "ALRM", SIGALRM },
+        };
+        char *end;
+        long n;
+        size_t i;
+
+        if (strncmp(v, "SIG", 3) == 0)
+                v += 3;
+
+        for (i = 0; i < sizeof(table) / sizeof(table[0]); i++)
+                if (strcmp(v, table[i].name) == 0)
+                        return table[i].sig;
+
+        n = strtol(v, &end, 10);
+        if (v[0] != '\0' && *end == '\0' && n > 0 && n < 32)
+                return (int) n;
+
+        return -1;
+}
+
+static int config_parse_kill_signal(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        Service *s = unit_to_service(u, path, line);
+        int sig;
+        (void) lvalue;
+
+        if (!s)
+                return 0;
+
+        if (rvalue[0] == '\0') {
+                s->kill_signal = SIGTERM;
+                return 0;
+        }
+
+        sig = parse_signal_name(rvalue);
+        if (sig < 0) {
+                pico_log(PICO_LOG_WARNING, "%s:%u: invalid KillSignal= value '%s', ignoring", path, line, rvalue);
+                return 0;
+        }
+
+        s->kill_signal = sig;
+        return 0;
+}
+
+static int config_parse_send_sighup(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        Service *s = unit_to_service(u, path, line);
+        bool b;
+        (void) lvalue;
+
+        if (!s)
+                return 0;
+
+        if (parse_boolean_value(rvalue, &b) < 0) {
+                pico_log(PICO_LOG_WARNING, "%s:%u: invalid SendSIGHUP= value '%s', ignoring", path, line, rvalue);
+                return 0;
+        }
+
+        s->send_sighup = b;
+        return 0;
+}
+
+static int config_parse_send_sigkill(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        Service *s = unit_to_service(u, path, line);
+        bool b;
+        (void) lvalue;
+
+        if (!s)
+                return 0;
+
+        if (parse_boolean_value(rvalue, &b) < 0) {
+                pico_log(PICO_LOG_WARNING, "%s:%u: invalid SendSIGKILL= value '%s', ignoring", path, line, rvalue);
+                return 0;
+        }
+
+        s->send_sigkill = b;
         return 0;
 }
 
@@ -1722,6 +1845,10 @@ static const ConfigItem config_items[] = {
         { SECTION_SERVICE,               "RestartSec",                 config_parse_restart_sec },
         { SECTION_SERVICE,          "RemainAfterExit",           config_parse_remain_after_exit },
         { SECTION_SERVICE,                 "Delegate",                    config_parse_delegate },
+        { SECTION_SERVICE,                 "KillMode",                   config_parse_kill_mode },
+        { SECTION_SERVICE,               "KillSignal",                 config_parse_kill_signal },
+        { SECTION_SERVICE,               "SendSIGHUP",                 config_parse_send_sighup },
+        { SECTION_SERVICE,              "SendSIGKILL",                config_parse_send_sigkill },
         { SECTION_SERVICE,         "DelegateSubgroup",           config_parse_delegate_subgroup },
         { SECTION_SERVICE,          "TimeoutStartSec",           config_parse_timeout_start_sec },
         { SECTION_SERVICE,           "TimeoutStopSec",            config_parse_timeout_stop_sec },

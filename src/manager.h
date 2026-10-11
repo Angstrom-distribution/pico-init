@@ -153,6 +153,12 @@ struct Manager {
         Unit *cgroup_empty_queue;
         bool dispatching_cgroup_empty_queue;
 
+        /* cgroups whose unit is gone while processes were still running in
+         * them (KillMode=process or none, an ssh login's screen or tmux).
+         * A slow timer removes each one once it has emptied. */
+        struct pico_cgroup_orphan *orphan_cgroups;
+        PicoTimerEvent *orphan_timer;
+
         /* runnable jobs, linked via job->run_queue_next */
         Job *run_queue;
         uint32_t next_job_id;
@@ -292,6 +298,13 @@ void manager_dequeue_cgroup_empty(Manager *m, Unit *u);
 
 /* Drain it, delivering each unit's cgroup-empty event. Number delivered. */
 int manager_dispatch_cgroup_empty_queue(Manager *m);
+
+/* Take over a cgroup that still has processes in it: no unit owns it any
+ * more, the manager removes it when it empties. 0 and the manager owns cg, or
+ * -errno and the caller still does. */
+struct pico_cgroup;
+int manager_adopt_cgroup(Manager *m, struct pico_cgroup *cg);
+void manager_reap_orphan_cgroups(Manager *m);
 
 /* Build a transaction for (type, unit) + dependencies and activate it.
  * Installed job via ret (may be NULL). 0 or -errno. */

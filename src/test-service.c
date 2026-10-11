@@ -3278,6 +3278,211 @@ static void test_exec_condition_exit_space(void) {
         free(dir);
 }
 
+/*
+ * KillMode=: what happens to the rest of the cgroup when the main process
+ * exits or the unit is stopped. The leftover is a background sleep that
+ * ignores SIGHUP, its pid written to a file by the main script.
+ */
+static void write_kill_script(const char *dir) {
+        write_forkd(dir,
+                    "tree.sh",
+                    "#!/bin/sh\ntrap '' HUP\nsleep 100 &\necho $! > \"$1\"\nif [ \"$2\" = exit ]; then exit 0; fi\nwait\n");
+}
+
+static void kill_mode_leftover(const char *mode, bool stop, bool want_survive) {
+        Manager *m;
+        Service *s;
+        char *dir;
+        char body[PATH_MAX * 2], path[PATH_MAX], name[64];
+        pid_t leftover;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+        write_kill_script(dir);
+
+        snprintf(name, sizeof(name), "km-%s-%s.service", mode, stop ? "stop" : "exit");
+        snprintf(path, sizeof(path), "%s/leftover", dir);
+        snprintf(body,
+                 sizeof(body),
+                 "[Service]\nType=simple\nKillMode=%s\nTimeoutStopSec=20\nExecStart=%s/tree.sh %s %s\n",
+                 mode,
+                 dir,
+                 path,
+                 stop ? "wait" : "exit");
+        s = load_service(m, dir, name, body);
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+
+        if (!s->cgroup) {
+                printf("test-service: no cgroup, skipping the KillMode=%s check\n", mode);
+                ASSERT_EQ_INT(unit_stop(UNIT(s)), 0);
+                ASSERT_TRUE(drive_until(m, service_settled_done, s, 600));
+                manager_free(m);
+                test_rm_rf(dir);
+                free(dir);
+                return;
+        }
+
+        if (stop) {
+                int tries;
+
+                for (tries = 0; tries < 1000 && access(path, F_OK) != 0; tries++)
+                        test_sleep_ms(2);
+                ASSERT_EQ_INT(access(path, F_OK), 0);
+                ASSERT_EQ_INT(unit_stop(UNIT(s)), 0);
+        }
+        ASSERT_TRUE(drive_until(m, service_settled_done, s, 1500));
+        ASSERT_EQ_INT(s->state, SERVICE_DEAD);
+
+        leftover = read_pid_file(path);
+        ASSERT_TRUE(leftover > 0);
+        if (want_survive) {
+                ASSERT_TRUE(pid_is_running(leftover));
+                (void) kill(leftover, SIGKILL);
+        }
+        ASSERT_TRUE(pid_dies_within(leftover, 2000));
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+static void test_kill_mode_leftovers(void) {
+        kill_mode_leftover("control-group", false, false); /* main exits: the rest is killed */
+        kill_mode_leftover("process", false, true);        /* main exits: the rest lives on */
+        kill_mode_leftover("none", false, true);
+        kill_mode_leftover("control-group", true, false); /* stop: everything goes */
+        kill_mode_leftover("mixed", true, false);         /* stop: TERM to main, KILL to the rest */
+        kill_mode_leftover("process", true, true);        /* stop: only the main process */
+}
+
+/* KillMode=none signals nothing; the stop timeout abandons the process
+ * instead of killing it. */
+static void test_kill_mode_none_abandons_on_timeout(void) {
+        Manager *m;
+        Service *s;
+        char *dir;
+        pid_t main_pid;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+        s = load_service(
+                        m,
+                        dir,
+                        "km-none-timeout.service",
+                        "[Service]\nType=simple\nKillMode=none\nTimeoutStopSec=1\nExecStart=/bin/sleep 100\n");
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        main_pid = s->main_pid;
+        ASSERT_TRUE(main_pid > 0);
+        ASSERT_EQ_INT(unit_stop(UNIT(s)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, s, 1500));
+        ASSERT_TRUE(pid_is_running(main_pid));
+        (void) kill(main_pid, SIGKILL);
+        ASSERT_TRUE(pid_dies_within(main_pid, 2000));
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* KillSignal= replaces SIGTERM as the stop signal. */
+static void test_kill_signal_is_sent(void) {
+        Manager *m;
+        Service *s;
+        char *dir;
+        char body[PATH_MAX * 2], marker[PATH_MAX];
+        int tries;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+        snprintf(marker, sizeof(marker), "%s/got-usr1", dir);
+        write_forkd(dir,
+                    "usr1.sh",
+                    "#!/bin/sh\ntrap 'echo got > \"$1\"; exit 0' USR1\ntrap '' HUP\necho ready > \"$1.ready\"\nwhile :; do sleep 0.05; done\n");
+        snprintf(body,
+                 sizeof(body),
+                 "[Service]\nType=simple\nKillSignal=SIGUSR1\nExecStart=%s/usr1.sh %s\n",
+                 dir,
+                 marker);
+        s = load_service(m, dir, "km-signal.service", body);
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        for (tries = 0; tries < 1500; tries++) {
+                char ready[PATH_MAX + 8];
+
+                snprintf(ready, sizeof(ready), "%s.ready", marker);
+                if (access(ready, F_OK) == 0)
+                        break;
+                test_sleep_ms(2);
+        }
+        ASSERT_EQ_INT(unit_stop(UNIT(s)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, s, 1500));
+        ASSERT_EQ_INT(access(marker, F_OK), 0);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* A unit removed while processes still run in its cgroup: the manager keeps
+ * the bare cgroup and removes it after the last process has gone. */
+static void test_orphaned_cgroup_is_reaped(void) {
+        Manager *m;
+        Service *s;
+        char *dir;
+        char path[PATH_MAX], cgpath[PATH_MAX], body[PATH_MAX * 2];
+        struct stat st;
+        pid_t leftover;
+        int tries;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+        write_kill_script(dir);
+        snprintf(path, sizeof(path), "%s/leftover", dir);
+        snprintf(body,
+                 sizeof(body),
+                 "[Service]\nType=simple\nKillMode=process\nExecStart=%s/tree.sh %s exit\n",
+                 dir,
+                 path);
+        s = load_service(m, dir, "orphan.service", body);
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        if (!s->cgroup) {
+                printf("test-service: no cgroup, skipping the orphaned cgroup check\n");
+                ASSERT_TRUE(drive_until(m, service_settled_done, s, 600));
+                manager_free(m);
+                test_rm_rf(dir);
+                free(dir);
+                return;
+        }
+        ASSERT_TRUE(drive_until(m, service_settled_done, s, 1500));
+        leftover = read_pid_file(path);
+        ASSERT_TRUE(pid_is_running(leftover));
+
+        snprintf(cgpath, sizeof(cgpath), "%s", s->cgroup->path);
+        ASSERT_EQ_INT(manager_remove_unit(m, UNIT(s)), 0);
+        ASSERT_TRUE(m->orphan_cgroups != NULL);
+        ASSERT_EQ_INT(stat(cgpath, &st), 0); /* still there, the process lives */
+
+        manager_reap_orphan_cgroups(m);
+        ASSERT_TRUE(m->orphan_cgroups != NULL); /* not empty yet: kept */
+
+        (void) kill(leftover, SIGKILL);
+        ASSERT_TRUE(pid_dies_within(leftover, 2000));
+        for (tries = 0; tries < 200 && m->orphan_cgroups; tries++) {
+                manager_reap_orphan_cgroups(m);
+                if (m->orphan_cgroups)
+                        test_sleep_ms(10);
+        }
+        ASSERT_TRUE(m->orphan_cgroups == NULL);
+        ASSERT_TRUE(stat(cgpath, &st) < 0 && errno == ENOENT);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
         test_close_all_except_keeps_every_fd();
         test_lifecycle_simple();
@@ -3293,6 +3498,10 @@ int main(void) {
         test_b7_start_limit_stops_the_loop();
         test_start_limit_from_failed_finishes_job();
         test_stop_signals_whole_cgroup();
+        test_kill_mode_leftovers();
+        test_kill_mode_none_abandons_on_timeout();
+        test_kill_signal_is_sent();
+        test_orphaned_cgroup_is_reaped();
         test_exec_start_dash_ignores_main_failure();
         test_oneshot_with_leftover_child_finishes_job();
         test_stop_timeout_escalates_to_kill();

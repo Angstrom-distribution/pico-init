@@ -19,6 +19,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1793,6 +1794,85 @@ static void test_delegate_subgroup(void) {
 }
 
 /*
+ * KillMode=, KillSignal=, SendSIGHUP= and SendSIGKILL=: values as systemd
+ * reads them, an unknown value ignored with the earlier one kept, an empty
+ * assignment back to the default, and no degradation recorded.
+ */
+static void test_kill_settings(void) {
+        Manager *m;
+        char *dir;
+        Service *s;
+        size_t i;
+        static const struct {
+                const char *value;
+                KillMode want;
+        } modes[] = {
+                { "control-group", KILL_CONTROL_GROUP },
+                {         "mixed",         KILL_MIXED },
+                {       "process",       KILL_PROCESS },
+                {          "none",          KILL_NONE },
+        };
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        for (i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
+                char name[32], body[96];
+
+                snprintf(name, sizeof(name), "k%zu.service", i);
+                snprintf(body, sizeof(body), "[Service]\nExecStart=/bin/true\nKillMode=%s\n", modes[i].value);
+                ASSERT_EQ_INT(test_write_file(dir, name, body), 0);
+        }
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "sig.service",
+                                      "[Service]\nExecStart=/bin/true\nKillSignal=SIGUSR1\nSendSIGHUP=yes\nSendSIGKILL=no\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir, "num.service", "[Service]\nExecStart=/bin/true\nKillSignal=2\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "bad.service",
+                                      "[Service]\nExecStart=/bin/true\nKillMode=process\nKillMode=bogus\nKillSignal=SIGNOPE\nSendSIGHUP=maybe\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "reset.service",
+                                      "[Service]\nExecStart=/bin/true\nKillMode=none\nKillMode=\nKillSignal=SIGUSR1\nKillSignal=\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir, "plain.service", "[Service]\nExecStart=/bin/true\n"), 0);
+
+        m = manager_for(dir);
+
+        for (i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
+                char name[32];
+
+                snprintf(name, sizeof(name), "k%zu.service", i);
+                s = (Service *) load_one(m, name);
+                ASSERT_EQ_INT(s->kill_mode, modes[i].want);
+                ASSERT_EQ_INT(UNIT(s)->n_degraded_directives, 0);
+        }
+        s = (Service *) load_one(m, "sig.service");
+        ASSERT_EQ_INT(s->kill_signal, SIGUSR1);
+        ASSERT_EQ_INT(s->send_sighup, true);
+        ASSERT_EQ_INT(s->send_sigkill, false);
+        s = (Service *) load_one(m, "num.service");
+        ASSERT_EQ_INT(s->kill_signal, SIGINT);
+        s = (Service *) load_one(m, "bad.service");
+        ASSERT_EQ_INT(s->kill_mode, KILL_PROCESS);
+        ASSERT_EQ_INT(s->kill_signal, SIGTERM);
+        ASSERT_EQ_INT(s->send_sighup, false);
+        s = (Service *) load_one(m, "reset.service");
+        ASSERT_EQ_INT(s->kill_mode, KILL_CONTROL_GROUP);
+        ASSERT_EQ_INT(s->kill_signal, SIGTERM);
+        s = (Service *) load_one(m, "plain.service");
+        ASSERT_EQ_INT(s->kill_mode, KILL_CONTROL_GROUP);
+        ASSERT_EQ_INT(s->kill_signal, SIGTERM);
+        ASSERT_EQ_INT(s->send_sigkill, true);
+        ASSERT_EQ_INT(s->send_sighup, false);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
  * ExecStop= goes through ExecStart='s own parse_exec_line(), so the prefix
  * rules are the same ones: '-' glued to the path is kept per line, '-'
  * separated from it by whitespace is refused, and the modifiers pico-init
@@ -2207,6 +2287,7 @@ int main(void) {
         test_exec_dash_prefix_sets_ignore();
         test_delegate();
         test_delegate_subgroup();
+        test_kill_settings();
         test_exec_stop_lines();
         test_exec_condition_stop_post_reload_lines();
         test_bare_exec_name_is_accepted();

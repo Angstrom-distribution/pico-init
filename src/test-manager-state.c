@@ -176,6 +176,9 @@ static const char *console_service =
                 "ExecStart=/bin/sleep 300\n"
                 "Delegate=pids cpu\n"
                 "DelegateSubgroup=main\n"
+                "KillMode=process\n"
+                "KillSignal=SIGUSR1\n"
+                "SendSIGHUP=yes\n"
                 "\n"
                 "[Install]\n"
                 "WantedBy=default.target\n";
@@ -288,6 +291,16 @@ static void test_boot_files_match_reality(void) {
         ASSERT_STREQ(val, "yes");
         ASSERT_EQ_INT(read_property(rtdir, "console.service", "DelegateControllers", val, sizeof(val)), 0);
         ASSERT_STREQ(val, "cpu pids");
+        ASSERT_EQ_INT(read_property(rtdir, "console.service", "KillMode", val, sizeof(val)), 0);
+        ASSERT_STREQ(val, "process");
+        ASSERT_EQ_INT(read_property(rtdir, "console.service", "KillSignal", val, sizeof(val)), 0);
+        ASSERT_STREQ(val, "10");
+        ASSERT_EQ_INT(read_property(rtdir, "console.service", "SendSIGHUP", val, sizeof(val)), 0);
+        ASSERT_STREQ(val, "yes");
+        ASSERT_EQ_INT(read_property(rtdir, "console.service", "SendSIGKILL", val, sizeof(val)), 0);
+        ASSERT_STREQ(val, "yes");
+        ASSERT_EQ_INT(read_property(rtdir, "sysinit.service", "KillMode", val, sizeof(val)), 0);
+        ASSERT_STREQ(val, "control-group");
         ASSERT_EQ_INT(read_property(rtdir, "console.service", "DelegateSubgroup", val, sizeof(val)), 0);
         ASSERT_STREQ(val, "main");
         ASSERT_EQ_INT(read_property(rtdir, "sysinit.service", "DelegateSubgroup", val, sizeof(val)), 0);

@@ -123,6 +123,15 @@ typedef enum ServiceState {
 
 /* Restart=, in upstream's own enum order. ON_WATCHDOG parses but never
  * fires: there is no per-service watchdog (see service_shall_restart()). */
+/* KillMode=: which processes a stop, or the main process exiting, signals. */
+typedef enum KillMode {
+        KILL_CONTROL_GROUP, /* every process in the unit's cgroup (the default) */
+        KILL_MIXED,         /* SIGTERM to the main process, then SIGKILL to the whole cgroup */
+        KILL_PROCESS,       /* the main and control processes only; the rest of the cgroup lives on */
+        KILL_NONE,          /* nothing */
+        _KILL_MODE_MAX,
+} KillMode;
+
 typedef enum ServiceRestart {
         SERVICE_RESTART_NO,
         SERVICE_RESTART_ON_SUCCESS,
@@ -290,6 +299,11 @@ typedef struct Service {
         unsigned delegate_controllers; /* SERVICE_DELEGATE_*: the controllers a Delegate= list names */
         char *delegate_subgroup; /* DelegateSubgroup=: where the main process goes, NULL for the unit cgroup */
 
+        KillMode kill_mode; /* KillMode= */
+        int kill_signal;    /* KillSignal=, SIGTERM unless set */
+        bool send_sighup;   /* SendSIGHUP=: SIGHUP follows the stop signal */
+        bool send_sigkill;  /* SendSIGKILL=, on by default: SIGKILL when the stop times out */
+
         /*
          * Set by service_stop(): an explicit stop is the one thing Restart=
          * must never turn back into a start. Cleared again by service_start()
@@ -396,6 +410,7 @@ void service_notify_ready(Service *s);
 const char *service_type_to_string(ServiceType t);
 const char *service_state_to_string(ServiceState s);
 const char *service_restart_to_string(ServiceRestart r);
+const char *kill_mode_to_string(KillMode m);
 const char *service_result_to_string(ServiceResult r);
 
 /* Delegate= controller names, in systemd's order. */
