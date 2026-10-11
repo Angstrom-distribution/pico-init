@@ -7,7 +7,7 @@
  * release-agent notification is unreliable enough that upstream needed a
  * PID-set tracker, and v2's cgroup.events makes that unnecessary.
  *
- * Three things here are load-bearing and easy to get wrong:
+ * Three things here are easy to get wrong:
  *  - cgroup.kill takes "1", not "all". "all" is rejected with EIO.
  *  - cgroup.kill only exists on Linux >= 5.14, so its absence must be
  *    survivable rather than fatal.

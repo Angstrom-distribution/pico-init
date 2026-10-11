@@ -16,7 +16,7 @@
  * (with SO_PASSCRED set) as well as nl_pid == 0 in the sender address, so
  * both are checked.
  *
- * Also load-bearing for the parser: a
+ * Also matters for the parser: a
  * uevent's body repeats ACTION= and DEVPATH= from the header line, and a
  * synthetic-uuid-capable kernel always sends SYNTH_UUID=, "0" when the
  * event was not synthesized with one. The header-parsed copies go straight

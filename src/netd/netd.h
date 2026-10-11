@@ -174,7 +174,7 @@ Netd *netd_free(Netd *n);
  *   3. open the rtnetlink socket and *subscribe* to link events;
  *   4. only then enumerate existing links.
  *
- * 3 before 4 is the load-bearing part: an interface that appears between the
+ * 3 before 4 is the part that matters: an interface that appears between the
  * dump and the subscription would be missed forever, and netd has no
  * After=eudev.service to fall back on.
  *

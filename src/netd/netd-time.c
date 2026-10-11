@@ -304,7 +304,7 @@ int netd_time_set_timezone(Netd *n, const char *tz) {
          * timedated.c's method_set_timezone() steps 2-3, run unconditionally
          * for every branch above including the unlink one: "make glibc
          * notice the new timezone", then "tell the kernel our timezone".
-         * tzset() first is load-bearing -- netd_time_build_tz() reads
+         * tzset() first matters -- netd_time_build_tz() reads
          * tm_gmtoff off localtime_r(), which only reflects the zone just
          * installed once tzset() has reloaded it.
          *

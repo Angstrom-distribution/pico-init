@@ -515,7 +515,7 @@ static void test_timezone_symlink_swap(void) {
 
 /*
  * The tzset()-before-kernel-push ordering that netd_time_set_timezone()'s
- * header comment marks load-bearing. settimeofday() itself needs
+ * header comment says must hold. settimeofday() itself needs
  * CAP_SYS_TIME (denied here, verified directly), so the symlink-swap test
  * above cannot observe the kernel-push side of an inversion -- only that the
  * symlink lands correctly. This drives netd_time_build_tz(), the pure half

@@ -102,7 +102,7 @@ int devd_uevent_parse(const char *buf, size_t n, DevdUevent *ret);
  * Is this message really from the kernel? `nl_pid` and `nl_groups` come from
  * the sockaddr_nl recvmsg() filled in.
  *
- * Both halves are load-bearing. nl_pid == 0 means the sender is the kernel
+ * Both halves matter. nl_pid == 0 means the sender is the kernel
  * rather than a process, and nl_groups != 0 means the message arrived by
  * multicast rather than as a unicast send aimed straight at this socket -- a
  * peer can spoof neither, but a peer that could spoof one would still be caught

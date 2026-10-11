@@ -443,7 +443,7 @@ int netd_startup(Netd *n) {
 
         /*
          * 3. Open rtnetlink and *subscribe* before enumerating -- the
-         * load-bearing part of this whole function (netd.h): an interface
+         * part that matters most in this function (netd.h): an interface
          * that appears between the dump and the subscription would be missed
          * forever, and netd has no After=eudev.service to fall back on.
          */

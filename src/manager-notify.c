@@ -110,7 +110,7 @@ static void notify_apply(Manager *m, Unit *u, const struct ucred *ucred, char *b
                         /* A raw control character (esp. '\n', already split
                          * out here, but '\r' and friends are not) would
                          * inject a fake Property=value line into the
-                         * published state file -- load-bearing, not
+                         * published state file -- this matters, not
                          * cosmetic. */
                         for (i = 0; i < vlen; i++)
                                 if ((unsigned char) val[i] < 0x20 || val[i] == 0x7f) {

@@ -30,7 +30,7 @@
 #endif
 
 /* Best-effort SO_RCVBUF on the request socket -- see netd-rtnl.c's
- * NETD_RTNL_RCVBUF comment; not load-bearing, only reduces retries. */
+ * NETD_RTNL_RCVBUF comment; optional, it only reduces retries. */
 #define NL_SOCK_RCVBUF (1 << 20)
 
 /* --- request construction --- */

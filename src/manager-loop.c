@@ -8,7 +8,7 @@
  * at manager_new() time; manager_loop() is then the thin real-systemd-shaped
  * wrapper `while (m->objective == MANAGER_RUNNING) sd_event_run(...)`.
  *
- * The dispatch ORDER across one epoll batch is load-bearing, and is expressed
+ * The dispatch ORDER across one epoll batch matters, and is expressed
  * as the EVENT_PRIORITY_* table in manager.h. SIGCHLD carries an exit status; cgroup-empty does not -- the
  * process that happens to empty a cgroup is an arbitrary descendant whose
  * exit code says nothing about the service. So if a cgroup-empty event were

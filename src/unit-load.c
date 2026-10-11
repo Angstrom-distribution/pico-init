@@ -242,7 +242,7 @@ int unit_load(Unit *u) {
          * Literal beats template, and it does so by searching the whole
          * path for the literal name before the template name is tried
          * anywhere -- not "try literal, then template, in each directory".
-         * That ordering is load-bearing, not an implementation detail: it
+         * That ordering matters, not an implementation detail: it
          * is what lets serial-getty@ttyGS0.service in a higher-priority
          * directory win over serial-getty@.service in a lower-priority one,
          * and a per-directory "optimization" would invert it. See

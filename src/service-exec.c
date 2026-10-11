@@ -72,7 +72,7 @@
  * logd/logd-write.h). create_stdout_socket() runs in the parent: it creates
  * a datagram socket, binds it to a unique abstract-namespace name (no
  * filesystem path to clean up or collide with), then connect()s it to logd's
- * stdout socket. Binding first is load-bearing: a bound AF_UNIX socket cannot
+ * stdout socket. Binding first matters: a bound AF_UNIX socket cannot
  * be rebound (EINVAL), so every datagram sent through it, including from
  * children that inherit fd 1/2, carries the same source address in logd's
  * recvfrom(). logd keys fragment tails on that stream identity rather than
@@ -349,7 +349,7 @@ static int load_environment_files(Service *s, char ***ret) {
  *
  * Merge order is v30's own (execute.c:1365), a later NAME= replacing an
  * earlier one: the inherited environ, then NOTIFY_SOCKET=/LISTEN_FDS=, then
- * Environment=, then EnvironmentFile= contents. The order is load-bearing: a
+ * Environment=, then EnvironmentFile= contents. The order matters: a
  * file beats Environment= (oe-core's read-only-rootfs hook overrides a
  * unit's default that way).
  *
@@ -536,7 +536,7 @@ static int create_stdout_socket(const char *unit_id) {
 
         /* Matches the usual receive-side default (212992 bytes). The queue
          * depth of an AF_UNIX SOCK_DGRAM is governed by
-         * net.unix.max_dgram_qlen, so this is not load-bearing. */
+         * net.unix.max_dgram_qlen, so this is optional. */
         sndbuf = 212992;
         (void) setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 

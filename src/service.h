@@ -277,7 +277,7 @@ typedef struct Service {
          * status: main_exit_code is siginfo_t.si_code (CLD_EXITED /
          * CLD_KILLED / CLD_DUMPED), main_exit_status is si_status. A packed
          * status cannot tell CLD_KILLED from CLD_DUMPED without WCOREDUMP,
-         * and that distinction is load-bearing for pico_is_clean_exit() in
+         * and that distinction matters for pico_is_clean_exit() in
          * service.c: a core dump is never clean, for any signal, ever.
          */
         int main_exit_code;
@@ -393,7 +393,7 @@ int service_verify(Service *s);
  * `code` is siginfo_t.si_code (CLD_EXITED / CLD_KILLED / CLD_DUMPED) and
  * `status` is si_status. The two are separate because waitpid()'s packed
  * status cannot distinguish CLD_KILLED from CLD_DUMPED without WCOREDUMP,
- * and that distinction is load-bearing: a signal death may count as a clean
+ * and that distinction matters: a signal death may count as a clean
  * exit for a long-running daemon, but a core dump never counts as clean for
  * anything. Reap with waitid() so both arrive intact.
  */

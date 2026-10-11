@@ -8,7 +8,7 @@
  * subset is ~6,500 LOC whose src/basic dependency closure adds ~22,000 more,
  * of which netd would exercise ~20 of 145 public functions -- and two
  * structural facts make trimming it impractical anyway. Its attribute type
- * system is load-bearing (every append/read goes through a policy table;
+ * system is unavoidable (every append/read goes through a policy table;
  * there is no raw-TLV mode), and there is no public sd_netlink_get_fd(), so
  * driving it from netd's own epoll loop already means forking private
  * internals. This file is new code, using kernel UAPI structs and macros

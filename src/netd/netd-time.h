@@ -116,7 +116,7 @@ int netd_time_build_tz(struct timezone *ret_tz);
  * settimeofday(NULL, &tz) (via netd_time_build_tz(), above) so a local-time
  * RTC and anything reading the kernel timezone agree.
  *
- * The tzset()-before-netd_time_build_tz() ordering is load-bearing:
+ * The tzset()-before-netd_time_build_tz() ordering matters:
  * netd_time_build_tz() reads tm_gmtoff off localtime_r(), which only
  * reflects the zone just installed once tzset() has reloaded it -- get this
  * backwards and the kernel is handed the *previous* zone's offset.
@@ -124,7 +124,7 @@ int netd_time_build_tz(struct timezone *ret_tz);
  * A failure of the kernel push (including a plain CAP_SYS_TIME EPERM) is
  * logged and ignored rather than returned, exactly as timedated.c's own
  * method_set_timezone() treats a failing clock_set_timezone(): the symlink
- * is the durable, load-bearing state, and its swap already succeeded by the
+ * is the durable state that matters, and its swap already succeeded by the
  * time the kernel push is attempted.
  *
  * The empty-or-"UTC" case unlinks /etc/localtime rather than leaving a

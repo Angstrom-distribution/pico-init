@@ -189,7 +189,7 @@ int devd_set_udev_db_root(Devd *d, const char *path);
 
 /*
  * Subscribe first, then walk. The ordering is netd's own stated convention
- * (netd.h) and is load-bearing for the same reason: a card inserted between the
+ * (netd.h) and matters for the same reason: a card inserted between the
  * walk and the subscription would be missed by both paths forever, and devd has
  * no device manager underneath it to fall back on. 0 or -errno.
  */
