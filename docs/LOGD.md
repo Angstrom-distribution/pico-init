@@ -1,0 +1,338 @@
+# logd and picolog
+
+`logd` is pico-init's log daemon. It collects the stdout and stderr of
+services, datagrams sent to `/dev/log`, and the kernel ring from
+`/dev/kmsg`, and appends them to a size-capped two-file ring under
+`/run/logd` in the journal export format. `picolog` is the reader, the
+`journalctl` equivalent. There is no binary journal: the ring is plain
+export-format text on tmpfs, and nothing is written to persistent storage.
+
+## Processes and units
+
+| Binary | Installed to | Role |
+|--------|--------------|------|
+| `logd` | `sbindir` | Receiver and ring writer |
+| `picolog` | `bindir` | Ring reader, runs as any user that can read `/run/logd` |
+
+`logd.service` is a service with `Restart=on-failure` and `RestartSec=2`,
+wanted by `default.target`. `logd.socket` is wanted by
+`sockets.target`:
+
+```ini
+[Socket]
+ListenDatagram=/run/logd/stdout
+ListenDatagram=/dev/log
+SocketMode=0666
+```
+
+PID 1 binds and holds both sockets, so they outlive `logd`. Datagrams sent
+while `logd` is down queue in the socket receive buffer, and a restarted
+`logd` receives the same descriptors and drains the backlog. The sockets are
+handed over through `LISTEN_FDS`; `logd` expects the `/run/logd/stdout`
+socket as the first descriptor and `/dev/log` as the second. `LISTEN_FDNAMES`
+is not used, so the order of the `ListenDatagram=` lines in `logd.socket`
+must not change.
+
+`SocketMode=0666` applies to both sockets because the setting is per unit.
+It is needed for `/dev/log`, which any `syslog(3)` client opens by path.
+Attribution never depends on what the sender claims (see
+[Attribution](#attribution)).
+
+When `logd` is started without `LISTEN_PID` matching its own PID or with
+fewer than two descriptors in `LISTEN_FDS`, it binds its own sockets:
+`/run/logd/stdout` with mode `0600` and `/dev/log` with mode `0666`,
+unlinking a stale socket first. Failure to bind one socket is a warning;
+`logd` exits with status 1 if neither is available.
+
+## Command line
+
+`logd` takes two options, both of the form `--option=value`:
+
+| Option | Effect |
+|--------|--------|
+| `--runtime-dir=DIR` | Ring directory instead of `/run/logd`. In standalone mode the stdout socket moves to `DIR/stdout` too; `/dev/log` stays fixed. |
+| `--max-bytes=N` | Ring cap in bytes instead of 2 MiB. Values of 0 or less are ignored. |
+
+There is no configuration file and no `logd.conf`. `SIGTERM` and `SIGINT`
+flush the pending line tails (see below) and end `logd` with status 0.
+
+## Inputs
+
+### Service stdout and stderr
+
+For every start of every service command (not only `ExecStart=`), PID 1
+creates an `AF_UNIX`/`SOCK_DGRAM` socket in the parent before `fork()`,
+binds it to a unique abstract-namespace name of the form
+`pico-init-stdout/<unit>/<counter>`, connects it to `/run/logd/stdout`, and
+sets `SO_SNDBUF` to 212992. The child dup2()s that socket onto fd 1 and
+fd 2. Each invocation therefore has its own source address, which `logd`
+uses as the stream identity.
+
+The default is chosen by `StandardInput=` and `StandardOutput=`:
+
+| Situation | stdout and stderr |
+|-----------|-------------------|
+| Default, stdin not a tty | logd socket |
+| `StandardInput=socket` | the accepted connection |
+| `StandardInput=tty*` with no explicit `journal` | the terminal (stdin) |
+| `StandardOutput=journal`, `journal+console`, `syslog`, `syslog+console` | logd socket, even with a tty on stdin; the `+console` copy is not made |
+| `StandardOutput=null` | `/dev/null` |
+| `StandardError=` unset | follows an explicit `StandardOutput=` |
+| logd socket cannot be created or connected | `/dev/console` |
+
+`StandardOutput=kmsg` and other values are not implemented and are recorded
+as dropped directives by the unit parser. PID 1's own output is not sent
+to `logd`; it goes to `/dev/kmsg`, which `logd` reads, or to stderr when
+`/dev/kmsg` cannot be opened.
+
+All records from this input get `PRIORITY=6` and `_TRANSPORT=stdout`. The
+socket has no handshake, so a service cannot choose a priority or
+identifier for its stdout. `<N>` prefixes in the text are not interpreted
+(`SyslogLevelPrefix=` has no effect).
+
+Line handling, per stream:
+
+- A line ends at `\n`, or at a NUL byte, whichever comes first. An ordinary
+  newline adds no `_LINE_BREAK` field; a NUL adds `_LINE_BREAK=nul`.
+- A line longer than 8192 bytes (`LOGD_LINE_MAX`) is split and the leading
+  part is tagged `_LINE_BREAK=line-max`.
+- Bytes after the last break are kept as a tail and prepended to the next
+  datagram of the same stream.
+- The tail is flushed, tagged `_LINE_BREAK=pid-change`, when the sending PID
+  on the stream changes, or when the same PID shows a different start time
+  in `/proc/<pid>/stat` (PID reuse).
+- The tail is flushed, tagged `_LINE_BREAK=eof`, when the stream is evicted
+  from the table or when `logd` exits.
+- The table holds 64 streams (`LOGD_MAX_STREAMS`). When it is full the
+  least recently seen stream is evicted.
+- A datagram without a source address (an unbound sender) gets no tail
+  carry-over; any unterminated remainder is emitted at once with
+  `_LINE_BREAK=eof`.
+
+The receive buffer is 65536 bytes. A longer datagram is truncated and a
+warning is logged.
+
+### /dev/log
+
+Each datagram is one record; the stream table is not involved. The parser
+follows `journald-syslog.c`:
+
+- An optional `<N>` prefix of one to three decimal digits. Only `N & 7`
+  becomes `PRIORITY`; there is no `SYSLOG_FACILITY`. Without a valid prefix
+  `PRIORITY` is 6.
+- An optional `identifier[pid]: ` or `identifier: ` tag becomes
+  `SYSLOG_IDENTIFIER`. A bracketed suffix is stripped and discarded, and the
+  tag is ignored if longer than 255 bytes. `_PID` always comes from the
+  kernel credentials, never from the text.
+- The rest is `MESSAGE`, taken up to the first NUL byte.
+- `_TRANSPORT=syslog`.
+
+An empty datagram is ignored.
+
+libsystemd's `sd_journal_send()` family converts to a `syslog(3)`-shaped
+datagram on `/dev/log`. Only `MESSAGE`, `PRIORITY`, `SYSLOG_FACILITY` and
+`SYSLOG_IDENTIFIER` are carried, and `logd` then discards the facility; other
+application fields are dropped
+(see [COMPATIBILITY_LIBRARIES.md](COMPATIBILITY_LIBRARIES.md)).
+`sd_journal_stream_fd()` connects to `/run/logd/stdout`; its `priority`,
+`identifier` and `level_prefix` arguments are validated but not transported.
+
+### /dev/kmsg
+
+`logd` opens `/dev/kmsg` non-blocking at startup, before it binds or
+accepts any socket, and drains it. A fresh open starts at the oldest record
+in the kernel ring, so the first drain backfills everything the kernel and
+PID 1 logged before `logd` started. Later records are read when the
+descriptor becomes readable.
+
+Per record:
+
+- The severity is `prefix & 7`; the facility is discarded. An unparseable
+  prefix yields priority 0.
+- `MESSAGE` is the text after the first `;` up to the first newline. The
+  `KEY=VALUE` continuation lines of the kmsg record are not stored.
+- The fields are `MESSAGE`, `PRIORITY` and `_TRANSPORT=kernel`. The kernel
+  timestamp and sequence number are not stored: the entry's
+  `__REALTIME_TIMESTAMP` and `__MONOTONIC_TIMESTAMP` are the time `logd`
+  wrote it, so backfilled records all carry roughly the same time.
+- A record without `;` is discarded and ends the current drain pass; the next
+  readiness event continues with the following record.
+- `EPIPE` (the reader fell behind and the kernel dropped records) logs a
+  warning and ends the current drain pass the same way; reading resumes after
+  the gap.
+
+If `/dev/kmsg` cannot be opened (missing node, no `CAP_SYSLOG`), `logd`
+logs a warning and runs without the kernel transport.
+
+## Attribution
+
+For stdout records `logd` reads `SCM_CREDENTIALS` (`SO_PASSCRED` is set on
+both sockets, also on inherited ones), and adds `_PID`, `_UID`, `_GID`,
+`_COMM` and `_SYSTEMD_UNIT`. For stdout, `_COMM` and `_SYSTEMD_UNIT` are
+looked up once per stream and cached, because the process can exit while
+the stream lives on; the lookup is repeated after a PID change. For
+`/dev/log` the lookup is done per datagram.
+
+- `_COMM` is `/proc/<pid>/comm`.
+- `_SYSTEMD_UNIT` comes from the `0::` line of `/proc/<pid>/cgroup`. Leading
+  `*.slice` components are skipped and the first remaining component is the
+  unit if it ends in `.service`, `.socket`, `.target`, `.mount`, `.swap`,
+  `.device`, `.timer`, `.path` or `.scope`. Only cgroup v2 is parsed.
+- If the process is gone or the cgroup has no unit component, the record is
+  still written without those fields.
+- A datagram whose credential carries PID 0 is treated as having none.
+
+Kernel records carry no `_PID`, `_COMM` or `_SYSTEMD_UNIT`.
+
+## The ring
+
+The ring is two files in `/run/logd`:
+
+| File | Content |
+|------|---------|
+| `active.export` | Entries being appended |
+| `rotated.export` | The previous complete `active.export` |
+
+The default cap is 2 MiB (`LOGD_DEFAULT_MAX_BYTES`), changeable only with
+`--max-bytes=` at `logd` start. After each append, if `active.export` has
+reached half the cap, it is renamed over `rotated.export` and a new empty
+`active.export` is opened. The oldest data is thus dropped a whole file at
+a time. Since the check follows the write, each file can exceed half the
+cap by up to one entry, so the two files together stay near the cap.
+
+An entry that alone exceeds the cap is refused with `-EMSGSIZE` and not
+stored; the sender is not told. A field name that is not `[A-Z0-9_]{1,64}`
+or starts with a digit refuses the whole entry.
+
+Every `write()` carries one complete entry. If a write fails partway, the
+file is truncated back to its previous size, so a file always ends on an
+entry boundary. If `logd` is restarted within a boot it resumes appending to
+the existing `active.export`. The directory is created with mode 0755 and
+the files with mode 0644. `/run` is tmpfs: the ring is lost on reboot and
+no flash is written.
+
+## Stored format
+
+Entries are in the journal export format. Each entry starts with three
+fields the writer always emits, then the receiver's fields, then an empty
+line:
+
+```
+__REALTIME_TIMESTAMP=1760000000123456
+__MONOTONIC_TIMESTAMP=4821000123
+_BOOT_ID=0123456789abcdef0123456789abcdef
+MESSAGE=Started netd.
+PRIORITY=6
+_TRANSPORT=stdout
+_PID=123
+_UID=0
+_GID=0
+_COMM=netd
+_SYSTEMD_UNIT=netd.service
+
+```
+
+`_BOOT_ID` is read from `/proc/sys/kernel/random/boot_id`, with a
+`getrandom()` value as fallback. A field value that is not valid UTF-8
+without control characters (other than TAB), or that contains a newline or
+NUL, is written in the binary-safe form: `NAME`, a newline, a 64-bit
+little-endian length, the data, and a newline.
+
+The fields a reader can expect:
+
+| Field | Source |
+|-------|--------|
+| `__REALTIME_TIMESTAMP`, `__MONOTONIC_TIMESTAMP`, `_BOOT_ID` | writer, all transports |
+| `MESSAGE`, `PRIORITY`, `_TRANSPORT` | all transports; `_TRANSPORT` is `stdout`, `syslog` or `kernel` |
+| `SYSLOG_IDENTIFIER` | `/dev/log` tag |
+| `_PID`, `_UID`, `_GID`, `_COMM`, `_SYSTEMD_UNIT` | credentials and cgroup, when available |
+| `_LINE_BREAK` | stdout only: `nul`, `line-max`, `pid-change`, `eof` |
+
+The output of `picolog -o export` can be piped to upstream
+`systemd-journal-remote` to build a binary journal off the device.
+
+## picolog
+
+```
+picolog [-f] [-u UNIT] [-p PRIO] [-k] [-n LINES] [-o short|export] [-a]
+```
+
+`picolog` reads the ring files directly, rotated file first and then the
+active one, and does not talk to `logd`. A missing ring yields no output
+and success; an incomplete trailing entry is dropped. There is no `-b`: the
+ring only ever holds the current boot.
+
+| Option | Meaning |
+|--------|---------|
+| `-f` | Follow. Starts at the current end of the active file, reopens it when rotation replaces it, polls every 200 ms. With `-n`, the last N matching entries are printed first. |
+| `-u UNIT` | Only entries whose `_SYSTEMD_UNIT` equals UNIT. A name without a `.service`, `.socket` or `.target` suffix gets `.service` appended. |
+| `-p PRIO` | Entries at PRIO or more severe. PRIO is a name (`emerg`, `alert`, `crit`, `err`, `warning`, `notice`, `info`, `debug`) or 0 to 7. Entries without a parseable `PRIORITY` do not match. |
+| `-k` | Only entries with `_TRANSPORT=kernel`. |
+| `-n LINES` | Only the last LINES matching entries. 0 means all. |
+| `-o short` | Default. `Mon DD HH:MM:SS host identifier[pid]: message` in local time. |
+| `-o export` | The stored bytes of each matching entry, unchanged. |
+| `-a` | In `short`, print a message that is not valid text with `\xNN` escapes instead of a placeholder. |
+| `-h` | Print usage. |
+
+Details of the `short` format:
+
+- The host name is that of the machine running `picolog`; it is not stored in
+  the ring.
+- The identifier is `SYSLOG_IDENTIFIER`, else `_COMM`, else `unknown`. As
+  kernel records have neither, they print as `unknown`. `[pid]` follows when
+  the entry has `_PID`.
+- A binary-encoded `MESSAGE` prints as `[N bytes blob data]` unless `-a`.
+- Only the message text is coloured, by priority as `journalctl` does:
+  red for 0 to 3, yellow for 4, bold for 5, grey for 7, none for 6. Colour
+  is off when `NO_COLOR` is set, stdout is not a terminal or `TERM` is unset
+  or `dumb`; `SYSTEMD_COLORS` overrides all of these.
+- Entries without a valid `__REALTIME_TIMESTAMP` are skipped.
+
+`-u`, `-p` and `-k` combine with AND. The environment variable
+`LOGD_RUNTIME_DIR`, when set, replaces `/run/logd` as the ring location;
+this exists for the test suite.
+
+`picoctl status UNIT` uses the same reader for its per-unit log tail.
+
+## Limits and rate control
+
+There is no rate limiting. `logd` has no `RateLimitIntervalSec=` or
+`RateLimitBurst=` equivalent, no per-service quota and no suppression
+message. The bounds are structural:
+
+- ring size: the 2 MiB cap bounds memory, and the oldest half is dropped on
+  rotation;
+- line length: 8192 bytes;
+- stream table: 64 entries;
+- datagram size: 65536 bytes;
+- entry size: one entry cannot exceed the ring cap.
+
+A service that logs faster than `logd` drains fills the socket queue; the
+queue depth of a Unix datagram socket is governed by
+`net.unix.max_dgram_qlen`, which PID 1 sets to 64 at boot, and `logd` does
+not report overflow. Because the ring is half-rotated, a noisy service can
+push every other service's older records out of it.
+
+## Not implemented compared to journald
+
+- The binary journal file format, `journalctl` itself, and
+  `systemd-journald` as a name or D-Bus/varlink service. The sockets
+  `/run/systemd/journal/socket`, `/run/systemd/journal/stdout` and
+  `/run/systemd/journal/dev-log` do not exist; the native protocol
+  (`sd_journal_send()` with arbitrary fields) is reduced to `/dev/log`.
+- Persistent storage (`/var/log/journal`), `Storage=`, `SystemMaxUse=`,
+  `MaxRetentionSec=`, sealing and compression. There is no `journald.conf`.
+- Rate limiting, `Forward*=` (syslog, kmsg, console, wall) and
+  `LineMax=`/`MaxLevelStore=` settings. The unit parser has no
+  `LogLevelMax=`, `LogExtraFields=`, `LogNamespace=`, `SyslogIdentifier=`
+  or `SyslogLevelPrefix=`, so they cannot influence what is stored.
+- Per-stream handshake on the stdout socket: no per-service identifier,
+  priority or level prefix; all stdout is `PRIORITY=6`.
+- `SYSLOG_FACILITY`, `SYSLOG_PID`, `_CMDLINE`, `_EXE`, `_CAP_EFFECTIVE`,
+  `_SELINUX_CONTEXT`, `_SYSTEMD_CGROUP`, `_SYSTEMD_SLICE`,
+  `_SYSTEMD_INVOCATION_ID`, `_MACHINE_ID`, `_HOSTNAME`, `MESSAGE_ID`,
+  `CODE_FILE` and `__CURSOR`/`__SEQNUM`; audit records.
+- Kernel timestamps and sequence numbers on `_TRANSPORT=kernel` entries.
+- `picolog` has no `--since`, `--until`, `--grep`, `-b`, `-r`, `-o json`,
+  field matches (`FIELD=value`), `--list-boots`, `--vacuum-*`, `--rotate`
+  or `--flush`; filtering is limited to the options in the table above.

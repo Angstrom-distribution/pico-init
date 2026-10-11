@@ -153,6 +153,18 @@ rest.
 - D-Bus: no bus, no logind, no hwdb.
 - DHCPv6 and IPv6 router advertisements in `netd`.
 
+## Documentation
+
+The `docs/` directory follows the layout of systemd's own `docs/`.
+
+| Topic | Documents |
+|-------|-----------|
+| Design | [ARCHITECTURE](docs/ARCHITECTURE.md), [BOOT](docs/BOOT.md), [API_FILE_SYSTEMS](docs/API_FILE_SYSTEMS.md), [CGROUP_DELEGATION](docs/CGROUP_DELEGATION.md), [DAEMON_SOCKET_ACTIVATION](docs/DAEMON_SOCKET_ACTIVATION.md) |
+| Unit files | [INCOMPATIBILITIES](docs/INCOMPATIBILITIES.md), [PRESET](docs/PRESET.md) |
+| Daemons and libraries | [NETD](docs/NETD.md), [LOGD](docs/LOGD.md), [DEVD](docs/DEVD.md), [COMPATIBILITY_LIBRARIES](docs/COMPATIBILITY_LIBRARIES.md) |
+| Using and packaging | [DISTRO_PORTING](docs/DISTRO_PORTING.md), [DEBUGGING](docs/DEBUGGING.md), [FAQ](docs/FAQ.md) |
+| Development | [HACKING](docs/HACKING.md), [CODING_STYLE](docs/CODING_STYLE.md), [RELEASE](docs/RELEASE.md) |
+
 ## Building and testing
 
 pico-init builds with meson (0.62 or newer) and ninja on Linux:

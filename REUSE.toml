@@ -4,6 +4,7 @@ version = 1
 path = [
   "README.md",
   "NEWS",
+  "docs/**",
   "CONTRIBUTING.md",
   "SECURITY.md",
   "CODE_OF_CONDUCT.md",
