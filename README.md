@@ -1,5 +1,7 @@
 # pico-init
 
+![pico-init booting an iPAQ h2200 to a console login](docs/demo.svg)
+
 A small, systemd-compatible init system for constrained embedded Linux
 boards: 200 MHz-class CPUs with around 64 MiB of RAM. It is written in C,
 needs nothing at runtime beyond the C library, and is built for
