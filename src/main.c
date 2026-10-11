@@ -9,11 +9,13 @@
  */
 
 #include <errno.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/reboot.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -73,6 +75,34 @@ static void clock_save_final(void) {
 
         if (r < 0)
                 pico_log(PICO_LOG_WARNING, "clock save: %s", strerror(-r));
+}
+
+/*
+ * Everything still running goes before the final sync(): SIGTERM, up to five
+ * seconds for it to exit, then SIGKILL, as systemd-shutdown does. Units were
+ * stopped by now; what is left is what a KillMode=process or none unit
+ * deliberately left behind, such as a screen or tmux server from an ssh login.
+ */
+static void kill_remaining_processes(void) {
+        struct timespec step = { .tv_sec = 0, .tv_nsec = 100 * 1000 * 1000 };
+        int i;
+
+        if (kill(-1, SIGTERM) < 0 && errno == ESRCH)
+                return;
+        (void) kill(-1, SIGCONT);
+
+        for (i = 0; i < 50; i++) {
+                while (waitpid(-1, NULL, WNOHANG) > 0)
+                        ;
+                if (kill(-1, 0) < 0 && errno == ESRCH)
+                        return;
+                nanosleep(&step, NULL);
+        }
+
+        pico_log(PICO_LOG_WARNING, "processes ignored SIGTERM, sending SIGKILL");
+        (void) kill(-1, SIGKILL);
+        while (waitpid(-1, NULL, WNOHANG) > 0)
+                ;
 }
 
 int main(void) {
@@ -316,6 +346,7 @@ int main(void) {
         switch ((ManagerObjective) objective) {
         case MANAGER_REBOOT:
                 pico_log(PICO_LOG_INFO, "rebooting");
+                kill_remaining_processes();
                 clock_save_final();
                 sync();
                 reboot(RB_AUTOBOOT);
@@ -323,6 +354,7 @@ int main(void) {
 
         case MANAGER_POWEROFF:
                 pico_log(PICO_LOG_INFO, "powering off");
+                kill_remaining_processes();
                 clock_save_final();
                 sync();
                 reboot(RB_POWER_OFF);
