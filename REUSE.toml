@@ -3,6 +3,7 @@ version = 1
 [[annotations]]
 path = [
   "README.md",
+  "NEWS",
   "CONTRIBUTING.md",
   "SECURITY.md",
   "CODE_OF_CONDUCT.md",
