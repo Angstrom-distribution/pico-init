@@ -1013,7 +1013,7 @@ pc_conf = configuration_data({
   'LIBDIR': pc_prefix / get_option('libdir'),
   'INCLUDE_DIR': pc_prefix / get_option('includedir'),
   'SYSCONF_DIR': pc_prefix / get_option('sysconfdir'),
-  'PROJECT_URL': 'https://github.com/koenkooi/pico-init',
+  'PROJECT_URL': 'https://github.com/Angstrom-distribution/pico-init',
   'PROJECT_VERSION': libsystemd_compat_systemd_version,
   'SYSTEM_ALLOC_UID_MIN': 1,
   'SYSTEM_UID_MAX': 999,
