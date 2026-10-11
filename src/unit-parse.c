@@ -855,19 +855,25 @@ static int config_parse_delegate(
                 Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
         Service *s = unit_to_service(u, path, line);
         const char *p;
+        unsigned mask = 0;
         bool b;
         (void) lvalue;
 
         if (!s)
                 return 0;
 
+        /* As modern systemd: an empty assignment delegates with no controllers
+         * (systemd-udevd.service relies on it), "yes" names every controller
+         * it can delegate, "no" undoes either. */
         if (rvalue[0] == '\0') {
-                s->delegate = false;
+                s->delegate = true;
+                s->delegate_controllers = 0;
                 return 0;
         }
 
         if (parse_boolean_value(rvalue, &b) == 0) {
                 s->delegate = b;
+                s->delegate_controllers = b ? SERVICE_DELEGATE_ALL : 0;
                 return 0;
         }
 
@@ -882,7 +888,22 @@ static int config_parse_delegate(
                         return 0;
                 }
 
+        /* Controllers pico-init has no name for (bpf-*, ...) are skipped. */
+        for (p = rvalue; *p;) {
+                char word[16];
+                size_t n = strcspn(p, " ");
+
+                if (n > 0 && n < sizeof(word)) {
+                        memcpy(word, p, n);
+                        word[n] = '\0';
+                        mask |= service_delegate_controller_from_string(word);
+                }
+                p += n;
+                p += strspn(p, " ");
+        }
+
         s->delegate = true;
+        s->delegate_controllers = mask;
         return 0;
 }
 

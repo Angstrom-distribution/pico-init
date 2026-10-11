@@ -176,6 +176,7 @@ static const char *console_service =
                 "[Service]\n"
                 "Type=simple\n"
                 "ExecStart=/bin/sleep 300\n"
+                "Delegate=pids cpu\n"
                 "\n"
                 "[Install]\n"
                 "WantedBy=default.target\n";
@@ -284,6 +285,14 @@ static void test_boot_files_match_reality(void) {
         }
         ASSERT_EQ_INT(read_property(rtdir, "console.service", "NRestarts", val, sizeof(val)), 0);
         ASSERT_STREQ(val, "0");
+        ASSERT_EQ_INT(read_property(rtdir, "console.service", "Delegate", val, sizeof(val)), 0);
+        ASSERT_STREQ(val, "yes");
+        ASSERT_EQ_INT(read_property(rtdir, "console.service", "DelegateControllers", val, sizeof(val)), 0);
+        ASSERT_STREQ(val, "cpu pids");
+        ASSERT_EQ_INT(read_property(rtdir, "sysinit.service", "Delegate", val, sizeof(val)), 0);
+        ASSERT_STREQ(val, "no");
+        ASSERT_EQ_INT(read_property(rtdir, "sysinit.service", "DelegateControllers", val, sizeof(val)), 0);
+        ASSERT_STREQ(val, "");
 
         /* the manager file: unit count matches, updated by the boot */
         {

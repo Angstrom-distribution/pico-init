@@ -235,6 +235,7 @@ static void publish_unit_file(Unit *u) {
         char job_buf[80] = "";
         char notify_buf[192] = "";
         char *degraded;
+        char delegate_buf[64];
         Service *s = NULL;
         FILE *f;
         int n;
@@ -299,6 +300,13 @@ static void publish_unit_file(Unit *u) {
          * space-separated, empty when pico-init honoured every directive. */
         degraded = unit_degraded_directives_string(u);
 
+        /* Delegate=/DelegateControllers=: systemctl show's pair; the controller
+         * list is empty unless the unit named some. */
+        delegate_buf[0] = '\0';
+        if (s && s->delegate)
+                service_delegate_controllers_to_string(
+                                s->delegate_controllers, delegate_buf, sizeof(delegate_buf));
+
         fprintf(f,
                 "ActiveState=%s\n"
                 "SubState=%s\n"
@@ -312,6 +320,8 @@ static void publish_unit_file(Unit *u) {
                 "ExecMainStatus=%d\n"
                 "NRestarts=%u\n"
                 "Job=%s\n"
+                "Delegate=%s\n"
+                "DelegateControllers=%s\n"
                 "Degraded-Directives=%s\n"
                 "%s",
                 unit_active_state_to_string(unit_active_state(u)),
@@ -330,6 +340,8 @@ static void publish_unit_file(Unit *u) {
                 s ? s->main_exit_status : 0,
                 s ? s->n_restarts : 0u,
                 job_buf,
+                s && s->delegate ? "yes" : "no",
+                delegate_buf,
                 degraded ? degraded : "",
                 notify_buf);
         pico_mfree(degraded);

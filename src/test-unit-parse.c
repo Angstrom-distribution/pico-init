@@ -1687,28 +1687,35 @@ static void test_exec_dash_prefix_sets_ignore(void) {
 }
 
 /*
- * Delegate= is a boolean or a list of controller names; the list reads as yes,
- * an empty assignment resets, junk is ignored with the field left alone, and
- * the unit is not recorded as having dropped the directive.
+ * Delegate= is a boolean or a list of controller names. As in modern systemd a
+ * list delegates exactly those controllers, "yes" all of them, an empty
+ * assignment delegates none, and "no" undoes any of it; junk is ignored with
+ * the field left alone, and the unit is not recorded as having dropped the
+ * directive.
  */
 static void test_delegate(void) {
         static const struct {
                 const char *value;
                 bool want;
+                unsigned mask;
         } cases[] = {
-                {        "yes",  true },
-                {         "no", false },
-                {          "1",  true },
-                {        "off", false },
-                { "cpu memory",  true },
-                {        "cpu",  true },
-                {           "", false },
+                {             "yes",true,                                                   SERVICE_DELEGATE_ALL                                    },
+                {              "no", false,                                                                      0 },
+                {               "1",  true,                                                   SERVICE_DELEGATE_ALL },
+                {             "off", false,                                                                      0 },
+                {      "cpu memory",  true,                         SERVICE_DELEGATE_CPU | SERVICE_DELEGATE_MEMORY },
+                { "pids memory cpu",
+                 true, SERVICE_DELEGATE_CPU | SERVICE_DELEGATE_MEMORY | SERVICE_DELEGATE_PIDS                     },
+                {             "cpu",  true,                                                   SERVICE_DELEGATE_CPU },
+                { "cpu bpf-devices",  true,                                                   SERVICE_DELEGATE_CPU },
+                {                "",  true,                                                                      0 },
         };
         Manager *m;
         char *dir;
         size_t i;
         Unit *u;
         Service *s;
+        char buf[64];
 
         dir = test_tmpdir_new();
         ASSERT_TRUE(dir != NULL);
@@ -1720,10 +1727,10 @@ static void test_delegate(void) {
                 snprintf(body, sizeof(body), "[Service]\nExecStart=/bin/true\nDelegate=%s\n", cases[i].value);
                 ASSERT_EQ_INT(test_write_file(dir, name, body), 0);
         }
-        /* set, then reset by an empty assignment; invalid after yes keeps yes; absent is false */
+        /* "no" after "yes" clears both; invalid after yes keeps yes; absent is false */
         ASSERT_EQ_INT(test_write_file(dir,
                                       "reset.service",
-                                      "[Service]\nExecStart=/bin/true\nDelegate=yes\nDelegate=\n"),
+                                      "[Service]\nExecStart=/bin/true\nDelegate=yes\nDelegate=no\n"),
                       0);
         ASSERT_EQ_INT(test_write_file(dir,
                                       "junk.service",
@@ -1741,15 +1748,28 @@ static void test_delegate(void) {
                 ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
                 s = (Service *) u;
                 ASSERT_EQ_INT(s->delegate, cases[i].want);
+                ASSERT_EQ_INT((int) s->delegate_controllers, (int) cases[i].mask);
                 ASSERT_EQ_INT(u->n_degraded_directives, 0);
         }
 
         s = (Service *) load_one(m, "reset.service");
         ASSERT_EQ_INT(s->delegate, false);
+        ASSERT_EQ_INT((int) s->delegate_controllers, 0);
         s = (Service *) load_one(m, "junk.service");
         ASSERT_EQ_INT(s->delegate, true);
+        ASSERT_EQ_INT((int) s->delegate_controllers, (int) SERVICE_DELEGATE_ALL);
         s = (Service *) load_one(m, "absent.service");
         ASSERT_EQ_INT(s->delegate, false);
+
+        /* the printed form: systemd's controller order whatever the unit's */
+        service_delegate_controllers_to_string(SERVICE_DELEGATE_ALL, buf, sizeof(buf));
+        ASSERT_STREQ(buf, "cpu cpuset io memory pids");
+        service_delegate_controllers_to_string(SERVICE_DELEGATE_PIDS | SERVICE_DELEGATE_CPU, buf, sizeof(buf));
+        ASSERT_STREQ(buf, "cpu pids");
+        service_delegate_controllers_to_string(0, buf, sizeof(buf));
+        ASSERT_STREQ(buf, "");
+        service_delegate_controllers_to_string(SERVICE_DELEGATE_ALL, buf, 8);
+        ASSERT_STREQ(buf, "cpu");
 
         manager_free(m);
         test_rm_rf(dir);

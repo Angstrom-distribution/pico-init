@@ -1828,6 +1828,48 @@ const char *service_result_to_string(ServiceResult r) {
         return service_result_table[r];
 }
 
+static const struct {
+        const char *name;
+        unsigned bit;
+} delegate_controller_table[] = {
+        {    "cpu",    SERVICE_DELEGATE_CPU },
+        { "cpuset", SERVICE_DELEGATE_CPUSET },
+        {     "io",     SERVICE_DELEGATE_IO },
+        { "memory", SERVICE_DELEGATE_MEMORY },
+        {   "pids",   SERVICE_DELEGATE_PIDS },
+};
+
+unsigned service_delegate_controller_from_string(const char *name) {
+        size_t i;
+
+        for (i = 0; i < sizeof(delegate_controller_table) / sizeof(delegate_controller_table[0]); i++)
+                if (strcmp(name, delegate_controller_table[i].name) == 0)
+                        return delegate_controller_table[i].bit;
+
+        return 0;
+}
+
+void service_delegate_controllers_to_string(unsigned mask, char *buf, size_t size) {
+        size_t i, off = 0;
+
+        if (size == 0)
+                return;
+        buf[0] = '\0';
+
+        for (i = 0; i < sizeof(delegate_controller_table) / sizeof(delegate_controller_table[0]); i++) {
+                int n;
+
+                if (!(mask & delegate_controller_table[i].bit))
+                        continue;
+                n = snprintf(buf + off, size - off, "%s%s", off ? " " : "", delegate_controller_table[i].name);
+                if (n < 0 || (size_t) n >= size - off) {
+                        buf[off] = '\0';
+                        return;
+                }
+                off += (size_t) n;
+        }
+}
+
 void service_exec_stop_clear(Service *s) {
         unsigned i;
 

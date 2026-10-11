@@ -294,6 +294,7 @@ typedef struct Service {
 
         bool remain_after_exit; /* RemainAfterExit=: EXITED still counts as active */
         bool delegate;          /* Delegate=: the service manages the cgroup subtree below its own cgroup */
+        unsigned delegate_controllers; /* SERVICE_DELEGATE_*: the controllers a Delegate= list names */
 
         /*
          * Set by service_stop(): an explicit stop is the one thing Restart=
@@ -405,6 +406,23 @@ const char *service_type_to_string(ServiceType t);
 const char *service_state_to_string(ServiceState s);
 const char *service_restart_to_string(ServiceRestart r);
 const char *service_result_to_string(ServiceResult r);
+
+/* Delegate= controller names, in systemd's order. */
+#define SERVICE_DELEGATE_CPU (1u << 0)
+#define SERVICE_DELEGATE_CPUSET (1u << 1)
+#define SERVICE_DELEGATE_IO (1u << 2)
+#define SERVICE_DELEGATE_MEMORY (1u << 3)
+#define SERVICE_DELEGATE_PIDS (1u << 4)
+#define SERVICE_DELEGATE_ALL                                                                              \
+        (SERVICE_DELEGATE_CPU | SERVICE_DELEGATE_CPUSET | SERVICE_DELEGATE_IO | SERVICE_DELEGATE_MEMORY | \
+         SERVICE_DELEGATE_PIDS)
+
+/* The mask as systemctl's DelegateControllers= prints it: names joined by
+ * spaces, empty for no controllers. */
+void service_delegate_controllers_to_string(unsigned mask, char *buf, size_t size);
+
+/* One controller name to its SERVICE_DELEGATE_* bit, 0 for a name that is not one. */
+unsigned service_delegate_controller_from_string(const char *name);
 
 /* --- service-exec.c --- */
 
