@@ -182,6 +182,14 @@ int manager_new(Manager **ret) {
         if (r < 0)
                 goto fail;
 
+        /* Without +cpu +memory in the ancestors a unit cgroup has no cpu.weight or memory.high
+         * for the service (or a delegate) to use. Only PID 1 owns the real hierarchy. */
+        if (m->is_system) {
+                r = cgroup_v2_prepare_root(m->cgroup_root);
+                if (r < 0)
+                        pico_log(PICO_LOG_WARNING, "cgroup: preparing %s: %s", m->cgroup_root, strerror(-r));
+        }
+
         r = manager_set_runtime_dir(m, PICO_RUNTIME_DIR);
         if (r < 0)
                 goto fail;
