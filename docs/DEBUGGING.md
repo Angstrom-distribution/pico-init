@@ -94,7 +94,7 @@ instead of the running system.
 
 ### Degraded-Directives
 
-pico-init implements a subset of systemd's unit directives. A directive it
+Pico-init implements a subset of systemd's unit directives. A directive it
 does not implement is dropped at load time rather than treated as an error,
 and the unit records it. `show` prints the record as one space-separated
 field:

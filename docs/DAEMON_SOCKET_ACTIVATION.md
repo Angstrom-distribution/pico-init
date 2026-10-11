@@ -1,6 +1,6 @@
 # Socket Activation of Daemons
 
-pico-init implements the `sd_listen_fds()` flavour of socket activation: PID 1
+Pico-init implements the `sd_listen_fds()` flavour of socket activation: PID 1
 binds the listening sockets of a `.socket` unit, and hands them to the paired
 `.service` as file descriptors starting at 3, announced through `LISTEN_PID`
 and `LISTEN_FDS`. A socket unit has four states, no `Exec*=` lines, and no
@@ -153,7 +153,7 @@ Not set.
 
 ## Consuming the descriptors
 
-pico-init ships a `libsystemd` compatibility library whose `sd-daemon` is
+Pico-init ships a `libsystemd` compatibility library whose `sd-daemon` is
 symbol-compatible with systemd (see
 [COMPATIBILITY_LIBRARIES.md](COMPATIBILITY_LIBRARIES.md)). A daemon written
 for systemd needs no change:

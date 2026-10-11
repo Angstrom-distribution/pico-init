@@ -1,6 +1,6 @@
 # Architecture
 
-pico-init is a PID 1 that reads systemd unit files, plus a small set of
+Pico-init is a PID 1 that reads systemd unit files, plus a small set of
 companion programs that replace the parts of systemd an embedded image
 usually needs: a control tool, a network daemon, a log daemon, a device
 hotplug daemon, tmpfiles handling and ABI-compatible `libsystemd.so.0` and

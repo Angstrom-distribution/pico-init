@@ -1,6 +1,6 @@
 # Compatibility Libraries
 
-pico-init installs two shared libraries with the names, SONAMEs, header
+Pico-init installs two shared libraries with the names, SONAMEs, header
 layout, pkg-config files and symbol versions of the real ones:
 `libsystemd.so.0` and `libudev.so.1`. A package built against systemd's
 `libsystemd` or `libudev` links and loads against them unchanged. They are
@@ -142,7 +142,7 @@ real journal fails `sd_journal_seek_cursor()` with `-EINVAL`. Errors:
 
 ### sd-login
 
-pico-init is not logind and registers no sessions, seats or users. The
+Pico-init is not logind and registers no sessions, seats or users. The
 errno contract is upstream's for a system where logind is absent.
 
 - Real: `sd_pid_get_cgroup`, `sd_pid_get_unit`, `sd_pid_get_slice` and their

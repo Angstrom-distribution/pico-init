@@ -1,6 +1,6 @@
 # Incompatibilities with systemd
 
-pico-init reads systemd unit files unmodified, but it implements a small
+Pico-init reads systemd unit files unmodified, but it implements a small
 subset of what they can say. This document is for the author of a unit file
 or the maintainer of a package that ships one: it lists the unit types
 pico-init has, every directive it honours, what happens to everything else,

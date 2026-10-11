@@ -6,7 +6,7 @@ overview is in [the README](../README.md).
 
 ## Why not systemd?
 
-pico-init targets boards with a CPU in the 200 MHz class and around 64 MiB of
+Pico-init targets boards with a CPU in the 200 MHz class and around 64 MiB of
 RAM, where the full systemd does not fit. It keeps systemd's unit files,
 dependency-ordered jobs and one cgroup v2 per service, so packages that ship
 systemd units work unmodified, and drops what a small board does not use: no

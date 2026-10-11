@@ -1,7 +1,7 @@
 # API File Systems
 
 The kernel mounts the root file system and starts `/sbin/init`; nothing else
-is mounted. pico-init, as PID 1, therefore mounts the API virtual file
+is mounted. Pico-init, as PID 1, therefore mounts the API virtual file
 systems itself before it does anything else, creates the five `/dev`
 symlinks that devtmpfs does not provide, and sets one kernel tunable. This
 document lists what is mounted, with which options, in which order, and what

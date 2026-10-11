@@ -1,6 +1,6 @@
 # Control Group APIs and Delegation
 
-pico-init uses the cgroup v2 unified hierarchy only. Every service gets one
+Pico-init uses the cgroup v2 unified hierarchy only. Every service gets one
 cgroup, and PID 1 is the sole writer of the hierarchy above it. A service
 that wants to manage a subtree of its own, for example a container runtime
 or a supervisor that spawns workers, sets `Delegate=` and takes over the

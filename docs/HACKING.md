@@ -9,7 +9,7 @@ running system see [DEBUGGING.md](DEBUGGING.md).
 
 ## Build
 
-pico-init is a meson project written in C (`gnu17`). `warning_level=3` and
+Pico-init is a meson project written in C (`gnu17`). `warning_level=3` and
 `werror=true` are the project defaults, so a new warning breaks the build.
 The minimum meson version is 0.62.0. `meson.build` defines no project options
 of its own; the usual built-in options (`--prefix`, `--libdir`, `--buildtype`

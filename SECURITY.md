@@ -1,6 +1,6 @@
 # Security Policy
 
-pico-init is PID1 on any system that runs it: it is the parent of every
+Pico-init is PID1 on any system that runs it: it is the parent of every
 other process, it owns the cgroup hierarchy, and if it crashes the
 kernel panics. Security issues here have a larger blast radius than in most
 software, and are treated accordingly.

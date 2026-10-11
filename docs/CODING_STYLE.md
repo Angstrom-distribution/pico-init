@@ -1,6 +1,6 @@
 # Coding Style
 
-pico-init is C (`gnu17`), formatted by `clang-format` with a configuration
+Pico-init is C (`gnu17`), formatted by `clang-format` with a configuration
 derived from systemd's own, and written to systemd's conventions where the
 two projects overlap. A large part of the source is lifted or quarried from
 systemd, so staying close to its style keeps diffs against upstream small.

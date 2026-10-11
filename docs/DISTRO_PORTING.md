@@ -3,14 +3,14 @@
 This document lists what a distribution or OpenEmbedded layer has to provide
 to boot with pico-init as `/sbin/init`: what the build installs and where,
 how to split it into packages, which units and targets the image must bring
-itself, how presets are applied, and what to run at image build time. pico-init
+itself, how presets are applied, and what to run at image build time. Pico-init
 reads unmodified systemd unit files, so most packages need no changes; the
 work is in the image-level glue. For the overall design see
 [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Building
 
-pico-init builds with meson (0.62 or newer) and ninja, as a C project with
+Pico-init builds with meson (0.62 or newer) and ninja, as a C project with
 `c_std=gnu17`, `warning_level=3` and `werror=true`:
 
 ```sh
@@ -118,7 +118,7 @@ to supply whichever of them its packages reference.
 `network.target` is passive and `netd.service` orders itself before it;
 `network-online.target` is not provided.
 
-pico-init has no mount, swap, timer, path, device, scope or slice units.
+Pico-init has no mount, swap, timer, path, device, scope or slice units.
 `/etc/fstab` is processed by PID 1 itself, before any unit loads. A
 dependency on a unit type pico-init does not have is recorded as degraded
 rather than followed.
@@ -142,7 +142,7 @@ A literal instance unit wins over the template across all directories, so
 
 ## Presets
 
-pico-init applies presets itself, on first boot only:
+Pico-init applies presets itself, on first boot only:
 
 - First boot means `/etc/machine-id` is missing, empty, unparseable or
   contains `uninitialized`. PID 1 writes a new id and applies presets to every unit
@@ -177,7 +177,7 @@ disable *
 
 ## Getty and login units
 
-pico-init ships no getty units. Take `getty@.service` or
+Pico-init ships no getty units. Take `getty@.service` or
 `serial-getty@.service` from the distribution; they load unmodified.
 Supported pieces that these units use:
 

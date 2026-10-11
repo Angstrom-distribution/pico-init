@@ -7,7 +7,7 @@ boards: 200 MHz-class CPUs with around 64 MiB of RAM. It is written in C,
 needs nothing at runtime beyond the C library, and is built for
 OpenEmbedded images whose packages expect systemd.
 
-pico-init keeps systemd's architecture -- declarative unit files,
+Pico-init keeps systemd's architecture -- declarative unit files,
 dependency-ordered jobs, one cgroup v2 per service -- and the file formats
 packages already ship, and reimplements the rest at a much smaller scale.
 Parts of the PID 1 core are quarried from early (2011-era) systemd source;
@@ -91,7 +91,7 @@ started too early.
 
 ## cgroups
 
-pico-init uses the unified cgroup v2 hierarchy only. Each service runs in
+Pico-init uses the unified cgroup v2 hierarchy only. Each service runs in
 `/sys/fs/cgroup/system.slice/<unit>`, a stop kills the whole cgroup
 (through `cgroup.kill` where the kernel has it), and cgroup emptiness is
 watched rather than polled. At boot PID 1 enables the `cpu` and `memory`
@@ -167,7 +167,7 @@ The `docs/` directory follows the layout of systemd's own `docs/`.
 
 ## Building and testing
 
-pico-init builds with meson (0.62 or newer) and ninja on Linux:
+Pico-init builds with meson (0.62 or newer) and ninja on Linux:
 
 ```sh
 meson setup build
@@ -183,7 +183,7 @@ CI also checks formatting with `clang-format-18 --dry-run --Werror` over
 
 ## License
 
-pico-init as a whole is GPL-2.0-or-later (see [`LICENSE`](LICENSE)); the
+Pico-init as a whole is GPL-2.0-or-later (see [`LICENSE`](LICENSE)); the
 PID 1 core is derived from systemd source that predates its relicensing to
 LGPL-2.1-or-later. Every file carries an SPDX identifier or is covered by
 [`REUSE.toml`](REUSE.toml), and the license texts are in
