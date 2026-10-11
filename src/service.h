@@ -293,6 +293,7 @@ typedef struct Service {
         struct pico_cgroup *cgroup; /* owned, NULL until started */
 
         bool remain_after_exit; /* RemainAfterExit=: EXITED still counts as active */
+        bool delegate;          /* Delegate=: the service manages the cgroup subtree below its own cgroup */
 
         /*
          * Set by service_stop(): an explicit stop is the one thing Restart=

@@ -40,7 +40,14 @@ implementation experience as each subsystem landed. Summary:
   engine, and service state machine — not a literal fork, not written from
   spec. The main loop itself is a real `sd_event` consumer, quarried from
   *current* systemd's `src/core/manager.c` for that specific shape.
-- **cgroups**: v2 (unified), matching every modern kernel default.
+- **cgroups**: v2 (unified), matching every modern kernel default. At boot
+  `cpu` and `memory` are enabled for the children of the root and of
+  `system.slice`, so a unit cgroup has `cpu.weight`, `memory.high` and the
+  like. `Delegate=yes` (or a controller list, read as yes) leaves the
+  subtree below the unit's cgroup to the service and, for a non-root
+  `User=`, hands the cgroup to that user; child cgroups a service made are
+  removed when it stops, and a stale unit cgroup is reset before the next
+  start.
 - **Networking**: a minimal from-scratch `netd` speaking `.network`-file
   syntax, built on lifted `sd-dhcp`/`sd-netlink` source rather than
   hand-rolled DHCP or the whole of modern `systemd-networkd`. `netd` also

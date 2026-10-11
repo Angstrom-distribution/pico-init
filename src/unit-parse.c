@@ -845,6 +845,47 @@ static int config_parse_pid_file(
         return 0;
 }
 
+/*
+ * Delegate= takes a boolean or a list of controller names. pico-init always
+ * leaves a unit's cgroup subtree to the unit, so a list reads as "yes" and the
+ * names are not used; what the flag adds is ownership of the cgroup for a
+ * User= service. An empty assignment resets it, as in systemd.
+ */
+static int config_parse_delegate(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        Service *s = unit_to_service(u, path, line);
+        const char *p;
+        bool b;
+        (void) lvalue;
+
+        if (!s)
+                return 0;
+
+        if (rvalue[0] == '\0') {
+                s->delegate = false;
+                return 0;
+        }
+
+        if (parse_boolean_value(rvalue, &b) == 0) {
+                s->delegate = b;
+                return 0;
+        }
+
+        for (p = rvalue; *p; p++)
+                if (!((*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') || *p == '-' || *p == '_' ||
+                      *p == ' ')) {
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s:%u: invalid Delegate= value '%s', ignoring",
+                                 path,
+                                 line,
+                                 rvalue);
+                        return 0;
+                }
+
+        s->delegate = true;
+        return 0;
+}
+
 static int config_parse_guess_main_pid(
                 Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
         Service *s = unit_to_service(u, path, line);
@@ -1707,6 +1748,7 @@ static const ConfigItem config_items[] = {
         { SECTION_SERVICE,                  "Restart",                     config_parse_restart },
         { SECTION_SERVICE,               "RestartSec",                 config_parse_restart_sec },
         { SECTION_SERVICE,          "RemainAfterExit",           config_parse_remain_after_exit },
+        { SECTION_SERVICE,                 "Delegate",                    config_parse_delegate },
         { SECTION_SERVICE,          "TimeoutStartSec",           config_parse_timeout_start_sec },
         { SECTION_SERVICE,           "TimeoutStopSec",            config_parse_timeout_stop_sec },
         { SECTION_SERVICE,                     "User",                  config_parse_user_group },

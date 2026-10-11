@@ -1392,6 +1392,20 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
                 return r;
         }
 
+        /* Delegate=yes for a non-root User=: the service must own its cgroup to manage the subtree
+         * below it. Done here, not in the child, so a failure can be logged; the unit still starts. */
+        if (s->delegate && s->cgroup && creds.set && creds.uid != 0 && creds.uid != (uid_t) -1) {
+                int dr = cgroup_v2_delegate_to(s->cgroup->path, creds.uid, creds.gid);
+
+                if (dr < 0)
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s: Delegate=: cannot hand %s to uid %u: %s",
+                                 UNIT(s)->id,
+                                 s->cgroup->path,
+                                 (unsigned) creds.uid,
+                                 strerror(-dr));
+        }
+
         /* Same placement reasoning: a required EnvironmentFile= that cannot
          * be read fails the start before any side effect. */
         r = load_environment_files(s, &file_env);
