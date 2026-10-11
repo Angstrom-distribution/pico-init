@@ -13,8 +13,6 @@ packages already ship, and reimplements the rest at a much smaller scale.
 Parts of the PID 1 core are quarried from early (2011-era) systemd source;
 the DHCP and SNTP code in `netd` is lifted from current systemd.
 
-## What is in the box
-
 - **`pico-init`** (PID 1). Mounts the API filesystems, restores the wall
   clock, checks and remounts the root filesystem, processes `/etc/fstab`
   (including swap and UBI/ubifs), activates Discoverable Partitions swap,
