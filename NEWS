@@ -1,0 +1,248 @@
+# CHANGES WITH 0.2.0:
+
+        This is the first tagged release of pico-init, a small
+        systemd-compatible init system for embedded Linux boards with around
+        64 MiB of RAM. Everything below is new in this release; it describes
+        what the release does rather than how it got there.
+
+##        PID 1 and unit files:
+
+        * pico-init runs as PID 1 on the cgroup v2 hierarchy with an sd_event
+          main loop. It mounts /proc, /sys, /dev, /dev/pts, /dev/shm, /run,
+          /sys/fs/cgroup and /sys/kernel/config, creates the /dev/fd and
+          /dev/std{in,out,err} links, sets the hostname from /etc/hostname,
+          and never exits: a fatal error freezes with the reason on the
+          console instead of panicking the kernel.
+
+        * Unit files are read from /etc/systemd/system and
+          /usr/lib/systemd/system, /etc taking precedence. Service, socket
+          and target units are supported, with .wants/.requires directories,
+          symlink aliases, masking, template instances and the %n, %N, %p, %i
+          and %I specifiers. Presets are applied on first boot only, detected
+          the way systemd does it (/etc/machine-id missing, empty or
+          "uninitialized"), and /etc/machine-id is created then.
+
+        * [Unit] honours Description=, Requires=, Wants=, Before=, After=,
+          Conflicts=, ConditionPathExists= and ConditionPathIsDirectory=,
+          including '!' negation.
+
+        * [Service] honours Type=simple, exec, oneshot, forking and notify;
+          ExecCondition=, ExecStartPre= (every line, in order), ExecStart=,
+          ExecStop= and ExecStopPost=, with the '-' modifier, single and
+          double quoting, and $VAR/${VAR} expansion at spawn time;
+          Environment= and EnvironmentFile=; User=, Group= and
+          SupplementaryGroups=; PIDFile= and GuessMainPID=; Restart= with
+          every systemd value, RestartSec=, RemainAfterExit=,
+          TimeoutStartSec= and TimeoutStopSec= with systemd's defaults.
+
+        * StandardInput=socket, tty, tty-force and tty-fail, TTYPath=, and
+          StandardOutput=/StandardError= inherit, journal, syslog (and their
+          +console forms) and null are honoured. Service output goes to logd
+          by default.
+
+        * Socket units support ListenStream=, ListenDatagram=, Service=,
+          SocketMode=, Backlog=, Accept=yes per-connection instances with
+          MaxConnections=, and StandardInput=socket for those instances.
+          Services are ordered after sockets.target.
+
+        * A unit that uses directives pico-init cannot honour still loads.
+          Each dropped directive is recorded on the unit, PID 1 logs one
+          warning per unit and a summary once the boot has settled, and
+          "picoctl show" reports the list as Degraded-Directives=.
+          Type=dbus and Type=idle run as simple, Type=notify-reload as
+          notify, ExecReload= is stored but not run, and a dependency on an
+          unsupported unit type such as .mount or .timer is recorded rather
+          than followed. An unknown Type= still fails the unit.
+
+        * A stop runs ExecStop=, then signals every process in the unit's
+          cgroup, using cgroup.kill where the kernel provides it. A skipped
+          ExecCondition= ends the start cleanly without triggering
+          Restart=.
+
+        * The sd_notify() socket is handled: READY=1 completes a
+          Type=notify start, and STATUS=, ERRNO=, MAINPID= and BARRIER=1
+          are honoured. Services get NOTIFY_SOCKET in their environment.
+
+        * SIGHUP and "picoctl daemon-reload" re-read changed unit files, pick
+          up new units and .wants/.requires links, and apply the new values
+          from each unit's next start.
+
+        * The boot console shows a version greeting and systemd-style
+          OK, FAILED, TIME and DEPEND status lines.
+
+        * PID 1 feeds /dev/watchdog0 (or /dev/watchdog) when present and
+          leaves it armed through shutdown. Ctrl-Alt-Del triggers an orderly
+          reboot.
+
+        * The root filesystem is checked before anything writes to it and
+          then remounted read-write following /etc/fstab's "/" line. A
+          filesystem the checker could not repair stays read-only and the
+          boot continues.
+
+        * /etc/fstab is processed by PID 1 before any unit starts, using the
+          kernel's new mount API. UUID=, LABEL=, PARTUUID= and PARTLABEL=
+          are resolved by built-in readers for ext2/3/4, swap, FAT, exFAT,
+          XFS, btrfs and NTFS, matching blkid's output. Swap lines are
+          activated, noauto lines are left alone, and the outcome of every
+          line is recorded in /run/pico-init/fstab.
+
+        * MTD flash named in ubi.mtd= on the kernel command line is attached
+          to UBI from userspace when UBI is a module, so ubifs fstab lines
+          work either way.
+
+        * Swap partitions on the boot disk are activated following the
+          Discoverable Partitions Specification, unless /etc/fstab names
+          any swap.
+
+        * The wall clock is restored from /etc/timestamp before any service
+          starts and saved two minutes after boot, every ten minutes and at
+          shutdown. It only ever moves forward, to the latest of the saved
+          time, the file's mtime and a build epoch.
+
+##        cgroups:
+
+        * Every service runs in its own cgroup below
+          /sys/fs/cgroup/system.slice, watched through cgroup.events.
+
+        * At boot PID 1 enables the cpu and memory controllers in the root
+          cgroup.subtree_control and in system.slice, so unit cgroups have
+          cpu.weight, memory.high and similar files. This is best effort: a
+          controller the kernel refuses is logged as a warning.
+
+        * Delegate= is parsed with systemd's semantics: a boolean or a list
+          of controllers, an empty value delegates with no controllers, and
+          "no" clears it. For a service with a non-root User=, the unit
+          cgroup is chowned to that user.
+
+        * DelegateSubgroup= is supported. With Delegate= set, the main
+          process starts in <unit cgroup>/<name> (handed to a non-root
+          User=), and every other process of the unit (ExecStartPre=,
+          ExecStop=, ...) goes to <unit cgroup>/.control, so the unit cgroup
+          holds no process and the service can enable controllers in it. An
+          invalid name is ignored with a warning, and a subgroup that cannot
+          be created falls back to the unit cgroup.
+
+        * Child cgroups a service created are removed depth-first when the
+          unit stops, and a stale, empty unit cgroup left by an earlier run
+          is reset before the next start.
+
+##        picoctl:
+
+        * picoctl is the systemctl equivalent, with status, list-units,
+          list-unit-files, show, cat, is-active, is-failed, is-enabled,
+          is-system-running, enable, disable, reenable, preset, mask,
+          unmask, start, stop, restart, try-restart, reload-or-restart,
+          kill, reset-failed, daemon-reload, reboot, poweroff and halt.
+          Options are parsed anywhere on the command line, and a bare unit
+          name gets .service appended.
+
+        * Output and colours follow systemctl. "picoctl status" without a
+          unit prints the system overview, and with one it includes the
+          unit's recent log lines and says "A dependency job for X failed"
+          for a dependency failure.
+
+        * "picoctl show" prints Delegate=, DelegateControllers= and
+          DelegateSubgroup= alongside Degraded-Directives=.
+
+        * The read verbs work from the state files PID 1 publishes in
+          /run/pico-init/units and keep working when PID 1 is busy; the file
+          verbs accept --root.
+
+##        netd:
+
+        * netd reads .network files from /etc/systemd/network,
+          /run/systemd/network and /usr/lib/systemd/network, implementing
+          [Match] Name=, [Network] DHCP=, Address=, Gateway=, DNS=, NTP=,
+          DHCPServer=, LLDP=, EmitLLDP=, and [DHCPv4] UseDNS=, UseNTP= and
+          UseTimezone=. Other directives are ignored. DHCP=ipv6 is accepted
+          and does nothing.
+
+        * A DHCPv4 client and server, lifted from systemd. The client
+          applies DNS servers to /etc/resolv.conf, NTP servers from option
+          42 and the time zone from option 101; a lease's address and router
+          survive a reload.
+
+        * An SNTP client sets the clock from NTP= or DHCP-provided servers.
+
+        * netd speaks LLDP. LLDP=yes or LLDP=routers-only receives
+          neighbour announcements, and EmitLLDP= (yes, nearest-bridge,
+          non-tpmr-bridge, customer-bridge) sends them; both are off unless
+          set. The parser rejects malformed frames whole, the neighbour
+          table of each link is bounded, and neighbours are published in
+          /run/netd/lldp.
+
+        * A link whose kernel MAC address is random gets a stable one, and
+          netd sets fq_codel (or fq, cake) as the default qdisc and bbr as
+          TCP congestion control when the kernel offers them.
+
+        * netctl is a networkctl-style client with status, list, lldp and
+          reload. Apart from reload it does not need netd to be running.
+
+##        logd:
+
+        * logd collects service stdout/stderr, /dev/log and /dev/kmsg into a
+          2 MiB ring in /run/logd, in journal export format. Its sockets are
+          held by PID 1 through logd.socket, so a logd restart loses no
+          output, and PID 1's own messages written before logd started are
+          backfilled from the kernel log.
+
+        * picolog is a journalctl-style reader of that ring, with
+          journalctl's priority colours.
+
+##        devd:
+
+        * devd handles device events on images that run devtmpfs without
+          udev: it maintains /dev/disk/by-partuuid, by-partlabel, by-uuid,
+          by-label and by-id links, and mounts data partitions of
+          GPT-formatted removable media under /media, never touching a
+          device that is already mounted.
+
+        * devd runs installed udev rules files, supporting ACTION,
+          SUBSYSTEM, KERNEL, ENV{}, ATTR{}, ATTRS{}, MODE, OWNER, GROUP,
+          SYMLINK+=, RUN+=, GOTO and LABEL. A rule using any other key is
+          skipped whole, so a partly understood rule never matches more than
+          intended.
+
+        * devd loads kernel modules for a device's MODALIAS, and classifies
+          input devices the way udev's input_id builtin does, recording
+          ID_INPUT* properties in /run/udev/data.
+
+##        libsystemd and libudev compatibility:
+
+        * libsystemd.so.0 and libudev.so.1 are built with systemd v259's
+          symbol versions, with libsystemd.pc, systemd.pc, libudev.pc and
+          udev.pc checked against systemd's own templates.
+
+        * sd-daemon, sd-event and sd-id128 are real implementations;
+          sd-journal writes to logd and reads its ring; sd-device and
+          libudev read sysfs with the udev database devd writes overlaid,
+          and udev_monitor delivers real uevents; the cgroup queries of
+          sd-login are answered from /proc.
+
+        * Functions without a mechanism behind them return an honest error
+          rather than a fake success: sd-bus never connects, there is no
+          hwdb, and the logind queries report no sessions or seats.
+
+##        Build and tests:
+
+        * The build uses meson (0.62 or newer) and has no dependencies beyond
+          the C library. The test suite runs with "meson test"; CI runs
+          it as root, since it creates real cgroups and network devices.
+
+        * pico-unit-lint runs PID 1's unit parser over an installed unit
+          tree and reports every directive a booted system would drop, for
+          use in image builds.
+
+        * pico-tmpfiles implements systemd-tmpfiles --create, --clean and
+          --remove over tmpfiles.d files, with systemd v259's grammar and
+          file precedence.
+
+##        Miscellaneous:
+
+        * pico-init is GPL-2.0-or-later. The DHCP, SNTP and time code in
+          netd and the vendored systemd symbol and pkg-config files are
+          LGPL-2.1-or-later, and every file is REUSE compliant.
+
+##        Contributions from:
+
+        Koen Kooi

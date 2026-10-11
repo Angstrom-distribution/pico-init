@@ -1,116 +1,180 @@
 # pico-init
 
-A small, systemd-inspired PID1 for constrained embedded Linux targets —
-starting with [Angstrom Linux](https://github.com/koenkooi)'s `angstrom-pico`
-distro, aimed at 200MHz-class hardware with roughly 64MiB of RAM.
+A small, systemd-compatible init system for constrained embedded Linux
+boards: 200 MHz-class CPUs with around 64 MiB of RAM. It is written in C,
+needs nothing at runtime beyond the C library, and is built for
+OpenEmbedded images whose packages expect systemd.
 
-## What this is
+pico-init keeps systemd's architecture -- declarative unit files,
+dependency-ordered jobs, one cgroup v2 per service -- and the file formats
+packages already ship, and reimplements the rest at a much smaller scale.
+Parts of the PID 1 core are quarried from early (2011-era) systemd source;
+the DHCP and SNTP code in `netd` is lifted from current systemd.
 
-systemd's actual design — cgroups-based process supervision, declarative
-units, dependency-ordered startup — is the right architecture even on a
-constrained device. Its footprint is not: a full systemd stack costs
-somewhere around 15–20MiB of RAM on a device that only has 64MiB to begin
-with. pico-init keeps the architecture and rebuilds the implementation at a
-much smaller scale, in C, quarrying real systemd source where that's the
-fastest path to something correct rather than reimplementing everything from
-a man page.
+## What is in the box
 
-**Status: real, boots.** The PID1 core, `netd`, `devd`, and `logd` are
-implemented, tested, and boot-validated — `console-pico-image` reaches a
-login prompt with a working getty on every qemu test machine this project
-targets. PID1's own main loop is a real `sd_event` consumer (the same
-architecture modern systemd's own PID1 has always used), with a real
-`sd_notify()` listener and a hardware-watchdog feeder built on top of it.
-A `libsystemd-compat` shim (`src/compat/libsystemd/`) gives third-party
-software written against real systemd's public API a genuine, mostly-real
-implementation to link against under pico-init. Template/`%i` unit
-instancing is partially built (unit-name parsing and fallback loading
-land; generic-getty generation is still open). Resource-control/sandboxing
-and a DRM-based boot splash are designed but not yet implemented.
+- **`pico-init`** (PID 1). Mounts the API filesystems, restores the wall
+  clock, checks and remounts the root filesystem, processes `/etc/fstab`
+  (including swap and UBI/ubifs), activates Discoverable Partitions swap,
+  creates `/etc/machine-id` and applies presets on first boot, then loads
+  units and runs the boot transaction on an `sd_event` main loop. It feeds
+  a hardware watchdog when one exists, listens for `sd_notify()`, and
+  re-reads unit files on `SIGHUP`.
+- **`picoctl`**, the `systemctl` equivalent: `status`, `list-units`,
+  `list-unit-files`, `show`, `cat`, `is-active`, `is-failed`,
+  `is-enabled`, `is-system-running`, `enable`, `disable`, `reenable`,
+  `preset`, `mask`, `unmask`, `start`, `stop`, `restart`, `try-restart`,
+  `reload-or-restart`, `kill`, `reset-failed`, `daemon-reload`, `reboot`,
+  `poweroff`, `halt`. Output and colours follow `systemctl`. The read verbs
+  work from state files under `/run/pico-init` and keep working when PID 1
+  is wedged; `--root` works for the file verbs.
+- **`netd`**, a network daemon reading `.network` files from the
+  `systemd-networkd` directories: static addresses, a DHCPv4 client and
+  server, DNS into `/etc/resolv.conf`, an SNTP client, the time zone from
+  DHCP, and LLDP. **`netctl`** is its `networkctl`-style client (`status`,
+  `list`, `lldp`, `reload`).
+- **`logd`**, a log daemon collecting service stdout/stderr, `/dev/log` and
+  `/dev/kmsg` into a 2 MiB ring in `/run/logd` (journal export format, not
+  the binary journal). **`picolog`** is its `journalctl`-style reader.
+- **`devd`**, a device daemon for devtmpfs-only images: maintains
+  `/dev/disk/by-*` links, mounts GPT data partitions of removable media
+  under `/media`, loads modules by `MODALIAS`, classifies input devices like
+  udev's `input_id` builtin, and runs a subset of real udev rules files.
+- **`pico-tmpfiles`**: `systemd-tmpfiles --create`, `--clean` and
+  `--remove` over the `tmpfiles.d` files packages install.
+- **`libsystemd.so.0`** and **`libudev.so.1`**, compatibility libraries
+  with the symbol versions and `pkg-config` files of systemd v259. A
+  function is real where pico-init has a real mechanism (`sd-daemon`,
+  `sd-event`, `sd-id128`, `sd-journal` over `logd`, `sd-device` and
+  `libudev` over sysfs and devd's udev database, the cgroup half of
+  `sd-login`) and returns an honest error where it has none (`sd-bus`
+  never connects, there is no hwdb, no logind data). An image that runs a
+  real D-Bus daemon needs real libsystemd.
+- **`pico-unit-lint`**, PID 1's own unit parser run over an installed unit
+  tree, so a build log shows which directives a booted system would drop.
 
-## Scoping
+## systemd compatibility
 
-The real design decisions — what gets quarried from systemd, cgroups v1 vs
-v2, where the network stack comes from, how much of journald survives, the
-DHCP-timezone story — were made against a 2011-era-systemd feasibility study
-and a scoping dialog with the maintainer, then refined against real
-implementation experience as each subsystem landed. Summary:
+Unit files are read unmodified from `/etc/systemd/system` and
+`/usr/lib/systemd/system`; presets from the matching `system-preset`
+directories are applied on first boot. Service, socket and target units are
+supported, with templates, the `%n %N %p %i %I` specifiers, aliases,
+masking, and `.wants`/`.requires` directories.
 
-- **PID1 core**: quarried from systemd's ~2011-era unit parser, dependency
-  engine, and service state machine — not a literal fork, not written from
-  spec. The main loop itself is a real `sd_event` consumer, quarried from
-  *current* systemd's `src/core/manager.c` for that specific shape.
-- **cgroups**: v2 (unified), matching every modern kernel default. At boot
-  `cpu` and `memory` are enabled for the children of the root and of
-  `system.slice`, so a unit cgroup has `cpu.weight`, `memory.high` and the
-  like. `Delegate=` (a boolean or a controller list, an empty value delegates
-  no controllers, as in systemd) leaves the subtree below the unit's cgroup
-  to the service and, for a non-root `User=`, hands the cgroup to that user;
-  `picoctl show` prints `Delegate=` and `DelegateControllers=` like
-  `systemctl show`; child cgroups a service made are
-  removed when it stops, and a stale unit cgroup is reset before the next
-  start.
-- **Networking**: a minimal from-scratch `netd` speaking `.network`-file
-  syntax, built on lifted `sd-dhcp`/`sd-netlink` source rather than
-  hand-rolled DHCP or the whole of modern `systemd-networkd`. `netd` also
-  speaks LLDP: `LLDP=` listens for neighbours and `EmitLLDP=` announces
-  this host, with a bounded neighbour table per link and a strict frame
-  parser; `networkctl lldp` lists what was heard.
-- **Logging**: `logd`, a from-scratch syslog/journal-analogue daemon (not
-  the real binary journal format) plus a slim `journalctl`-equivalent
-  reader; no rate-limiting, sealing, or remote forwarding.
-- **Time**: an integrated minimal SNTP client with a DHCP option 100/101
-  hook inside `netd`. For boards whose RTC is dead or reset by a reboot,
-  PID1 keeps the wall clock roughly right on its own: it restores
-  `/etc/timestamp` (the OpenEmbedded file, `YYYYMMDDHHMMSS` UTC) before any
-  service starts, saves it two minutes after boot, every ten minutes and
-  at shutdown, and only ever moves the clock forward, to the largest of the
-  saved time, the file's mtime and a build epoch. NTP corrects the rest.
-- **systemd compatibility**: `libsystemd-compat`, a real/honest-failure/
-  no-op shim over the public `sd-*` API surface (`sd-daemon`, `sd-event`,
-  `sd-id128`, `sd-journal`, `sd-bus`/`sd-login`/`sd-hwdb`, `sd-device`/
-  `sd-network`) — real wherever pico-init has a genuine equivalent
-  mechanism, an honest error where it categorically doesn't, never a
-  faked success.
-- **Unit-file degradation is on the record**: a real systemd unit loads
-  even when pico-init cannot honour every directive in it, and every drop
-  is recorded on the unit — `picoctl show` reports it as
-  `Degraded-Directives=`, PID 1 logs one warning per unit at load and one
-  summary line once the boot has settled, and `pico-unit-lint DIR...` runs
-  the same parser over an installed unit tree at build time so the gap is
-  visible in a build log before anything boots.
-- **Build system**: meson.
+Directives that are honoured:
+
+- `[Unit]`: `Description=`, `Requires=`, `Wants=`, `Before=`, `After=`,
+  `Conflicts=`, `ConditionPathExists=`, `ConditionPathIsDirectory=`.
+- `[Service]`: `Type=` (`simple`, `exec`, `oneshot`, `forking`,
+  `notify`), `ExecCondition=`, `ExecStartPre=`, `ExecStart=`, `ExecStop=`,
+  `ExecStopPost=`, `Environment=`, `EnvironmentFile=`, `User=`, `Group=`,
+  `SupplementaryGroups=`, `PIDFile=`, `GuessMainPID=`, `Restart=`,
+  `RestartSec=`, `RemainAfterExit=`, `TimeoutStartSec=`,
+  `TimeoutStopSec=`, `StandardInput=` (`socket`, `tty`, `tty-force`,
+  `tty-fail`), `TTYPath=`, `StandardOutput=`/`StandardError=` (`inherit`,
+  `journal`, `syslog`, `null`), `Delegate=`, `DelegateSubgroup=`.
+- `[Socket]`: `ListenStream=`, `ListenDatagram=`, `Service=`, `Accept=`,
+  `SocketMode=`, `Backlog=`, `MaxConnections=`.
+- `[Install]`: `WantedBy=`, `RequiredBy=`.
+
+Anything else does not stop a unit from loading. Every directive pico-init
+cannot honour is recorded on the unit: PID 1 logs one warning per unit at
+load and a summary once the boot has settled, `picoctl show` lists the
+drops as `Degraded-Directives=`, and `pico-unit-lint [--warn-only] DIR...`
+reports the same record at build time. Some values degrade rather than
+drop: `Type=dbus` and `Type=idle` run as `simple`, `Type=notify-reload` as
+`notify`, and a dependency on a unit type pico-init does not have
+(`.mount`, `.timer`, ...) is recorded rather than followed. An unknown
+`Type=` fails the unit, because running it as `simple` would report it
+started too early.
+
+## cgroups
+
+pico-init uses the unified cgroup v2 hierarchy only. Each service runs in
+`/sys/fs/cgroup/system.slice/<unit>`, a stop kills the whole cgroup
+(through `cgroup.kill` where the kernel has it), and cgroup emptiness is
+watched rather than polled. At boot PID 1 enables the `cpu` and `memory`
+controllers in the root and in `system.slice`, so unit cgroups have
+`cpu.weight`, `memory.high` and the rest; a controller the kernel refuses
+is a warning, not a boot failure.
+
+`Delegate=` follows systemd: a boolean or a list of controllers, where an
+empty value delegates with no controllers and `no` clears it. With a
+non-root `User=`, the unit cgroup is handed to that user. With `Delegate=`
+set, `DelegateSubgroup=` starts the main process in `<unit cgroup>/<name>`
+and every other process of the unit in `<unit cgroup>/.control`, so the
+unit cgroup holds no process and the service can enable controllers in it.
+Child cgroups are removed depth-first when the unit stops, and a stale,
+empty unit cgroup is reset before the next start. `picoctl show` prints
+`Delegate=`, `DelegateControllers=` and `DelegateSubgroup=`.
+
+## Networking and time
+
+`netd` reads `.network` files from `/etc/systemd/network`,
+`/run/systemd/network` and `/usr/lib/systemd/network`. It implements
+`[Match] Name=`, `[Network] DHCP=` (IPv4; `ipv6` is accepted and ignored),
+`Address=`, `Gateway=`, `DNS=`, `NTP=`, `DHCPServer=`, `LLDP=`,
+`EmitLLDP=`, and `[DHCPv4] UseDNS=`, `UseNTP=`, `UseTimezone=`; other
+directives are ignored. NTP servers come from `NTP=` or DHCP option 42, the
+time zone from DHCP option 101. A link with a random kernel MAC address is
+given a stable one, and `netd` sets a modern default qdisc and TCP
+congestion control where the kernel offers them.
+
+`LLDP=` (`yes` or `routers-only`) receives neighbour announcements and
+`EmitLLDP=` sends them; both are off unless set. The neighbour table of
+each link is bounded, the frame parser rejects malformed frames whole, and
+`netctl lldp` lists what was heard.
+
+For boards whose RTC is dead or reset by a reboot, PID 1 restores the wall
+clock from `/etc/timestamp` (the OpenEmbedded `YYYYMMDDHHMMSS` UTC file)
+before any service starts and saves it two minutes after boot, every ten
+minutes and at shutdown. The clock only ever moves forward, to the latest
+of the saved time, the file's mtime and a build epoch; NTP corrects the
+rest.
+
+## Not implemented
+
+- Mount, swap, timer, path, device, scope and slice units. `/etc/fstab` is
+  handled by PID 1 at boot instead.
+- Running `ExecReload=`: it is parsed and recorded as degraded, and
+  `picoctl reload` refuses. `isolate`, `get-default` and `set-default` are
+  not available.
+- Resource-control directives (`CPUWeight=`, `MemoryHigh=`, `MemoryMax=`,
+  `TasksMax=`, ...) and sandboxing directives (`ProtectSystem=`,
+  `PrivateTmp=`, `NoNewPrivileges=`, ...).
+- `WatchdogSec=` and the `WATCHDOG=` notify keys, `NotifyAccess=`.
+- D-Bus: no bus, no logind, no hwdb.
+- DHCPv6 and IPv6 router advertisements in `netd`.
+
+## Building and testing
+
+pico-init builds with meson (0.62 or newer) and ninja on Linux:
+
+```sh
+meson setup build
+ninja -C build
+sudo -E meson test -C build --print-errorlogs
+```
+
+CI runs the tests as root, because the PID 1 tests create real cgroups and
+the `netd` tests create network devices.
+
+CI also checks formatting with `clang-format-18 --dry-run --Werror` over
+`src/` and license compliance with `reuse lint`.
 
 ## License
 
-**GPL-2.0-or-later**, not required-by-preference but required-by-fact:
-systemd was GPL-2.0-or-later until its 2012 relicensing to
-LGPL-2.1-or-later, and the PID1 core here is quarried from ~2011-era
-systemd source — code that predates that relicensing. Quarrying
-GPL-2.0-or-later source makes the resulting work GPL-2.0-or-later as a
-whole (GPL terms propagate; there's no picking a more permissive license for
-the combined work). Later-quarried subsystems (`netd`'s `sd-dhcp`/
-`sd-netlink` lifts, the `libsystemd-compat` shim's public API contract)
-read *current* systemd instead (post-relicense, LGPL-2.1-or-later) for
-design shape and API contract only, never copied — those files carry
-their own per-file LGPL-2.1-or-later license tag where source is genuinely
-lifted, following the file-level exception pattern in
-[`REUSE.toml`](REUSE.toml)/[`LICENSES/`](LICENSES/), same idea as systemd's
-own per-file licensing scheme, simplified. GPL-2.0-or-later code linking
-against LGPL-2.1-or-later code is fine; the reverse wouldn't be.
+pico-init as a whole is GPL-2.0-or-later (see [`LICENSE`](LICENSE)); the
+PID 1 core is derived from systemd source that predates its relicensing to
+LGPL-2.1-or-later. Every file carries an SPDX identifier or is covered by
+[`REUSE.toml`](REUSE.toml), and the license texts are in
+[`LICENSES/`](LICENSES/). The DHCPv4 code under `src/netd/dhcp/`, the SNTP
+and time code in `src/netd/`, and the vendored systemd symbol and
+`pkg-config` files are LGPL-2.1-or-later; `siphash24` is CC0-1.0 and
+`sparse-endian.h` is MIT.
 
-Every source file carries an
-[SPDX license identifier](https://spdx.dev/learn/handling-license-info/);
-full license text lives in [`LICENSES/`](LICENSES/).
+## Contributing and security
 
-## Contributing
-
-See [`CONTRIBUTING.md`](CONTRIBUTING.md). This repository is currently
-private; no tagged release exists yet, so expect the process to keep
-firming up as it does.
-
-## Security
-
-See [`SECURITY.md`](SECURITY.md) for how to report a vulnerability. PID1 is
-the process the kernel panics without — security issues here matter more
-than in most software.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) and the
+[code of conduct](CODE_OF_CONDUCT.md). Report vulnerabilities privately as
+described in [`SECURITY.md`](SECURITY.md), not in a public issue.

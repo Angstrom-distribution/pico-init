@@ -23,9 +23,8 @@ Include, where possible:
 
 ## Supported versions
 
-This project is pre-release. Until a first tagged version exists, only the
-`main` branch is supported — there is no older version to backport a fix to.
-This section will be updated once real releases exist.
+Only the `main` branch and the most recent tagged release are supported;
+there are no older versions to backport a fix to.
 
 ## Response
 

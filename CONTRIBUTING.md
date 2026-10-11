@@ -1,8 +1,7 @@
 # Contributing to pico-init
 
-This repository is currently private and pre-code — the notes below are the
-baseline process, and will get more detailed once real implementation work
-starts.
+This repository is currently private. The notes below are the baseline
+process and will get more detailed as the project grows.
 
 ## Reporting bugs / requesting features
 
