@@ -684,7 +684,7 @@ static int client_new_message(DhcpClient *client, uint8_t type, DhcpMessage **re
          * client began address acquisition or renewal process." It is a
          * SHOULD in the RFC, but some servers refuse to hand out a lease when
          * it is zero, so the elapsed time is floored at one second rather
-         * than reported honestly as zero. client->start_time is re-based at
+         * than reported as zero. client->start_time is re-based at
          * the start of every acquisition *and* every renewal, which is where
          * netd differs from upstream -- see dhcp-client.c's
          * client_timeout_t1().

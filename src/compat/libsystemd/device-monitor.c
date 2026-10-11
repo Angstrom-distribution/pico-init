@@ -416,9 +416,8 @@ bool device_monitor_filter_matches(sd_device_monitor *m, sd_device *dev) {
         if (m->n_tags > 0)
                 return false;
 
-        /* sysattr matches still read real sysfs (device-sysattr.c): honestly
-         * unavailable (treated as "no value") for a remove event whose
-         * directory is already gone, same as any other getter on it. */
+        /* sysattr matches still read real sysfs (device-sysattr.c): unavailable (treated as "no value") for
+         * a remove event whose directory is already gone, same as any other getter on it. */
         for (i = 0; i < m->n_sysattr_matches; i++) {
                 const char *v;
                 bool has = sd_device_get_sysattr_value(dev, m->sysattr_matches[i].sysattr, &v) >= 0;

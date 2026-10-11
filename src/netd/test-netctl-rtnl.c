@@ -263,7 +263,7 @@ static void test_queue_counts(void) {
         ASSERT_TRUE(!info.has_queues);
         netctl_link_info_free(&info);
 
-        /* Present but zero, both -- upstream's own ">0" guard: no honest
+        /* Present but zero, both -- upstream's own ">0" guard: no
          * row to print, same as absent. */
         init_base(&req);
         ASSERT_TRUE(nl_add_attr(&req, IFLA_NUM_TX_QUEUES, &zero, sizeof zero) == 0);

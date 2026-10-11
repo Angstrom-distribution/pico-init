@@ -9,7 +9,7 @@
  * about what is really on disk: a link left behind by a device that is gone, a
  * link whose target has been replaced, a label containing a character that
  * would otherwise turn one link name into a path. So each test builds a small
- * /dev of its own -- which is also the only honest way to run this at all,
+ * /dev of its own -- which is also the only way to run this at all,
  * since the alternative is creating and unlinking things under the test host's
  * real /dev.
  *

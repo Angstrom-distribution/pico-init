@@ -455,7 +455,7 @@ int sd_event_add_time(
         if (!callback)
                 callback = time_exit_cb;
 
-        /* CLOCK_*_ALARM without CAP_WAKE_ALARM fails right here, honestly,
+        /* CLOCK_*_ALARM without CAP_WAKE_ALARM fails right here
          * as -errno from the kernel -- not silently downgraded to a
          * non-alarm clock. */
         fd = timerfd_create(clock, TFD_CLOEXEC | TFD_NONBLOCK);

@@ -5,7 +5,7 @@
  * struct udev: the library context. Upstream keeps nothing in it but a
  * refcount and the caller's userdata either; the three deprecated logging
  * entry points still exist because a binary built against real libudev may
- * reference them, and record the priority so a get after a set is honest.
+ * reference them, and record the priority so a get after a set returns it.
  */
 
 #include "libudev.h"

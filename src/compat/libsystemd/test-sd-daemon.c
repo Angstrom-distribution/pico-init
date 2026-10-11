@@ -307,7 +307,7 @@ static void test_notify_bad_socket_value(void) {
         ASSERT_TRUE(getenv("NOTIFY_SOCKET") == NULL);
 }
 
-static void test_pid_notify_with_fds_honest_failure(void) {
+static void test_pid_notify_with_fds_failure(void) {
         int fds[1] = { 0 };
 
         unsetenv("NOTIFY_SOCKET");
@@ -362,7 +362,7 @@ int main(void) {
         test_is_socket_unix();
         test_notify_roundtrip();
         test_notify_bad_socket_value();
-        test_pid_notify_with_fds_honest_failure();
+        test_pid_notify_with_fds_failure();
         test_watchdog_enabled();
         test_booted();
 

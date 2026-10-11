@@ -156,7 +156,7 @@ static void netd_link_file_path(unsigned ifindex, char *out, size_t bufsize) {
 }
 
 /* "configured", "configuring", "unmanaged", "pending", "failed", or
- * "unmanaged" as the honest default when netd has never seen this link
+ * "unmanaged" as the default when netd has never seen this link
  * (not running, or the link predates it). */
 static void iface_setup_state(const char *ifname, char *out, size_t bufsize) {
         char path[128];
@@ -248,7 +248,7 @@ static bool iface_has_routable_address(const char *ifname) {
 }
 
 /* The kernel's own /sys/class/net/<if>/operstate, mapped onto networkd's
- * richer display vocabulary where the mapping is honest: "up" splits into
+ * richer display vocabulary where the mapping is exact: "up" splits into
  * "routable" (has a real address) or "carrier" (does not) the same way
  * networkd's own operational-state derivation does; everything else is the
  * kernel's own word, which is already one of networkd's own states
@@ -622,7 +622,7 @@ static void status_one(const char *ifname) {
                        off_setup);
                 /* real per-link status always has an Online state row right
                  * after State (networkctl-status-link.c); netd has no separate
-                 * online-state concept, so this is honestly always "unknown",
+                 * online-state concept, so this is always "unknown",
                  * matching real's own fallback for the same unknown case --
                  * online_state_to_color() leaves an "unknown" value plain,
                  * same as here. */
@@ -832,7 +832,7 @@ static void status_all(void) {
                        off_op);
                 /* real system_status() always adds Online state right after
                  * State (networkctl-status-system.c); netd has no separate
-                 * online-state concept, so this is honestly always
+                 * online-state concept, so this is always
                  * "unknown" -- online_state_to_color() leaves that plain,
                  * same as here. */
                 online_color("unknown", &on_online, &off_online);
@@ -894,7 +894,7 @@ static void status_all(void) {
          * (networkctl-status-system.c). Search Domains maps cleanly onto
          * resolv.conf's own "search" directive; Route Domains (per-link
          * routing-only domains, networkd's Domains=~ syntax) has no netd
-         * equivalent to back honestly, so it stays unclaimed like the other
+         * equivalent to back it, so it stays unclaimed like the other
          * fields this file's header comment already lists. */
         {
                 FILE *f = fopen("/etc/resolv.conf", "re");

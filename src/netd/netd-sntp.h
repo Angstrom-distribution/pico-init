@@ -68,7 +68,7 @@ typedef struct NetdSntp NetdSntp;
 #define NETD_SNTP_RETRY_USEC ((usec_t) (10ULL * USEC_PER_SEC))
 
 /* A reply whose root delay/2 + root dispersion exceeds this is discarded: the
- * server may be honest and still be too far from a real clock to be worth
+ * server may be correct and still be too far from a real clock to be worth
  * stepping to. */
 #define NETD_SNTP_MAX_ROOT_DISTANCE_USEC ((usec_t) (5ULL * USEC_PER_SEC))
 

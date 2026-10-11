@@ -474,7 +474,7 @@ UnitType unit_type_from_name(const char *id) {
  * The character set systemd itself accepts in a unit name (its
  * VALID_CHARS_WITH_AT in src/basic/unit-name.c): alphanumerics plus
  * ':-_.\@'. Matching it exactly is what keeps the drop-in
- * unit-file-compatibility goal honest -- a stricter set would reject names
+ * unit-file-compatibility goal intact -- a stricter set would reject names
  * real images ship, a looser one would accept paths.
  */
 #define UNIT_NAME_VALID_CHARS        \

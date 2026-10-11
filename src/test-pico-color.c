@@ -8,7 +8,7 @@
  *
  * Each case forks: the cache is global per-process state, and the decision
  * depends on isatty(STDOUT_FILENO), which only a real fd change can flip, so
- * a fresh child with its own redirected stdout is the only honest way to
+ * a fresh child with its own redirected stdout is the only way to
  * cover both the tty and non-tty sides of the TERM/NO_COLOR checks. A
  * child's stdout is either /dev/null (guaranteed non-tty) or one end of a
  * freshly opened pty (guaranteed a tty, without needing to become its

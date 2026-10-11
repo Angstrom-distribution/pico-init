@@ -253,7 +253,7 @@ static void test_unit_name_validation(void) {
         ASSERT_TRUE(!unit_name_is_valid("foo bar.service"));  /* whitespace */
         ASSERT_TRUE(!unit_name_is_valid("foo\nbar.service")); /* control char */
         /* Still-unimplemented upstream unit types keep the negative case
-         * honest: a suffix this init has no type for must not validate, or a
+         * strict: a suffix this init has no type for must not validate, or a
          * name would become a filesystem path with nothing able to load it. */
         ASSERT_TRUE(!unit_name_is_valid("foo.timer"));
         ASSERT_TRUE(!unit_name_is_valid("foo.mount"));

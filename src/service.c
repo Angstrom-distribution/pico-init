@@ -409,7 +409,7 @@ static int service_get_pids(Service *s, pid_t *pids, size_t max, size_t *ret_n) 
 /* True when pid is listed in the unit's own cgroup.procs. A cgroup that
  * could not be created (service_ensure_cgroup() failed, logged there) has
  * no membership to check against, and then the answer is "unknown", which
- * this reports as false so the caller's refusal message is honest. */
+ * this reports as false so the caller's refusal message is accurate. */
 static bool service_pid_in_cgroup(Service *s, pid_t pid) {
         pid_t pids[64];
         size_t n = 0, i;

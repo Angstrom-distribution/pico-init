@@ -66,7 +66,7 @@ typedef enum UnitDependency {
 /*
  * The longest unit name accepted. systemd uses 256 including the NUL; this
  * matches, so a name valid there is valid here -- keeping the drop-in
- * unit-file-compatibility goal honest rather than inventing a smaller limit.
+ * unit-file-compatibility goal intact rather than inventing a smaller limit.
  */
 #define UNIT_NAME_MAX 255
 

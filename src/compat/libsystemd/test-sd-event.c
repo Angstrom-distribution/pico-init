@@ -451,7 +451,7 @@ static void test_error_paths(void) {
         sd_event_source *ex = NULL;
         ASSERT_EQ_INT(sd_event_add_exit(e, &ex, NULL, NULL), -EINVAL);
 
-        /* Pressure and ratelimit families always fail the same honest way. */
+        /* Pressure and ratelimit families always fail the same way. */
         ASSERT_EQ_INT(sd_event_add_memory_pressure(e, NULL, NULL, NULL), -EOPNOTSUPP);
         ASSERT_EQ_INT(sd_event_source_set_memory_pressure_type(s, "some"), -EDOM);
         ASSERT_EQ_INT(sd_event_source_set_ratelimit(s, 1000, 4), -EOPNOTSUPP);

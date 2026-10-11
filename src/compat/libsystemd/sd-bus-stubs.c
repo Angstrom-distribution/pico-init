@@ -6,7 +6,7 @@
  * sd_bus_message, sd_bus_slot, sd_bus_track or sd_bus_creds object to do
  * anything. None of those objects can ever exist -- sd_bus_new() and every
  * sd_bus_open_*()/sd_bus_default*() variant (sd-bus-open.c) always fail --
- * so every function below has exactly one honest answer: -EINVAL, the
+ * so every function below has exactly one answer: -EINVAL, the
  * same errno upstream's own assert_return(ptr, -EINVAL) gives a NULL
  * handle, touching no output parameter and invoking no callback.
  *

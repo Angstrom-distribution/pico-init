@@ -366,7 +366,7 @@ static void test_cursor_roundtrip(void) {
         sd_journal_close(j);
 }
 
-static void test_info_and_honest_failures(void) {
+static void test_info_and_failures(void) {
         sd_journal *j;
         uint64_t from, to, bytes;
         sd_id128_t bogus_boot;
@@ -457,7 +457,7 @@ int main(void) {
         test_data_threshold_truncates();
         test_unique_and_fields();
         test_cursor_roundtrip();
-        test_info_and_honest_failures();
+        test_info_and_failures();
         test_open_rejects_bad_flags_and_null();
         test_empty_ring_is_not_an_error();
 

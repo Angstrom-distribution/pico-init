@@ -689,7 +689,7 @@ static void test_early_disconnect_leaks_nothing(void) {
 /* Two start requests for the same unit, both queued before the loop ever
  * runs, so both get installed as jobs within the same manager_loop() pass:
  * job_install()'s displacement path finishes the loser as JOB_CANCELED,
- * which must map to an honest "err canceled" reply, never "ok". */
+ * which must map to an "err canceled" reply, never "ok". */
 static void test_displaced_job_gets_canceled_reply(void) {
         struct ctrl_fixture f;
         struct ctrl_client c1, c2;

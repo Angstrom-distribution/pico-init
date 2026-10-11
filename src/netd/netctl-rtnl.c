@@ -176,7 +176,7 @@ int netctl_rtnl_decode_link(const struct nlmsghdr *nlh, NetctlLinkInfo *out) {
                 bool got_rx = rtattr_get_u32(rta, rem, IFLA_NUM_RX_QUEUES, &out->rx_queues);
 
                 /* Upstream's own ">0" guard (networkctl-link-info.c): a link
-                 * reporting neither attribute, or 0 of both, has no honest
+                 * reporting neither attribute, or 0 of both, has no
                  * row to print. */
                 out->has_queues = (got_tx && out->tx_queues > 0) || (got_rx && out->rx_queues > 0);
         }
