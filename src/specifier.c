@@ -10,9 +10,8 @@
 
 #include "util.h"
 
-/* Grow *buf so it holds at least min_cap bytes, geometrically -- this is
- * the whole reason for departing from v30's per-specifier exact-fit
- * realloc: one grow every doubling, not one per substitution. */
+/* Grow *buf to at least min_cap bytes, doubling, instead of v30's
+ * per-specifier exact-fit realloc. */
 static int buf_reserve(char **buf, size_t *cap, size_t min_cap) {
         size_t new_cap;
         char *n;
@@ -66,9 +65,8 @@ int pico_specifier_printf(const char *text, const PicoSpecifier table[], const v
                 c = f[1];
 
                 if (c == '\0') {
-                        /* A lone trailing '%': v30 silently drops it, pico
-                         * keeps it literal -- see specifier.h. The outer
-                         * loop's f++ reaches the NUL next and stops. */
+                        /* A lone trailing '%' is kept literal (v30 drops it).
+                         * The outer loop's f++ reaches the NUL next. */
                         r = buf_append(&buf, &len, &cap, "%", 1);
                         if (r < 0)
                                 goto fail;
@@ -92,8 +90,8 @@ int pico_specifier_printf(const char *text, const PicoSpecifier table[], const v
                                         break;
 
                         if (!i->specifier) {
-                                /* unknown specifier: passed through as-is,
-                                 * the drop-in-tolerance property */
+                                /* unknown specifier: passed through as-is, so a
+                                 * stock unit using one pico lacks still loads */
                                 char lit[2] = { '%', c };
 
                                 r = buf_append(&buf, &len, &cap, lit, 2);
@@ -136,13 +134,9 @@ int pico_specifier_string(char specifier, const void *data, const void *userdata
         (void) specifier;
         (void) userdata;
 
-        /*
-         * v30's specifier_string() does assert(data) then
-         * strdup(strempty(data)) -- contradictory, and reachable: unit.c's
-         * %i table entry passes u->instance, which is NULL for any
-         * non-instanced unit, so a stock unit file with a bare %i in
-         * Requires= would abort PID 1. Empty string instead.
-         */
+        /* v30 does assert(data) then strdup(strempty(data)). data is NULL for
+         * a bare %i in a non-instanced unit (unit.c passes u->instance), which
+         * would abort PID 1; expand to "" instead. */
         *ret = pico_strdup(data ? (const char *) data : "");
         return *ret ? 0 : -ENOMEM;
 }

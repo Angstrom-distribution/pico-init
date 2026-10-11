@@ -5,8 +5,7 @@
  * Object-path label escaping (sd_bus_path_encode/decode) and the
  * template-driven multi-label variants, contract read from real sd-bus.c
  * (:4031-4075 encode/decode, :4077+ the _many variants, HEAD ded83144).
- * Pure string transforms -- no bus involved -- so these, like
- * sd-bus-validate.c, are genuinely real rather than stubbed.
+ * Pure string transforms; like sd-bus-validate.c they are fully implemented.
  */
 
 #include "sd-bus.h"

@@ -2,33 +2,21 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The true_noop corner of sd-bus.h: ref/unref, sd_bus_close()/
- * sd_bus_default_flush_close(), and the pointer/mask "current thing"
- * accessors. Every one of these is reachable only with a NULL/invalid
- * handle -- no sd_bus/sd_bus_message/sd_bus_slot/sd_bus_track/sd_bus_creds
- * object can ever exist (sd-bus-open.c, sd-bus-stubs.c) -- and upstream's
- * own contract for that case is exactly what these return: ref/unref(NULL)
- * is NULL, sd_bus_close(NULL) is a documented no-op, and "no current
- * message"/"no current slot"/etc. is NULL in real libsystemd too. Nothing
- * here can mislead a caller; it is the same answer the real library gives
- * in the same situation.
+ * The sd-bus.h entry points whose upstream answer for a NULL handle is a
+ * plain value: ref/unref, sd_bus_close()/sd_bus_default_flush_close(), and
+ * the pointer/mask "current thing" accessors. No sd_bus, sd_bus_message,
+ * sd_bus_slot, sd_bus_track or sd_bus_creds object can ever exist
+ * (sd-bus-open.c, sd-bus-stubs.c), so ref/unref(NULL) is NULL,
+ * sd_bus_close(NULL) is a no-op and "no current message/slot" is NULL, as
+ * in real libsystemd.
  *
- * sd_bus_object_vtable_format's storage lives here (see sd-bus-vtable.h's
- * header comment): SD_BUS_VTABLE_START() takes its address, so any
- * vtable[] a caller builds at file scope needs the symbol to exist at
- * link time even though sd_bus_add_object_vtable() (sd-bus-stubs.c) never
- * reads it.
+ * sd_bus_object_vtable_format's storage lives here (see sd-bus-vtable.h):
+ * SD_BUS_VTABLE_START() takes its address, so a vtable[] at file scope
+ * needs the symbol at link time.
  *
- * Mechanically generated from the real header's own signatures, the same
- * way as sd-bus-stubs.c -- see that file's header for why.
- *
- * sd_bus_get_event() and sd_bus_track_contains() are hand-added here, not
- * generated: the design doc lists both in sd-bus-stubs.c's -EINVAL bucket,
- * but their real return types (sd_event*, const char*) can't hold -EINVAL
- * at all -- see sd-bus-stubs.c's header for the full note. Both get the
- * same NULL "no such thing exists" answer as their sibling accessors
- * immediately below (sd_bus_get_current_message() and
- * sd_bus_track_first()/next()).
+ * sd_bus_get_event(), sd_bus_track_contains() and sd_bus_track_count() are
+ * here rather than in sd-bus-stubs.c because their return types (sd_event*,
+ * const char*, unsigned) cannot carry -EINVAL; they return NULL/NULL/0.
  */
 
 #include "sd-bus.h"

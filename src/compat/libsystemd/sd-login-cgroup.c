@@ -3,27 +3,19 @@
 
 /*
  * sd_pid_get_cgroup()/get_unit()/get_slice() and their pidfd/peer
- * siblings: the three sd-login.h queries this shim can answer for real,
- * because pico-init actually runs every supervised service inside a v2
- * cgroup at a fixed, known path -- system.slice/<unit>.service, the exact
- * layout real systemd itself uses (src/manager.h:47 PICO_CGROUP_ROOT,
- * src/service.c:255-268) -- so reading /proc/<pid>/cgroup answers these
- * honestly instead of faking them.
+ * siblings: the sd-login.h queries answerable without logind, because
+ * pico-init runs every supervised service in a v2 cgroup at
+ * system.slice/<unit>.service, the layout real systemd uses
+ * (src/service.c). /proc/<pid>/cgroup therefore gives the real answer.
  *
- * get_unit()/get_slice() are both implemented in terms of get_cgroup(),
- * not a second /proc read: the cgroup path is the one piece of real data
- * here, and every other question is just parsing it further.
+ * get_unit()/get_slice() are implemented in terms of get_cgroup() rather
+ * than a second /proc read.
  *
- * Deliberately does NOT call this project's own unit_name_is_valid()
- * (unit.h/unit.c): that function pulls in unit.c's whole per-type vtable
- * table (service.c, socket.c, target.c) as a side effect of static
- * linking, which would make a one-string syntax check on a cgroup path
- * drag pico-init's entire unit engine into any consumer of this
- * standalone library. is_valid_service_component() below is a small,
- * deliberately duplicated copy of the same character-class and length
- * rule (unit.h:61 UNIT_NAME_MAX, unit.c's UNIT_NAME_VALID_CHARS), with
- * the ".service"/".slice" suffix check this call site actually needs
- * folded in instead of delegated to unit_type_from_name().
+ * This file does not call unit_name_is_valid() (unit.c): that would link
+ * unit.c's per-type vtables (service.c, socket.c, target.c) and with them
+ * the whole unit engine into every consumer of this library.
+ * is_valid_unit_component() below duplicates its character-class and length
+ * rule (UNIT_NAME_MAX, UNIT_NAME_VALID_CHARS) and adds the suffix check.
  */
 
 #include "sd-login.h"
@@ -53,9 +45,8 @@ static int is_valid_unit_component(const char *name, const char *suffix) {
         return 1;
 }
 
-/* The v2 unified entry is always "0::<path>" -- one hierarchy, no
- * controller-name list. Absent -> -ENODATA (this shim never runs on a v1
- * or hybrid hierarchy, but the file could in principle lack the line). */
+/* The v2 unified entry is "0::<path>". Absent -> -ENODATA (v1 and hybrid
+ * hierarchies are not supported). */
 static int extract_unified_cgroup(const char *content, char **ret) {
         const char *line = content;
         size_t len;
@@ -85,8 +76,7 @@ static int extract_unified_cgroup(const char *content, char **ret) {
                 path[len] = '\0';
         }
 
-        /* ret is optional, matching sd_pid_get_cgroup()'s own upstream
-         * `if (ret_cgroup) *ret_cgroup = TAKE_PTR(c);` idiom. */
+        /* ret is optional, as in upstream. */
         if (ret)
                 *ret = path;
         else
@@ -179,7 +169,7 @@ static int extract_unit_component(const char *cgroup_path, char **ret) {
                 return -ENODATA;
         }
 
-        /* ret is optional, same idiom as extract_unified_cgroup() above. */
+        /* ret is optional. */
         if (ret)
                 *ret = name;
         else
@@ -245,8 +235,7 @@ static int extract_slice_component(const char *cgroup_path, char **ret) {
                         p++;
         }
 
-        /* ret is optional throughout, same idiom as extract_unified_cgroup()
-         * and extract_unit_component() above. */
+        /* ret is optional. */
         if (!best) {
                 if (!ret)
                         return 0;

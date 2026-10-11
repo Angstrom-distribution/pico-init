@@ -3,11 +3,9 @@
 
 /*
  * pico-init's own implementation of the sd-hwdb.h ABI surface, matching
- * real systemd's src/systemd/sd-hwdb.h (HEAD ded83144, 2026-08-23) in
- * function names and signatures -- read for that contract only, nothing
- * copied from that LGPL-2.1-or-later source. Behavior lives in
- * sd-hwdb.c: no hwdb.bin reader exists in this build, so every function
- * here fails.
+ * systemd's src/systemd/sd-hwdb.h in function names and signatures. No
+ * hwdb.bin reader exists in this build, so every function fails; see
+ * sd-hwdb.c.
  */
 
 #pragma once

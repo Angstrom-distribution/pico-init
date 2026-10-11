@@ -2,72 +2,39 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * N2/N3's acceptance test: the DHCPv4 client and server.
+ * The DHCPv4 server end to end, plus the shim-layer tests.
  *
- * WHAT ACTUALLY RUNS HERE, STATED PLAINLY (per this milestone's own
- * instructions): the DHCP client (src/netd/dhcp/dhcp-client.c et al) is
- * being written by a sibling agent in parallel and was not ready when this
- * file was built -- it is a black box this file does not touch. So the
- * "client" side of every exchange below is a scripted harness built
- * directly on the shared wire codec (dhcp/dhcp-message.h), not netd's own
- * dhcp-client.c. This is real netd-server-against-a-real-DHCP-peer over a
- * genuine kernel UDP socket pair on a veth link inside a network namespace
- * -- not a mock -- but it is NOT the "netd-against-netd" pairing plan
- * §2.10 describes as N3's actual done-when criterion. When the real client
- * lands, the scripted build_discover()/build_request() helpers below are
- * the seam to replace with real dhcp_client_* calls; everything downstream
- * of "a wire-correct DISCOVER/REQUEST/RELEASE arrives at the server" stays
- * as-is.
- *
- * §2.8/§7 both flag that a netd-client-vs-netd-server pairing could mirror
- * a shared wire-format bug. That risk is *lower*, not higher, with a
- * scripted harness standing in for the client: the harness is built
- * straight off dhcp-message.h with no shared assumptions about client
- * *behaviour* (retry timing, state machine shape) to accidentally mirror,
- * and test-netd-codec.c pins the wire format against real upstream packet
- * dumps this file never touches. That said, this file's harness and the
- * server both still share the same codec implementation, so a codec bug
- * that is wrong in a self-consistent way is still a real residual risk --
- * exactly why test-netd-codec.c exists as independent evidence and is not
- * duplicated here (meson.build's own comment on netd_tests explains the
- * split).
- *
- * What this file actually exercises, over a real veth pair in a fresh
- * netns (mirroring test-netd-rtnl.c's proven unshare(CLONE_NEWUSER|
- * CLONE_NEWNET) mechanism -- a bare CLONE_NEWNET fails here, EPERM, no
- * CAP_SYS_ADMIN):
+ * The "client" side of every exchange is a scripted harness built on the
+ * shared wire codec (dhcp/dhcp-message.h), not dhcp-client.c. The server runs
+ * against it over a genuine kernel UDP socket pair on a veth link inside a
+ * network namespace (unshare(CLONE_NEWUSER|CLONE_NEWNET), as in
+ * test-netd-rtnl.c; a bare CLONE_NEWNET fails with EPERM without
+ * CAP_SYS_ADMIN). The harness and the server share the codec, so a codec bug
+ * that is self-consistently wrong would go unnoticed here; test-netd-codec.c
+ * pins the wire format against fixed bytes independently.
  *
  *   - DISCOVER -> OFFER -> REQUEST -> ACK (dhcp_server_process_discover()/
  *     _request(), the siphash-offset pool pick, dhcp_server_ack()).
  *   - Renewal: a second REQUEST with ciaddr already set (the collapsed
- *     RENEW-OR-REBIND path, dhcp-server-request.c's header) -> ACK, lease
+ *     RENEW-OR-REBIND path, see dhcp-server-request.c) -> ACK, lease
  *     expiration extended.
  *   - RELEASE -> the lease's slot is freed.
  *   - A rapid-commit DISCOVER (DISCOVER -> immediate ACK, no OFFER round
  *     trip) is the vehicle for the DHCP_SERVER_DONT_DESTROY test: its
  *     callback calls dhcp_server_stop() on the server object from *inside*
- *     dhcp_server_on_lease_change()'s call stack -- the exact "SIGHUP
- *     reconfigure reached from inside a lease callback" hazard the plan
- *     names -- and the test asserts the guard's extra ref is actually held
- *     (server->n_ref >= 2 at the point the callback fires) rather than
- *     merely hoping nothing crashes.
- *   - A mode-switch reconfigure (the usb0 fallback scenario): the pool is
- *     reconfigured to a disjoint subnet mid-run (dhcp_server_configure_pool()
- *     called again, exactly what a SIGHUP-driven `.network` reload would
- *     do once netd-link.c wires DHCPServer= reconfiguration up -- not this
- *     milestone's file to write, see dhcp-server-internal.h). The old
- *     address must fall out of the pool immediately and a REQUEST for it
- *     must NAK; a fresh DISCOVER must be offered from the new subnet.
+ *     dhcp_server_on_lease_change()'s call stack, and the test asserts the
+ *     guard's extra ref is held (server->n_ref >= 2 when the callback fires).
+ *   - A pool reconfigure to a disjoint subnet mid-run (dhcp_server_configure_
+ *     pool() called again, as a .network reload would): the old address must
+ *     fall out of the pool immediately and a REQUEST for it must NAK; a
+ *     fresh DISCOVER must be offered from the new subnet.
  *   - Two direct (no-socket) calls into dhcp_server_process_message() with
- *     hand-built malformed packets, proving netd-compat.h's assertion
- *     policy actually landed: a nonzero giaddr and a REQUEST carrying
+ *     hand-built malformed packets: a nonzero giaddr and a REQUEST carrying
  *     REQUESTED_IP_ADDRESS while ciaddr is already set both return
- *     -EBADMSG rather than asserting or misbehaving.
- *
- * Also still here from N0/N2's placeholder body: the shim-layer tests
- * (u8set, ownership macros, unaligned access, siphash24 reference
- * vectors) -- the substrate every lifted file in dhcp/ runs on, kept
- * because nothing else in netd_tests exercises them directly.
+ *     -EBADMSG rather than asserting.
+ *   - The shim-layer tests (u8set, ownership macros, unaligned access,
+ *     siphash24 reference vectors), which nothing else in netd_tests
+ *     exercises directly.
  */
 
 /* unshare()/CLONE_NEWUSER/CLONE_NEWNET need __USE_GNU; must be first. */
@@ -97,7 +64,7 @@
 #include "netd-compat.h"
 #include "netd.h"
 
-/* --- shim-layer tests (unchanged from N0/N2's placeholder body) --- */
+/* --- shim-layer tests --- */
 
 static void test_u8set(void) {
         NetdU8Set s;
@@ -225,10 +192,8 @@ static void write_proc_file(const char *path, const char *content) {
         }
 }
 
-/* Same mechanism as test-netd-rtnl.c's enter_test_netns() (that file's own
- * header has the full explanation of why CLONE_NEWUSER is needed alongside
- * CLONE_NEWNET here). A test that cannot prove its own isolation must fail
- * loudly, never silently skip and report success. */
+/* Same mechanism as test-netd-rtnl.c's enter_test_netns(). A test that cannot
+ * prove its own isolation must fail loudly, never silently skip. */
 static void enter_test_netns(void) {
         uid_t outer_uid = getuid();
         gid_t outer_gid = getgid();
@@ -423,13 +388,10 @@ static void dont_destroy_callback(DhcpServer *server, DhcpServerEvent event, voi
         st->callback_fired = true;
         st->n_ref_seen = server->n_ref;
 
-        /* The reentrancy hazard the plan names verbatim: a lease-change
-         * callback that reaches back in and reconfigures/stops the very
-         * object whose call stack it is running on. Without
-         * DHCP_SERVER_DONT_DESTROY (dhcp-server-internal.h) at
-         * dhcp_server_process_message()/dhcp_server_on_lease_change(), this
-         * would be a use-after-free the instant dhcp_server_process_message()
-         * tried to touch `server` again after this callback returns. */
+        /* A lease-change callback that stops the very object whose call stack
+         * it is running on. Without DHCP_SERVER_DONT_DESTROY
+         * (dhcp-server-internal.h) this would be a use-after-free once
+         * dhcp_server_process_message() touched `server` again. */
         ASSERT_TRUE(dhcp_server_stop(server) == 0);
 }
 
@@ -507,24 +469,15 @@ static void test_netns_dhcp_server(void) {
         run_ip("link set lo up");
 
         /*
-         * Deliberately NO kernel addresses on either end yet. This
-         * container's virtualized veth networking has a real, reproducible
-         * limitation (isolated with a from-scratch Python repro entirely
-         * outside this codebase, so it is not this file's own bug): once
-         * *either* veth end has an IPv4 address configured, UDP broadcast
-         * (255.255.255.255) delivery between the pair stops working in
-         * both directions. Every DHCPDISCOVER/OFFER exchange and every
-         * ACK/NAK whose ciaddr is zero (dhcp-server-send.c's own broadcast
-         * fallback) needs real broadcast delivery, so this test runs the
-         * entire broadcast-dependent portion of the exchange first, with
-         * neither interface configured -- exactly the state a real DHCP
-         * client is in before it has a lease, which is also the only state
-         * this environment reliably delivers broadcast in. Real kernel
-         * addresses are applied only once, right before the one phase that
-         * genuinely needs routed unicast (renewal), after which nothing
-         * broadcast-based runs again -- see that phase's own comment for
-         * the rest of this story, including why the renewal exchange itself
-         * ends up driven by a direct call rather than over the socket too.
+         * No kernel addresses on either end yet. In this container's
+         * virtualized networking, once *either* veth end has an IPv4 address,
+         * UDP broadcast (255.255.255.255) delivery between the pair stops
+         * working in both directions. DISCOVER/OFFER and every ACK/NAK with a
+         * zero ciaddr (dhcp-server-send.c's broadcast fallback) need
+         * broadcast, so all of that runs first with both interfaces
+         * unconfigured -- the state a real client is in before it has a
+         * lease. Addresses are applied only right before the renewal phase,
+         * which needs routed unicast.
          */
 
         server_ifindex = if_index_or_die("dsrv0");
@@ -585,12 +538,9 @@ static void test_netns_dhcp_server(void) {
         ASSERT_TRUE(lease != NULL);
         ASSERT_TRUE(lease->in_use);
 
-        /* Independent confirmation via `ip`, not this layer agreeing with
-         * itself about what it thinks it did -- matches test-netd-rtnl.c's
-         * own convention. The server never touches the kernel's address
-         * table itself (that is netd-link.c's job once N3 is wired up), so
-         * this simply checks the veth pair is still exactly as configured
-         * and the exchange did not corrupt anything at the link layer. */
+        /* Independent confirmation via `ip`, as in test-netd-rtnl.c. The
+         * server never touches the kernel's address table, so this only
+         * checks the veth pair is still as configured. */
         run_shell("ip link show dsrv0 | grep -q 'state UP\\|<.*UP.*>'");
 
         /* --- RELEASE --- */
@@ -653,12 +603,10 @@ static void test_netns_dhcp_server(void) {
 
         /* A REQUEST for the now-defunct old address must NAK, not ACK. */
         uint32_t xid_old = xid_new + 1;
-        /* server_id2, not server_id: the client must name the *current*
-         * (reconfigured) server as authoritative to reach the pool check at
-         * all -- naming the stale server_id here would just make
+        /* server_id2, not server_id: naming the stale server_id would make
          * dhcp_server_process_request() silently ignore the packet as "not
-         * addressed to us" (RFC 2131 §4.3.2's SELECTING branch), which is a
-         * different, weaker assertion than the NAK this is testing for. */
+         * addressed to us" (RFC 2131 §4.3.2's SELECTING branch) instead of
+         * NAKing it. */
         build_request(xid_old, &hw, offered, server_id2, /* renew= */ false, &pkt);
         client_send(cfd, &pkt);
         free(pkt.iov_base);
@@ -689,37 +637,20 @@ static void test_netns_dhcp_server(void) {
          * --- renewal: the one phase that genuinely needs routed unicast
          * (dhcp-server-send.c unicasts an ACK whose ciaddr is set) ---
          *
-         * Real kernel addresses go on, matching the current (post-mode-
-         * switch) pool: dsrv0 gets the server's own pool address, dcli0
-         * gets the lease it just acquired -- the scripted harness's stand-
-         * in for what the real dhcp-client.c will apply once it lands
-         * (netd-link.c's lease-application path, plan §2.5).
+         * Real kernel addresses go on, matching the current (post-
+         * reconfigure) pool: dsrv0 gets the server's own pool address, dcli0
+         * the lease it just acquired.
          *
-         * The exchange itself is driven directly (dhcp_server_process_
-         * message(), same call dhcp_server_io_callback() makes internally),
-         * not through the client's socket, for a reason worth recording
-         * plainly rather than hiding: this container's virtualized veth
-         * networking has a confirmed, reproducible limitation (isolated
-         * with a from-scratch Python repro entirely outside this codebase)
-         * where a UDP send *from* a wildcard-bound (INADDR_ANY) + SO_
-         * BINDTODEVICE socket -- exactly dhcp_server_open_socket()'s own,
-         * unchanged, standard-BSD-sockets, upstream-matching setup -- does
-         * not reliably traverse the pair once a real route exists, in
-         * either direction. That is an artifact of this specific container
-         * runtime's network virtualization, not a defect in netd's socket
-         * code (which real Linux kernels, including every target this
-         * project ships to, handle correctly and identically to how
-         * countless real production DHCP/NTP/syslog daemons already use
-         * this exact pattern). Driving the exchange directly still runs
-         * every line of real protocol logic this phase exists to prove --
-         * parsing, the RENEW-OR-REBIND branch, dhcp_server_ack(),
-         * dhcp_server_set_lease(), and dhcp_server_send_reply() actually
-         * building and sending the ACK (its return value is checked below,
-         * which is where a real ENETUNREACH would surface) -- the only
-         * thing it does not independently prove is that this particular
-         * container's virtual NIC delivers the resulting packet, which the
-         * two sanity commands right below confirm is a routing property of
-         * the interfaces, not of netd.
+         * The exchange is driven directly (dhcp_server_process_message(), the
+         * call dhcp_server_io_callback() makes internally), not through the
+         * client's socket: in this container's virtualized networking a UDP
+         * send from a wildcard-bound SO_BINDTODEVICE socket (as
+         * dhcp_server_open_socket() sets up) does not reliably traverse the
+         * veth pair once a route exists. That is a property of this
+         * environment, not of netd's socket code. Driving the exchange
+         * directly still runs the real protocol logic: parsing, the
+         * RENEW-OR-REBIND branch, dhcp_server_ack(), dhcp_server_set_lease(),
+         * and dhcp_server_send_reply() building and sending the ACK.
          */
         run_ip("addr add 10.31.0.1/24 dev dsrv0");
         {

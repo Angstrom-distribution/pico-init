@@ -42,5 +42,5 @@ static inline int bus_init_noop(void) {
 
 #endif /* SYSTEMD_QUARRY_COMPAT */
 
-/* compat.c's anchor symbol, so the M0 symbol-presence test can see the TU linked */
+/* compat.c's anchor symbol, so a test can check the TU linked */
 int compat_noop(void);

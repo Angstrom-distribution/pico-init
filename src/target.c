@@ -2,14 +2,12 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * Target units. Deliberately thin: a target owns no process and no resources,
- * so starting one is just a state change plus the notification that completes
- * its job. Everything that makes a target useful -- pulling in the units it
- * Wants=, honouring the order they must run in -- is the job engine walking
- * edges, not anything this file does.
+ * Target units. A target owns no process and no resources, so starting one is
+ * a state change plus the notification that completes its job. Pulling in
+ * Wants= units and ordering them is the job engine's work.
  *
- * This file is written fresh rather than quarried; systemd's target.c at the
- * quarry point is mostly cgroup-v1 and D-Bus plumbing pico-init does not have.
+ * Written fresh rather than quarried: systemd's target.c at the quarry point
+ * is mostly cgroup-v1 and D-Bus plumbing.
  */
 
 #include <errno.h>

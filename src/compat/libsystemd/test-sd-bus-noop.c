@@ -2,9 +2,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * Exhaustively calls every function in sd-bus-noop.c's true_noop bucket
- * and asserts NULL/0/void -- generated the same mechanical way the noop
- * bodies themselves were (see that file's header).
+ * Calls every function in sd-bus-noop.c and asserts NULL/0/void.
  */
 
 #include "sd-bus.h"
@@ -26,7 +24,7 @@ static void call_noop_variants(void) {
         ASSERT_TRUE(sd_bus_track_unref(NULL) == NULL);
         sd_bus_close(NULL);
         sd_bus_default_flush_close();
-        /* Re-bucketed from the -EINVAL family -- see sd-bus-stubs.c's header. */
+        /* These cannot return -EINVAL; see sd-bus-noop.c's header. */
         ASSERT_TRUE(sd_bus_get_event(NULL) == NULL);
         ASSERT_TRUE(sd_bus_get_current_message(NULL) == NULL);
         ASSERT_TRUE(sd_bus_get_current_slot(NULL) == NULL);

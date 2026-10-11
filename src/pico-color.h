@@ -6,17 +6,14 @@
  * journalctl's on-device equivalents), mirroring real systemd's own rules:
  * the on/off decision (colors_enabled()/get_color_mode() in
  * src/basic/ansi-color.c) and the escape sequences themselves (the ANSI_*
- * #defines in src/basic/ansi-color.h -- renamed/moved out of terminal-util.h
- * at some point after this project's v30 baseline). Quarried from systemd
- * main as of commit 4c63532c28094aeba6dccc5afb9690e02fd98d66 (2026-10-04).
+ * #defines in src/basic/ansi-color.h), taken from systemd main as of commit
+ * 4c63532c28094aeba6dccc5afb9690e02fd98d66 (2026-10-04).
  *
- * Two deliberate simplifications versus upstream, both because pico-init's
- * three tools are plain one-shot CLIs with no pager and no colour-depth
- * concept (just on/off):
+ * Two simplifications versus upstream, because pico-init's three tools are
+ * plain one-shot CLIs with no pager and no colour-depth concept (just on/off):
  *
  *   - upstream's on_tty() checks both stdout AND stderr (defensive against a
- *     pager/shell piping just one of them); this checks stdout only, per the
- *     owner's own framing of the requirement.
+ *     pager/shell piping just one of them); this checks stdout only.
  *   - upstream's 256-colour accessors (ansi_highlight_yellow(), ansi_grey())
  *     pick between a 16-colour FALLBACK sequence and a 256-colour sequence
  *     by way of get_color_mode()'s COLOR_16/COLOR_256/COLOR_24BIT depth.
@@ -26,9 +23,8 @@
  *
  * underline_enabled()'s extra exception (upstream turns underline off when
  * $TERM is exactly "linux", even with colours otherwise on, because the
- * Linux console cannot render it) is NOT mirrored either: pico_ansi_underline()
- * follows pico_colors_enabled() only. Flagged here for whoever wires this
- * into picolog's timestamp underline, the one call site that would need it.
+ * Linux console cannot render it) is not mirrored either: pico_ansi_underline()
+ * follows pico_colors_enabled() only.
  */
 
 #pragma once

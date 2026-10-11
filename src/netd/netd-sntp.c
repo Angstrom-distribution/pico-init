@@ -11,38 +11,26 @@
  * manager_adjust_clock() (packet build, the validation chain, the offset/
  * delay arithmetic of RFC 5905 §8) and timesyncd-ntp-message.h (the
  * TIME_EPOCH/OFFSET_1900_1970 epoch-floor constants). Neither carries a
- * per-file copyright line upstream (verified against the checkout at the
- * quarry point, not assumed), so this file follows the project-default
- * attribution the rest of the lift set uses.
+ * per-file copyright line upstream, so this file follows the project-default
+ * attribution.
  *
- * Quarry-discipline history review (plan §2.2's prose block records the
- * window's methodology; this is the per-file call for the two upstream
- * commits the window's src/timesync scope actually touches):
+ * Upstream commits after that point that touch src/timesync do not apply:
  *
  *  - 98e7cc36f0 "timesyncd: resolve NTP hostnames through resolved's
- *    varlink interface" -- not applicable. netd has no resolver and no
- *    hostnames; servers arrive as addresses only (§2.1, §2.6).
- *  - 8027ff6ecd "timesyncd: don't ask for AAAA when IPv6 is disabled" --
- *    not applicable for the same reason; it is a follow-up to the commit
- *    above and touches the same DNS-resolution path this file does not
- *    carry.
+ *    varlink interface": netd has no resolver; servers arrive as addresses.
+ *  - 8027ff6ecd "timesyncd: don't ask for AAAA when IPv6 is disabled":
+ *    follow-up to the above, same DNS path.
  *
- * What *is* carried, deliberately beyond §2.6's own summary list, because
- * the history review found the summary incomplete: the short-packet reject
- * and the epoch floor (manager_receive_response(), timesyncd-manager.c
- * :439-443 and :471-475 respectively). See NETD_SNTP_REJECT_MALFORMED and
- * NETD_SNTP_REJECT_EPOCH in netd-sntp.h.
+ * Beyond the basic validation set, the short-packet reject and the epoch
+ * floor are carried (manager_receive_response() in timesyncd-manager.c); see
+ * NETD_SNTP_REJECT_MALFORMED and NETD_SNTP_REJECT_EPOCH in netd-sntp.h.
  *
- * Adapted, not ported near-verbatim, the way the DHCP codec is: no sd-event,
- * no Manager object, one server queried at a time instead of one connection
- * per configured/resolved address, and the eight-sample spike/jitter
- * detector and the adaptive poll-interval doubling in manager_adjust_poll()
- * are gone entirely (§2.6 explicitly drops them). The validation chain's
- * check order is adapted to match the fixed order NetdSntpReject already
- * declares in netd-sntp.h (pending-request correlation before the source-
- * address compare, where upstream's real manager_receive_response() checks
- * source first) -- every individual check upstream performs is still here,
- * just not in upstream's exact sequence.
+ * Adapted rather than ported near-verbatim: no sd-event, no Manager object,
+ * one server queried at a time, and no eight-sample spike/jitter detector or
+ * adaptive poll-interval doubling (manager_adjust_poll()). The validation
+ * chain follows the fixed order NetdSntpReject declares in netd-sntp.h
+ * (pending-request correlation before the source-address compare, where
+ * upstream checks source first); every check upstream performs is still here.
  */
 
 #include "netd-sntp.h"
@@ -238,8 +226,7 @@ static int netd_sntp_io_callback(Netd *n, struct netd_epoll_tag *tag, uint32_t r
 }
 
 /* Fill `ts` with 8 random bytes, used as-is: the nonce is never a time, so it
- * has no byte-order and needs no conversion on either side (plan §2.6 step
- * 4). */
+ * has no byte-order and needs no conversion on either side. */
 static int sntp_random_nonce(NetdNtpTs *ts) {
         ssize_t n;
 
@@ -271,8 +258,7 @@ static int sntp_arm_timer(NetdSntp *s, usec_t interval) {
 /* Build and send one client-mode request to the current round-robin server,
  * record the pending request, and arm the retry timer -- the same operation
  * whether this is the very first query, a scheduled resync, or a retry after
- * no reply arrived in time (plan §2.6 step 4: "retries and a fixed re-sync
- * interval on the shared timer queue"). */
+ * no reply arrived in time. */
 static int sntp_send_request(NetdSntp *s) {
         NetdNtpMsg msg = { 0 };
         struct sockaddr_in dest = { 0 };
@@ -314,8 +300,7 @@ static int sntp_send_request(NetdSntp *s) {
 
         /* Arm the retry regardless of the send outcome: a transient sendto()
          * failure should not stop the client forever, and there is nothing
-         * more useful to do with the error than log it (left to the caller,
-         * netd-link.c does not exist yet to receive it). */
+         * more useful to do with the error than return it. */
         (void) sntp_arm_timer(s, NETD_SNTP_RETRY_USEC);
 
         return r;
@@ -346,11 +331,8 @@ int netd_sntp_new(Netd *n, NetdSntp **ret) {
 
         s->netd = n;
         s->fd = -1;
-        /* calloc() leaves tag.fd at 0, not -1 -- and netd-loop.h's own
-         * invariant is "-1 when not registered", checked with `fd >= 0` in
-         * netd_loop_add_io(). Without this, a fresh NetdSntp looks
-         * already-registered on fd 0 and every netd_sntp_new() call fails
-         * -EBUSY. */
+        /* calloc() leaves tag.fd at 0, a valid descriptor number; -1 means
+         * "none yet". */
         s->tag.fd = -1;
 
         fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -530,7 +512,7 @@ int netd_sntp_process(NetdSntp *s) {
         (void) netd_time_clock_floor_touch(s->netd);
 
         /* Successful sync: cancel the short retry and go to the fixed resync
-         * interval instead (plan §2.6 step 4). */
+         * interval instead. */
         (void) sntp_arm_timer(s, NETD_SNTP_POLL_INTERVAL_USEC);
 
         return 0;

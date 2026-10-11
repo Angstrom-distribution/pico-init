@@ -6,14 +6,10 @@
  * Service units: the state machine. service-exec.c has the fork/exec + fd/
  * cgroup child-side setup. Quarried from systemd's ~2011-era src/service.c
  * (tag v30, commit 501c92c, copyright 2010 Lennart Poettering,
- * GPL-2.0-or-later), reduced to the two-state-machine shape pico-init needs
- * (Type=simple/oneshot at first, no watchdog/D-Bus),
- * with a full history review (v30 -> 2026, ~2299 commits enumerated, ~300
- * read in full) applied on top so the reduction does not re-ship bugs
- * upstream has since fixed. No CVE has ever been assigned against
- * service.c/execute.c in 15 years; the real risk here is state-machine
- * errors and races, not memory safety, so the ordering rules below are the
- * security-critical part of this file, not an afterthought.
+ * GPL-2.0-or-later), reduced to what pico-init needs (no watchdog, no D-Bus),
+ * with the fixes upstream made since then applied so the reduction does not
+ * re-ship them. The risk in this file is state-machine errors and races, not
+ * memory safety, so the ordering rules below are the security-critical part.
  *
  * Backports (commit hashes from github.com/systemd/systemd), each in the
  * function it applies to:
@@ -39,9 +35,8 @@
  *    and Restart=on-failure never fires.
  *  - 51894d706f / 3c751b1bfa -- main_pid_good()/control_pid_good() are
  *    tri-state (0 known-dead, >0 alive, <0 unknown), not bool.
- *  - 4b9397474f .. 90f4c0473a -- start-rate limiting. v30 already had this;
- *    pico-init dropping it was a quarrying regression, not a deferred
- *    feature -- see service_start_limit_check().
+ *  - 4b9397474f .. 90f4c0473a -- start-rate limiting; see
+ *    service_start_limit_check().
  *  - a509f0e631 / 0c7f15b3a9 / c972880640 / 2e9d6c1251 -- the restart
  *    decision: service_enter_dead() always visits DEAD/FAILED before ever
  *    considering AUTO_RESTART; a pending stop job vetoes a restart outright;
@@ -59,9 +54,7 @@
  *  - abaf5edd08 -- the reason service_cgroup_empty_event() never invents an
  *    exit status: systemd reverted a whole feature over this. See the
  *    SIGCHLD-vs-cgroup-empty ordering note above service_sigchld_event().
- *  - v30's own sigchld_code_to_string() and its log_full() severity split,
- *    both dropped by the original quarry while its log line kept the
- *    arguments that needed them. Restored, not diverged from: see
+ *  - v30's sigchld_code_to_string() and its log_full() severity split: see
  *    sigchld_code_to_string() and format_exit_status().
  *
  *  - v30's Type=forking, quarried later than the rest: ExecStart= runs as
@@ -141,14 +134,13 @@
 #define PICO_DEFAULT_TIMEOUT_USEC (90 * USEC_PER_SEC)
 #define PICO_DEFAULT_RESTART_USEC (100 * USEC_PER_MSEC)
 
-/* B7: v30's own hardcoded numbers, still upstream's real defaults today.
- * Deliberately not exposed as StartLimitIntervalSec=/StartLimitBurst=
- * parseable settings -- these values being load-bearing regardless of unit
- * authorship is the entire point. */
+/* v30's hardcoded numbers, still upstream's defaults. Not exposed as
+ * StartLimitIntervalSec=/StartLimitBurst=: a unit file cannot disable the
+ * limit. */
 #define PICO_START_LIMIT_INTERVAL_USEC (10 * USEC_PER_SEC)
 #define PICO_START_LIMIT_BURST 5
 
-/* --- tri-state pid liveness (B5) --- */
+/* --- tri-state pid liveness --- */
 
 /*
  * 0 = known dead (we hold no pid for it), >0 = alive/tracked, <0 (-EAGAIN)
@@ -156,12 +148,10 @@
  * have today: s->control_pid is only ever 0 or a pid this process forked
  * and has not yet reaped, and s->main_pid is that or an alien pid (Type=
  * forking, MAINPID=) whose SIGCHLD still reaches us as PID 1 or subreaper
- * (manager.c). Kept int rather than bool anyway, per B5: a bool caller
- * cannot later distinguish "positively dead" from "unknown", and that
- * collapse is a real upstream bug class. Deliberately does NOT probe with
- * kill(pid, 0) or /proc/<pid> -- an unreaped zombie is "alive" by either
- * cheap test, which is exactly wrong when called from inside this service's
- * own SIGCHLD handling.
+ * (manager.c). Kept int rather than bool because a bool cannot distinguish
+ * "positively dead" from "unknown", a real upstream bug class. Does not probe
+ * with kill(pid, 0) or /proc/<pid>: an unreaped zombie is "alive" by either
+ * test, which is wrong inside this service's own SIGCHLD handling.
  */
 static int main_pid_good(Service *s) {
         return s->main_pid > 0 ? 1 : 0;
@@ -171,7 +161,7 @@ static int control_pid_good(Service *s) {
         return s->control_pid > 0 ? 1 : 0;
 }
 
-/* --- exit-status classification (B2) --- */
+/* --- exit-status classification --- */
 
 typedef enum { PICO_EXIT_CLEAN_DAEMON, PICO_EXIT_CLEAN_COMMAND } PicoExitClean;
 
@@ -238,7 +228,7 @@ static void service_timer_stop_timeout(void *userdata, usec_t now);
 static void service_timer_stop_post_timeout(void *userdata, usec_t now);
 static void service_timer_restart(void *userdata, usec_t now);
 
-/* B1: timer.h's own rule -- a caller with an infinite timeout skips
+/* timer.h's rule: a caller with an infinite timeout skips
  * pico_timer_add() entirely rather than relying on some sentinel deadline. */
 static void service_arm_timeout(Service *s, usec_t timeout, pico_timer_callback_t cb) {
         usec_t deadline;
@@ -263,7 +253,7 @@ static void service_kill_stale_cgroup_members(Service *s) {
         if (cgroup_v2_is_empty(s->cgroup) == 1)
                 return;
 
-        /* B11/8f53a7b8ea: leftovers from a previous run, or anything
+        /* 8f53a7b8ea: leftovers from a previous run, or anything
          * ExecStartPre= itself leaked, must never survive into this run. */
         pico_log(PICO_LOG_WARNING, "%s: killing leftover processes in the cgroup before starting", UNIT(s)->id);
         cgroup_v2_kill(s->cgroup);
@@ -280,8 +270,8 @@ static void service_reap_cgroup_remainder(Service *s) {
                 return;
 
         if (s->remain_after_exit) {
-                /* Deliberately not killed: this log line is what later
-                 * explains a failed rmdir on the cgroup directory. */
+                /* Not killed; this log line explains a later failed rmdir on
+                 * the cgroup directory. */
                 pico_log(PICO_LOG_INFO,
                          "%s: main process exited, leftover processes remain (RemainAfterExit=yes)",
                          UNIT(s)->id);
@@ -534,20 +524,18 @@ static void service_forking_locate_main_pid(Service *s) {
         pico_log(PICO_LOG_INFO, "%s: no main pid known, supervising by cgroup only", UNIT(s)->id);
 }
 
-/* --- start-rate limiting (B7) --- */
+/* --- start-rate limiting --- */
 
 /*
- * v30 already had this; pico-init lacking it is a quarrying regression, not
- * a deferred feature. Without it, Restart=on-failure + a small RestartSec=
+ * Start-rate limiting (StartLimitIntervalSec=/StartLimitBurst=): without it,
+ * Restart=on-failure + a small RestartSec=
  * + a nonexistent ExecStart= path spins fork/execve/ENOENT as fast as the
- * kernel allows, forever, as PID 1, on a device with no second console --
- * and because the run queue dispatches after this, a tight restart loop can
- * starve job dispatch badly enough that even shutdown never gets scheduled.
+ * kernel allows, and the tight loop can starve job dispatch badly enough
+ * that even shutdown never gets scheduled.
  *
- * CLOCK_BOOTTIME would be the more correct clock here (a monotonic window
- * survives a suspend/resume as a stale prohibition), but util.h only
- * exposes CLOCK_MONOTONIC today and pico-init has no suspend/resume story
- * yet; noted rather than inventing new time plumbing for this MVP.
+ * CLOCK_BOOTTIME would be more correct (a CLOCK_MONOTONIC window survives
+ * suspend/resume as a stale prohibition), but util.h only exposes
+ * CLOCK_MONOTONIC and there is no suspend/resume support.
  */
 static bool service_start_limit_check(Service *s) {
         usec_t now = now_monotonic();
@@ -561,7 +549,7 @@ static bool service_start_limit_check(Service *s) {
         return ++s->start_limit_num <= s->start_limit_burst;
 }
 
-/* --- the restart decision (B8) --- */
+/* --- the restart decision --- */
 
 /*
  * Value by value as upstream's service_shall_restart() (src/core/service.c),
@@ -737,9 +725,8 @@ static void service_enter_dead(Service *s) {
         service_exec_fd_close(s);
         service_revert_tty(s);
 
-        /* B8/a509f0e631: always the real DEAD/FAILED state first, then --
-         * and only then -- AUTO_RESTART is even considered. Skipping this
-         * made "start" never return in the systemd bug this fixed. */
+        /* a509f0e631: always the real DEAD/FAILED state first, and only then
+         * consider AUTO_RESTART; skipping it made "start" never return. */
         service_set_state(s, service_result_is_failure(s->result) ? SERVICE_FAILED : SERVICE_DEAD);
 
         /* Terminal, so a paired .socket unit may go back to listening and
@@ -752,10 +739,9 @@ static void service_enter_dead(Service *s) {
                 return;
         }
 
-        /* B8/c972880640: a pending stop job vetoes a restart outright rather
-         * than rescheduling one -- with RestartSec=0 the reschedule alone
-         * would busy-loop PID 1 and starve the job queue so thoroughly the
-         * rate limiter itself would never get a chance to fire. */
+        /* c972880640: a pending stop job vetoes a restart outright; with
+         * RestartSec=0 rescheduling would busy-loop PID 1 and starve the job
+         * queue, so the rate limiter would never get to fire. */
         if (UNIT(s)->job && UNIT(s)->job->type == JOB_STOP) {
                 pico_log(PICO_LOG_DEBUG, "%s: stop job pending, not scheduling a restart", UNIT(s)->id);
                 return;
@@ -890,23 +876,17 @@ static void service_enter_exec_stop(Service *s) {
         service_run_exec_stop(s);
 }
 
-/* B4/ec5b1452ac: result checked before service_good() before
- * remain_after_exit, in exactly that order. The reverse order lets
- * RemainAfterExit=yes silently swallow a failed main process, and
- * Restart=on-failure then never fires -- reachable in pico-init the moment
- * ExecStartPre= and ExecStart= can be outstanding together. */
+/* ec5b1452ac: result is checked before the main pid, before
+ * remain_after_exit, in that order. The reverse order lets
+ * RemainAfterExit=yes swallow a failed main process, and Restart=on-failure
+ * then never fires. */
 static void service_enter_running(Service *s) {
         /*
-         * Bug found in review, not in any upstream commit: every branch below
-         * leaves the start attempt behind for good (RUNNING, EXITED, or a
-         * stop/dead on failure), so whichever start timeout got us here no
-         * longer applies. Without this, a Type=simple daemon that forked
-         * cleanly and has been happily RUNNING for TimeoutStartSec= (90s by
-         * default) gets SIGTERM'd out from under itself the moment that
-         * timer -- armed at service_enter_start() and never cancelled --
-         * finally fires. service_enter_stop() below cancels it too on the
-         * failure path, making this a harmless duplicate there; it is not
-         * harmless on the RUNNING/EXITED paths, which never called it at all.
+         * Every branch below leaves the start attempt behind for good, so the
+         * start timeout no longer applies. Left armed, it would SIGTERM a
+         * Type=simple daemon that has been RUNNING for TimeoutStartSec=.
+         * service_enter_stop() cancels it too on the failure path; the
+         * RUNNING/EXITED paths do not.
          */
         service_timer_reset(s);
         service_exec_fd_close(s); /* whichever way EXEC_START ended, nothing waits on it now */
@@ -944,7 +924,7 @@ static void service_enter_start(Service *s) {
         int r;
 
         service_timer_reset(s);
-        service_kill_stale_cgroup_members(s); /* B11: before EXEC_START too, not just START_PRE */
+        service_kill_stale_cgroup_members(s); /* before EXEC_START too, not just START_PRE */
 
         service_set_state(s, SERVICE_EXEC_START);
         service_arm_timeout(s, s->timeout_start_usec, service_timer_start_timeout);
@@ -1014,7 +994,7 @@ static void service_run_exec_start_pre(Service *s) {
 
 static void service_enter_start_pre(Service *s) {
         service_timer_reset(s);
-        service_kill_stale_cgroup_members(s); /* B11: before START_PRE */
+        service_kill_stale_cgroup_members(s); /* before START_PRE */
 
         service_set_state(s, SERVICE_START_PRE);
         service_arm_timeout(s, s->timeout_start_usec, service_timer_start_timeout);
@@ -1048,7 +1028,7 @@ static void service_run_exec_condition(Service *s) {
  * earlier, under the same TimeoutStartSec=. */
 static void service_enter_condition(Service *s) {
         service_timer_reset(s);
-        service_kill_stale_cgroup_members(s); /* B11: before the first thing this start spawns */
+        service_kill_stale_cgroup_members(s); /* before the first thing this start spawns */
 
         s->exec_condition_idx = 0;
         service_set_state(s, SERVICE_CONDITION);
@@ -1064,9 +1044,8 @@ static void service_enter_condition(Service *s) {
 static int service_do_start(Service *s) {
         int r;
 
-        /* B7: after "is a start even legal" (the caller already checked),
-         * before any state change or fork -- this is where upstream's own
-         * placement settled after moving it four times over 14 years. */
+        /* After "is a start even legal" (the caller already checked), before
+         * any state change or fork. */
         if (!service_start_limit_check(s)) {
                 pico_log(PICO_LOG_WARNING,
                          "%s: start request repeated too quickly (limit %u per %llu us), refusing",
@@ -1081,10 +1060,9 @@ static int service_do_start(Service *s) {
                 service_timer_reset(s);
                 service_set_state(s, SERVICE_FAILED);
 
-                /* This path deliberately skips service_enter_dead(), so it
-                 * needs its own notify -- and it is the one that matters most:
-                 * a paired socket must go FAILED here rather than re-arm, or
-                 * it re-triggers the crash loop its own start limit just
+                /* This path skips service_enter_dead(), so it needs its own
+                 * notify: a paired socket must go FAILED here rather than
+                 * re-arm and re-trigger the crash loop the start limit just
                  * stopped (c2f3480897, "so sockets won't act as tarpits"). */
                 socket_notify_service_dead(UNIT(s));
 
@@ -1096,8 +1074,8 @@ static int service_do_start(Service *s) {
 
         s->result = SERVICE_SUCCESS;
 
-        /* A fresh start must never carry a stale READY/STATUS from a
-         * previous run forward -- see service.h's own comment on these. */
+        /* A fresh start must not carry READY/STATUS over from a previous
+         * run (see service.h). */
         s->notify_ready = false;
         s->status_text = pico_mfree(s->status_text);
         s->status_errno = 0;
@@ -1136,9 +1114,9 @@ int service_start(Service *s) {
                 return -EAGAIN; /* mid-shutdown; let it finish first */
 
         case SERVICE_AUTO_RESTART:
-                /* B8/0c7f15b3a9: an explicit start must not fail just
-                 * because a restart is already pending -- proceed now
-                 * rather than waiting out the rest of RestartSec=. */
+                /* 0c7f15b3a9: an explicit start must not fail because a
+                 * restart is already pending; proceed now rather than waiting
+                 * out RestartSec=. */
                 service_timer_reset(s);
                 break;
 
@@ -1167,10 +1145,9 @@ int service_stop(Service *s) {
                 return 0; /* already stopped or stopping */
 
         case SERVICE_AUTO_RESTART:
-                /* B8/2e9d6c1251: through service_enter_dead(), never a raw
-                 * state assignment -- that is what makes forbid_restart
-                 * actually take effect instead of a stale timer reviving
-                 * the service anyway. */
+                /* 2e9d6c1251: through service_enter_dead(), never a raw state
+                 * assignment, so forbid_restart takes effect instead of a
+                 * stale timer reviving the service. */
                 s->forbid_restart = true;
                 service_timer_reset(s);
                 service_enter_dead(s);
@@ -1198,17 +1175,12 @@ int service_stop(Service *s) {
 }
 
 /*
- * Naming the (si_code, si_status) pair, because printing it raw is actively
- * misleading. si_code is CLD_EXITED/CLD_KILLED/CLD_DUMPED, whose values are
- * 1/2/3 -- so a clean `exit 0` logged as "code=1 status=0, result=success"
- * reads as an exit status of 1 sitting next to a success verdict. si_status
- * is worse: it is an exit status under CLD_EXITED and a *signal number*
- * otherwise, so a SIGTERM at shutdown logs as "status=15". Both halves get
- * named here, giving systemd's own "code=exited, status=0" shape.
- *
- * v30 had sigchld_code_to_string() and this file's quarry dropped it while
- * keeping its arguments; this restores the upstream behaviour rather than
- * diverging from it.
+ * Names the (si_code, si_status) pair, because printing it raw misleads.
+ * si_code is CLD_EXITED/CLD_KILLED/CLD_DUMPED (1/2/3), so a clean `exit 0`
+ * would read "code=1 status=0, result=success". si_status is an exit status
+ * under CLD_EXITED and a *signal number* otherwise. Both halves are named,
+ * giving systemd's "code=exited, status=0" shape (v30's
+ * sigchld_code_to_string()).
  */
 static const char *sigchld_code_to_string(int code) {
         switch (code) {
@@ -1263,7 +1235,7 @@ static void format_exit_status(char *buf, size_t size, int code, int status) {
 }
 
 /*
- * SIGCHLD vs cgroup-empty -- the ordering hazard.
+ * SIGCHLD vs cgroup-empty: the ordering hazard.
  *
  * SIGCHLD carries an exit status; cgroup-empty does not. That asymmetry is
  * why systemd reverted a whole feature (abaf5edd08): the process that
@@ -1273,9 +1245,8 @@ static void format_exit_status(char *buf, size_t size, int code, int status) {
  * service_cgroup_empty_event() below may change state but has no legitimate
  * way to invent an exit status of its own.
  *
- * Another agent is making the manager loop dispatch cgroup-empty strictly
- * after SIGCHLD, and re-verify emptiness before dispatching -- this file
- * relies on that ordering rather than re-deriving it.
+ * manager-loop.c dispatches cgroup-empty strictly after SIGCHLD and
+ * re-verifies emptiness first; this file relies on that ordering.
  */
 void service_sigchld_event(Service *s, pid_t pid, int code, int status) {
         char statusbuf[64];
@@ -1312,9 +1283,9 @@ void service_sigchld_event(Service *s, pid_t pid, int code, int status) {
         else if (code == CLD_KILLED || code == CLD_DUMPED)
                 f = SERVICE_FAILURE_SIGNAL;
         else {
-                /* Not reachable for a real waitid() result, but this project
-                 * never asserts on input it did not itself fully control --
-                 * see the 35b1078e1 note in unit-parse.c for why. */
+                /* Not reachable for a real waitid() result, but input this
+                 * file does not control is never asserted on (see the
+                 * 35b1078e1 note in unit-parse.c). */
                 pico_log(PICO_LOG_WARNING,
                          "%s: unrecognized wait status code %d, treating as a failure",
                          UNIT(s)->id,
@@ -1351,21 +1322,17 @@ void service_sigchld_event(Service *s, pid_t pid, int code, int status) {
         if (is_control && s->state == SERVICE_CONDITION && f == SERVICE_FAILURE_EXIT_CODE && status < 255)
                 f = SERVICE_SKIP_CONDITION;
 
-        /* B3/a0fef983ab: write-once -- the *first* failure wins, not the
+        /* a0fef983ab: write-once -- the *first* failure wins, not the
          * last. A watchdog-style timeout that goes on to SIGABRT the
          * service must report the timeout, not the coredump it caused. */
         if (s->result == SERVICE_SUCCESS)
                 s->result = f;
 
-        /* v30 logged this through log_full() at NOTICE when the unit failed
-         * and DEBUG when it did not; the quarry collapsed both to DEBUG, so a
-         * service failing on a board whose only output is a serial console
-         * announced itself at the same level as every routine exit.
-         *
-         * The level follows s->result rather than v30's local f, so that it
-         * agrees with the result= this same line prints: under the write-once
-         * rule an earlier failure survives a later clean exit, and logging
-         * "result=timeout" at debug would hide exactly the case that matters. */
+        /* v30 logs through log_full() at NOTICE when the unit failed and DEBUG
+         * otherwise, so a failure is visible on a serial console. The level
+         * follows s->result rather than the local f, to agree with the
+         * result= this line prints: under the write-once rule an earlier
+         * failure survives a later clean exit. */
         format_exit_status(statusbuf, sizeof statusbuf, code, status);
         pico_log(service_result_is_failure(s->result) ? PICO_LOG_WARNING : PICO_LOG_DEBUG,
                  "%s: %s process exited, code=%s, status=%s, result=%s",
@@ -1572,13 +1539,11 @@ void service_cgroup_empty_event(Service *s) {
         case SERVICE_START_PRE:
         case SERVICE_EXEC_START:
                 /*
-                 * B11/f52e9ed62b: reaching here means whatever was spawned
-                 * is gone -- cgroup empty -- without either this function or
-                 * the SIGCHLD path (already checked above) ever learning how
-                 * it exited. That is not "the start completed"; it is a
-                 * resources-class failure with no attributable exit status,
-                 * the one legitimate case where this function reports
-                 * failure rather than passing success through untouched.
+                 * f52e9ed62b: whatever was spawned is gone (cgroup empty)
+                 * without the SIGCHLD path ever learning how it exited. That
+                 * is not "the start completed"; it is a resources failure
+                 * with no attributable exit status, the one case where this
+                 * function reports failure itself.
                  */
                 if (s->result == SERVICE_SUCCESS)
                         s->result = SERVICE_FAILURE_RESOURCES;
@@ -1616,8 +1581,8 @@ static void service_timer_start_timeout(void *userdata, usec_t now) {
 
         pico_log(PICO_LOG_WARNING, "%s: start operation timed out", UNIT(s)->id);
 
-        /* Report the cause, not whatever signal death this timeout is about
-         * to cause: set before killing anything, per B3's watchdog example. */
+        /* Report the cause, not the signal death this timeout is about to
+         * cause: set before killing anything (a0fef983ab). */
         if (s->result == SERVICE_SUCCESS)
                 s->result = SERVICE_FAILURE_TIMEOUT;
 
@@ -1699,10 +1664,8 @@ static void service_timer_restart(void *userdata, usec_t now) {
         (void) now;
 
         if (s->forbid_restart) {
-                /* Defensive only: service_stop() already cancels this timer
-                 * and routes through service_enter_dead() directly when
-                 * stopping from SERVICE_AUTO_RESTART, so this should not be
-                 * reachable in practice. */
+                /* Defensive: service_stop() already cancels this timer when
+                 * stopping from SERVICE_AUTO_RESTART. */
                 service_set_state(s, SERVICE_DEAD);
                 return;
         }
@@ -1710,19 +1673,16 @@ static void service_timer_restart(void *userdata, usec_t now) {
         (void) service_do_start(s); /* no job to fail: AUTO_RESTART -> FAILED notifies */
 }
 
-/* --- service_verify() (B9) --- */
+/* --- service_verify() --- */
 
 static bool exec_line_is_valid(char * const *argv) {
         /* 69339ae9f7: never let a unit load with an ExecStart= that would
          * reach execve() with a NULL or empty argv[0] -- the CVE-2021-4034
-         * (PwnKit) primitive, and no PAM/seccomp/namespaces stand between
-         * pico-init and it. The parser already rejects anything that is
+         * (PwnKit) primitive. The parser already rejects anything that is
          * neither an absolute path nor a bare (slash-free) executable name
-         * for anything it actually stores (see unit-parse.c's
-         * parse_exec_line() and pico_exec_path_is_valid()); what it cannot
-         * catch is a unit that never sets ExecStart= at all, leaving this
-         * NULL. Re-checking the same rule here, rather than trusting the
-         * parser alone, is the belt-and-braces this function has always been.
+         * (unit-parse.c's parse_exec_line() and pico_exec_path_is_valid());
+         * what it cannot catch is a unit that never sets ExecStart= at all,
+         * leaving this NULL.
          */
         return argv && argv[0] && pico_exec_path_is_valid(argv[0]);
 }
@@ -1968,9 +1928,9 @@ static void service_done(Unit *u) {
 
         service_exec_fd_close(s); /* same hazard as the timer: a source outliving its Service */
 
-        /* B13: disable/unref the events_source before cgroup_v2_free() closes
-         * the fd underneath it, or a pending dispatch could still run its
-         * callback against memory that is about to be freed. */
+        /* Disable/unref the events_source before cgroup_v2_free() closes the
+         * fd under it, or a pending dispatch could run its callback against
+         * freed memory. */
         if (s->cgroup && s->cgroup->events_source)
                 s->cgroup->events_source = sd_event_source_disable_unref(s->cgroup->events_source);
 
@@ -2000,12 +1960,10 @@ static UnitActiveState service_active_state_of(ServiceState state, bool remain_a
                 return UNIT_ACTIVE;
 
         case SERVICE_EXITED:
-                /* A cleanly exited service is still "active" only if it said
-                 * so: that is the whole meaning of RemainAfterExit=, and it is
-                 * how a Type=oneshot boot-plumbing unit stays satisfied after
-                 * its process is gone. service_enter_running() only ever
-                 * enters this state when remain_after_exit is already true,
-                 * so the ternary below is defensive, not load-bearing. */
+                /* Active only with RemainAfterExit=, which is how a
+                 * Type=oneshot unit stays satisfied after its process is
+                 * gone. service_enter_running() only enters this state when
+                 * remain_after_exit is set, so the ternary is defensive. */
                 return remain_after_exit ? UNIT_ACTIVE : UNIT_INACTIVE;
 
         case SERVICE_EXEC_STOP:

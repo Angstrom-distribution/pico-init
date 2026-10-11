@@ -7,10 +7,9 @@
  * manager_load_unit()'s rejection) -- all against a real Manager and real
  * files on disk, never a mock of the search loop.
  *
- * test_wants_symlink_instantiates_template() is also (g)'s own regression:
- * the plan's own confirmation that a .wants symlink resolves purely by
- * name, with nothing in unit-enable.c needing to change, gets no commit of
- * its own -- this is where that claim is actually exercised end to end.
+ * test_wants_symlink_instantiates_template() exercises end to end that a
+ * .wants symlink resolves purely by name, with nothing in unit-enable.c
+ * involved.
  */
 
 #include <errno.h>
@@ -138,7 +137,7 @@ static void test_literal_beats_template_same_dir(void) {
  * higher-priority directory must not shadow a literal instance file that
  * ships in a lower-priority one. This is what unit-load.c's own header
  * comment calls out as the ordering a per-directory "optimization" would
- * silently invert -- and it is the exact shape G3(b)'s
+ * silently invert -- and it is the exact shape a
  * serial-getty@ttyGS0.service override depends on.
  */
 static void test_literal_beats_template_across_dirs(void) {
@@ -521,7 +520,7 @@ static void test_mask_shadows_lower_priority_fragment(void) {
 }
 
 /* The same rule for an instance: a masked literal must not fall back to the
- * template, the same way a real literal beats the template (G3(b)). */
+ * template, the same way a real literal beats the template. */
 static void test_masked_instance_does_not_fall_back_to_template(void) {
         char *dir;
         Manager *m;

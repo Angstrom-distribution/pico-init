@@ -2,27 +2,22 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * N4's acceptance test: the SNTP client and the clock/timezone applier.
+ * The SNTP client and the clock/timezone applier.
  *
- * §2.8's ~50-line fake UDP/123 responder is test_sntp_process_over_real_
- * socket() below, and it deliberately only ever exercises a REJECT: a reply
- * that is validate()-accepted would make netd_sntp_process() call
- * netd_time_adjust_clock() -> clock_adjtime() for real, which is
- * process-global and stays global inside a network namespace, so there is no
- * isolation trick that makes that safe here (plan §2.8; netd-sntp.h's own
- * header comment). Every individual validation check, including the nonce
- * mismatch that is the anti-off-path-spoofing test, is instead exercised
- * directly against netd_sntp_validate() -- a pure function over a buffer, a
- * source address and a request, needing no socket at all.
+ * test_sntp_process_over_real_socket() below is a fake UDP/123 responder, and
+ * it only ever exercises a REJECT: an accepted reply would make
+ * netd_sntp_process() call netd_time_adjust_clock() -> clock_adjtime() for
+ * real, which is process-global even inside a network namespace (see
+ * netd-sntp.h). Every individual validation check, including the nonce
+ * mismatch that is the anti-off-path-spoofing test, is exercised directly
+ * against netd_sntp_validate(), a pure function over a buffer, a source
+ * address and a request.
  *
- * The same constraint turned out to apply one level further than the header
- * originally accounted for: settimeofday() and clock_settime() both need
- * CAP_SYS_TIME, which this project's own verify.sh container denies even to
- * root (confirmed directly against the image: EPERM). netd_time_build_tz()
- * and netd_time_clock_floor_decide() exist in netd-time.h for exactly that
- * reason -- see their own doc comments -- and are what let this file test
- * the kernel-timezone-push computation and the TIME_EPOCH-vs-clock-file-mtime
- * floor decision without ever calling the syscall that would apply either.
+ * settimeofday() and clock_settime() need CAP_SYS_TIME, which test containers
+ * may deny even to root. netd_time_build_tz() and
+ * netd_time_clock_floor_decide() (netd-time.h) exist so this file can test the
+ * kernel-timezone-push computation and the TIME_EPOCH-vs-clock-file-mtime
+ * floor decision without calling the syscalls that would apply them.
  */
 
 #include <endian.h>
@@ -75,8 +70,8 @@ static void test_field_packing(void) {
 /*
  * usec <-> NTP 32.32, round trip. The transmit timestamp doubles as the
  * anti-spoofing nonce that has to come back byte-identical in the reply's
- * origin field, so a lossy conversion here is a client that rejects every
- * honest answer it gets.
+ * origin field, so a lossy conversion here makes the client reject every
+ * valid reply.
  */
 static void test_timestamp_roundtrip(void) {
         static const usec_t samples[] = {
@@ -192,7 +187,7 @@ static void test_validate_zero_timestamp(void) {
 }
 
 /*
- * The history-review addition (plan §2.2 prose, §2.6): a reply claiming a
+ * A reply claiming a
  * time before this build's epoch is rejected, not stepped to -- the whole
  * point being that a broken or hostile server cannot walk an RTC-less
  * board's clock backwards past the day it was built.
@@ -393,13 +388,10 @@ static void test_clock_floor_apply_and_touch(void) {
         struct stat st1, st2;
         int r;
 
-        /* A bare, directly-built Netd rather than netd_new()/netd_free():
-         * meson.build (not ours, correctly so -- this is a deliberate scope
-         * boundary, not a gap) does not link netd.c, where those live, into
-         * any test binary. n.state_dir is the only field
-         * netd_time_clock_floor_apply()/_touch() ever read, and neither
-         * frees or reassigns it, so pointing it at caller-owned storage is
-         * safe without a strdup. */
+        /* A bare Netd rather than netd_new()/netd_free():
+         * n.state_dir is the only field netd_time_clock_floor_apply()/_touch()
+         * read, and neither frees or reassigns it, so pointing it at
+         * caller-owned storage is safe without a strdup. */
         memset(&n, 0, sizeof(n));
         tmp = test_tmpdir_new();
         ASSERT_TRUE(tmp != NULL);
@@ -569,14 +561,11 @@ static void test_tz_build_ordering(void) {
 }
 
 /*
- * §2.8's fake UDP/123 responder. Deliberately rejects-only (see the file
- * header): a real NTP server on loopback, replying with a packet too short
- * to be a valid header, driven through netd_sntp_process()'s real
- * recvmsg()/SO_TIMESTAMPNS path rather than a synthetic buffer -- proof the
- * socket plumbing and netd_sntp_validate() agree outside a unit test's own
- * hand-built bytes. No network namespace: two loopback UDP sockets have no
- * effect to isolate from the host in the first place, unlike the interfaces
- * and routes the rtnl/DHCP tests touch.
+ * Fake UDP/123 responder. Rejects-only (see the file header): a real NTP server on loopback, replying with a
+ * packet too short to be a valid header, driven through netd_sntp_process()'s real recvmsg()/SO_TIMESTAMPNS
+ * path rather than a synthetic buffer -- proof the socket plumbing and netd_sntp_validate() agree outside a
+ * unit test's own hand-built bytes. No network namespace: two loopback UDP sockets have no effect to isolate
+ * from the host in the first place, unlike the interfaces and routes the rtnl/DHCP tests touch.
  */
 static void test_sntp_process_over_real_socket(void) {
         Netd n;

@@ -1,7 +1,7 @@
 # Security Policy
 
 pico-init is PID1 on any system that runs it: it is the parent of every
-other process, it owns the cgroup hierarchy, and if it exits unexpectedly the
+other process, it owns the cgroup hierarchy, and if it crashes the
 kernel panics. Security issues here have a larger blast radius than in most
 software, and are treated accordingly.
 
@@ -16,7 +16,7 @@ details).
 
 Include, where possible:
 
-- What component is affected (PID1 core, `netd`, the journal reader, etc.)
+- What component is affected (PID1 core, `netd`, `logd`, `devd`, the compatibility libraries, etc.)
 - Reproduction steps or a minimal test case
 - The potential impact (privilege escalation, denial of service, memory
   corruption, etc.)

@@ -1,10 +1,8 @@
 /* SPDX-FileCopyrightText: 2026 Koen Kooi */
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
-/* struct ucred (SO_PEERCRED) is a GNU/glibc extension; -std=gnu17 alone
- * does not imply _GNU_SOURCE (same reasoning src/socket.c already gives
- * for accept4(), and sd-daemon.c for vasprintf()/pipe2()/ppoll()), so
- * this has to be explicit and first. */
+/* struct ucred (SO_PEERCRED) is a GNU extension; -std=gnu17 alone does not
+ * imply _GNU_SOURCE, so it must be defined first. */
 #define _GNU_SOURCE
 
 #include "sd-login-resolve.h"
@@ -17,11 +15,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-/* /proc/<pid>/cgroup is always tiny (one "N::path" line per controller
- * hierarchy, one line total under the unified v2 hierarchy this project
- * targets); this cap is a defensive backstop against a pathological
- * /proc, not a real limit -- see conf-scan.h's own "unbounded getline()"
- * note for why this project bounds reads like this on principle. */
+/* /proc/<pid>/cgroup is one line under cgroup v2; the cap only bounds a
+ * pathological /proc. */
 #define CGROUP_FILE_MAX 65536
 
 static int read_whole_file(const char *path, char **ret) {
@@ -81,9 +76,9 @@ static int read_whole_file(const char *path, char **ret) {
         return 0;
 }
 
-/* ENOENT -> -ESRCH: "process does not exist" is sd-login.c's own errno
- * contract for a pid that has already gone away (HEAD ded83144 :30-36).
- * Any other open()/read() failure passes its errno straight through. */
+/* ENOENT -> -ESRCH: upstream sd-login.c's errno for a pid that has gone
+ * away (HEAD ded83144 :30-36). Any other open()/read() failure passes its
+ * errno through. */
 static int read_proc_cgroup(pid_t pid, char **ret_content) {
         char path[64];
         int r;
@@ -96,9 +91,8 @@ static int read_proc_cgroup(pid_t pid, char **ret_content) {
         return r;
 }
 
-/* Real pidfd_get_pid()'s own contract: -1 means the pid has been reaped
- * (the pidfd outlived it), 0 means it lives in a pid namespace this
- * process cannot see into. Neither is this project's invention. */
+/* As upstream pidfd_get_pid(): -1 means the pid has been reaped (the pidfd
+ * outlived it), 0 means it lives in a pid namespace this process cannot see. */
 static int pidfd_get_pid(int pidfd, pid_t *ret) {
         char path[64];
         char *content;
@@ -112,7 +106,7 @@ static int pidfd_get_pid(int pidfd, pid_t *ret) {
         snprintf(path, sizeof path, "/proc/self/fdinfo/%d", pidfd);
         r = read_whole_file(path, &content);
         if (r < 0)
-                return r == -ENOMEM ? r : -EBADF; /* "unopenable" per the design contract */
+                return r == -ENOMEM ? r : -EBADF; /* pidfd unusable */
 
         if (strncmp(content, "Pid:", 4) == 0)
                 field = content;
@@ -168,9 +162,8 @@ int login_resolve_pidfd(int pidfd, pid_t *ret_pid, char **ret_cgroup_content) {
         if (r < 0)
                 return r;
 
-        /* Close the recycle race pidfd-based lookups exist to avoid: the
-         * pid could have exited and been reused by the time the cgroup
-         * read above completed. */
+        /* The pid could have exited and been reused while the cgroup was
+         * read; re-check the pidfd still maps to it. */
         r = pidfd_get_pid(pidfd, &second);
         if (r < 0) {
                 free(content);

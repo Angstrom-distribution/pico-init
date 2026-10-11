@@ -11,11 +11,6 @@
  * is blind; no /sys/fs/cgroup, so this project's entire supervision mechanism
  * silently degrades to running services unsupervised; no /run, so anything
  * expecting a writable runtime directory fails.
- *
- * That last one is not hypothetical here -- an image booted before this
- * existed reached a working login prompt with `mount` itself reporting
- * "no /proc/mounts", which is exactly how invisible this failure is from
- * inside PID 1: everything appears to start correctly.
  */
 
 #pragma once

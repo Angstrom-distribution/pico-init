@@ -125,9 +125,8 @@ static int write_machine_id_file(const char *path, const char *line, size_t len)
  * always writable -- mount_setup() mounted it long before this runs) and
  * bind-mount that file over /etc/machine-id, matching upstream's own
  * transient-file mechanism (src/shared/machine-id-setup.c). Requires
- * `etc_path` to already exist as a regular file -- true for every
- * angstrom-pico image, which ships /etc/machine-id as an empty 0-byte file
- * for exactly this reason. Remounting the bind read-only is best-effort:
+ * `etc_path` to already exist as a regular file -- so the image must
+ * ship /etc/machine-id as an empty 0-byte file. Remounting the bind read-only is best-effort:
  * a failure there leaves a working, merely less-hardened, machine id.
  */
 static int bind_transient_machine_id(const char *run_path, const char *etc_path, const char *line, size_t len) {

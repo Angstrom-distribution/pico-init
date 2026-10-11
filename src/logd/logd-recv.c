@@ -3,38 +3,29 @@
 
 /*
  * Datagram receive, fragment handling, /dev/log parsing and ucred+cgroup
- * attribution. See logd-recv.h for the corrected per-stream design and why
- * it superseded the original per-PID wording.
+ * attribution. See logd-recv.h for the per-stream design.
  *
- * Reference only, cited per file the way netd-rtnl.c cites its
- * constructors -- nothing here is lifted (plan §3.5):
+ * Not lifted from systemd; upstream was the reference:
  *   - src/journal/journald-syslog.c (syslog_parse_priority(),
  *     syslog_parse_identifier()) for the <N> prefix and identifier[pid]:
  *     tag grammar /dev/log parsing follows.
  *   - src/journal/journald-stream.c (stdout_stream_scan()) for the line-
- *     break scan: a literal NUL byte breaks a line exactly like '\n' does
- *     (whichever occurs first within the window), because many downstream
- *     consumers of a MESSAGE cannot handle an embedded NUL even though
- *     this project's own binary-safe export encoding (logd-write.h) can;
- *     and for the _LINE_BREAK field/value vocabulary itself
- *     (line-max/pid-change/eof), reused verbatim rather than invented, so
- *     a converted ring reads exactly like a real journal on this point.
+ *     break scan: a literal NUL byte breaks a line like '\n' does
+ *     (whichever occurs first within the window), because many consumers of
+ *     a MESSAGE cannot handle an embedded NUL; and for the _LINE_BREAK
+ *     field/value vocabulary (line-max/pid-change/eof), reused verbatim so a
+ *     converted ring reads like a real journal.
  *   - src/basic/cgroup-util.c (cg_path_get_unit_full(), skip_slices(),
  *     cg_path_decode_unit()) for the unit-from-cgroup walk: skip a leading
  *     run of valid *.slice components, then the unit is the FIRST
- *     remaining component -- not the last, which is where an earlier
- *     draft of plan §3.3 had it backwards. Only the cgroup-v2 "0::" line
- *     is parsed (the v1 fallback was removed upstream in b525a72f7b, and
- *     pico never mounts any v1 hierarchy -- mount-setup.c only ever mounts
- *     cgroup2).
+ *     remaining component, not the last. Only the cgroup-v2 "0::" line is
+ *     parsed (upstream removed the v1 fallback in b525a72f7b, and
+ *     mount-setup.c only mounts cgroup2).
  */
 
-/* struct ucred and SCM_CREDENTIALS live under glibc's __USE_GNU guard in
- * <sys/socket.h> -- -std=gnu17 alone does not imply _GNU_SOURCE, so this
- * has to be explicit and first, before any header (including this file's
- * own logd-recv.h, which pulls in <sys/socket.h> itself) -- the same fix
- * netd-time.c and test-netd-rtnl.c already needed for their own glibc
- * extensions. */
+/* struct ucred and SCM_CREDENTIALS are under glibc's __USE_GNU guard in
+ * <sys/socket.h>, which -std=gnu17 does not imply; this must come before any
+ * header, including logd-recv.h. */
 #define _GNU_SOURCE
 
 #include "logd-recv.h"
@@ -52,14 +43,11 @@
 #include "../util.h"
 #include "logd.h"
 
-/* Linux's own TASK_COMM_LEN (16, including the NUL) -- /proc/<pid>/comm
- * never reports more. */
+/* TASK_COMM_LEN (16, including the NUL). */
 #define LOGD_COMM_MAX 16
 
-/* Matches unit.h's UNIT_NAME_MAX (255) without including unit.h: logd is
- * deliberately independent of PID1's own headers (plan §3.2), and this is
- * the one constant worth duplicating rather than coupling the two binaries
- * over. */
+/* Matches unit.h's UNIT_NAME_MAX; duplicated so logd does not depend on
+ * PID 1's headers. */
 #define LOGD_UNIT_NAME_MAX 255
 
 #define LOGD_RECV_BUF_SIZE ((size_t) 65536)
@@ -96,10 +84,9 @@ struct LogdRecv {
 
 /*
  * "<N>" POSIX syslog PRI prefix, 1-3 decimal digits (journald-syslog.c's
- * own syslog_parse_priority(..., with_facility=true) grammar: no upper
- * bound beyond digit count, matching real syslogd leniency). Only the
- * severity (value & 7) is kept -- pico's field set (plan §3.3) carries no
- * SYSLOG_FACILITY. Returns false (and leaves *p untouched) if the buffer
+ * syslog_parse_priority(..., with_facility=true) grammar: no upper bound
+ * beyond digit count). Only the severity (value & 7) is kept; there is no
+ * SYSLOG_FACILITY field. Returns false (and leaves *p untouched) if the buffer
  * does not start with a well-formed prefix.
  */
 static bool syslog_parse_priority_prefix(const char **p, int *out_priority) {
@@ -135,9 +122,8 @@ static bool syslog_parse_priority_prefix(const char **p, int *out_priority) {
  * syslog_parse_identifier()): a run of non-whitespace ending in ':', with
  * an optional "[...]" suffix immediately before the colon stripped from
  * the identifier regardless of whether its content is numeric. The
- * bracketed pid is deliberately discarded, not surfaced as a field: pico's
- * own _PID always comes from the kernel-verified ucred, never from
- * client-supplied message text a spoofing sender fully controls. Returns
+ * bracketed pid is discarded: _PID always comes from the kernel-verified
+ * ucred, never from sender-controlled text. Returns
  * false (and leaves *p untouched) if no ':'-terminated tag is found.
  */
 static bool syslog_parse_tag(const char **p, const char **ident, size_t *ident_len) {
@@ -156,7 +142,7 @@ static bool syslog_parse_tag(const char **p, const char **ident, size_t *ident_l
 
         tag_len = l - 1;
         if (tag_len > LOGD_UNIT_NAME_MAX)
-                return false; /* ridiculously long: treat as "no identifier", same spirit as upstream's NAME_MAX guard */
+                return false; /* too long: treat as "no identifier" */
 
         if (tag_len > 0 && s[tag_len - 1] == ']') {
                 size_t k = tag_len - 1;
@@ -205,20 +191,12 @@ static bool cgroup_component_is_slice(const char *name, size_t len) {
 }
 
 /*
- * A cgroup path component shaped like a real unit name: valid characters
- * plus a suffix from the set upstream's own unit-type table recognizes.
- * Deliberately broader than this project's own unit_name_is_valid()
- * (unit.c), which only recognizes the three types pico-init itself can
- * load as a fragment (service/target/socket): attribution reports
- * whatever the cgroup hierarchy actually says, exactly like upstream's
- * cg_path_get_unit() does regardless of which unit types the local system
- * happens to support, so a process under a real .scope or .mount cgroup
- * (never created by pico itself today, but not a format error either)
- * still attributes rather than being silently dropped. ".slice" is
- * deliberately absent from the suffix set: skip_slices() (below) already
- * consumed every leading slice, so one surviving to this point means the
- * walk went wrong, and rejecting it here is upstream's own belt-and-braces
- * check.
+ * A cgroup path component shaped like a unit name: valid characters plus a
+ * suffix from upstream's unit-type table. Broader than unit_name_is_valid()
+ * (unit.c), which only knows the unit types pico-init loads, so a process
+ * under e.g. a .scope or .mount cgroup is still attributed. ".slice" is
+ * absent from the set: leading slices are already skipped by
+ * cgroup_path_get_unit(), so a surviving one is rejected, as upstream does.
  */
 static bool cgroup_component_is_unit_shaped(const char *name, size_t len) {
         static const char * const suffixes[] = {
@@ -240,14 +218,11 @@ static bool cgroup_component_is_unit_shaped(const char *name, size_t len) {
 
 /*
  * Extract the owning unit from a raw cgroup v2 path (e.g.
- * "/system.slice/netd.service"), cg_path_get_unit_full()'s own walk: skip
- * a leading run of valid *.slice components, then the unit is the FIRST
- * remaining component -- not the last (plan §3.3, corrected 2026-08-24).
- * On pico's own flat system.slice/<unit>/ layout the two rules coincide
- * for every unit with no further sub-component, which is exactly why the
- * error was easy to miss; a real .scope-bearing cgroup is where they
- * diverge. Returns a pointer+length INTO `path` (no copy) on success, or
- * NULL.
+ * "/system.slice/netd.service"), cg_path_get_unit_full()'s walk: skip a
+ * leading run of valid *.slice components, then the unit is the FIRST
+ * remaining component, not the last. On the flat system.slice/<unit>/
+ * layout the two coincide; they differ for a cgroup with sub-components.
+ * Returns a pointer+length INTO `path` (no copy) on success, or NULL.
  */
 static const char *cgroup_path_get_unit(const char *path, size_t *ret_len) {
         const char *p = path;
@@ -272,8 +247,8 @@ static const char *cgroup_path_get_unit(const char *path, size_t *ret_len) {
         return p;
 }
 
-/* /proc/<pid>/cgroup's "0::<path>" line (cgroup-v2-only, see header) -- a
- * malloc'd copy of the path field, or NULL. */
+/* /proc/<pid>/cgroup's "0::<path>" line (cgroup v2 only): a malloc'd copy of
+ * the path field, or NULL. */
 static char *read_proc_cgroup(pid_t pid) {
         char path[64];
         FILE *f;
@@ -304,12 +279,10 @@ static char *read_proc_cgroup(pid_t pid) {
 }
 
 /*
- * /proc/<pid>/stat field 22 (starttime, clock ticks since boot) -- changes
- * whenever `pid` is recycled to a different process even though the
- * numeric pid did not, the residual PID-reuse defence logd-recv.h
- * describes for a stream whose sender legitimately keeps the same pid
- * across many datagrams. 0 means "unknown" (process gone, or a read
- * failure) and is never treated by callers as "confirmed unchanged".
+ * /proc/<pid>/stat field 22 (starttime, clock ticks since boot): differs
+ * when `pid` has been recycled to another process (the PID-reuse defence
+ * described in logd-recv.h). 0 means "unknown" (process gone, or a read
+ * failure) and is never treated as "confirmed unchanged".
  */
 static unsigned long long read_proc_starttime(pid_t pid) {
         char path[64];
@@ -323,9 +296,8 @@ static unsigned long long read_proc_starttime(pid_t pid) {
                 return 0;
 
         if (fgets(buf, sizeof(buf), f)) {
-                /* comm (field 2) is parenthesized and may itself contain
-                 * spaces/parens -- find the LAST ')' before splitting on
-                 * whitespace, exactly the caveat proc(5) itself documents. */
+                /* comm (field 2) is parenthesized and may contain spaces or
+                 * parens: split after the LAST ')' (see proc(5)). */
                 char *rparen = strrchr(buf, ')');
 
                 if (rparen) {
@@ -352,10 +324,8 @@ static unsigned long long read_proc_starttime(pid_t pid) {
         return starttime;
 }
 
-/* Attribution is best-effort throughout: a process that has already
- * exited (common for a short-lived ExecStart=/bin/sh -c '...' helper) just
- * yields empty comm/unit rather than an error -- attribution never blocks
- * writing a record (logd-recv.h). */
+/* Best-effort: a process that has already exited just yields empty
+ * comm/unit. */
 static void attribute_pid(pid_t pid, char *comm_out, size_t comm_out_sz, char *unit_out, size_t unit_out_sz) {
         comm_out[0] = '\0';
         unit_out[0] = '\0';
@@ -417,11 +387,9 @@ static void flush_tail(LogdRecv *r, LogdStream *s, const char *line_break_reason
         s->tail_len = 0;
 }
 
-/* Find a stream by identity, or allocate one -- a free slot if there is
- * one, otherwise the least-recently-seen slot (LOGD_MAX_STREAMS never
- * grows; see logd.h). Evicting a still-live stream flushes its tail first
- * (tagged _LINE_BREAK=eof, upstream's own "this stream is going away"
- * value) rather than silently dropping it. */
+/* Find a stream by identity, or allocate one: a free slot if there is one,
+ * otherwise the least-recently-seen slot (see logd.h). Evicting a live
+ * stream flushes its tail first, tagged _LINE_BREAK=eof. */
 static LogdStream *find_or_create_stream(LogdRecv *r, const struct sockaddr_un *peer, socklen_t peer_len) {
         LogdStream *s = find_stream(r, peer, peer_len);
         size_t slot = LOGD_MAX_STREAMS;
@@ -458,10 +426,9 @@ static LogdStream *find_or_create_stream(LogdRecv *r, const struct sockaddr_un *
 }
 
 /*
- * Update a stream's cached pid/credentials/attribution for one incoming
- * datagram, handling both PID-change-on-stream and same-PID-but-recycled
- * (logd-recv.h's two-layer defence) by force-flushing the tail first and
- * marking attribution stale so the next datagram re-attributes.
+ * Update a stream's cached pid/credentials/attribution for one datagram.
+ * A PID change on the stream, or the same PID with a different starttime
+ * (logd-recv.h), flushes the tail and marks attribution stale.
  */
 static void update_stream_identity(LogdRecv *r, LogdStream *s, const struct ucred *cred) {
         if (!cred)
@@ -502,10 +469,9 @@ static void emit_stdout_line(
         char pid_buf[16], uid_buf[16], gid_buf[16];
 
         fields[n++] = (LogdField){ "MESSAGE", line, line_len };
-        fields[n++] = (LogdField){ "PRIORITY", "6", 1 }; /* LOG_INFO: upstream's own stdout-stream default
-                                                          * (journald-stream.c), and pico's single shared
-                                                          * stdout/stderr socket has no handshake to say
-                                                          * otherwise (plan §3.2) */
+        fields[n++] = (LogdField){ "PRIORITY", "6", 1 }; /* LOG_INFO: upstream's stdout-stream default
+                                                          * (journald-stream.c); the shared socket has no
+                                                          * handshake to say otherwise */
         fields[n++] = (LogdField){ "_TRANSPORT", "stdout", 6 };
 
         if (s->has_pid) {
@@ -529,8 +495,8 @@ static void emit_stdout_line(
 }
 
 /*
- * Scan `data`[0..len) for line breaks exactly as journald-stream.c's own
- * stdout_stream_scan() does (see this file's header): within each
+ * Scan `data`[0..len) for line breaks as journald-stream.c's
+ * stdout_stream_scan() does (see the header): within each
  * LOGD_LINE_MAX-bounded window, whichever of '\n' or a literal NUL byte
  * occurs first ends the line; with neither found and a full LOGD_LINE_MAX
  * accumulated, force a split tagged "line-max". Whatever remains
@@ -627,8 +593,8 @@ int logd_recv_bind_socket(const char *path, mode_t mode, int *ret_fd) {
         if (fd < 0)
                 return -errno;
 
-        /* Before bind(): see logd_recv_ensure_passcred()'s doc on why the
-         * ordering itself matters, not just that it happens eventually. */
+        /* Before bind(): the ordering matters, see
+         * logd_recv_ensure_passcred(). */
         r = logd_recv_ensure_passcred(fd);
         if (r < 0) {
                 close(fd);
@@ -673,19 +639,15 @@ int logd_recv_process_stdout(
         if (!r || (!payload && payload_len > 0))
                 return -EINVAL;
 
-        /* cred->pid == 0 with the cmsg present means "unknown" (a datagram
-         * queued before SO_PASSCRED took effect), never a real process --
-         * see logd-recv.h. Treat it as no credentials at all rather than
-         * attributing to a process that cannot exist. */
+        /* pid == 0 with the cmsg present means "unknown" (a datagram queued
+         * before SO_PASSCRED took effect): treat as no credentials. */
         if (cred && cred->pid == 0)
                 cred = NULL;
 
         if (!peer || peer_len == 0) {
-                /* No reliable stream identity (production traffic never
-                 * produces this -- see logd-recv.h): never carry a tail
-                 * across calls without one. Split what we have now and
-                 * force-flush any remainder immediately under a throwaway
-                 * stream. */
+                /* No stream identity: never carry a tail across calls.
+                 * Emit what we have, flushing any remainder immediately
+                 * under a throwaway stream. */
                 LogdStream anon;
 
                 memset(&anon, 0, sizeof(anon));
@@ -710,11 +672,8 @@ int logd_recv_process_stdout(
         update_stream_identity(r, s, cred);
 
         if (s->tail_len == 0) {
-                /* Overwhelmingly the common case (most datagrams already
-                 * end in a newline, leaving no partial-line tail to stitch
-                 * onto): nothing to combine, so scan straight out of the
-                 * caller's own receive buffer instead of paying for a
-                 * malloc()+memcpy() of the whole payload first. */
+                /* Common case (no pending tail): scan the receive buffer
+                 * directly instead of copying it. */
                 scan_and_emit(r, s, payload, payload_len);
         } else {
                 combined_len = s->tail_len + payload_len;
@@ -739,7 +698,7 @@ int logd_recv_process_stdout(
 int logd_recv_process_syslog(LogdRecv *r, const void *payload, size_t payload_len, const struct ucred *cred) {
         char *buf;
         const char *p;
-        int priority = 6; /* LOG_INFO: journald-syslog.c's own default (LOG_USER|LOG_INFO) once facility is masked off */
+        int priority = 6; /* LOG_INFO: journald-syslog.c's default */
         const char *ident = NULL;
         size_t ident_len = 0;
         LogdField fields[9];

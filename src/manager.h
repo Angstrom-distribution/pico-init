@@ -27,9 +27,9 @@
 /*
  * Dispatch priorities for every PID1 event source, mirroring the load-
  * bearing order manager-loop.c's own header lays out (cgroup verify, then
- * signals, then cgroup-empty, then timers, then the run queue) -- now
- * expressed as int64 priorities the shim's sd_event_dispatch() enforces
- * itself: strictly lowest-priority-first, one source per dispatch, re-
+ * signals, then cgroup-empty, then timers, then the run queue) --
+ * as int64 priorities the shim's sd_event_dispatch() enforces: strictly
+ * lowest-priority-first, one source per dispatch, re-
  * polling with a zero timeout between dispatches while anything stays
  * pending. Patterned on real systemd's own table (src/core/manager.h).
  */
@@ -52,10 +52,9 @@ enum {
         EVENT_PRIORITY_SOCKET_REAP = SD_EVENT_PRIORITY_IDLE + 3, /* last: frees units other sources name */
 };
 
-/* angstrom-pico-init adopts usrmerge (see plans/29-pico-init.md §4), so
- * this matches oe-core's real systemd_system_unitdir for that distro:
- * /etc overrides admin-placed units, /usr/lib is where packages install
- * theirs -- same two-entry order real systemd searches. */
+/* Assumes a usrmerged rootfs: /etc overrides admin-placed units, /usr/lib is
+ * where packages install theirs -- same two-entry order real systemd
+ * searches. */
 #define PICO_UNIT_DIR "/etc/systemd/system"
 #define PICO_PACKAGED_UNIT_DIR "/usr/lib/systemd/system"
 
@@ -81,7 +80,7 @@ enum {
  * files under units/, one manager file, and the picoctl control socket.
  * Settable on the Manager for the same reason the search paths are -- so a
  * test can point it at a temporary directory instead of the host's real /run.
- * See manager-state.h and manager-ctrl.h (plan §1.7).
+ * See manager-state.h and manager-ctrl.h.
  */
 #define PICO_RUNTIME_DIR "/run/pico-init"
 
@@ -102,7 +101,7 @@ typedef enum ManagerObjective {
 } ManagerObjective;
 
 struct Manager {
-        /* unit table: flat array for now, replace with the quarried hashmap later */
+        /* unit table: flat array; a hashmap would replace it if the unit count ever warranted */
         Unit **units;
         size_t n_units;
 
@@ -130,9 +129,9 @@ struct Manager {
         char *default_target;
 
         /* State publisher, control socket, sd_notify() listener, and the
-         * hardware watchdog feeder (plan §1.7, manager-notify.h; manager-
-         * watchdog.h). All four are opaque here: their own .c files own
-         * their shapes, so landing one does not mean editing this header.
+         * hardware watchdog feeder (manager-state.h,
+         * manager-ctrl.h, manager-notify.h, manager-watchdog.h). All four are
+         * opaque here: their own .c files own their shapes.
          * NULL until the corresponding setup() has run, and NULL is a
          * supported state -- an unwritable /run costs picoctl its verbs and
          * sd_notify() its listener, an absent /dev/watchdog costs only
@@ -147,7 +146,7 @@ struct Manager {
         bool dispatching_load_queue; /* re-entrancy guard, see manager_load_unit() */
 
         /* units whose cgroup was observed empty, linked via
-         * unit->cgroup_empty_queue_next. Deliberately a queue rather than a
+         * unit->cgroup_empty_queue_next. A queue rather than a
          * direct call: emptiness must not be acted on until every SIGCHLD in
          * the same epoll batch has been reaped, or the exit status is lost.
          * See manager-loop.c. */

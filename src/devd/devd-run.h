@@ -2,19 +2,16 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * RUN+=: starting a tool on match, without ever waiting for it (plans/31, Part
- * 2, H2).
+ * RUN+=: starting a tool on match, without ever waiting for it.
  *
- * The asynchrony is the whole design constraint, not a refinement of it. devd
- * is a single-threaded epoll loop, and `usb_modeswitch` against a modem that is
- * mid-reset can take seconds -- long enough for the kernel's uevent socket
- * buffer to overrun and for the daemon to miss the very events the tool's own
- * work produces. So a RUN+= child is forked, recorded, and left alone: it is
- * reaped when SIGCHLD arrives on the signalfd the loop is already watching,
- * which is scaffolding H1 built and this milestone reuses rather than adds.
+ * devd is a single-threaded epoll loop, and `usb_modeswitch` against a modem
+ * that is mid-reset can take seconds -- long enough for the kernel's uevent
+ * socket buffer to overrun and for devd to miss the events the tool's own work
+ * produces. So a RUN+= child is forked, recorded and left alone; it is reaped
+ * when SIGCHLD arrives on the signalfd the loop already watches.
  *
- * Two things a fork/exec in a signalfd daemon must do and would otherwise
- * silently get wrong, both handled in the child below:
+ * A fork/exec in a signalfd daemon must do two things, both handled in the
+ * child:
  *
  *  - Restore the signal mask. pico_signal_new() blocks SIGCHLD, SIGTERM and the
  *    rest process-wide so they can be read from a descriptor instead, and
@@ -36,10 +33,9 @@
 #include <sys/types.h>
 
 /*
- * Where a RUN+= program with a non-absolute path is looked up. udev's own rule,
- * and on this image it is a real directory with a real file in it:
- * usb-modeswitch installs its dispatcher wrapper as /usr/lib/udev/usb_modeswitch
- * and its rules file calls it by that bare name.
+ * Where a RUN+= program with a non-absolute path is looked up (udev's own
+ * rule). usb-modeswitch's rules file calls its dispatcher
+ * /usr/lib/udev/usb_modeswitch by the bare name.
  */
 #define DEVD_RUN_HELPER_DIR "/usr/lib/udev"
 
@@ -79,9 +75,8 @@ int devd_run_set_helper_dir(DevdRun *r, const char *dir);
 
 /*
  * Split a RUN+= value into argv the way udev does: whitespace-separated, with
- * single and double quotes grouping and then removed. `usb_modeswitch '/%k'`
- * -- the shape 415 of the shipped file's rules use -- is two arguments, and the
- * quotes are not part of the second one.
+ * single and double quotes grouping and then removed. `usb_modeswitch '/%k'` is
+ * two arguments, and the quotes are not part of the second one.
  *
  * Returns the argument count, or -EINVAL on an unterminated quote or an
  * argument that does not fit.

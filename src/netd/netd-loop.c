@@ -2,36 +2,20 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * netd's epoll loop, and -- since this file was built to review this
- * comment carefully -- the Netd object's whole lifecycle: allocation, the
+ * netd's epoll loop and the Netd object's whole lifecycle: allocation, the
  * settable paths, netd_startup()/netd_reload()/netd_bring_up_loopback(), and
- * netd_runtime_path(). All of that used to live in netd.c, next to main().
- * It moved here for a build-graph reason, not a design change:
- * meson.build's netd_core static_library() links netd_own_sources (this
- * file among them) into every netd test binary, but deliberately never
- * links netd.c itself -- the same exclusion main.c gets from
- * pico-init-core, so a test executable never ends up with two main()s. A
- * symbol that exists only in netd.c is therefore invisible to every test,
- * including this milestone's own end-to-end static-.network-plus-SIGHUP
- * test in test-netd-rtnl.c, which needs netd_new()/netd_startup()/
- * netd_set_*()/netd_free() to drive the real entry points rather than
- * reach into a hand-built Netd. netd.c itself now holds only main(), and
- * every declaration below still lives in netd.h exactly where it always
- * did -- a caller never needs to know which .c file defines it. This is
- * the same manager.c/main.c split M0-M5's PID 1 core already uses, for the
- * same reason: the real object lives in the library the tests link, and
- * main() stays a thin driver that nothing links but the real binary.
+ * netd_runtime_path().
  *
- * The loop itself: one thing about it is not obvious. A reload is acted on
- * *after* the whole epoll batch is dispatched, never inside it.
- * netd_reload() frees every Network, and a callback still holding the
- * borrowed Network* its Link points at would be reading freed memory. This
- * is the same class of bug M5 found in PID 1's run queue, and it is cheaper
- * to design out than to debug on a board. netd_loop_run() reaches
- * netd_reload() through Netd.reload_handler rather than calling it by name,
- * which by now is not a link-time necessity (both live in this file) but is
- * kept anyway: it lets a test install a spy, or nothing at all, without
- * netd_loop_run() ever needing to know that.
+ * These live here rather than in netd.c because meson.build links this file
+ * into netd-core and every netd test binary, but never links netd.c (a
+ * second main() would collide with each test's own). netd.c holds only
+ * main(), as main.c does for PID 1.
+ *
+ * A reload is acted on *after* the whole epoll batch is dispatched, never
+ * inside it: netd_reload() frees every Network, and a callback still holding
+ * the borrowed Network* its Link points at would read freed memory.
+ * netd_loop_run() reaches netd_reload() through Netd.reload_handler so a test
+ * can install a spy, or nothing at all.
  */
 
 #include "netd-loop.h"
@@ -270,7 +254,7 @@ int netd_runtime_path(Netd *n, const char *subdir, const char *name, bool mkdir_
         return 0;
 }
 
-/* --- startup / reload sequencing (moved from netd.c; see this file's header) --- */
+/* --- startup / reload sequencing --- */
 
 /*
  * Enumerate links, deferring per-link configuration until the dump itself
@@ -380,18 +364,14 @@ static void netd_apply_static_ntp(Netd *n) {
  * system-wide, rather than per-link -- the kernel's own dev_init_scheduler()
  * reads net.core.default_qdisc for every interface at creation time,
  * including one a DHCP lease or a bnep PAN connection creates long after
- * boot, so this needs no per-link rtnetlink work at all (netd-rtnl.c's own
- * scope never covered TCA_QDISC, and does not need to for this).
+ * boot, so this needs no per-link rtnetlink work (netd-rtnl.c has no
+ * TCA_QDISC support).
  *
  * Each list is tried in order and the first value the kernel actually
  * accepts wins; a value failing just means that qdisc/congestion-control
- * module is not built into this particular kernel (this project's pico
- * kernels are deliberately minimal -- see h2200/h3800's own
- * CONFIG_NET_SCH_FQ_CODEL=y, with CONFIG_NET_SCH_FQ/CONFIG_NET_SCH_CAKE/
- * CONFIG_TCP_CONG_BBR not yet added anywhere), not a bug here. Silent
- * otherwise-than-debug-log: a bufferbloat-mitigating qdisc and a modern
- * congestion control are both real quality improvements, never something
- * to fail boot over.
+ * module is not built into this kernel, not a bug here. Only logged at debug
+ * level: a better qdisc or congestion control is never worth failing boot
+ * over.
  */
 static void netd_set_default_qdisc_and_congestion_control(void) {
         static const char * const qdiscs[] = { "fq_codel", "fq", "cake" };
@@ -490,7 +470,7 @@ int netd_startup(Netd *n) {
 
         /*
          * Loopback: netd's job explicitly, upstream leaves it to PID 1 and
-         * pico-init deliberately does not do it (netd.h). Bringing it up
+         * pico-init does not do it (netd.h). Bringing it up
          * here, before enumeration, keeps it independent of whether any
          * .network file happens to match "lo" (none is expected to).
          */
@@ -759,7 +739,7 @@ int netd_loop_dispatch_signal(Netd *n, int signo) {
                 return 0;
 
         case SIGHUP:
-                /* The whole management API (§2.9). Deferred, see above. */
+                /* The whole management API. Deferred, see above. */
                 pico_log(PICO_LOG_INFO, "netd: SIGHUP, reload queued");
                 n->reload_requested = true;
                 return 0;

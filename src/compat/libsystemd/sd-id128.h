@@ -2,28 +2,18 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * pico-init's own implementation of the sd-id128 public API surface (see
- * sd-id128(3) upstream). Function names, macro names/values and documented
- * error conventions below match real libsystemd byte-for-byte -- that is
- * the compatibility contract, so code written against the real header
- * builds and links unmodified against this one. Written from scratch
- * against the real, current sd-id128.h and the sd-id128.c/id128-util.c
- * implementation it documents (systemd.git, HEAD ded83144, 2026-08-23) for
- * signatures and error semantics only -- no text from that
- * LGPL-2.1-or-later source is reproduced here.
+ * pico-init's own implementation of the sd-id128 API (see sd-id128(3)).
+ * Function and macro names/values and documented error conventions match
+ * real libsystemd, so code written against the real header builds and links
+ * unmodified against this one.
  *
- * sd-id128 carries no "is this systemd?" signal and this shim never invents
- * one: a missing or malformed backing file always maps to the specific
- * documented errno for that resource, never to "not systemd". See each
- * getter below, and id128-internal.h, for exactly which errno means what.
+ * A missing or malformed backing file maps to the documented errno for that
+ * resource, never to a "not systemd" error. See each getter below and
+ * id128-internal.h for which errno means what.
  *
- * sd_id128_t's layout (bytes[16] / qwords[2] union) is the wire/ABI
- * contract, not an implementation detail -- anything that marshals this
- * type across a boundary depends on it being exactly these 16 bytes in
- * this shape. The typedef is guarded by PICO_SD_ID128_T_DEFINED so this
- * real definition and sd-device.h's stand-in (see its own comment) agree
- * on one definition regardless of which header a translation unit includes
- * first.
+ * sd_id128_t's layout (bytes[16] / qwords[2] union) is ABI. The typedef is
+ * guarded by PICO_SD_ID128_T_DEFINED so this definition and sd-device.h's
+ * stand-in agree regardless of which header is included first.
  */
 
 #pragma once
@@ -51,19 +41,17 @@ char *sd_id128_to_uuid_string(sd_id128_t id, char s[_SD_ARRAY_STATIC SD_ID128_UU
 int sd_id128_from_string(const char *s, sd_id128_t *ret);
 int sd_id128_string_equal(const char *s, sd_id128_t id);
 
-/* The buffer is a compound literal in the caller's own statement, valid until the end of that
- * statement's block -- long enough to pass straight into a printf-family call, never to store. */
+/* The buffer is a compound literal valid until the end of the enclosing block: enough to pass
+ * into a printf-family call, not to store. */
 #define SD_ID128_TO_STRING(id) sd_id128_to_string((id), (char[SD_ID128_STRING_MAX]){ 0 })
 #define SD_ID128_TO_UUID_STRING(id) sd_id128_to_uuid_string((id), (char[SD_ID128_UUID_STRING_MAX]){ 0 })
 
 int sd_id128_randomize(sd_id128_t *ret);
 
 /*
- * sd_id128_get_boot()'s -ENOSYS is the one case worth calling out by name
- * here: it means /proc itself is not mounted, not "this kernel has no boot
- * id". sd_id128_get_invocation()'s -ENXIO is pico-init's permanent, honest
- * answer today (no service-exec INVOCATION_ID export yet) -- see the .c
- * file for why that is not a stand-in for a missing mechanism.
+ * sd_id128_get_boot()'s -ENOSYS means /proc is not mounted, not that the
+ * kernel has no boot id. sd_id128_get_invocation() returns -ENXIO until
+ * service-exec exports INVOCATION_ID.
  */
 int sd_id128_get_machine(sd_id128_t *ret);
 int sd_id128_get_boot(sd_id128_t *ret);
@@ -107,9 +95,8 @@ int sd_id128_get_invocation_app_specific(sd_id128_t app_id, sd_id128_t *ret);
                         (x).bytes[7], (x).bytes[8], (x).bytes[9], (x).bytes[10], (x).bytes[11],           \
                         (x).bytes[12], (x).bytes[13], (x).bytes[14], (x).bytes[15]
 
-/* Like SD_ID128_FORMAT_STR, but 8-4-4-4-12 dashed. Always big-endian byte order, matching every other
- * Linux userspace UUID renderer, even for an id whose own variant bits say otherwise -- deliberate, not
- * a bug: see sd_id128_to_uuid_string()'s own comment in sd-id128.c. */
+/* Like SD_ID128_FORMAT_STR, but 8-4-4-4-12 dashed. Always big-endian byte order, even for an id whose
+ * variant bits say otherwise: see sd_id128_to_uuid_string() in sd-id128.c. */
 #define SD_ID128_UUID_FORMAT_STR "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x"
 
 #define SD_ID128_MAKE_STR(b00, b01, b02, b03, b04, b05, b06, b07, b08, b09, b10, b11, b12, b13, b14, b15) \
@@ -118,8 +105,7 @@ int sd_id128_get_invocation_app_specific(sd_id128_t app_id, sd_id128_t *ret);
 #define SD_ID128_MAKE_UUID_STR(b00, b01, b02, b03, b04, b05, b06, b07, b08, b09, b10, b11, b12, b13, b14, b15) \
         #b00 #b01 #b02 #b03 "-" #b04 #b05 "-" #b06 #b07 "-" #b08 #b09 "-" #b10 #b11 #b12 #b13 #b14 #b15
 
-/* One hex nibble to its lowercase digit -- pico's own building block for SD_ID128_CONST_STR below,
- * not a copy of upstream's inline-everywhere ternary text. */
+/* One hex nibble to its lowercase digit; building block for SD_ID128_CONST_STR below. */
 #define _PICO_ID128_NIBBLE(n) ((char) ((n) < 10 ? '0' + (n) : 'a' + (n) - 10))
 
 #define SD_ID128_CONST_STR(x)                                                         \
@@ -201,7 +187,7 @@ static __inline__ int sd_id128_in_set_sentinel(sd_id128_t a, ...) {
 }
 
 /* Appends the SD_ID128_NULL sentinel so in_set_sentinel()'s va_arg loop always terminates, even
- * called with zero extra ids (sd_id128_in_set(x) is then simply always false). */
+ * called with zero extra ids (sd_id128_in_set(x) is then always false). */
 #define sd_id128_in_set(a, ...) sd_id128_in_set_sentinel((a), ##__VA_ARGS__, SD_ID128_NULL)
 
 _SD_END_DECLARATIONS;

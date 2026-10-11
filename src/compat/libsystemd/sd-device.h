@@ -2,35 +2,24 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * pico-init's own implementation of the sd-device public API surface (plan:
- * libsystemd-compat, sd-device/sd-network family).
+ * pico-init's implementation of the sd-device public API, written against
+ * the signatures and documented error conventions of systemd's
+ * src/systemd/sd-device.h; no text from that LGPL-2.1-or-later header is
+ * reproduced. Everything is backed by real /sys and netlink. The one udev
+ * database read (device-db.c) is of entries devd writes itself, in
+ * upstream's on-disk format.
  *
- * This header is written from scratch against the real, current sd-device.h
- * (systemd.git, src/systemd/sd-device.h) for its function signatures and
- * documented error conventions only -- no text from that LGPL-2.1-or-later
- * header is reproduced here. sd-device did not exist yet at the GPL-2.0-era
- * v30 tag this project quarries algorithm shape from (it postdates the
- * libudev/sd-device split by several years), so there is no GPL shape to
- * carry forward either: every function below is a pico-original
- * reimplementation of the documented ABI, backed by real /sys and real
- * netlink. The one udev-database read it does (device-db.c) is of entries
- * devd writes itself, in upstream's on-disk format, reimplemented from that
- * format alone.
+ * The struct behind `sd_device` is private (device-internal.h).
  *
- * The struct layout behind `sd_device` is private (device-internal.h);
- * callers only ever see the opaque pointer, exactly as real libsystemd users
- * do.
- *
- * Coverage is intentionally partial and every gap is a comment at its call
- * site, not a silent omission: pico runs devtmpfs + devd, not udevd. devd
- * writes a real /run/udev/data entry for input devices only, carrying its
- * input_id classification (ID_INPUT, ID_INPUT_TOUCHSCREEN, ...), and that
- * reaches every consumer through the property overlay in device-db.c; every
- * other device has no entry, and there are no other udev-added ID_*
- * properties and no tag mechanism. Getters for data that plainly doesn't
- * exist here return the honest "not present" answer (usually -ENOENT or an
- * empty iterator) rather than a fabricated one. See device-monitor.c for the
- * one family that is genuinely deferred to a future sd-event shim.
+ * Coverage is partial, with each gap noted at its call site: pico runs
+ * devtmpfs + devd, not udevd. devd writes a /run/udev/data entry for input
+ * devices only, carrying its input_id classification (ID_INPUT,
+ * ID_INPUT_TOUCHSCREEN, ...), which reaches every consumer through the
+ * property overlay in device-db.c. Every other device has no entry, and
+ * there are no other udev-added ID_* properties and no tag mechanism.
+ * Getters for data that does not exist return "not present" (usually
+ * -ENOENT or an empty iterator). The one unimplemented family is sd-event
+ * integration of the monitor (device-monitor.c).
  */
 
 #pragma once
@@ -39,15 +28,9 @@
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 
-/*
- * sd_id128_t (sd_device_get_trigger_uuid()/sd_device_trigger_with_uuid())
- * and sd_event/sd_event_source (sd_device_monitor_attach_event() and
- * friends, part of the real API surface even though device-monitor.c
- * defers their implementation) both now have their own real family in
- * this shim -- include them rather than the stand-in typedefs an earlier
- * version of this header carried while sd-id128/sd-event did not exist
- * yet, exactly as real systemd's own sd-device.h does.
- */
+/* sd_id128_t (trigger uuid functions) and sd_event/sd_event_source
+ * (sd_device_monitor_attach_event() and friends, which device-monitor.c does
+ * not implement), included as upstream's sd-device.h does. */
 #include "sd-event.h"
 #include "sd-id128.h"
 

@@ -3,42 +3,25 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 /*
- * Ported from src/libsystemd-network/dhcp-client-send.c (708 lines) plus the
- * two pieces its send/receive paths reach into and netd's codec deliberately
- * stopped short of: dhcp_message_send_udp()/dhcp_message_send_raw() from
- * dhcp-message.c, and the IPv4/UDP header build and verify from ip-util.c
- * (both LGPL-2.1-or-later, neither carrying a copyright line of its own --
- * checked against the real v261.2 files). dhcp-message.h's header records the
- * boundary from the other side: dhcp_message_build() hands back the wire
- * bytes, and putting them on the wire is this file's job.
+ * Ported from systemd v261.2 src/libsystemd-network/dhcp-client-send.c plus
+ * dhcp_message_send_udp()/dhcp_message_send_raw() from dhcp-message.c and the
+ * IPv4/UDP header build and verify from ip-util.c. dhcp_message_build()
+ * (dhcp-message.h) hands back the wire bytes; putting them on the wire is
+ * this file's job.
  *
- * Quarry point: systemd v261.2, commit 4925d9f07f. History review
- * (4925d9f07f..main, plan §2.2): the two commits in the window that touch
- * this file's upstream neighbourhood are recorded with their keep-or-backport
- * call in dhcp-client-internal.h's header (05f790da8f, 01e1303f9c); neither
- * is carried, and no commit in the window touches ip-util.c or ip-util.h at
- * all -- checked directly, not inferred.
+ * Two sockets only: AF_PACKET / SOCK_DGRAM bound through sockaddr_ll before
+ * a lease exists, and plain AF_INET / SOCK_DGRAM once one does. There is no
+ * netlink dependency in the client.
  *
- * WHAT THIS FILE DOES
+ * The BPF filter is not an optimisation to trim: without it an AF_PACKET
+ * socket wakes the daemon for every IPv4 frame on the segment. It also does
+ * the xid/chaddr correlation in the kernel, so a reply meant for another
+ * host never reaches the parser.
  *
- * Two sockets and only two, which is the finding that made the whole
- * sd-netlink question independent of the DHCP lift (plan §2.1): AF_PACKET /
- * SOCK_DGRAM bound through sockaddr_ll before a lease exists, and plain
- * AF_INET / SOCK_DGRAM once one does. There is no netlink dependency
- * anywhere in the client.
- *
- * The BPF filter is carried in full rather than trimmed. It is easy to read
- * as an optimisation and it is not one: an AF_PACKET socket without it wakes
- * the daemon for every IPv4 frame on the segment, which on a 64MiB ARMv5TE
- * board sharing a link with anything chatty is the difference between an idle
- * daemon and a busy one. It also does the xid/chaddr correlation in the
- * kernel, so a reply meant for another host never reaches the parser.
- *
- * DIVERGENCES, all argued at their site below:
+ * Divergences from upstream, argued at their site:
  *  - the Internet checksum is computed over one contiguous buffer instead of
- *    upstream's scattered-iovec walk;
- *  - a computed UDP checksum of zero is transmitted as 0xffff, per RFC 768,
- *    which upstream does not do;
+ *    a scattered-iovec walk;
+ *  - a computed UDP checksum of zero is transmitted as 0xffff, per RFC 768;
  *  - the UDP send is a plain sendto() rather than a sendmsg() carrying an
  *    IP_PKTINFO control message.
  */
@@ -68,13 +51,9 @@
 /* --- the Internet checksum (RFC 1071) --- */
 
 /*
- * Upstream's ip-util.c accumulates 64 bits at a time with end-around carry
- * and walks an iovec_wrapper, because its payload is scattered across
- * several buffers. netd's dhcp_message_build() returns one contiguous
- * allocation and this file assembles the packet into a single buffer, so the
- * plain 16-bit form is enough -- and being able to check it by eye against
- * RFC 1071 is worth more here than the word-at-a-time version's speed on a
- * packet that is emitted a handful of times per lease.
+ * Upstream's ip-util.c accumulates 64 bits at a time over an iovec_wrapper.
+ * Here the packet is one contiguous buffer, so the plain 16-bit form of
+ * RFC 1071 is enough.
  *
  * The accumulation is in big-endian word order, so the folded result is the
  * checksum as a network-order *value*; storing it means htobe16(). Verifying
@@ -134,12 +113,8 @@ static uint16_t udp_checksum(
 
 /* --- receive-side IPv4/UDP verification (upstream's udp_packet_verify) --- */
 
-/*
- * Every one of these is a check on bytes a peer controls, so every one is a
- * real -EBADMSG return and none of them is an assert -- netd-compat.h's
- * assertion policy, and the reason it exists: upstream's asserts compile to
- * __builtin_unreachable() under NDEBUG.
- */
+/* Every check here is on peer-controlled bytes, so each is an -EBADMSG
+ * return, never an assert (see netd-compat.h's assertion policy). */
 static int client_verify_udp_packet(
                 DhcpClient *client, const struct iovec *packet, bool checksum, struct iovec *ret_payload) {
 
@@ -404,14 +379,9 @@ static int client_open_udp_socket(DhcpClient *client) {
         if (r < 0)
                 return r;
 
-        /*
-         * IP_FREEBIND is load-bearing, not defensive. RENEWING begins at T1,
-         * and the address it binds to is the one netd-link.c put on the
-         * interface -- but a renewal can also be reached before the kernel
-         * has the address (a failed or slow apply, a link that bounced), and
-         * without this the bind fails with EADDRNOTAVAIL and the renewal
-         * never happens at all.
-         */
+        /* IP_FREEBIND: a renewal can be reached before the kernel has the
+         * leased address (slow apply, bounced link); without it the bind
+         * fails with EADDRNOTAVAIL and the renewal never happens. */
         r = client_setsockopt_int(fd, IPPROTO_IP, IP_FREEBIND, 1);
         if (r < 0)
                 return r;
@@ -443,13 +413,9 @@ void dhcp_client_disable_io(DhcpClient *client) {
         client->fd_domain = AF_UNSPEC;
 }
 
-/*
- * Upstream asks the kernel (getsockopt(SO_DOMAIN)) which kind of socket the
- * receive event source currently holds, because that fd may have been handed
- * in from outside. netd's never is -- the external-socket escape hatch is
- * cut (dhcp-client-internal.h) -- so it simply records what it opened.
- * Returns the reusable fd, or -EBADF when a new socket is needed.
- */
+/* Upstream asks the kernel (getsockopt(SO_DOMAIN)) which kind of socket is
+ * registered; here the fd is always our own, so client->fd_domain records it.
+ * Returns the reusable fd, or -EBADF when a new socket is needed. */
 static int client_get_socket(DhcpClient *client, int domain) {
         assert(client);
         assert(IN_SET(domain, AF_PACKET, AF_INET));
@@ -542,14 +508,9 @@ static int client_transmit_raw(DhcpClient *client, DhcpMessage *message, int fd)
 
         sum = udp_checksum(ip.saddr, ip.daddr, &udp, built.iov_base, built.iov_len);
 
-        /*
-         * RFC 768: "If the computed checksum is zero, it is transmitted as
-         * all ones... An all zero transmitted checksum value means that the
-         * transmitter generated no checksum." Upstream stores the computed
-         * value unconditionally, so roughly one packet in 65536 is sent
-         * claiming to have no checksum at all. Harmless in practice, wrong on
-         * the wire, and one line to get right.
-         */
+        /* RFC 768: a computed zero is transmitted as all ones; an all-zero
+         * field means "no checksum". Upstream stores the computed value
+         * unconditionally. */
         udp.check = (uint16_t) htobe16(sum != 0 ? sum : 0xffffU);
 
         memcpy(packet, &ip, sizeof(ip));

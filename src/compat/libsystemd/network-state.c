@@ -5,27 +5,18 @@
  * Everything in sd-network.h that is not the resolv.conf family
  * (network-resolv.c) or the monitor (network-monitor.c).
  *
- * This shim uses two different -EOPNOTSUPP flavours here, and the
- * distinction is deliberate (see network-internal.h's header and the
- * design note this family shipped with): a "defer" function names a real
- * netd publisher that does not exist YET (netd computes the data
- * in-memory and simply never writes it anywhere) and graduates to real
- * once that publisher lands; a "honest_failure" function names a netd.
- * directive or resolver feature that plain does not exist in netd's
- * parser at all, so there is no truthful value even in principle -- both
- * return the same -EOPNOTSUPP today, but the comment at each tells a
- * reader which kind of gap they hit and whether it is worth waiting for.
+ * Everything here returns -EOPNOTSUPP except sd_network_link_get_stat(),
+ * which is implemented. Some functions name data netd
+ * computes in memory but publishes nowhere; others name directives or
+ * features netd's parser does not have, so no truthful value exists. The
+ * comment at each group says which.
  *
- * -EOPNOTSUPP itself (rather than the real library's usual -ENODATA) is
- * the point: sd-network's -ENODATA means "networkd is not aware of this
- * link (yet)", which every real caller (systemd-networkd-wait-online
- * included) treats as transient and retries. A code sd-network is
- * documented to never return gives callers a positive, truthful "this is
- * not systemd-networkd" signal instead of an infinite retry loop.
+ * -EOPNOTSUPP rather than the usual -ENODATA: sd-network's -ENODATA means
+ * "networkd is not aware of this link (yet)", which callers such as
+ * systemd-networkd-wait-online treat as transient and retry forever.
+ * -EOPNOTSUPP tells them this is not systemd-networkd.
  *
- * Every per-link function still validates ifindex for real: a caller bug
- * (ifindex <= 0) must surface as -EINVAL regardless of how much of the
- * rest of this shim exists yet.
+ * Per-link functions still validate ifindex: ifindex <= 0 gives -EINVAL.
  */
 
 #include "sd-network.h"
@@ -41,8 +32,7 @@ static int check_ifindex(int ifindex) {
         return ifindex > 0 ? 0 : -EINVAL;
 }
 
-/* --- global state: netd computes it, but publishes no state file at all
- * (§2.9 excludes every IPC channel) --- */
+/* --- global state: netd computes it but publishes no state file --- */
 
 int sd_network_get_operational_state(char **ret) {
         return ret ? -EOPNOTSUPP : -EINVAL;
@@ -95,10 +85,9 @@ int sd_network_link_get_online_state(int ifindex, char **ret) {
         return r < 0 ? r : (ret ? -EOPNOTSUPP : -EINVAL);
 }
 
-/* --- per-link EFFECTIVE dns/ntp/search: the lease file has the DHCP
- * server's offer, not netd's UseDNS=/UseNTP=-gated decision; serving the
- * offer as if it were effective is exactly the misleading-partial this
- * family's design refuses to do --- */
+/* --- per-link effective dns/ntp/search: the lease file holds the DHCP
+ * server's offer, not the result of netd's UseDNS=/UseNTP= gating, so
+ * serving it would be misleading --- */
 
 int sd_network_link_get_dns(int ifindex, char ***ret) {
         int r = check_ifindex(ifindex);
@@ -145,8 +134,7 @@ int sd_network_link_get_activation_policy(int ifindex, char **ret) {
 }
 
 /* --- .netdev files, DHCP options netd's client never requests, and
- * resolver feature flags with no resolver on pico (pico-resolv is a
- * static file mechanism, not a running service with these controls) --- */
+ * resolver feature flags (there is no resolver service) --- */
 
 int sd_network_link_get_netdev_file(int ifindex, char **ret) {
         int r = check_ifindex(ifindex);
@@ -207,8 +195,7 @@ int sd_network_link_get_carrier_bound_by(int ifindex, int **ret) {
         int r = check_ifindex(ifindex);
         return r < 0 ? r : (ret ? -EOPNOTSUPP : -EINVAL);
 }
-/* netd is DHCPv4-only by explicit scope (netd-network.h, §2.9: all of
- * IPv6 out of scope), so there is no DHCPv6 client to have an IAID/DUID. */
+/* netd has no DHCPv6 client (netd-network.h), so no IAID/DUID. */
 int sd_network_link_get_dhcp6_client_iaid_string(int ifindex, char **ret) {
         int r = check_ifindex(ifindex);
         return r < 0 ? r : (ret ? -EOPNOTSUPP : -EINVAL);
@@ -219,11 +206,9 @@ int sd_network_link_get_dhcp6_client_duid_string(int ifindex, char **ret) {
 }
 
 /*
- * Real: netd's lease file is, today, the only per-link state file netd
- * has at all, so stat()ing it is a genuine (if narrow) answer -- -ENOENT
- * is the API's own truthful "no state recorded for this link" signal.
- * When the link-state publisher named throughout this file lands, this
- * retargets to /run/netd/links/<ifindex> instead.
+ * Implemented: netd's lease file is its only per-link state file, so
+ * stat()ing it is a narrow but truthful answer; -ENOENT is the API's own
+ * "no state recorded for this link".
  */
 int sd_network_link_get_stat(int ifindex, struct stat *ret) {
         char path[PATH_MAX], suffix[32];

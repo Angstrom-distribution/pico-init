@@ -2,18 +2,15 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * GOAL B: persistent MAC derivation for a random-hardware-address link
+ * Persistent MAC derivation for a random-hardware-address link
  * (netd-link.c's link_apply_persistent_mac(), via the exposed pure helper
- * netd_persistent_mac_derive() -- see netd-link.h's own comment on why that
- * split exists).
+ * netd_persistent_mac_derive(), see netd-link.h).
  *
  * The four fixed (machine_id, ifname) -> mac vectors below were computed
  * independently with a from-scratch Python SipHash-2-4 implementation
- * (RFC-faithful, cross-checked against the three published reference
- * vectors for key 000102...0f and inputs of length 0/1/2 before trusting it
- * for these), not derived from or copied out of netd-link.c itself -- a
- * mirrored bug in both the reference and the implementation would
- * otherwise pass this test silently. Algorithm under test:
+ * (cross-checked against the published reference vectors for key 000102...0f
+ * and inputs of length 0/1/2), not derived from netd-link.c itself, so a
+ * mirrored bug would not pass silently. Algorithm under test:
  *
  *   v = machine_id (16 bytes) || ifname (strlen bytes, no NUL)
  *   mac = low 6 bytes of htole64(siphash24(v, PERSISTENT_MAC_HASH_KEY))
@@ -25,9 +22,8 @@
  *
  * What this file does NOT cover: the exemption gating in
  * link_apply_persistent_mac() itself (loopback, already-up, addr_assign_type
- * PERM/SET/STOLEN, missing machine-id) -- each needs a live Link with a real
- * ifindex/flags/arp_type, the way test-netd-rtnl.c's netns/veth fixtures
- * give test-netd-rtnl.c one. Left as a follow-up rather than built here.
+ * PERM/SET/STOLEN, missing machine-id), which needs a live Link with a real
+ * ifindex/flags/arp_type, as test-netd-rtnl.c's netns/veth fixtures provide.
  */
 
 #include <string.h>
@@ -78,11 +74,8 @@ static void test_fixed_vectors(void) {
 /* net_verify_hardware_address()'s own unconditional fixup (netif-util.c):
  * every generated MAC has the multicast bit clear and the local-admin bit
  * set -- true for every vector, and for vectors[0]/vectors[2] specifically
- * because the RAW (pre-fixup) low byte has the opposite of one of those
- * bits (0xbc and 0x9b respectively, confirmed against the same reference
- * implementation that produced the expected vectors above), so this is
- * checking the fixup actually ran, not a tautology the raw bytes already
- * satisfied. */
+ * because the raw (pre-fixup) low byte has the opposite of one of those bits
+ * (0xbc and 0x9b respectively), so this checks the fixup actually ran. */
 static void test_bit_fixup(void) {
         for (size_t i = 0; i < sizeof(vectors) / sizeof(vectors[0]); i++) {
                 uint8_t mid[16], mac[NETD_HW_ADDR_MAX];

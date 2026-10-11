@@ -2,19 +2,15 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The handful of macros the public sd-*.h headers under this directory need
- * from upstream's private _sd-common.h (systemd.git src/systemd/_sd-common.h)
- * -- not a copy of it, a from-scratch subset sized to what sd-journal.h
- * actually uses, grown only when a later family's header needs another
- * entry. A private header, same as upstream's: never include this directly,
- * only through a public sd-*.h.
+ * The subset of upstream's private _sd-common.h (systemd.git
+ * src/systemd/_sd-common.h) that the public sd-*.h headers here need. Never
+ * include this directly, only through a public sd-*.h.
  */
 
 #pragma once
 
-/* Never include this directly -- same guard upstream's own private header
- * uses, so a stray direct #include fails the same way it would against a
- * real libsystemd install. */
+/* Same guard as upstream's private header, so a stray direct #include fails
+ * the same way it would against a real libsystemd install. */
 #if defined(__INCLUDE_LEVEL__) && __INCLUDE_LEVEL__ <= 1 && !defined(__COVERITY__) && \
                 !defined(__clang_analyzer__)
 #        error "Do not include _sd-common.h directly; it is a private header."
@@ -45,8 +41,7 @@
 #        define _SD_STRINGIFY(x) _SD_XSTRINGIFY(x)
 #endif
 
-/* sd-id128.h's out-buffer parameters (char s[_SD_ARRAY_STATIC N]) need this;
- * first entry to need it, added rather than guessed at up front. */
+/* sd-id128.h's out-buffer parameters: char s[_SD_ARRAY_STATIC N]. */
 #ifndef _SD_ARRAY_STATIC
 #        if __STDC_VERSION__ >= 199901L && !defined(__cplusplus)
 #                define _SD_ARRAY_STATIC static

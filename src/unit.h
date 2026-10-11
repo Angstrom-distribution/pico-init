@@ -136,7 +136,7 @@ struct Unit {
         bool *condition_path_is_directory_negated; /* parallel to condition_path_is_directory, owned, may be NULL */
 
         /* Result of the last unit_start() condition check. False means the
-         * unit was deliberately left inactive, which is what job.c reads to
+         * unit was left inactive on purpose, which is what job.c reads to
          * decide the unit gets no "Started ..." console line. */
         bool condition_result;
 

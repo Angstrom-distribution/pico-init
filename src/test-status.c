@@ -12,10 +12,10 @@
  * the way that defeats the point of matching systemd's output at all. A test
  * that only checked for the substring "OK" would pass on all of it.
  *
- * What is NOT covered here, deliberately: that any of this reaches a real
+ * Not covered here: that any of this reaches a real
  * console. status_enable() opens /dev/console, which a test must not do, so
- * the write path is proven by a real qemuarmv5 serial capture instead, the
- * same way dev_setup()'s symlinks are.
+ * the write path is left to booting on a target, the same way dev_setup()'s
+ * symlinks are.
  */
 
 #include <errno.h>

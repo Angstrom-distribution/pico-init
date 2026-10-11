@@ -21,15 +21,11 @@
  *    root partition before deciding whether a filesystem checker is warranted
  *    at all -- the cheap gate that has to run in front of an expensive one.
  *
- * The offsets and bit values below are interface, not implementation: they are
- * what an on-disk ext4 filesystem IS, fixed by the format rather than by any
- * particular kernel. They were verified for this milestone against a real
- * `mke2fs -t ext4` image -- each field read raw and cross-checked against
- * dumpe2fs, and the two state-carrying ones (s_state, the RECOVER feature bit)
- * additionally toggled with debugfs and re-read, so the bit values are a
- * measured property of the format and not a citation this file agrees with
- * because it was written from the same citation. Linux's own
- * fs/ext4/ext4.h struct ext4_super_block is the reference they match.
+ * The offsets and bit values below are fixed by the on-disk format, not by any
+ * particular kernel; Linux's fs/ext4/ext4.h struct ext4_super_block is the
+ * reference. They were checked against a real `mke2fs -t ext4` image with
+ * dumpe2fs, and s_state and the RECOVER feature bit were toggled with
+ * debugfs and re-read.
  */
 
 #pragma once

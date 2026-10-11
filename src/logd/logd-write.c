@@ -2,33 +2,22 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The export-format writer and the /run ring. See logd-write.h for the
- * reference citations and the field-set reasoning (plan §3.3, milestone J0).
+ * The export-format writer and the /run ring. See logd-write.h.
  *
- * CRASH SAFETY, thought through rather than assumed. /run is tmpfs, so a
- * power loss loses the whole ring regardless -- that is the design (plan
- * §3.3), not a gap. What remains is logd itself dying mid-append. Every
- * entry is assembled into one heap buffer and handed to the kernel in one
- * write() call (write_full()'s retry loop exists only for EINTR and for a
- * genuine short write, not as a multi-call assembly): a single write() to a
- * regular/tmpfs file either copies its whole argument into the page cache
- * or it doesn't, and that copy runs in kernel context before the syscall
- * returns to user space, where an async signal (including SIGKILL) is
- * delivered -- so there is no window in which a SIGKILL lands the process
- * mid-copy and leaves a half-written record. The one path that can still
- * leave a boundary mid-entry is this process observing its own write()
- * error partway through (ENOSPC against the tmpfs size cap, chiefly): that
- * partial write is truncated back to the pre-write size before returning,
- * so the file on disk is always either the old complete tail or the old
- * complete tail plus one more complete entry, never a torn one.
+ * Crash safety. /run is tmpfs, so a power loss loses the whole ring by
+ * design; what remains is logd dying mid-append. Every entry is assembled
+ * in one heap buffer and handed to the kernel in one write() (write_full()
+ * retries only for EINTR and short writes). A single write() to a tmpfs
+ * file copies its whole argument in kernel context before any signal,
+ * SIGKILL included, is delivered, so a kill cannot leave a half-written
+ * record. If write() itself fails partway (chiefly ENOSPC), the partial
+ * write is truncated back to the pre-write size, so the file always ends on
+ * a complete entry.
  *
- * Rotation shares the same property by construction: rotate_if_needed() is
- * only ever reached after logd_writer_append()'s own write() has already
- * landed a complete record, so a rotated file is always the byte-exact
- * prefix of what the active file was a moment before, and a crash between
- * closing the old active fd and reopening a fresh one just leaves the next
- * logd_writer_open() to find (and correctly resume) whichever half of the
- * rename already happened.
+ * Rotation keeps the property: rotate_if_needed() only runs after a complete
+ * record has landed, and a crash between closing the old active fd and
+ * reopening a fresh one leaves the next logd_writer_open() to resume
+ * whichever half of the rename already happened.
  */
 
 #include "logd-write.h"
@@ -85,11 +74,8 @@ static void boot_id_to_string(const uint8_t boot_id[LOGD_BOOT_ID_BYTES], char ou
         out[LOGD_BOOT_ID_STRLEN] = '\0';
 }
 
-/* /proc/sys/kernel/random/boot_id: the kernel's own per-boot random ID,
- * generated once at boot with no entropy-pool dependency and no daemon --
- * the same source sd_id128_get_boot() reads upstream, so a device's _BOOT_ID
- * here is the same value a real systemd on the same kernel would report.
- * Dashes (the canonical UUID form the kernel writes) are simply skipped. */
+/* /proc/sys/kernel/random/boot_id: the per-boot ID sd_id128_get_boot()
+ * reads upstream. Dashes (the UUID form the kernel writes) are skipped. */
 static int read_boot_id_from_proc(uint8_t boot_id[LOGD_BOOT_ID_BYTES]) {
         char buf[64];
         FILE *f;
@@ -128,12 +114,9 @@ static int read_boot_id_from_proc(uint8_t boot_id[LOGD_BOOT_ID_BYTES]) {
         return nibbles == LOGD_BOOT_ID_BYTES * 2 ? 0 : -EINVAL;
 }
 
-/* Fallback only -- real hardware always has /proc mounted (mount-setup.c
- * runs before any service starts) and a kernel-generated boot_id. Blocking
- * getrandom(), same call shape as netd-sntp.c's sntp_random_nonce(): a
- * predictable or all-zero _BOOT_ID is a real correctness bug (journal-remote
- * flatly rejects the all-zero case, see logd-write.h), so correctness wins
- * over never blocking a path production should not reach. */
+/* Fallback only: /proc is mounted before any service starts. Blocking
+ * getrandom(), because a predictable or all-zero _BOOT_ID is rejected by
+ * journal-remote (see logd-write.h). */
 static int read_boot_id_random(uint8_t boot_id[LOGD_BOOT_ID_BYTES]) {
         ssize_t n;
 
@@ -164,15 +147,11 @@ static int now_realtime(usec_t *ret) {
 
 /*
  * Whether `value` can use the plain "NAME=value\n" form: JOURNAL_EXPORT_
- * FORMATS.md's rule verbatim -- non-control UTF-8 codepoints (>= 0x20, or
- * TAB) only, which as a side effect already excludes a literal newline
- * (0x0A < 0x20), the one byte that would otherwise corrupt the plain form's
- * own field-boundary parsing. Anything else -- an embedded NUL, a raw
- * control byte, invalid or truncated UTF-8 -- gets the binary-safe encoding
- * instead. Overlong encodings are rejected as invalid UTF-8 too: a value
- * that decodes as one thing to a strict validator and another to a lax one
- * (e.g. 0xC0 0x80 for NUL) is exactly the ambiguity binary-safe encoding
- * exists to avoid, so it forces that path rather than passing through.
+ * FORMATS.md's rule -- non-control UTF-8 codepoints (>= 0x20, or TAB) only,
+ * which also excludes a newline. Anything else (embedded NUL, control byte,
+ * invalid or truncated UTF-8) gets the binary-safe encoding. Overlong
+ * encodings count as invalid UTF-8, since strict and lax decoders disagree
+ * on them (e.g. 0xC0 0x80 for NUL).
  */
 static bool value_is_plain_safe(const uint8_t *value, size_t len) {
         size_t i = 0;
@@ -220,12 +199,10 @@ static bool value_is_plain_safe(const uint8_t *value, size_t len) {
         return true;
 }
 
-/* journal_field_valid()'s own rule (journal-file.c, allow_protected=true --
- * every field logd emits, its own or a caller's, is entitled to a leading
- * underscore): 1-64 bytes, first byte not a digit, every byte in
- * [A-Z0-9_]. A name that fails this is silently dropped by a real importer
- * rather than merely misfiled, so logd_writer_append() refuses to write the
- * entry at all rather than write a truncated one. */
+/* journal_field_valid() (journal-file.c, allow_protected=true, so a leading
+ * underscore is fine): 1-64 bytes, first byte not a digit, every byte in
+ * [A-Z0-9_]. A real importer silently drops a bad name, so
+ * logd_writer_append() refuses the whole entry. */
 static bool field_name_valid(const char *name) {
         size_t len;
 
@@ -310,10 +287,9 @@ static int writer_ring_path(LogdWriter *w, const char *name, char **ret) {
         return 0;
 }
 
-/* One write() for the whole entry (see this file's header comment for why
- * that is the crash-safety boundary), retried only across EINTR and a
- * genuine short write. Any error after some bytes already landed is backed
- * out with ftruncate() rather than left as a torn final record. */
+/* One write() for the whole entry (see the header comment), retried only
+ * across EINTR and short writes. An error after some bytes landed is backed
+ * out with ftruncate(). */
 static int write_full(int fd, const char *buf, size_t len, size_t original_size) {
         size_t off = 0;
 
@@ -349,11 +325,9 @@ static int write_full(int fd, const char *buf, size_t len, size_t original_size)
 
 /*
  * Rotate: close, rename active -> rotated (atomic; replaces any previous
- * rotated file), reopen a fresh empty active. Only ever called right after
- * logd_writer_append()'s own write() landed a complete record -- see this
- * file's header comment. Self-healing on a partial failure: whether or not
- * the rename succeeded, this always attempts to leave w->active_fd open on
- * *some* active file rather than returning with the writer unusable.
+ * rotated file), reopen a fresh empty active. Only called after a complete
+ * record landed. Even if the rename fails, it still tries to leave
+ * w->active_fd open on an active file so the writer stays usable.
  */
 static int rotate_if_needed(LogdWriter *w) {
         char *active_path = NULL, *rotated_path = NULL;
@@ -518,12 +492,7 @@ int logd_writer_open(LogdWriter *w) {
 int logd_writer_append(LogdWriter *w, const LogdField *fields, size_t n_fields) {
         char realtime_buf[32], monotonic_buf[32], boot_id_buf[LOGD_BOOT_ID_STRLEN + 1];
         LogdField auto_fields[3];
-        /* realtime is initialised only to satisfy -Wmaybe-uninitialised under
-         * optimisation: now_realtime() writes it on every success and this
-         * function returns on its failure, so the value is never actually
-         * read uninitialised -- gcc simply cannot prove that across the
-         * inlined call at -Os. Zero is not a plausible timestamp, so a
-         * regression that did reach the writer would still be obvious. */
+        /* Initialised only to satisfy -Wmaybe-uninitialised at -Os. */
         usec_t realtime = 0;
         usec_t monotonic;
         char *buf;
@@ -541,10 +510,8 @@ int logd_writer_append(LogdWriter *w, const LogdField *fields, size_t n_fields) 
                 return r;
 
         /* now_monotonic() (util.h) returns USEC_INFINITY on clock_gettime()
-         * failure; that sentinel fails VALID_MONOTONIC's < 2^55 bound, so a
-         * real importer would EBADMSG the whole entry over it. Caught here
-         * instead, with a real errno, rather than shipped as a byte stream
-         * that looks fine until an oracle disagrees. */
+         * failure, which fails VALID_MONOTONIC's < 2^55 bound and would make
+         * a real importer reject the entry. */
         monotonic = now_monotonic();
         if (monotonic == USEC_INFINITY)
                 return -EIO;
@@ -557,9 +524,7 @@ int logd_writer_append(LogdWriter *w, const LogdField *fields, size_t n_fields) 
         auto_fields[1] = (LogdField){ "__MONOTONIC_TIMESTAMP", monotonic_buf, strlen(monotonic_buf) };
         auto_fields[2] = (LogdField){ "_BOOT_ID", boot_id_buf, strlen(boot_id_buf) };
 
-        /* Validate and size in full before writing anything: an entry is
-         * never partially assembled on disk because a later field turned
-         * out to have a bad name. */
+        /* Validate and size everything before writing anything. */
         for (size_t i = 0; i < 3; i++)
                 total += field_encoded_size(&auto_fields[i]);
 

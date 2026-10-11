@@ -8,10 +8,8 @@
  * at manager_new() time; manager_loop() is then the thin real-systemd-shaped
  * wrapper `while (m->objective == MANAGER_RUNNING) sd_event_run(...)`.
  *
- * The dispatch ORDER across one epoll batch is still the load-bearing part
- * of this file, not an implementation detail -- now expressed as the
- * EVENT_PRIORITY_* table in manager.h rather than a hand-coded two-pass
- * walk. SIGCHLD carries an exit status; cgroup-empty does not -- the
+ * The dispatch ORDER across one epoll batch is load-bearing, and is expressed
+ * as the EVENT_PRIORITY_* table in manager.h. SIGCHLD carries an exit status; cgroup-empty does not -- the
  * process that happens to empty a cgroup is an arbitrary descendant whose
  * exit code says nothing about the service. So if a cgroup-empty event were
  * acted on before the SIGCHLD that accompanies it, the exit status would be
@@ -50,12 +48,9 @@
  *   101  the job run queue
  *   102  shutdown check
  *
- * Two deliberate, strictly-tightening changes from the old hand-coded
- * ordering: signals now always precede sockets/ctrl (the old code dispatched
- * those in arbitrary events[] order); and because the shim re-polls with a
+ * Signals always precede sockets/ctrl, and because the shim re-polls with a
  * zero timeout between dispatches, a SIGCHLD arriving mid-batch is picked up
- * and, at -4 < -2, still beats a pending cgroup-empty -- the old code could
- * only see it on the next batch.
+ * and, at -4 < -2, still beats a pending cgroup-empty.
  *
  * CALLBACK CONTRACT: every callback here returns 0, never a negative value,
  * on anything short of "this source must never fire again." The shim
@@ -69,11 +64,9 @@
  * unconditionally from job_add_to_run_queue(), covering every path that
  * might make some job runnable (job_install(), a completed restart's
  * start-conversion, a finished job's neighbour wakeup, manager_shutdown()'s
- * stop sweep). A future runnability change that does not route through
- * job_add_to_run_queue() will deadlock the boot instead of costing one
- * spin -- the old brute-force "dispatch the run queue every iteration"
- * masked exactly this class of bug, and the new design trades that safety
- * net for not busy-polling once only unrunnable jobs are queued.
+ * stop sweep). A runnability change that does not route through
+ * job_add_to_run_queue() deadlocks the boot, because nothing polls the run
+ * queue once only unrunnable jobs are left in it.
  */
 
 #include <errno.h>
@@ -286,10 +279,9 @@ static int manager_on_run_queue(sd_event_source *s, void *userdata) {
  * defer callback for the cgroup-empty queue (EVENT_PRIORITY_CGROUP_EMPTY),
  * ONESHOT-armed by manager_enqueue_cgroup_empty(). Pops exactly ONE unit and
  * re-arms itself if more remain, the same shape real systemd's own
- * manager_dispatch_cgroup_empty_queue() dispatch takes (quarry
- * src/core/cgroup.c) -- manager_dispatch_cgroup_empty_queue() in manager.c
- * still drains the whole queue in one call and is kept for direct test use,
- * but is not what this source calls.
+ * manager_dispatch_cgroup_empty_queue() dispatch takes (src/core/cgroup.c) --
+ * manager_dispatch_cgroup_empty_queue() in manager.c still drains the whole queue in one call and is kept
+ * for direct test use, but is not what this source calls.
  */
 static int manager_on_cgroup_empty(sd_event_source *s, void *userdata) {
         Manager *m = userdata;

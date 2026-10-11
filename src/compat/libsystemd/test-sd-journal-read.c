@@ -2,14 +2,12 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The read side: sd_journal_open() over a real fixture ring written in
- * logd's export format, then navigation, per-entry data, matches,
- * unique/fields, cutoffs/usage and the honest-failure group, all against
- * real entries -- never a mocked LogdRing.
+ * The read side: sd_journal_open() over a fixture ring written in logd's
+ * export format, then navigation, per-entry data, matches, unique/fields,
+ * cutoffs/usage and the functions that always fail.
  *
  * Links libsystemd_compat alone, nothing from logd_core or pico_init_core:
- * that link line is the property under test as much as any assertion
- * below, since it is what a shared libsystemd.so's consumers get.
+ * that is what a shared libsystemd.so's consumers get.
  */
 
 #include "sd-journal.h"
@@ -59,22 +57,16 @@ static uint64_t clock_usec(clockid_t id) {
 
 /*
  * Three entries: two from "netd" (one info, one warning) and one from
- * "eudev" at err, as the exact bytes logd_writer_append() emits -- the
- * writer-generated clocks and _BOOT_ID first, the caller's fields in order,
- * then the blank-line separator -- but written here directly rather than
- * through logd-write.h, whose writer needs pico_init_core. Real clocks, one
- * microsecond apart per entry, since realtime/monotonic seek tests need
- * genuinely increasing values.
+ * "eudev" at err, as the bytes logd_writer_append() emits (writer-generated
+ * clocks and _BOOT_ID first, the caller's fields in order, then a blank
+ * line), written directly because logd-write.h's writer needs
+ * pico_init_core. Clocks increase by one microsecond per entry for the
+ * realtime/monotonic seek tests.
  *
- * Deliberately the REAL machine's boot ID, not a fixed one (unlike test-
- * logd-write.c's own fixture): sd_journal_seek_monotonic_usec()/
- * seek_cursor() cross-check a cursor's/caller's boot ID against
- * /proc/sys/kernel/random/boot_id (journal_current_boot_id()), by
- * design -- that is what makes get_cutoff_monotonic_usec()'s bogus-boot-id
- * case in test_info_and_honest_failures() below meaningful. A fixture under
- * a fake, fixed boot ID would make every one of those checks see "a
- * different, unknown boot" and report no data, which is correct behavior
- * facing a fake ID but would make this whole fixture untestable against it.
+ * The boot ID is this machine's real one: sd_journal_seek_monotonic_usec()/
+ * seek_cursor() compare boot IDs against /proc/sys/kernel/random/boot_id
+ * (journal_current_boot_id()), and with a fixed fake ID every such check
+ * would see an unknown boot and report no data.
  */
 static void build_fixture(void) {
         static const struct {
@@ -208,10 +200,9 @@ static void test_next_skip_previous_skip(void) {
         ASSERT_STREQ(msg, "link down eth0");
 
         /* Only one more entry exists: the skip count returned is clamped to
-         * what was actually found, but -- matching real_journal_next_skip's
-         * own verified contract (sd-journal.c @ main, "if (r == 0) return
-         * c") -- the exhausting final sd_journal_next() call still leaves
-         * the journal AFTER_TAIL, not "still on the last entry reached". */
+         * what was found, but as in upstream's real_journal_next_skip
+         * ("if (r == 0) return c") the exhausting final sd_journal_next()
+         * leaves the journal AFTER_TAIL. */
         ASSERT_EQ_INT(sd_journal_next_skip(j, 10), 1);
 
         ASSERT_EQ_INT(sd_journal_previous_skip(j, 100), 3); /* clamps to what's there */
@@ -419,8 +410,7 @@ static void test_open_rejects_bad_flags_and_null(void) {
         ASSERT_EQ_INT(sd_journal_open_directory(&j, "/anywhere", 0), -EOPNOTSUPP);
         ASSERT_EQ_INT(sd_journal_open_files(&j, NULL, 0), -EOPNOTSUPP);
 
-        /* _sd_deprecated_ on the real signature (upstream deprecated this
-         * one too) means -Werror would otherwise fail this deliberate call. */
+        /* Deprecated upstream too; -Werror would otherwise fail this call. */
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
         ASSERT_EQ_INT(sd_journal_open_container(&j, "anything", 0), -EOPNOTSUPP);

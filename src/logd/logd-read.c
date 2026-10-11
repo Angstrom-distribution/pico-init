@@ -2,24 +2,18 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The ring reader. Shared by picolog and picoctl -- see the header for the
- * ownership rules and the API split (plan §3.4, milestone J3).
+ * The ring reader. Shared by picolog and picoctl; see the header for
+ * ownership rules.
  *
- * PARSER. The writer (logd-write.c) only ever produces well-formed entries
- * and only ever rotates right after one completes, so this does not need
- * to be adversarial-grade the way logd-write.c's tests hold the *writer* to
- * (a real journal-importer.c oracle) -- this reads our own trusted, root-
- * owned tmpfs ring back. What it must still get right, because both are
- * real and not merely theoretical: a torn final record from a crash mid-
- * append (logd-write.c's own crash-safety section), and a rotation racing
- * a `picolog -f` mid-read. Both are handled the same way -- an incomplete
- * span is never surfaced as data, only ever completed later or (for a
- * genuinely corrupt span, not expected in practice but not assumed
- * impossible either) skipped to the next entry boundary.
+ * The parser reads our own root-owned tmpfs ring, so it is not hardened
+ * against adversarial input. It does handle a torn final record from a
+ * crash mid-append (see logd-write.c) and a rotation racing a `picolog -f`
+ * read: an incomplete span is never surfaced as data, only completed later
+ * or, if corrupt, skipped to the next entry boundary.
  *
- * libc only, deliberately: libsystemd-compat link_wholes this file for
- * sd-journal's read side, and a shared libsystemd.so must not carry
- * pico-init-core's util.c/log symbols -- so no "../util.h" here.
+ * libc only: libsystemd-compat links this file whole for sd-journal's read
+ * side, and a shared libsystemd.so must not carry util.c/log symbols, so
+ * no "../util.h" here.
  */
 
 #include "logd-read.h"
@@ -75,9 +69,7 @@ static int ring_path(const char *runtime_dir, const char *name, char **ret) {
 }
 
 /* Append the whole content of `path` onto the (buf, len) pair. A missing
- * file is not an error -- the rotated file legitimately does not exist yet
- * on a young ring, and by design a missing ring altogether just yields zero
- * entries. */
+ * file is not an error (the rotated file does not exist on a young ring). */
 static int append_file_contents(const char *path, char **buf, size_t *len) {
         int fd;
         struct stat st;
@@ -159,8 +151,7 @@ typedef enum {
 
 /*
  * Parse one entry starting at buf[start..len). Field values/names are
- * views into `buf` -- see this file's header on why that is safe as long
- * as the caller keeps `buf` alive at least as long as the result.
+ * views into `buf`, which must outlive the result.
  */
 static ParseResult
                 parse_one_entry(const char *buf,
@@ -336,12 +327,10 @@ bool logd_field_equals(const LogdReadField *f, const char *s) {
         return f->value_len == s_len && memcmp(f->value, s, s_len) == 0;
 }
 
-/* Upstream mangles a bare -u argument the same way systemctl does
- * (unit_name_mangle(), default suffix ".service", src/basic/unit-name.c) --
- * a name already ending in a suffix pico-init actually has a unit type for
- * is left alone, anything else gets ".service" appended. Without this,
- * `journalctl -u picowl` silently matched nothing against a real
- * _SYSTEMD_UNIT=picowl.service entry. */
+/* A bare -u argument is mangled as systemctl does (unit_name_mangle(),
+ * default suffix ".service", src/basic/unit-name.c): a name already ending in
+ * a suffix of a unit type pico-init has is left alone, anything else gets
+ * ".service" appended. */
 static bool unit_has_known_suffix(const char *unit, size_t len) {
         static const char * const suffixes[] = { ".service", ".socket", ".target" };
 
@@ -369,9 +358,8 @@ bool logd_entry_matches_unit(const LogdEntry *e, const char *unit) {
         if (unit_has_known_suffix(unit, len))
                 return logd_field_equals(f, unit);
 
-        /* bare name: mangle the same way systemctl/journalctl do, falling
-         * back to an exact (un-mangled) comparison if it would overflow the
-         * stack buffer rather than mis-happily truncating the match */
+        /* Bare name: append ".service"; compare un-mangled instead if it
+         * would overflow the buffer. */
         if (len + strlen(".service") >= sizeof(mangled))
                 return logd_field_equals(f, unit);
 
@@ -493,8 +481,7 @@ int logd_ring_read_filtered(const char *runtime_dir, const char *unit, size_t ma
         if (r < 0)
                 return r;
 
-        /* Count matches first so the tail-N cutoff is exact without a
-         * two-pass realloc dance below. */
+        /* Count matches first so the tail-N cutoff is exact. */
         for (size_t i = 0; i < full->n_entries; i++)
                 if (logd_entry_matches_unit(&full->entries[i], unit))
                         n_match++;
@@ -527,9 +514,8 @@ int logd_ring_read_filtered(const char *runtime_dir, const char *unit, size_t ma
                                 continue;
                         }
 
-                        /* Steal this entry's field array; blank the source
-                         * slot so freeing `full` below never double-frees
-                         * it. */
+                        /* Steal the field array; blank the source so freeing
+                         * `full` does not double-free it. */
                         filtered->entries[out_idx] = full->entries[i];
                         full->entries[i].fields = NULL;
                         full->entries[i].n_fields = 0;
@@ -540,9 +526,7 @@ int logd_ring_read_filtered(const char *runtime_dir, const char *unit, size_t ma
                 filtered->n_entries = out_idx;
         }
 
-        /* The kept entries' raw/value pointers still alias full->buf, so it
-         * must outlive them -- move it into `filtered` rather than freeing
-         * it along with the rest of `full`. */
+        /* The kept entries still alias full->buf: move it into `filtered`. */
         filtered->buf = full->buf;
         filtered->buf_len = full->buf_len;
         full->buf = NULL;
@@ -572,9 +556,9 @@ int logd_follow_new(const char *runtime_dir, LogdFollow **ret) {
                 return r;
         }
 
-        /* Best-effort: seek to the current end so no historical entries are
-         * delivered. A ring that does not exist yet is not an error --
-         * logd_follow_poll() opens it lazily on a later call. */
+        /* Seek to the current end so no historical entries are delivered.
+         * A ring that does not exist yet is not an error:
+         * logd_follow_poll() opens it lazily. */
         {
                 struct stat st;
                 int fd = open(f->active_path, O_RDONLY | O_CLOEXEC);
@@ -647,11 +631,8 @@ int logd_follow_poll(LogdFollow *f, LogdRing **ret) {
                                 -errno; /* momentarily missing mid-rotation: nothing new, not an error */
 
         if (!f->have_stat || st.st_dev != f->dev || st.st_ino != f->ino) {
-                /* First open, or rotation replaced the file underneath us.
-                 * Drain whatever remains of the OLD fd first: logd-write.c
-                 * only rotates right after a complete append, so there
-                 * should be no leftover partial tail there, but read-and-
-                 * parse rather than assume it. */
+                /* First open, or rotation replaced the file. Drain what
+                 * remains of the old fd first. */
                 if (f->fd >= 0) {
                         r = follow_drain(f, f->fd);
                         close(f->fd);
@@ -693,9 +674,8 @@ int logd_follow_poll(LogdFollow *f, LogdRing **ret) {
                 if (n_parsed == 0)
                         return 0; /* still accumulating a partial entry */
 
-                /* Copy the consumed span into its own buffer so this batch
-                 * outlives f->buf, which keeps mutating across future
-                 * polls -- see logd-read.h. */
+                /* Copy the consumed span so this batch outlives f->buf
+                 * (see logd-read.h). */
                 batch_buf = malloc(consumed);
                 if (!batch_buf) {
                         for (size_t i = 0; i < n_parsed; i++)

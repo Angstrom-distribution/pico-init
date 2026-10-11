@@ -12,22 +12,17 @@
  * processed at, `E:KEY=VALUE` once per property, `V:` the database format
  * version last. Nothing here is copied from that LGPL-2.1-or-later file; the
  * line grammar is what its reader (device_read_db_internal_filename(),
- * sd-device.c:1817) accepts, reimplemented from the format alone, which is the
- * same policy sd-device.h already states for the whole compat layer.
+ * sd-device.c:1817) accepts, reimplemented from the format alone.
  *
- * Why a real file rather than a devd-private channel: every consumer that
- * wants ID_INPUT_* -- Xorg's config/udev, libinput, anything built on libudev
- * -- reads it through sd_device, and the compat layer's sd_device overlays
- * this file onto the uevent properties (src/compat/libsystemd/device-db.c)
- * exactly where upstream does. One writer, one reader, the upstream path and
- * upstream filename between them, and no consumer change.
+ * It is a real file because every consumer of ID_INPUT_* (Xorg's config/udev,
+ * libinput, anything built on libudev) reads it through sd_device, whose compat
+ * implementation overlays this file onto the uevent properties
+ * (src/compat/libsystemd/device-db.c) as upstream does.
  *
- * Deliberately absent, every one of them a record type devd has nothing to put
- * in: `S:` (devlinks -- the compat layer scans /dev for those), `L:` (link
- * priority), `G:`/`Q:` (tags; devd has no TAG+=), `W:` (watch). And never any
- * of /run/udev/control, /run/udev/queue or /run/udev/tags/: software takes
- * `control` to mean a udevd is running, and libudev-queue.c answers that
- * question from it on purpose.
+ * Absent, each being a record type devd has nothing to put in: `S:` (devlinks -- the compat layer scans /dev
+ * for those), `L:` (link priority), `G:`/`Q:` (tags; devd has no TAG+=), `W:` (watch). And never any of
+ * /run/udev/control, /run/udev/queue or /run/udev/tags/: software takes `control` to mean a udevd is
+ * running, and libudev-queue.c answers that question from it on purpose.
  */
 
 #pragma once

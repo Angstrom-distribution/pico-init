@@ -2,10 +2,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * Socket units (plan §1.6). Scaffolding only at this point: the real type,
- * its state machine and its quarried body land with milestones S0-S2, which
- * own this file. What is fixed here is the contract manager-loop.c and unit.c
- * are already written against, so neither has to be edited again to land it.
+ * Socket units. See socket.c for the state machine and the backport record.
  */
 
 #pragma once
@@ -23,13 +20,12 @@ typedef struct Manager Manager;
 /*
  * DEAD -> LISTENING -> RUNNING -> {LISTENING, FAILED}, plus DEAD from an
  * orderly stop out of any state. No socket-side Exec*= collapses v30's
- * eleven states to these four -- see socket.c's header for the full quarry
- * citation and the per-fix backport record.
+ * eleven states to these four.
  */
 typedef enum SocketState {
         SOCKET_DEAD,
         SOCKET_LISTENING, /* fds open and in the manager's epoll set */
-        SOCKET_RUNNING,   /* fds open, NOT watched -- handed to the service; see H7 in socket.c */
+        SOCKET_RUNNING,   /* fds open, NOT watched -- handed to the service; see socket_unwatch_fds() */
         SOCKET_FAILED,
         _SOCKET_STATE_MAX,
         _SOCKET_STATE_INVALID = -1,
@@ -44,15 +40,15 @@ typedef enum SocketState {
 typedef struct SocketPort {
         /* io source on fd, EVENT_PRIORITY_SOCKET (manager.h); NULL until
          * socket_watch_port() runs, and again once socket_unwatch_port()
-         * tears it down -- see H7 for why unwatch never closes fd itself. */
+         * tears it down. Unwatching never closes fd itself. */
         sd_event_source *event_source;
 
-        struct SocketPort *next; /* tail-appended: fd order == declared Listen* order (H12) */
+        struct SocketPort *next; /* tail-appended: fd order == declared Listen* order */
         struct Socket *socket;   /* owning unit, borrowed */
 
         int family; /* AF_UNIX, or AF_UNSPEC until bound */
         int type;   /* SOCK_STREAM or SOCK_DGRAM */
-        int fd;     /* -1 until socket_open_fds() binds it; H13: written only on success */
+        int fd;     /* -1 until socket_open_fds() binds it; written only on success */
 
         char *path;    /* AF_UNIX only, owned, absolute */
         uint16_t port; /* AF_INET/AF_INET6 only, host byte order */
@@ -91,11 +87,9 @@ typedef struct Socket {
         int backlog;        /* Backlog=; default INT_MAX (768fcd779f) -- let the kernel clamp it */
 
         /*
-         * Trigger ratelimit: a hardcoded 20 tokens per 2s window, the same
-         * token-bucket shape as service.c's own start-rate limiter
-         * (service_start_limit_check()). Deliberately not a parseable
-         * TriggerLimitIntervalSec=/TriggerLimitBurst= pair -- see socket.c's
-         * header for why these two numbers specifically.
+         * Trigger ratelimit: a hardcoded 20 triggers per 2s window, shaped
+         * like service.c's start-rate limiter (service_start_limit_check()).
+         * Not a parseable TriggerLimitIntervalSec=/TriggerLimitBurst= pair.
          */
         usec_t trigger_ratelimit_begin;
         unsigned trigger_ratelimit_num;
@@ -117,9 +111,9 @@ const char *socket_state_to_string(SocketState s);
  * accept()s -- the connection stays queued in the backlog and is handed to
  * the paired service, which is what makes the socket survive a service
  * restart. Under Accept=yes it accept()s one connection per wakeup and
- * starts a fresh instance for it. The sd_event_io_handler_t shape itself, registered directly by
- * socket_watch_port(); userdata is the SocketPort*. Always returns 0 -- see
- * the definition's own callback-contract comment.
+ * starts a fresh instance for it. This is the sd_event_io_handler_t
+ * registered by socket_watch_port(); userdata is the SocketPort*. Always
+ * returns 0 so the source is never disabled.
  */
 int socket_dispatch_io(sd_event_source *es, int fd, uint32_t revents, void *userdata);
 
@@ -163,7 +157,7 @@ void socket_notify_service_job_finished(Unit *service);
 
 /*
  * Called by unit-parse.c once a [Socket] fragment has finished parsing
- * (never on a stub/unloaded unit -- see 75193d4128 in socket.c's header).
+ * (never on a stub/unloaded unit; see 75193d4128 in socket.c's header).
  * Validates the section (at least one Listen*; under Accept=yes, stream
  * ports only and no Service=) and, for Accept=no, resolves service pairing:
  * the explicit Service= override if given, else the same-basename suffix

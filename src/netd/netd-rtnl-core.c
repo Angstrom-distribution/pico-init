@@ -3,13 +3,10 @@
 
 /*
  * The low-level rtnetlink plumbing shared by netd-rtnl.c and netctl-rtnl.c.
- * See netd-rtnl-core.h for why this is a separate file and what it
- * deliberately does not do (log, or depend on anything outside kernel UAPI
- * headers and libc).
- *
- * Moved near-verbatim out of netd-rtnl.c; see that file's own banner for the
- * ALIGNMENT and nl_recv() oversized-datagram reasoning, unchanged by the
- * move.
+ * See netd-rtnl-core.h for why this is a separate file and what it does not
+ * do (log, or depend on anything outside kernel UAPI headers and libc). See
+ * netd-rtnl.c's banner for the ALIGNMENT and nl_recv() oversized-datagram
+ * reasoning.
  */
 
 #include "netd-rtnl-core.h"
@@ -274,8 +271,8 @@ int nl_execute(NlSock *sock, struct nl_request *req, char *errbuf, size_t errbuf
                 m = (struct nlmsghdr *) rb.buf;
                 rem = (int) len;
 
-                /* int rem, NLMSG_OK sign-compare: see netd-rtnl.c's
-                 * nl_execute() comment -- unchanged by the move. */
+                /* rem is an int because NLMSG_OK() compares it
+                 * against signed values. */
                 for (; NLMSG_OK(m, rem); m = NLMSG_NEXT(m, rem)) {
                         if (m->nlmsg_seq != seq)
                                 continue;

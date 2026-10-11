@@ -2,22 +2,16 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * D0's acceptance test (plan §1.8): dev_setup() creates all five /dev symlinks
- * as correct symlinks, and running it twice is safe.
+ * dev_setup() creates all five /dev symlinks as correct symlinks, and running
+ * it twice is safe.
  *
- * Everything here runs against a test root rather than the real /dev, which is
- * the whole reason dev_setup() takes a prefix -- the assertions are about
- * paths this test owns, so it needs neither root nor a container-wide mutation
- * to mean anything.
+ * Everything runs against a test root rather than the real /dev (dev_setup()
+ * takes a prefix for this), so no root privileges are needed.
  *
- * Note what is asserted about /dev/core: its presence is conditional on the
- * running kernel having CONFIG_PROC_KCORE, deliberately, and the check is made
- * against the real /proc/kcore rather than one under the prefix because the
- * link's target is the literal string either way (see mount-setup.c). So this
- * file asks the same question dev_setup() asks rather than hardcoding an
- * answer -- a test that assumed /dev/core always appears would fail on a
- * kernel that simply does not have kcore, and one that assumed it never
- * appears would assert nothing at all on the kernels that do.
+ * /dev/core exists only if the running kernel has CONFIG_PROC_KCORE. The check
+ * is made against the real /proc/kcore, not one under the prefix, because the
+ * link target is the literal string either way (see mount-setup.c). The test
+ * asks the same question dev_setup() asks instead of hardcoding an answer.
  */
 
 #include <errno.h>
@@ -75,7 +69,7 @@ static void assert_all_five(const char *root) {
 }
 
 /*
- * The D0 criterion itself: an empty /dev gains all five, asserted through
+ * An empty /dev gains all five, asserted through
  * readlink() rather than through mere existence -- a symlink pointing at the
  * wrong place exists just as hard as a correct one.
  */
@@ -123,7 +117,7 @@ static void test_run_twice_is_safe(void) {
 /*
  * A link pointing somewhere wrong is repaired.
  *
- * This is the deliberate divergence from upstream, which calls symlink(),
+ * This diverges from upstream, which calls symlink(),
  * takes the EEXIST, logs it at debug and leaves the wrong target in place
  * forever. Testing it is the only thing that keeps the divergence real:
  * without this case the repair branch could be deleted and everything else
@@ -183,15 +177,11 @@ static void test_existing_non_symlink_is_left_alone(void) {
 }
 
 /*
- * The one case deliberately NOT tested here is dev_setup(NULL) -- the real
- * boot path, where upstream needed an actual fix so a NULL prefix did not
- * compose "(null)/dev/fd" (01ed0e2307). The only way to exercise it is to let
- * it write to the host's own /dev, and this suite runs as root in a build
- * container, so a test for it would repair or create symlinks in the machine
- * running the test. Mutating the host to assert a string-formatting property
- * is a worse trade than leaving it to the place it is genuinely exercised: PID
- * 1 calls exactly dev_setup(NULL) on every boot, and D0's booted-guest check
- * (`ls /dev/fd/`, `echo x >/dev/stderr`) is what proves that path works.
+ * dev_setup(NULL), the real boot path, is not tested: upstream needed a fix so
+ * a NULL prefix did not compose "(null)/dev/fd" (01ed0e2307), but exercising it
+ * would create or repair symlinks in the host's own /dev. PID 1 calls exactly
+ * dev_setup(NULL) on every boot, so a booted guest (`ls /dev/fd/`,
+ * `echo x >/dev/stderr`) proves that path.
  */
 
 int main(void) {

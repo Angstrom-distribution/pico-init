@@ -6,10 +6,9 @@
  * keys, and the fields (ACTION/SEQNUM/SYNTH_UUID) that only ever come
  * from a monitor message. That last part is exercised via
  * device_new_from_devpath_bare() + device_add_property() directly --
- * device-internal.h functions, not the public API -- the same
- * pure-function testing shape netd-sntp.c's own tests use, since building
- * a real netlink message just to test property parsing would test the
- * socket, not the parser.
+ * device-internal.h functions, not the public API, since building a netlink
+ * message just to test property parsing would test the socket, not the
+ * parser.
  */
 
 #include "sd-device.h"

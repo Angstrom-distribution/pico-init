@@ -3,25 +3,20 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * Golden-byte tests for the carried DHCP wire codec (plan §2.8).
+ * Golden-byte tests for the carried DHCP wire codec.
  *
- * Split out from test-netd-dhcp deliberately (see meson.build): this
- * program asserts the wire format against fixed byte strings that did NOT
- * come from netd, while test-netd-dhcp runs the real client against the
- * real server over a veth pair. Keeping them apart is what stops a
- * mirrored encoder/decoder bug from passing silently -- a
- * netd-encodes/netd-decodes round trip agrees with itself no matter how
- * wrong both halves are.
+ * Kept apart from test-netd-dhcp (see meson.build): this program asserts the
+ * wire format against fixed byte strings that did not come from netd, so a
+ * mirrored encoder/decoder bug cannot pass silently -- a netd-encodes/
+ * netd-decodes round trip agrees with itself however wrong both halves are.
  *
  * Fixture provenance: the ten raw BOOTP/DHCPv4 frames embedded below are
  * byte-for-byte copies of systemd v261.2's test/fuzz/fuzz-dhcp-server/ and
  * test/fuzz/fuzz-dhcp-client/overload-file-roundtrip corpus (LGPL-2.1-or-
- * later, "The systemd project" default copyright per plan §2.11 -- these
- * are project fixture data, not derived from a file carrying the 2013
- * Intel line). They are embedded as C arrays rather than read from disk at
- * test time because meson.build (not owned by this milestone) has no
- * fixture-directory wiring for netd's tests, and out-of-tree builds cannot
- * assume a source-relative path at runtime anyway. Every frame is decoded
+ * later, "The systemd project" default copyright -- project fixture data,
+ * not derived from a file carrying the 2013 Intel line). They are embedded
+ * as C arrays because out-of-tree builds cannot assume a source-relative
+ * path at runtime. Every frame is decoded
  * with the exact dhcp_message_parse() call shape the real caller uses:
  * fuzz-dhcp-server's op/xid/arp_type/hw_addr come from
  * dhcp-server-request.c's dhcp_server_parse_message() (BOOTREQUEST, no xid
@@ -31,8 +26,7 @@
  * The DUID-EN and dhcp_identifier_set_iaid() vectors are transcribed from
  * sd-dhcp-duid.c:191 (the sd_dhcp_duid_set_en() self-check under test mode)
  * and src/libsystemd-network/test-dhcp-duid.c's TEST(dhcp_identifier_set_iaid)
- * respectively -- both cited in plan §2.8. Neither source file carries the
- * 2013 Intel copyright line (verified directly, not assumed).
+ * respectively. Neither source file carries the 2013 Intel copyright line.
  */
 
 #include <net/if_arp.h>
@@ -40,10 +34,8 @@
 #include <stdio.h>
 #include <string.h>
 
-/* netd-compat.h must come before any lifted dhcp/ header (its own
- * convention, see dhcp-protocol.h's header comment): it supplies bool/
- * usec_t/_packed_/assert_cc/etc. that those headers assume are already
- * in scope. */
+/* netd-compat.h must come before any lifted dhcp/ header: it supplies
+ * bool/usec_t/_packed_/assert_cc/etc. that those headers assume. */
 #include "netd-compat.h"
 
 #include "../test-util.h"
@@ -258,7 +250,7 @@ static const uint8_t duplicate_input_data[] = {
 /* fuzz-dhcp-client/overload-file-roundtrip (243 bytes): op=BOOTREPLY, and
  * option 52 (Overload)=1 (FILE) so the file[] header field must be parsed
  * as a continuation of the option list -- the one fixture exercising this
- * path (plan §2.8). */
+ * path. */
 static const uint8_t overload_file_roundtrip[] = {
         0x02, 0x01, 0x06, 0x20, 0x00, 0x00, 0x00, 0x02, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
         0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0xff, 0x20, 0xff, 0x41, 0x42, 0x43, 0x31, 0x32, 0x33,
@@ -352,7 +344,7 @@ static void test_overload_file_roundtrip(void) {
         ASSERT_TRUE(dhcp_message_has_option(message, SD_DHCP_OPTION_SERVER_IDENTIFIER));
 }
 
-/* --- DUID-EN and IAID golden vectors (plan §2.8) --- */
+/* --- DUID-EN and IAID golden vectors --- */
 
 static void test_duid_en_golden_vector(void) {
         DhcpDuid duid = { 0 };

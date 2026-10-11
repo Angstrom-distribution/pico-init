@@ -1,8 +1,5 @@
 # Contributing to pico-init
 
-This repository is currently private. The notes below are the baseline
-process and will get more detailed as the project grows.
-
 ## Reporting bugs / requesting features
 
 Use [GitHub Issues](../../issues). There are templates for bug reports and
@@ -10,7 +7,7 @@ feature requests; pick whichever fits, or open a blank issue if neither does.
 
 ## Submitting changes
 
-1. Fork (once this is public) or branch, and open a
+1. Fork or branch, and open a
    [pull request](../../pulls) against `main`. The PR template will prompt
    for what changed and why.
 2. Every new or modified source file needs an
@@ -30,13 +27,11 @@ feature requests; pick whichever fits, or open a blank issue if neither does.
   comparing against upstream).
 - PID1 code specifically: no unbounded recursion, no unchecked allocation
   failures, prefer explicit error returns over anything that can bring the
-  process down. If it exits unexpectedly, the kernel panics — see
+  process down. If PID 1 crashes, the kernel panics — see
   [`SECURITY.md`](SECURITY.md).
 
 ## Design discussions
 
 Anything that changes scope (what gets quarried vs. written fresh, which
 systemd behaviors get kept or dropped) should be discussed in an issue
-before a PR — these are exactly the kind of decisions that were made via a
-scoping dialog for the project's initial direction, and future ones should
-go through the same kind of discussion, not land silently in a diff.
+before a PR, not land silently in a diff.

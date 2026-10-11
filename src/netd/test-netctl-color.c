@@ -4,24 +4,20 @@
 /*
  * Colour tests for netctl's `status`/`status <iface>`/`list` output.
  *
- * The rendering lives in netctl.c's own static functions (status_one(),
- * status_all(), cmd_list(), and their colour helpers operational_color()/
- * setup_color()/online_color()/field_label_color()) -- file-local statics
- * with no header, and netctl.c is its own standalone executable with no
- * netctl-core library the way test-picoctl.c's own header already explains
- * for picoctl. So, like that file (and test-tmpfiles-create.c), this runs
- * the REAL built `netctl` binary as a subprocess -- found via /proc/self/exe,
- * since both land in the same meson build root -- rather than linking any
- * of netctl.c's own code into this test.
+ * The rendering lives in netctl.c's file-local static functions
+ * (status_one(), status_all(), cmd_list() and the colour helpers
+ * operational_color()/setup_color()/online_color()/field_label_color()), and
+ * netctl is a standalone executable with no library. So, like test-picoctl.c,
+ * this runs the real built `netctl` binary as a
+ * subprocess, found via /proc/self/exe since both land in the same meson
+ * build root.
  *
- * Fixture is the loopback interface, "lo": every test namespace has one, so
- * no root/network setup is needed. Its real operational/setup words aren't
- * assumed (environments differ); each test reads them back from a
- * colours-disabled run first, then checks that a colours-forced run wraps
- * exactly the expected escape bytes around that same real value -- an
- * independent oracle reproduction of netctl.c's own colour rules (the same
- * upstream spec its own operational_color()/setup_color()/online_color()
- * mirror), not a call into netctl.c's code under test.
+ * Fixture is the loopback interface, "lo", which every namespace has. Its
+ * operational/setup words are not assumed (environments differ); each test
+ * reads them back from a colours-disabled run first, then checks that a
+ * colours-forced run wraps exactly the expected escape bytes around that same
+ * value -- an independent reproduction of the upstream colour rules, not a
+ * call into netctl.c's code under test.
  */
 
 #include <errno.h>
@@ -117,14 +113,12 @@ static int run_binary(const char *path, char * const args[], struct run_result *
 
 /* --- the independent oracle: same spec netctl.c's own colour helpers mirror --- */
 
-/* Quarried the same way as netctl.c's own helpers and pico-color.c, from
- * systemd main as of commit 4c63532c28094aeba6dccc5afb9690e02fd98d66
+/* From systemd main as of commit 4c63532c28094aeba6dccc5afb9690e02fd98d66
  * (2026-10-04): src/basic/ansi-color.h's ANSI_* literals, and
  * src/shared/format-table.c's table_data_color() default for an
- * uncoloured TABLE_FIELD cell (ANSI_BRIGHT_BLUE). Kept as literal escape
- * bytes here rather than pico-color.h's accessors on purpose: the point of
- * this file is to check netctl's actual bytes against the spec
- * independently, not against pico-color.c's own implementation of it.
+ * uncoloured TABLE_FIELD cell (ANSI_BRIGHT_BLUE). Literal escape bytes
+ * rather than pico-color.h's accessors, so netctl's output is checked
+ * against the spec rather than against pico-color.c.
  */
 #define T_ANSI_NORMAL "\x1B[0m"
 #define T_ANSI_HIGHLIGHT_GREEN "\x1B[0;1;32m"
@@ -275,9 +269,7 @@ static void assert_contains(const char *haystack, const char *needle, const char
 /* --- the tests --- */
 
 /* With colours off (the default here: stdout is a pipe, never a tty), every
- * command's output must stay exactly what it was before this change -- no
- * ESC byte anywhere. Existing golden-output expectations elsewhere rely on
- * this. */
+ * command's output must contain no ESC byte. */
 static void test_colors_disabled_no_escapes(const char *netctl_path) {
         struct run_result res;
         char *args_list[] = { (char *) netctl_path, "list", NULL };

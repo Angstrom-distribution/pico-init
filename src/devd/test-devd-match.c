@@ -82,7 +82,7 @@ static void join(char *ret, size_t size, const char *a, const char *b) {
 /*
  * Lay out one USB serial adapter under <root>/sys. `manufacturer` may be NULL
  * for a device whose descriptors carry no strings -- the named v1 divergence,
- * where upstream's usb_id would fall back to hex IDs and devd deliberately does
+ * where upstream's usb_id would fall back to hex IDs and devd does
  * not.
  */
 static void
@@ -284,7 +284,7 @@ static void test_attrs_must_match_one_ancestor(void) {
         free(root);
 }
 
-/* --- the 415-rule shape, and the guards around it --- */
+/* --- the vendor-rule shape, and the guards around it --- */
 
 static void test_vendor_pair_rule_and_guards(void) {
         static const char text[] =
@@ -499,7 +499,7 @@ static void test_lookup_id(void) {
         ASSERT_EQ_INT(devd_rules_lookup_id(path, "nosuchgroup", &id), 0);
 
         /* A numeric name answers itself, which is what makes MODE/OWNER/GROUP
-         * work on an image with no /etc/group at all -- today's pico image. */
+         * work on an image with no /etc/group. */
         ASSERT_EQ_INT(devd_rules_lookup_id("/nonexistent", "44", &id), 1);
         ASSERT_EQ_INT(id, 44);
 
@@ -534,9 +534,8 @@ static void test_device_from_uevent(void) {
         ASSERT_STREQ(d->devname, "bus/usb/001/004");
         ASSERT_STREQ(d->sysfs, "/sys/devices/platform/soc/usb1/1-1");
 
-        /* The whole property tail is there, not just the six fields H1
-         * decoded -- that is what ENV{} matches on and what a RUN+= child is
-         * handed. */
+        /* The whole property tail is there, not just the named fields -- that is what ENV{} matches on and
+         * what a RUN+= child is handed. */
         ASSERT_STREQ(devd_rule_device_property(d, "PRODUCT"), "12d1/1f01/102");
         ASSERT_STREQ(devd_rule_device_property(d, "DEVTYPE"), "usb_device");
         ASSERT_TRUE(devd_rule_device_property(d, "NOTHERE") == NULL);

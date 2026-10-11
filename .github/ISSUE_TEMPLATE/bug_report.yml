@@ -5,10 +5,9 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for taking the time to report this. This project is
-        pre-release, so "doesn't work at all yet" for something not in the
-        README's scope list is expected, not a bug -- please check there
-        first.
+        Thanks for taking the time to report this. Features listed
+        under "Not implemented" in the README are known gaps, not bugs --
+        please check there first.
   - type: textarea
     id: what-happened
     attributes:
@@ -25,7 +24,7 @@ body:
     id: component
     attributes:
       label: Component
-      description: PID1 core, netd, journal reader, build system, etc.
+      description: PID1 core, netd, logd, devd, picoctl, libsystemd/libudev, build system, etc.
   - type: textarea
     id: environment
     attributes:

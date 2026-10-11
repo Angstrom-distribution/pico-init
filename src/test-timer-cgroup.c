@@ -2,7 +2,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * M4's acceptance test: the timer queue, cgroups v2 and SIGCHLD reaping.
+ * Tests the timer queue, cgroups v2 and SIGCHLD reaping.
  *
  * The cgroup half needs a writable cgroup2 hierarchy. Where there is one it
  * runs for real -- create, populate, observe the empty event, kill, remove --

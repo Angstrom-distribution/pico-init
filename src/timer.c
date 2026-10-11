@@ -27,9 +27,8 @@ struct PicoTimerEvent {
 
         /*
          * The caller's own handle slot, or NULL if it passed no `ret`. Cleared
-         * when this event fires or is cancelled, which is what makes a fired
-         * handle impossible to reuse by accident rather than merely documented
-         * as unsafe. See timer.h.
+         * when this event fires or is cancelled, so a fired handle cannot be
+         * reused by accident. See timer.h.
          */
         PicoTimerEvent **owner_ref;
 };

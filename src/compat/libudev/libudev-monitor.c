@@ -11,17 +11,15 @@
  * received sd_device with libudev_device_new().
  *
  * "kernel" and "udev" are both wired to the same group-1 socket: nothing on
- * this image ever writes to group 2 (udev's own rebroadcast, which does not
- * exist without udevd), so a consumer asking for "udev" -- libusb_init()
- * does, see below -- gets the only real uevent source there is rather than
- * a permanently silent one. test-libudev-monitor.c already pinned the two
- * names as equivalent while this was still a stub; that pin now holds for
- * the real reason instead of by construction.
+ * this image writes to group 2 (udev's own rebroadcast, which does not exist
+ * without udevd), so a consumer asking for "udev" (libusb_init() does) gets the
+ * only real uevent source rather than a permanently silent one.
+ * test-libudev-monitor.c pins the two names as equivalent.
  *
- * NULL from udev_monitor_new_from_netlink() is a real failure now (ENOMEM,
- * or no uevent netlink in this kernel/sandbox) rather than a fabricated
- * fd: a consumer that correctly treats NULL as "no USB/hotplug at all"
- * (libusb_init() does) should see that only when it is actually true.
+ * NULL from udev_monitor_new_from_netlink() is a real failure (ENOMEM, or no
+ * uevent netlink in this kernel/sandbox), not a fabricated fd: a consumer that
+ * treats NULL as "no USB/hotplug at all" (libusb_init() does) should see that
+ * only when it is true.
  */
 
 #include "libudev.h"

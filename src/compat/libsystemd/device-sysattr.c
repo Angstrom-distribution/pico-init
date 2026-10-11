@@ -6,11 +6,10 @@
  * value getter/setter, and the (device, resolved-attr) cache in front of
  * both.
  *
- * "driver", "subsystem" and "module" are read specially -- they are
- * symlinks, not regular files, so sd_device_get_sysattr_first()/_next()
- * never discovers them, but sd_device_get_sysattr_value() reading one of
- * those three names by hand still has to work, exactly as real
- * sd_device_get_sysattr_value_with_size() does.
+ * "driver", "subsystem" and "module" are symlinks, so
+ * sd_device_get_sysattr_first()/_next() never lists them, but
+ * sd_device_get_sysattr_value() on one of those names still works, as in
+ * upstream.
  *
  * Values are read with a single read(2) call into a fixed buffer rather
  * than a loop to EOF: a sysfs attribute's show() callback writes its whole
@@ -20,8 +19,8 @@
  */
 
 /* vasprintf() is a glibc extension; -std=gnu17 alone does not imply
- * _GNU_SOURCE (see socket.c's own note), so this has to be explicit and
- * first, before any header pulls in features.h. */
+ * _GNU_SOURCE, so it must be defined first, before any header pulls in
+ * features.h. */
 #define _GNU_SOURCE
 
 #include "sd-device.h"
@@ -202,13 +201,9 @@ int sd_device_get_sysattr_value(sd_device *device, const char *sysattr, const ch
 }
 
 /*
- * Removes the entry outright rather than nulling it in place: a cached
- * entry's `value == NULL` already means "known negative result" to the
- * getter above, so clearing a *positive* entry's value in place without
- * removing it would be indistinguishable from a real cached -ENOENT and
- * the getter would return that stale success/failure code without ever
- * touching the value pointer again -- exactly the stale-read bug a set
- * must not have.
+ * Removes the entry rather than nulling it: `value == NULL` means "cached
+ * negative result" to the getter, so a nulled positive entry would be
+ * mistaken for a cached -ENOENT.
  */
 static void cache_invalidate(sd_device *d, const char *sysattr) {
         size_t i;
@@ -260,14 +255,9 @@ int sd_device_set_sysattr_value(sd_device *device, const char *sysattr, const ch
                 out = value;
 
         /*
-         * O_TRUNC: a real sysfs attribute's store() callback treats every
-         * write as the whole new value regardless of file position, but a
-         * plain regular file (a test fixture, or any non-sysfs path a
-         * caller points this at) does not -- writing a shorter value
-         * without truncating leaves the old value's tail bytes in place.
-         * `echo value > attr`'s own shell redirection always truncates
-         * too, so this matches the tool this getter/setter pair is really
-         * standing in for.
+         * O_TRUNC: a sysfs store() callback takes every write as the whole
+         * new value, but a plain file (a test fixture) would keep the old
+         * value's tail after a shorter write. Matches `echo value > attr`.
          */
         fd = open(path, O_WRONLY | O_TRUNC | O_CLOEXEC);
         if (fd < 0) {

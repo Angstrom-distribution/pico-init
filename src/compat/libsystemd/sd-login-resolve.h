@@ -2,13 +2,12 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The one "who is this process" resolution shared by every sd_pid_get_*(),
- * sd_pidfd_get_*() and sd_peer_get_*() function in sd-login.h -- a raw pid, a
- * pidfd, or a connected AF_UNIX socket's peer, all reduced to a live pid
- * plus the /proc/<pid>/cgroup content that resolving it already had to
- * read, so the real getters (sd-login-cgroup.c) don't re-open the file
- * and the honest_failure getters (sd-login.c) get the same existence
- * check without needing the content at all.
+ * Process resolution shared by every sd_pid_get_*(), sd_pidfd_get_*() and
+ * sd_peer_get_*() function in sd-login.h: a pid, pidfd, or a connected
+ * AF_UNIX socket's peer is reduced to a live pid plus its
+ * /proc/<pid>/cgroup content, so the getters in sd-login-cgroup.c need not
+ * re-read it and the failing getters in sd-login.c get the same existence
+ * check.
  */
 
 #pragma once
@@ -25,10 +24,10 @@
  * -ENODATA.
  *
  * All three then confirm the resolved pid is alive by opening
- * /proc/<pid>/cgroup (ENOENT -> -ESRCH, "process does not exist" --
- * sd-login.c's own errno contract, HEAD ded83144 :30-36); the pidfd form
- * additionally re-reads its Pid: field afterwards and demands it still
- * matches, closing the TOCTOU window pidfd-based lookups exist to avoid.
+ * /proc/<pid>/cgroup (ENOENT -> -ESRCH, as upstream sd-login.c,
+ * HEAD ded83144 :30-36); the pidfd form additionally re-reads its Pid:
+ * field afterwards and requires it to still match, closing the pid-reuse
+ * race.
  *
  * On success, *ret_pid is the live pid and *ret_cgroup_content is the
  * malloc'd whole content of /proc/<pid>/cgroup (never NULL). Every other

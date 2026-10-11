@@ -4,12 +4,10 @@
 /*
  * Constructors, refcounting, parent/child walk, and the two identity
  * getters that synthesize from other getters (get_device_id,
- * get_is_initialized). Two kinds of fixture, deliberately: a scratch
- * /sys tree (device_set_sys_root_for_tests()) for everything the design
- * requires to reject or accept by grammar, and the host's own real /sys
- * (the default root) for the handful of cases -- /dev/null, the loopback
- * interface -- guaranteed to exist and be stable on any Linux this test
- * ever runs on.
+ * get_is_initialized). Two kinds of fixture: a scratch /sys tree
+ * (device_set_sys_root_for_tests()) for what is accepted or rejected by
+ * grammar, and the host's real /sys (the default root) for the few cases
+ * guaranteed to exist on any Linux: /dev/null and the loopback interface.
  */
 
 #include "sd-device.h"
@@ -30,9 +28,8 @@ static void mkpath(const char *base, const char *rel) {
         for (seg = strtok_r(rel_copy, "/", &saveptr); seg; seg = strtok_r(NULL, "/", &saveptr)) {
                 char next[512];
 
-                /* GCC's format-truncation checker cannot see that these are short,
-                 * controlled test fixture path segments -- it only sees three
-                 * unbounded %s into a 512-byte buffer. Real risk is zero here. */
+                /* GCC's format-truncation check sees three unbounded %s into a
+                 * 512-byte buffer; these are short fixture segments. */
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wformat-truncation"
                 snprintf(next, sizeof(next), "%s%s%s", partial, partial[0] ? "/" : "", seg);
@@ -96,7 +93,7 @@ static void test_fixture_basics(void) {
 
         /* is_initialized is unconditionally true; usec_initialized is
          * -ENODATA for a device with no udev database entry, which this
-         * fixture never has -- see device-new.c's own comments. */
+         * fixture never has. */
         ASSERT_EQ_INT(sd_device_get_is_initialized(d), 1);
         {
                 uint64_t usec;
@@ -149,9 +146,8 @@ static void test_fixture_basics(void) {
 }
 
 /* "drivers" and "module" grammar: neither lives under /devices, and a
- * real kernel's own driver directories genuinely have no "subsystem"
- * symlink -- see device-new.c's location_is_valid() comment for why the
- * blanket "/devices only" reading of the design had to be corrected. */
+ * kernel driver directory has no "subsystem" symlink; see
+ * location_is_valid() in device-new.c. */
 static void test_driver_and_module_grammar(void) {
         char *tmp = test_tmpdir_new();
         char sysroot[620];
@@ -238,8 +234,7 @@ static void test_new_from_subsystem_sysname_bus_and_class(void) {
         free(tmp);
 }
 
-/* /dev/null and the loopback interface are guaranteed present on any
- * Linux this test runs on -- real ground truth, not a fixture. */
+/* /dev/null and the loopback interface exist on any Linux. */
 static void test_real_host_facts(void) {
         sd_device *d = NULL;
         const char *v;

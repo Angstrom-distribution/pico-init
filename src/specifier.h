@@ -4,26 +4,20 @@
 
 /*
  * Generic %x-specifier substitution engine, quarried from systemd's v30
- * src/specifier.c + src/specifier.h. Deliberately split from unit-name.c,
- * mirroring v30's own layout: this engine knows nothing about Unit, which
- * is what lets it be tested with a synthetic table instead of a real one.
+ * src/specifier.c + src/specifier.h. Split from unit-name.c as in v30: this
+ * engine knows nothing about Unit, so it can be tested with a synthetic table.
  *
- * Three deliberate departures from the v30 shape:
+ * Departures from the v30 shape:
  *
- *  - int return with an out-param, not `char *`. This is the actual
- *    resolution of the 487060c239 note deferred at unit-parse.c's own
- *    header: upstream's fix was to stop treating a NULL return as OOM and
- *    fall back to the unexpanded rvalue with a log line. Every lookup here
- *    is a pure string operation, so OOM is the only possible failure, and
- *    typing it as -ENOMEM removes the ambiguity structurally instead of by
- *    convention.
+ *  - int return with an out-param, not `char *`, so OOM (-ENOMEM) is
+ *    distinct from a lookup result. Upstream's 487060c239 stopped treating a
+ *    NULL return as OOM and fell back to the unexpanded rvalue; every lookup
+ *    here is a pure string operation, so OOM is the only possible failure.
  *  - pico_specifier_string() returns "" for NULL data rather than v30's
- *    assert(data) -- and NULL data is reachable, not hypothetical: unit.c's
- *    own %i table entry passes u->instance, which is NULL for any
- *    non-instanced unit. See specifier.c for the regression this closes.
+ *    assert(data). NULL data is reachable: unit.c's %i table entry passes
+ *    u->instance, which is NULL for any non-instanced unit.
  *  - a growable output buffer instead of v30's j/k/l realloc arithmetic,
- *    which is correct but only just, and drops a trailing lone '%'. Pico
- *    keeps it literal.
+ *    which drops a trailing lone '%'. Pico keeps it literal.
  */
 
 #pragma once

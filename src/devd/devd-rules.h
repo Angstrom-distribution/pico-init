@@ -2,22 +2,13 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The udev-rules parser (plans/31, Part 2, milestone H2).
+ * The udev-rules parser.
  *
- * devd consumes real udev-rules syntax rather than a pico-invented format, and
- * that is a decision with a stated reason rather than an aesthetic one. This
- * project's standing principle is drop-in systemd compatibility first --
- * deviating requires considering the systemd way and rejecting it out loud --
- * and the concrete consumer is already on the image: usb-modeswitch-data
- * installs /usr/lib/udev/rules.d/40-usb_modeswitch.rules (42,990 bytes, 1,262
- * lines, 420 rules) and it has been sitting there inert since eudev was
- * removed. An mdev-shaped format would mean hand-translating its 415
- * vendor:product pairs, and redoing that on every upgrade of that recipe.
+ * devd consumes real udev rules syntax rather than a pico-specific format, so
+ * rule files shipped by other packages (usb-modeswitch-data's
+ * /usr/lib/udev/rules.d/40-usb_modeswitch.rules, for one) work unmodified.
  *
- * What is parsed is a verified subset, not the language. v261.2's
- * src/udev/udev-rules.c defines 49 token kinds; devd implements eleven of them
- * plus GOTO/LABEL, chosen by reading the two real target files rather than by
- * guessing at what looked important:
+ * What is parsed is a subset of the language, not all of it:
  *
  *   ACTION, SUBSYSTEM, KERNEL, ENV{}   match, straight off the uevent
  *   ATTR{}                             one read of /sys<devpath>/<attr>
@@ -32,30 +23,20 @@
  * on top -- udev's patterns have never been regular expressions, so there is no
  * regcomp() anywhere in devd.
  *
- * THE SAFETY SEMANTIC, which is the one thing here that is easy to get exactly
- * backwards: a rule containing a key devd does not implement is skipped WHOLE,
- * and logged once at load. Dropping only the unrecognised clause and firing the
- * rest would make the rule match MORE devices than the rule's author intended
- * -- an unimplemented PROGRAM= or TEST!= is usually the clause doing the
- * narrowing -- which inverts the safety property instead of degrading it. The
- * unit-parse.c analogy carries the consume-the-real-format principle across and
- * deliberately leaves its accept-and-ignore failure mode behind.
+ * A rule containing a key devd does not implement is skipped WHOLE, and logged
+ * once at load. Dropping only the unrecognised clause and firing the rest would
+ * make the rule match more devices than its author intended, since an
+ * unimplemented PROGRAM= or TEST!= is usually the clause doing the narrowing.
  *
- * The residue that semantic leaves, named rather than hidden: a skipped rule
- * whose action was GOTO stops jumping, so rules after it are reached where
- * upstream would have skipped them. Neither target file has such a rule (both
- * GOTO guards here are ACTION/SUBSYSTEM matches devd implements), and the
- * alternative -- refusing the whole file -- would silently disable a working
- * usb-modeswitch over one unrelated line. An unresolvable GOTO *is* refused
- * file-wide, because that one really does change the meaning of everything
+ * Residue: a skipped rule whose action was GOTO stops jumping, so the rules
+ * after it are reached where upstream would have skipped them. An unresolvable
+ * GOTO is refused file-wide, because it changes the meaning of everything
  * after it.
  *
- * Memory shape, because the target is a 64MiB ARMv5TE machine and the naive
- * representation is not: clauses and rules are fixed-size records in two flat
- * arrays, and every string is interned once into a shared arena and referred to
- * by offset. The real usb-modeswitch file's 415 identical RUN values become one
- * string. Offsets rather than pointers is what lets the arena be realloc()'d
- * while the tables already reference it.
+ * Memory: clauses and rules are fixed-size records in two flat arrays, and
+ * every string is interned once into a shared arena and referred to by offset
+ * (so identical RUN values are stored once). Offsets rather than pointers let
+ * the arena be realloc()'d while the tables already reference it.
  */
 
 #pragma once
@@ -72,14 +53,9 @@
 #define DEVD_RULES_DIR_ETC "/etc/udev/rules.d"
 
 /*
- * Caps, in the spirit of devd-block.h's: the input is a file on disk rather
- * than a device, but it is still input, and a bound this file sets is worth
- * more than one the file sets. Over any of them the rule is skipped whole --
- * the same outcome an unsupported key gets, and for the same reason.
- *
- * The widest real rule is the Huawei catch-all at five clauses; the longest
- * real value is the gsmmodem PROGRAM at 68 bytes. The headroom is for rules
- * files this project has not read yet.
+ * Caps. Over any of them the rule is skipped whole, as for an unsupported key.
+ * The widest rule in usb-modeswitch's file is five clauses and the longest
+ * value 68 bytes; the headroom is for other rules files.
  */
 #define DEVD_RULE_CLAUSES_MAX 16
 #define DEVD_RULE_ATTR_MAX 64

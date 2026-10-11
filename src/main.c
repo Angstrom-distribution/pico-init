@@ -35,7 +35,7 @@
  * that would not allocate, an event loop that errored, a reboot() that came
  * back -- into an unrecoverable panic with nothing readable on the console.
  * Freezing instead keeps the log on screen and leaves the machine in a state
- * someone can power-cycle deliberately.
+ * someone can power-cycle it.
  */
 static _Noreturn void freeze(const char *reason) {
         pico_log(PICO_LOG_ERR, "%s -- freezing, as PID 1 must not return", reason);
@@ -148,7 +148,7 @@ int main(void) {
          * backfills every line pico-init emitted before logd existed, with no
          * persistent state involved.
          *
-         * Deliberately PID 1 only, not every daemon. netd and logd are
+         * PID 1 only, not every daemon. netd and logd are
          * supervised services whose stdout service-exec.c already connects
          * straight to logd, which is strictly better: those records arrive
          * with _TRANSPORT=stdout and a real _SYSTEMD_UNIT resolved from
@@ -161,13 +161,10 @@ int main(void) {
 
         /*
          * Who is running this machine, before it does anything to it. A log
-         * record rather than console status output, and deliberately so:
-         * systemd's own version banner is log_info("systemd " GIT_VERSION
-         * " running in %ssystem mode (%s)") in src/core/main.c, for the same
-         * reason -- this is the line someone reads back out of a log to find
-         * out what was actually running, which is exactly what the prefix,
-         * the level and the kmsg mirror are for. status.h has the other half
-         * of that split.
+         * record rather than console status output, like systemd's own
+         * version banner in src/core/main.c: it is the line someone reads
+         * back out of a log to find what was running. status.h has the other
+         * half of that split.
          */
         pico_log(PICO_LOG_INFO, "pico-init " PICO_INIT_VERSION_STRING " running as PID 1");
 
@@ -238,8 +235,7 @@ int main(void) {
         fstab_table_done(&fstab);
 
         /*
-         * Swap, off the partition table alone. Placed here for three separate
-         * reasons rather than by taste: it needs the /proc and /sys that
+         * Swap, off the partition table alone. Placed here because it needs the /proc and /sys that
          * mount_setup() mounted and the /dev nodes devtmpfs put there, it wants
          * the kmsg sink already installed so its record survives into logd's
          * backfill, and swap should exist before the first service does -- on a

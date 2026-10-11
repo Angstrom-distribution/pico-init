@@ -2,9 +2,9 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The hand-rolled rtnetlink layer (plan §2.1, §2.2).
+ * The hand-rolled rtnetlink layer.
  *
- * sd-netlink is not lifted. Measured rather than guessed: a minimal rtnl-only
+ * sd-netlink is not lifted: a minimal rtnl-only
  * subset is ~6,500 LOC whose src/basic dependency closure adds ~22,000 more,
  * of which netd would exercise ~20 of 145 public functions -- and two
  * structural facts make trimming it impractical anyway. Its attribute type
@@ -20,10 +20,10 @@
  * match links, subscribe to RTM_NEWLINK/RTM_DELLINK, bring a link up, add an
  * address, add a route including the default route. Nothing else. Everything
  * networkd's netlink surface additionally covers -- tunnels, bonding, bridge
- * and VLAN attributes, MACsec, WireGuard, tc, policy routing -- was never in
- * scope (§2.9), and it was most of that type table.
+ * and VLAN attributes, MACsec, WireGuard, tc, policy routing -- is out of
+ * scope, and it was most of that type table.
  *
- * TWO SOCKETS, on purpose. `event_fd` is subscribed to RTNLGRP_LINK and is
+ * TWO SOCKETS. `event_fd` is subscribed to RTNLGRP_LINK and is
  * the only one epoll ever sees; the request socket is private and every
  * operation on it is a synchronous request -> ACK exchange. One socket would
  * work too, but then every synchronous request would have to buffer the
@@ -32,9 +32,8 @@
  * trivially correct, at the cost of one extra fd.
  *
  * Both sockets set NETLINK_EXT_ACK, so a rejected request comes back with the
- * kernel's own explanation. That is not a nicety: rtnetlink's bare -EINVAL is
- * otherwise indistinguishable between a dozen different malformed-attribute
- * mistakes, and this layer is new code that will make them.
+ * kernel's own explanation: rtnetlink's bare -EINVAL is otherwise
+ * indistinguishable between a dozen different malformed-attribute mistakes.
  *
  * The low-level socket/message plumbing (request construction, send/recv,
  * NLMSG_ERROR decoding, generic attribute getters) lives in
@@ -54,8 +53,7 @@
 typedef struct NetdRtnl NetdRtnl;
 
 /* The maximum hardware address netd stores. 6 covers ether and the CDC-Subset
- * gadget; InfiniBand's 20 is not a pico target and DHCP over it is not
- * implemented. */
+ * gadget; InfiniBand's 20 is not supported. */
 #define NETD_HW_ADDR_MAX 6
 
 /*
@@ -111,7 +109,7 @@ int netd_rtnl_new(NetdRtnl **ret);
 NetdRtnl *netd_rtnl_free(NetdRtnl *rtnl); /* returns NULL */
 
 /* The subscribed socket, for registration in netd's epoll. The request socket
- * is deliberately not exposed: nothing should ever poll it. */
+ * is not exposed: nothing should poll it. */
 int netd_rtnl_event_fd(NetdRtnl *rtnl);
 
 /* Install the link event/enumeration handler. */

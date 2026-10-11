@@ -85,8 +85,7 @@ static void test_usb_only(char *root) {
         ASSERT_STREQ(result, "usb-0:2:1.0");
 }
 
-/* The task's own worked example: a USB-Ethernet dongle on a PCI-attached
- * USB controller. */
+/* A USB-Ethernet dongle on a PCI-attached USB controller. */
 static void test_usb_over_pci(char *root) {
         char pci_dev[PATH_MAX], usb_dev[PATH_MAX], result[256];
 

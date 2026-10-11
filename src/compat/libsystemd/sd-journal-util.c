@@ -2,12 +2,11 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * Helpers shared by the read-side sd_journal_*() files. See
- * sd-journal-internal.h for what each one is for.
+ * Helpers shared by the read-side sd_journal_*() files; see
+ * sd-journal-internal.h.
  */
 
-/* asprintf() is a glibc extension; -std=gnu17 alone does not imply
- * _GNU_SOURCE (socket.c's own note, same reasoning here). */
+/* asprintf() is a GNU extension; -std=gnu17 alone does not imply _GNU_SOURCE. */
 #define _GNU_SOURCE
 
 #include "sd-journal-internal.h"
@@ -66,8 +65,7 @@ bool journal_parse_boot_id(const char *hex, size_t len, sd_id128_t *ret) {
         return true;
 }
 
-/* Cached process-wide: the kernel's boot ID cannot change under a running
- * process, so every caller sharing one cache is correct, not just cheap. */
+/* Cached process-wide: the boot ID cannot change under a running process. */
 static bool boot_id_cached = false;
 static sd_id128_t boot_id_cache;
 
@@ -211,10 +209,9 @@ int journal_entry_clocks(const LogdEntry *e, uint64_t *ret_monotonic, uint64_t *
         return 0;
 }
 
-/* NAME=value bytes for `e`'s field `name` (name_len bytes, not NUL-
- * terminated), compared against one stored match's raw bytes. Constructs
- * the comparison locally rather than materializing a buffer, since matches
- * are typically short and this runs per-entry, per-match. */
+/* Compares the NAME=value bytes of `e`'s field `name` (name_len bytes, not
+ * NUL-terminated) against one stored match's raw bytes, without
+ * materializing a buffer. */
 static bool field_equals_match(const LogdEntry *e, const char *name, size_t name_len, const SdJournalMatch *m) {
         char namebuf[65];
         const LogdReadField *f;
@@ -249,10 +246,8 @@ bool journal_entry_matches(const struct sd_journal *j, const LogdEntry *e) {
                 bool is_first_of_name = true;
                 bool any_equal = false;
 
-                /* Only evaluate each distinct name once, the first time it's
-                 * seen -- an AND group already resolved by an earlier index
-                 * would otherwise be re-checked (harmlessly, but O(n^2) for
-                 * no reason) every time a later match shares its name. */
+                /* Evaluate each distinct name once, at its first match, to avoid
+                 * O(n^2) re-checks. */
                 for (size_t k = 0; k < i; k++)
                         if (j->matches[k].name_len == mi->name_len &&
                             memcmp(j->matches[k].data, mi->data, mi->name_len) == 0) {

@@ -3,7 +3,6 @@
 
 /*
  * Small shared helpers: time type, logging, string/strv basics.
- * Deliberately minimal -- grown only when another file actually needs it.
  */
 
 #pragma once
@@ -22,14 +21,11 @@ typedef uint64_t usec_t;
 usec_t now_monotonic(void);
 
 /*
- * Saturating a + b, for computing a deadline from "now + timeout". Every
- * caller that does that arithmetic must use this rather than a bare '+': a
- * timeout of USEC_INFINITY ("never") added to a real timestamp would wrap
- * uint64_t and produce a deadline in the past, firing immediately instead of
- * never (see B1 in service.c). Callers with a USEC_INFINITY timeout should
- * skip arming a timer at all rather than relying on this to no-op, per
- * timer.h's own rule -- this exists for the few places that still need a
- * concrete (possibly-saturated) deadline value.
+ * Saturating a + b, for computing a deadline from "now + timeout". A bare '+'
+ * with a timeout of USEC_INFINITY ("never") would wrap uint64_t and produce a
+ * deadline in the past, firing immediately instead of never. Callers with a
+ * USEC_INFINITY timeout should skip arming a timer at all (see timer.h); this
+ * is for the few places that need a concrete, possibly saturated, deadline.
  */
 static inline usec_t usec_add(usec_t a, usec_t b) {
         usec_t c = a + b;
@@ -49,14 +45,11 @@ void pico_log_internal(PicoLogLevel level, const char *format, ...) __attribute_
  * Redirect pico_log() to /dev/kmsg, with a real syslog priority prefix so the
  * kernel ring carries the level rather than flattening it.
  *
- * Opt-in at runtime, and deliberately not unconditional: pico_log() is shared
- * by the daemons AND by the interactive tools (picolog, picoctl), and an
- * interactive tool's diagnostics belong on the caller's own terminal, never in
- * the kernel ring. A settable sink also leaves pico_log()'s signature alone,
- * so no existing call site changes.
+ * Opt-in at runtime: pico_log() is shared by the daemons and by the
+ * interactive tools (picolog, picoctl), whose diagnostics belong on the
+ * caller's terminal, not in the kernel ring.
  *
- * Best-effort: if /dev/kmsg cannot be opened the sink stays stderr, which is
- * the pre-existing behaviour and always safe.
+ * Best-effort: if /dev/kmsg cannot be opened the sink stays stderr.
  */
 void pico_log_to_kmsg(void);
 
@@ -75,8 +68,8 @@ void *pico_mfree(void *p);
  * path-util.{c,h}). A relative path WITH a slash ("foo/bar") is rejected
  * either way: it is neither absolute nor a single path component, and
  * nothing in Exec*=/exec-time lookup knows what to resolve it against.
- * Shared by unit-parse.c (parse-time) and service.c (service_verify()'s
- * belt-and-braces re-check) so the two can never drift apart.
+ * Shared by unit-parse.c (parse time) and service.c (service_verify()'s
+ * re-check).
  */
 bool pico_exec_path_is_valid(const char *p);
 

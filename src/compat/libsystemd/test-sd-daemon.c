@@ -2,13 +2,11 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * Exercises the shim against real kernel objects wherever one exists: a
- * real fifo, a real AF_UNIX socket, real fds renumbered exactly the way
- * service-exec.c's shift_fds() leaves them, a real receiving datagram
- * socket for sd_notify(). The env-var-only protocols (sd_listen_fds()'s
- * LISTEN_PID/LISTEN_FDS, sd_watchdog_enabled()) are exercised by setting
- * and clearing the real process environment, since that IS their whole
- * mechanism -- there is nothing else to fake.
+ * Runs against real kernel objects: a fifo, an AF_UNIX socket, fds
+ * renumbered the way service-exec.c's shift_fds() leaves them, and a
+ * receiving datagram socket for sd_notify(). The env-var-only protocols
+ * (sd_listen_fds()'s LISTEN_PID/LISTEN_FDS, sd_watchdog_enabled()) are
+ * driven by setting and clearing the process environment.
  */
 
 #include <errno.h>
@@ -25,18 +23,13 @@
 #include "sd-daemon.h"
 
 /* Puts a fresh pipe's read end at exactly fd `target`, closing whatever was
- * there first -- the shape sd_listen_fds() actually consumes
- * (SD_LISTEN_FDS_START..+n-1), without relying on fds landing there by
- * accident of allocation order. */
+ * there first: the layout sd_listen_fds() consumes (SD_LISTEN_FDS_START..+n-1). */
 static void install_fd_at(int target) {
         int p[2];
 
-        /* Close first, then pipe(): closing target frees exactly that slot,
-         * so pipe()'s own lowest-fd allocation typically lands p[0] there
-         * directly. Calling pipe() before closing target risks pipe()
-         * allocating target as p[0] itself, so that closing target
-         * afterwards would close the very fd this function is trying to
-         * install. */
+        /* Close first, then pipe(): pipe() takes the lowest free fd, which is
+         * then target. Calling pipe() first could allocate target as p[0], and
+         * closing it afterwards would close the fd being installed. */
         close(target);
         ASSERT_TRUE(pipe(p) == 0);
         if (p[0] != target) {
@@ -96,8 +89,7 @@ static void test_listen_fds_real(void) {
         install_fd_at(4);
 
         /* Mirrors service-exec.c's child_exec(): PID 1 clears FD_CLOEXEC
-         * before execve() (step 5b), leaving it to sd_listen_fds() to
-         * re-arm per this header's own documented contract. */
+         * before execve(), leaving sd_listen_fds() to re-arm it. */
         flags = fcntl(3, F_GETFD);
         ASSERT_TRUE(fcntl(3, F_SETFD, flags & ~FD_CLOEXEC) == 0);
         flags = fcntl(4, F_GETFD);
@@ -141,8 +133,8 @@ static void test_listen_fds_with_names_unknown(void) {
         setenv("LISTEN_PID", pidbuf, 1);
         setenv("LISTEN_FDS", "2", 1);
 
-        /* build_socket_envp() never sets LISTEN_FDNAMES -- this is the path
-         * every pico-init-started service actually takes. */
+        /* service-exec.c never sets LISTEN_FDNAMES, so this is the path every
+         * pico-init-started service takes. */
         r = sd_listen_fds_with_names(1, &names);
         ASSERT_EQ_INT(r, 2);
         ASSERT_TRUE(names != NULL);
@@ -353,10 +345,8 @@ static void test_watchdog_enabled(void) {
 static void test_booted(void) {
         int r = sd_booted();
 
-        /* Not a real pico-init boot here -- just proving it returns a
-         * legal value (0/1), never crashes, and never mistakes "the test
-         * host happens to have some other /run/pico-init/" for a real one
-         * beyond what the plain access() check can tell. */
+        /* Not a pico-init boot: only checks for a legal value (0/1) and no
+         * crash. */
         ASSERT_TRUE(r == 0 || r == 1);
 }
 

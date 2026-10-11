@@ -3,8 +3,8 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 /*
- * Unaligned integer access, carried near-verbatim from systemd v261.2
- * (commit 4925d9f07f): src/basic/unaligned.h plus the
+ * Unaligned integer access, carried near-verbatim from systemd v261.2:
+ * src/basic/unaligned.h plus the
  * src/fundamental/unaligned.h it includes, merged into one file because the
  * two-file split exists only to serve systemd's EFI build.
  *

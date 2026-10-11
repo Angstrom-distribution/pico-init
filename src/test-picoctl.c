@@ -2,25 +2,17 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * picoctl's file and symlink half (plan §1.7, C1): golden-output tests per verb against fixture state trees,
+ * picoctl's file and symlink half: golden-output tests per verb against fixture state trees,
  * systemctl-matching exit codes, and symlink layouts byte-identical to systemctl --root on the same fixtures.
  *
- * meson.build (frozen for this milestone) links this program against
- * pico-init-core, not against picoctl.c itself -- picoctl is its own
- * executable with its own main(), and there is no picoctl-core library to
- * link. So every case here runs the REAL built `picoctl` binary as a
- * subprocess (found next to this test binary via /proc/self/exe, since both
- * land in the same meson build root) and asserts its actual stdout and exit
- * code -- the same end-to-end discipline the oracle comparison itself needs
- * (real systemctl --root vs. real picoctl, never an in-process shortcut).
+ * This program is linked against pico-init-core, not picoctl.c (picoctl has
+ * its own main() and there is no picoctl-core library). So every case runs the
+ * built `picoctl` binary as a subprocess, found next to this test binary via
+ * /proc/self/exe, and asserts its stdout and exit code.
  *
- * The oracle test (test_oracle_symlinks_byte_identical) shells out to the
- * real `systemctl` this project's verification container installs
- * specifically for it. It SKIPs (exit 77) rather than fails when systemctl
- * is not on PATH, so `meson test` stays green in an environment that
- * legitimately has no systemd (e.g. an OE build sandbox) -- but it is a
- * real, required comparison whenever systemctl is available, which it is in
- * this project's own verification container.
+ * The oracle test (test_oracle_symlinks_byte_identical) compares against the
+ * real `systemctl --root`. It SKIPs (exit 77) when systemctl is not on PATH,
+ * so `meson test` stays green on hosts without systemd.
  */
 
 #include <dirent.h>
@@ -290,8 +282,7 @@ static const char *static_service =
  * .wants/.requires directories one level under an existing tmpdir); the
  * fixture roots here need several levels created fresh under a tmpdir
  * (<root>/etc/systemd/system, <root>/usr/lib/systemd/system-preset, ...).
- * A local recursive mkdir keeps that need out of test-util.c, which this
- * milestone does not own.
+ * A local recursive mkdir keeps that need out of test-util.c.
  */
 static int fixture_mkdir_p(const char *path) {
         char buf[PATH_MAX];
@@ -421,9 +412,7 @@ static void test_enable_disable_is_enabled(void) {
          * current upstream (verb_enable()'s own carries_install_info == 0
          * case, systemctl-enable.c): it succeeds, exit 0, and only explains
          * why on stderr (not captured by RUN_PICOCTL, by design -- see its
-         * own header). picoctl used to treat this as exit 1, matching only
-         * a much older systemd; this is the real behavior bug this verb
-         * audit found. */
+         * own header). */
         RUN_PICOCTL(&res, "--root", root, "enable", "static.service");
         ASSERT_EQ_INT(res.exit_code, 0);
 
@@ -672,7 +661,7 @@ static void stop_the_loop(void *userdata, usec_t now) {
  * real to open -- so this cannot be relocated under --root the way /etc and
  * /run are. A pid-tagged real path is still needed to avoid colliding with
  * test-manager-state.c's own real-boot fixtures when `meson test` runs both
- * binaries concurrently (the actual bug this pattern was added to fix).
+ * binaries concurrently.
  *
  * Consequence: picoctl's --root in this test cannot reach the real cgroup
  * path (it only prefixes /etc and /run), so print_cgroup_procs()'s
@@ -892,16 +881,14 @@ static void test_read_verbs_against_real_boot(void) {
 }
 
 /*
- * --- status's log tail (the slot this milestone fills in cmd_status()) ---
+ * --- status's log tail ---
  *
- * meson.build (frozen for this milestone) links this test program against
- * pico-init-core only, not logd-core -- the real `picoctl` binary under
- * test links logd-core and is what actually exercises logd_ring_read_
+ * This test program links pico-init-core only, not logd-core; the `picoctl`
+ * binary under test links logd-core and is what exercises logd_ring_read_
  * filtered(). So the fixture ring file below is hand-written to match
  * logd-write.c's on-disk encoding byte for byte (plain "NAME=value\n", or
- * the binary-safe "NAME\n<8-byte-LE-len><data>\n" form), rather than built
- * via logd_writer_append(), which is the only way to exercise the read
- * side here without a link_with change to a frozen file. "/run/logd" below
+ * the binary-safe "NAME\n<8-byte-LE-len><data>\n" form) rather than built
+ * via logd_writer_append(). "/run/logd" below
  * is LOGD_RUNTIME_DIR (src/logd/logd.h), inlined for the same reason.
  */
 static void write_plain_field(FILE *f, const char *name, const char *value) {
@@ -1069,9 +1056,7 @@ static void test_is_system_running_fstab(void) {
  * arguments, repeated options keep the last value, "--" ends option
  * parsing, both "--opt=value" and "--opt value" work, and an unrecognised
  * option is a hard failure -- the exact bug a live 'systemctl --no-block
- * restart X' and 'systemctl is-active X --no-block' hit (picoctl used to
- * only recognise --root/--version/--help before the verb, and nothing at
- * all after it).
+ * restart X' and 'systemctl is-active X --no-block' use.
  */
 static void test_cli_option_parsing(void) {
         char *root;
@@ -1091,15 +1076,13 @@ static void test_cli_option_parsing(void) {
                                       "LoadState=loaded\nDescription=Demo\n"),
                       0);
 
-        /* a global option BEFORE the verb that used to be verb-only
-         * territory ("--no-legend" was only ever scanned out of the
-         * post-verb argv) */
+        /* a global option before the verb */
         RUN_PICOCTL(&res, "--root", root, "--no-legend", "list-units");
         ASSERT_EQ_INT(res.exit_code, 0);
         ASSERT_TRUE(strstr(res.out, "UNIT") == NULL);
         ASSERT_TRUE(strstr(res.out, "demo.service") != NULL);
 
-        /* the exact second live bug: a unit verb's own "--no-block" sitting
+        /* a unit verb's own "--no-block" sitting
          * AFTER the unit name must not be swallowed as a second unit --
          * exactly one ActiveState line comes out, not two. */
         RUN_PICOCTL(&res, "--root", root, "is-active", "demo.service", "--no-block");
@@ -1113,8 +1096,8 @@ static void test_cli_option_parsing(void) {
         ASSERT_STREQ(res.out, "active\nactive\n");
         ASSERT_EQ_INT(res.exit_code, 0);
 
-        /* the exact first live bug: an option BEFORE the verb (the shape
-         * stock systemd.bbclass postinsts actually use, e.g. "--no-block
+        /* an option BEFORE the verb (the shape
+         * stock systemd.bbclass postinsts use, e.g. "--no-block
          * restart X") must not be looked up as if it were the verb itself. */
         RUN_PICOCTL(&res, "--root", root, "--no-block", "is-active", "demo.service");
         ASSERT_STREQ(res.out, "active\n");
@@ -1213,8 +1196,7 @@ static void test_show_unit_file_state_live(void) {
 
 /*
  * `systemctl status` with no unit name shows the manager's own overview
- * (systemctl-show.c show_system_status()), not an error -- the bug this
- * milestone fixes (picoctl used to print "missing unit name" and exit 1).
+ * (systemctl-show.c show_system_status()), not an error.
  * One active and one failed unit, exactly as the fixture name says, so
  * State/Units/Jobs/Failed all have a real, assertable answer.
  */

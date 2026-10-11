@@ -3,14 +3,11 @@
 
 /*
  * pico-tmpfiles's main(): systemd-tmpfiles(8)'s command line, the subset
- * pico-tmpfiles.service and a person at a shell actually use. Nothing else
- * lives here, for the reason netd.c and devd.c give: meson links this file
- * into the binary alone, and tmpfiles-core into every test, so anything a
- * test needs has to be defined in the core.
+ * pico-tmpfiles.service and a person at a shell actually use. meson links
+ * this file into the binary alone and tmpfiles-core into every test, so
+ * anything a test needs has to be defined in the core.
  *
- * --purge is refused rather than silently accepted: it has no consumer in
- * these images, and a flag that "works" by doing nothing is exactly the
- * silent degradation the rest of pico-init exists to avoid.
+ * --purge is refused rather than silently accepted as a no-op.
  */
 
 #include "tmpfiles.h"

@@ -3,28 +3,23 @@
 
 /*
  * sd_journal_print()/printv()/send() and their _with_location twins: the
- * printf-shaped write API, real down to sd_journal_sendv() (sd-journal-
- * sendv.c), the one choke point that actually talks to logd.
+ * printf-shaped write API, built on sd_journal_sendv() (sd-journal-sendv.c),
+ * the one function that talks to logd.
  *
  * SD_JOURNAL_SUPPRESS_LOCATION is defined before including the public
- * header on purpose: sd-journal.h's own macros redirect a caller's plain
- * sd_journal_print()/send()/sendv() to the *_with_location() variant, which
- * is right for an external caller but wrong here -- this file's own calls
- * into sd_journal_printv()/sd_journal_sendv() must reach the real,
- * undecorated symbol, not silently gain a CODE_FILE/CODE_LINE/CODE_FUNC
- * pointing at *this* file's internals instead of the original caller's.
+ * header because sd-journal.h's macros redirect plain
+ * sd_journal_print()/send()/sendv() to the *_with_location() variant; this
+ * file's own calls must reach the undecorated symbol instead of recording
+ * CODE_FILE/CODE_LINE/CODE_FUNC of this file.
  *
- * sd_journal_send()'s variadic scanning follows the documented calling
- * convention (a format string, its own conversions' worth of args, then
- * the next format string, NULL-terminated) rather than upstream's private
- * VA_FORMAT_ADVANCE macro, which this project cannot use verbatim (GNU
- * statement-expression-free, per netd-compat.h's own reasoning for the
- * same upstream macro family). advance_va() below is the portable
- * equivalent: format each field with vasprintf() on a va_copy (leaving the
- * caller's own va_list untouched), then separately walk that same format
- * string's conversions against the *real* va_list purely to consume the
- * matching va_arg()s -- which is exactly what's needed to leave the real
- * va_list positioned at the next format string, and nothing more.
+ * sd_journal_send() scans its variadic arguments per the documented
+ * convention (a format string, its conversions' arguments, the next format
+ * string, ..., NULL) without upstream's VA_FORMAT_ADVANCE macro, which needs
+ * GNU statement expressions (netd-compat.h gives the same reason for the
+ * same macro family). advance_va() is the portable equivalent: each field is
+ * formatted with vasprintf() on a va_copy, then the format's conversions are
+ * walked against the real va_list only to consume the matching va_arg()s,
+ * leaving it positioned at the next format string.
  */
 
 #define SD_JOURNAL_SUPPRESS_LOCATION
@@ -40,11 +35,8 @@
 #include <string.h>
 #include <wchar.h>
 
-/* Trims trailing ' '/'\t'/'\n' from s[0..*len) in place (leading whitespace
- * is kept -- upstream only ever strips the tail, journal-send.c's own
- * rule). *len is updated; the buffer itself is not reallocated or
- * NUL-moved by the caller here, since every caller already tracks length
- * explicitly for the iovec it is about to build. */
+/* Trims trailing ' '/'\t'/'\n' from s[0..*len) in place and updates *len;
+ * leading whitespace is kept, as upstream. The buffer is not NUL-moved. */
 static void strip_trailing_ws(const char *s, size_t *len) {
         while (*len > 0 && (s[*len - 1] == ' ' || s[*len - 1] == '\t' || s[*len - 1] == '\n'))
                 (*len)--;
@@ -53,16 +45,10 @@ static void strip_trailing_ws(const char *s, size_t *len) {
 enum { LEN_NONE, LEN_HH, LEN_H, LEN_L, LEN_LL, LEN_LD, LEN_Z, LEN_J, LEN_T };
 
 /* Walks the '%' conversions in `format` and va_arg()s the matching type off
- * *ap for each -- the standard-C substitute for upstream's private
- * VA_FORMAT_ADVANCE. Only what a message-field format string plausibly
- * uses is covered (see the file comment); an unrecognized conversion is
- * left unconsumed rather than guessed at, which is safe here because it can
- * only make sd_journal_send()'s very next va_arg() read one of the current
- * field's own already-intended arguments back out as if it were the next
- * format string -- the caller passed something outside the documented
- * calling convention either way, and this fails by taking the immediately
- * next field literally rather than by reading further into unrelated
- * memory.
+ * *ap for each. An unrecognized conversion is left unconsumed: the caller is
+ * outside the documented calling convention either way, and this way the
+ * next va_arg() reads at most the current field's own argument as a format
+ * string rather than unrelated memory.
  */
 static void advance_va(const char *format, va_list *ap) {
         for (const char *p = format; *p; p++) {
@@ -269,13 +255,9 @@ int sd_journal_print(int priority, const char *format, ...) {
 
 int sd_journal_printv_with_location(
                 int priority, const char *file, const char *line, const char *func, const char *format, va_list ap) {
-        /* CODE_FILE=/CODE_LINE=/CODE_FUNC= are forwarded to sd_journal_sendv()
-         * and dropped there (not transportable); this file never special-
-         * cases them, which keeps the no-location and with-location paths
-         * byte-identical apart from those three extra iovs. Reimplemented
-         * rather than delegating to sd_journal_printv(), since that function
-         * builds exactly two iovs and calling sd_journal_sendv() is the only
-         * shared choke point both paths actually need. */
+        /* CODE_FILE=/CODE_LINE=/CODE_FUNC= are passed to sd_journal_sendv(),
+         * which drops them. Not delegated to sd_journal_printv() because that
+         * builds exactly two iovs. */
         char stackbuf[8192];
         char *buf = stackbuf;
         size_t bufsize = sizeof(stackbuf);
@@ -362,11 +344,9 @@ int sd_journal_print_with_location(
 }
 
 /* Formats one sd_journal_send()/_with_location() field, appending it as a
- * malloc'd iovec entry. `format`'s own conversions are then consumed off
- * `*ap` via advance_va() so the caller's va_list is correctly positioned at
- * the next format-string argument. Returns 0, or a negative error (freeing
- * nothing itself -- the caller owns the whole batch and frees it on any
- * failure). */
+ * malloc'd iovec entry, then consumes `format`'s arguments off `*ap` via
+ * advance_va(). Returns 0 or a negative error; the caller frees the batch on
+ * failure. */
 static int send_one_field(const char *format, va_list *ap, struct iovec *iov, size_t *n) {
         va_list copy;
         char *s;
@@ -398,16 +378,13 @@ static void free_iov_strings(struct iovec *iov, size_t n_reserved, size_t n) {
 
 /* Shared by sd_journal_send() and sd_journal_send_with_location(): scans
  * format,args,format,args,...,NULL starting at iov[n_reserved] (the caller
- * has already filled in any location iovs below that index), then makes
- * the one real sd_journal_sendv() call and frees the strings this function
- * itself allocated -- never the caller's reserved (borrowed) location
- * pointers. `ap` must already be va_start()ed by the caller, who also owns
- * the matching va_end().
+ * fills the location iovs below that), calls sd_journal_sendv() and frees
+ * the strings allocated here, not the caller's borrowed location pointers.
+ * `ap` must already be va_start()ed; the caller owns the va_end().
  *
  * Takes va_list* rather than va_list: where va_list is an array type
- * (x86-64), a by-value parameter decays to a pointer, so &ap yields the
- * wrong type -- an error under -Werror there while building fine on
- * aarch64, where va_list is a struct. */
+ * (x86-64) a by-value parameter decays to a pointer, so &ap has the wrong
+ * type. */
 static int scan_fields_and_send(
                 struct iovec *iov, size_t cap, size_t n_reserved, const char *format, va_list *ap) {
         size_t n = n_reserved;
@@ -437,7 +414,7 @@ static int scan_fields_and_send(
 
 int sd_journal_send_with_location(const char *file, const char *line, const char *func, const char *format, ...) {
         va_list ap;
-        struct iovec iov[64]; /* upstream has no fixed cap either; this is a generous, documented one for pico */
+        struct iovec iov[64]; /* fixed cap on fields per call */
         char funcbuf[256];
         int rc;
 

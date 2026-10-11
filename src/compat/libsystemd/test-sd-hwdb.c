@@ -33,7 +33,7 @@ int main(void) {
         ASSERT_TRUE(sd_hwdb_ref(NULL) == NULL);
         ASSERT_TRUE(sd_hwdb_unref(NULL) == NULL);
 
-        /* The FOREACH macro's loop body must simply never run. */
+        /* The FOREACH macro's loop body must never run. */
         {
                 const char *key, *value;
                 int ran = 0;

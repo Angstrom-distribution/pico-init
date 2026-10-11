@@ -14,7 +14,7 @@
  *
  * READY=1 from a Type=notify service's main pid completes its start
  * (service_notify_ready(), service.c); for every other type it is a flag
- * picoctl reports. Still deliberately unbuilt: NotifyAccess= (the sender
+ * picoctl reports. Not implemented: NotifyAccess= (the sender
  * check is fixed at upstream's =main default), STOPPING=1 as a stop path,
  * RELOADING=1 (no reload machinery exists to drive), the watchdog keys.
  */

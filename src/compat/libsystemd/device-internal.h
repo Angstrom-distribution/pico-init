@@ -179,7 +179,7 @@ struct sd_device_enumerator {
         char **match_parent; /* syspaths */
         size_t n_match_parent;
 
-        bool allow_uninitialized; /* true_noop: stored, changes nothing */
+        bool allow_uninitialized; /* stored, changes nothing */
         bool all_parents;
 
         /* --- scan result --- */
@@ -206,8 +206,7 @@ struct sd_device_monitor {
         char *description;
 
         /* Every filter is evaluated in userspace inside
-         * sd_device_monitor_receive() -- see device-monitor.c's top
-         * comment for why there is no kernel BPF program to install. */
+         * sd_device_monitor_receive(). */
         DeviceMonitorSubsystemDevtype *subsystem_devtype;
         size_t n_subsystem_devtype;
 
@@ -227,8 +226,7 @@ struct sd_device_monitor {
  * Shared /sys root, "/sys" in production. Every constructor and the
  * enumerator's bus/class walk goes through this rather than a literal
  * "/sys", so tests can point it at a fixture tree without root and without
- * touching the host's real /sys. Test-only: production code never calls the
- * setter.
+ * touching the host's real /sys. Test-only.
  */
 const char *device_sys_root(void);
 void device_set_sys_root_for_tests(const char *root);
@@ -243,16 +241,13 @@ sd_device *device_new_bare(void); /* zeroed, n_ref = 1, everything else unset; N
 
 /*
  * A monitor-received device (device-monitor.c), built with no filesystem
- * access at all: a "remove" event's device is routinely already gone from
- * /sys by the time a consumer gets around to reading the message (verified
- * against a real kernel: the sysfs directory disappears very shortly after
- * the broadcast), so requiring it to still exist -- what
- * device_new_from_syspath_internal() does -- would make exactly the most
- * important event type spuriously undeliverable. `devpath` is the kernel-
- * relative path from the message header ("/devices/..."); the syspath is
- * synthesized as sys_root + devpath. Every getter still works honestly:
- * one that touches disk (get_driver(), a sysattr read) just gets -ENOENT
- * for a device that is really gone, which is the true answer.
+ * access: a "remove" event's device is usually already gone from /sys when
+ * the message is read, so requiring it to exist, as
+ * device_new_from_syspath_internal() does, would make remove events
+ * undeliverable. `devpath` is the kernel-relative path from the message
+ * header ("/devices/..."); the syspath is sys_root + devpath. Getters that
+ * touch disk (get_driver(), a sysattr read) return -ENOENT for a device
+ * that is gone.
  */
 int device_new_from_devpath_bare(sd_device **ret, const char *devpath);
 
@@ -299,8 +294,7 @@ const char *device_get_property_raw(sd_device *d, const char *key);
 const char *device_action_to_string(sd_device_action_t a);
 sd_device_action_t device_action_from_string(const char *s);
 
-/* Minimal sd_id128_t <-> RFC 4122 36-char string, since pico-init has no
- * sd-id128 shim yet to borrow this from (see sd-device.h's stand-in typedef). */
+/* sd_id128_t <-> RFC 4122 36-char string. */
 void device_id128_to_uuid_string(sd_id128_t id, char s[37]);
 int device_id128_from_uuid_string(const char *s, sd_id128_t *ret); /* 0 or -EINVAL */
 
@@ -327,12 +321,8 @@ void device_set_dev_root_for_tests(const char *root);
 
 /* --- device-monitor.c --- */
 
-/*
- * True when `dev` passes every filter installed on `m`. Exposed so tests
- * can exercise the matching logic directly against a fixture device, the
- * same way netd-sntp.c's pure netd_sntp_validate() is tested without a
- * real socket.
- */
+/* True when `dev` passes every filter installed on `m`. Exposed so tests
+ * can exercise the matching logic against a fixture device without a socket. */
 bool device_monitor_filter_matches(sd_device_monitor *m, sd_device *dev);
 
 /* --- shared path-safety helper (device-new.c) --- */

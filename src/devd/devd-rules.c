@@ -18,8 +18,8 @@
 
 #include "../util.h"
 
-/* Growth steps. Small, because the real file's 420 rules is the working size
- * and doubling from here reaches it in a handful of reallocs. */
+/* Growth steps. Small, so a file of a few hundred rules is reached in a
+ * handful of reallocs. */
 #define DEVD_RULES_ARENA_INITIAL 1024
 #define DEVD_RULES_TABLE_INITIAL 64
 
@@ -35,11 +35,9 @@
 /*
  * How many skipped rules get their own log line before the summary takes over.
  *
- * "Skipped whole and logged once" is per rule, and on the files this project
- * actually ships that means exactly one line -- the gsmmodem PROGRAM= rule. The
- * cap is for the day someone drops systemd's own rules directory onto an image:
- * several hundred WARNING lines on a serial console at boot is not a diagnostic
- * any more, and the count still comes out in the summary.
+ * Skipping is logged per rule; the cap keeps a large foreign rules directory
+ * from flooding the console with warnings at boot. The count still comes out
+ * in the summary.
  */
 #define DEVD_RULES_SKIP_LOG_MAX 16
 
@@ -47,9 +45,8 @@
 #define DEVD_RULE_GOTO_PENDING (-2)
 
 /*
- * Which operators each key takes. Named rather than spelled out per row, both
- * to keep the table below readable and because the sets themselves are the
- * interesting part -- two of them encode a decision:
+ * Which operators each key takes. Named rather than spelled out per row, to
+ * keep the table readable. Two of the sets matter:
  *
  *  - ATTR has no assignment form. ATTR{}= writes to sysfs upstream, which devd
  *    does not do, so a rule using it is skipped whole rather than quietly read
@@ -144,12 +141,10 @@ static int arena_grow(DevdRuleSet *rs, size_t need) {
 /*
  * Intern one string, reusing an identical one already in the arena.
  *
- * Linear, and deliberately so: the arena is a few kilobytes even for the real
- * usb-modeswitch file, this runs once at daemon start, and the payoff is large
- * enough to be the reason the arena exists at all -- that file's 415 identical
- * RUN values, and every repeated `idVendor`/`idProduct` attribute name, become
- * one copy each. Equal strings also become equal offsets, which is what lets
- * GOTO resolution compare labels as integers.
+ * The lookup is linear: it runs once at daemon start and the arena is a few
+ * kilobytes. Repeated values (identical RUN strings, `idVendor`/`idProduct`
+ * names) become one copy each. Equal strings also become equal offsets, which
+ * lets GOTO resolution compare labels as integers.
  */
 static int arena_intern(DevdRuleSet *rs, const char *s, size_t len, uint32_t *ret) {
         size_t off;
@@ -398,10 +393,9 @@ typedef struct RawClause {
  * Parse one clause out of *pos, advancing it. Returns 1 on a clause, 0 at the
  * end of the line, or -EINVAL on something this cannot make sense of.
  *
- * Leading commas and whitespace are consumed before anything else, which is
- * exactly what makes the real file's one stray double comma
- * (`SUBSYSTEM!="usb", ACTION!="add",, GOTO="..."`) a non-event here rather than
- * a special case: an empty clause is not a clause, it is separator noise.
+ * Leading commas and whitespace are consumed first, so a stray double comma
+ * (`SUBSYSTEM!="usb", ACTION!="add",, GOTO="..."`) is separator noise rather
+ * than a special case.
  */
 static int clause_parse(const char **pos, RawClause *ret) {
         const char *p = *pos, *start;

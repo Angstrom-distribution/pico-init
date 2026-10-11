@@ -2,7 +2,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * sd_network_monitor's real inotify watch, including the two-level
+ * sd_network_monitor's inotify watch, including the two-level
  * upward re-arm: started against a scratch root where none of
  * run/netd/leases exists yet, it has to fall back to watching "run"
  * itself, then climb back down to the real leases directory as netd

@@ -111,7 +111,7 @@ static void reap_sleeper(pid_t pid) {
 
 /*
  * The target case: a running service's file changes on disk, SIGHUP
- * arrives, and every directive now reads the new value -- on the same Unit
+ * arrives, and every directive reads the new value -- on the same Unit
  * object, still RUNNING, with the same main pid, and that pid still alive
  * and never signalled.
  */
@@ -352,7 +352,7 @@ static void test_reload_leaves_dependency_edges(void) {
         ASSERT_EQ_INT(b->n_dependencies[UNIT_BEFORE], 1);
         ASSERT_TRUE(unit_has_dependency(b, UNIT_BEFORE, a));
 
-        /* c.service is now a known unit (the full-reload fragment rescan),
+        /* c.service is a known unit (the full-reload fragment rescan),
          * but a's own After=c.service edge was never added -- unrelated to
          * whether c.service itself got loaded. */
         {

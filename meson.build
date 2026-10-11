@@ -13,20 +13,14 @@ project(
   meson_version: '>= 0.62.0',
 )
 
-# The version PID 1 announces on the console. Two halves, mirroring systemd's
-# own PROJECT_VERSION/GIT_VERSION pair -- see status.h for what each is for.
-#
-# A -D rather than a second generated header: vcs_tag() substitutes exactly one
-# placeholder, so carrying the project version through it too would mean
-# chaining a configure_file() into it for what one compiler flag does.
+# The version PID 1 announces on the console, in two halves mirroring systemd's
+# PROJECT_VERSION/GIT_VERSION pair (see status.h). A -D because vcs_tag()
+# substitutes only one placeholder.
 add_project_arguments('-DPICO_INIT_VERSION="' + meson.project_version() + '"', language: 'c')
 
-# vcs_tag() runs `git describe` at BUILD time rather than configure time, so a
-# rebuild after a commit reports the new hash without anyone re-running meson.
-#
-# The fallback is not decoration: an OE build compiles whatever the fetcher
-# unpacked, which may be an exported tree with no .git in it at all, and a
-# board that says "unknown" is telling the truth about what it was built from.
+# vcs_tag() runs `git describe` at build time, so a rebuild after a commit
+# reports the new hash without re-running meson. The fallback covers exported
+# trees without a .git.
 version_h = vcs_tag(
   command: ['git', 'describe', '--always', '--dirty', '--tags'],
   fallback: 'unknown',
@@ -34,18 +28,12 @@ version_h = vcs_tag(
   output: 'version.h',
 )
 
-# sd-event.c/sd-event-source.c, hoisted into their own tiny static library
-# ahead of pico_init_core: PID 1's own manager (manager.c/manager-loop.c)
-# embeds an sd_event as its main loop and needs just these objects, not the
-# rest of libsystemd-compat (sd-bus, sd-device, ...), and vice versa
-# libsystemd-compat must not depend on pico-init-core. sd-daemon.c rides
-# along too, purely as a link dependency: sd_event_set_watchdog() calls its
-# real sd_watchdog_enabled() env parser, and pulling in the .o that defines
-# it means every consumer of this small library must resolve that symbol
-# too, whether or not it ever calls the watchdog path. The full
-# libsystemd_compat static library below link_wholes this back in rather
-# than listing these three files directly among its own sources, so the
-# libsystemd.so built from it still carries every symbol it always did.
+# sd-event.c/sd-event-source.c in their own static library ahead of
+# pico_init_core: PID 1's manager embeds an sd_event as its main loop and needs
+# only these objects, and libsystemd-compat must not depend on pico-init-core.
+# sd-daemon.c rides along because sd_event_set_watchdog() calls
+# sd_watchdog_enabled(). libsystemd_compat link_wholes this library back in, so
+# libsystemd.so still carries every symbol.
 libsystemd_compat_includes = include_directories('src/compat/libsystemd')
 
 sd_event_lib = static_library(
@@ -58,18 +46,12 @@ sd_event_lib = static_library(
   include_directories: libsystemd_compat_includes,
 )
 
-# sd-id128.c hoisted the same way, for the same reason: machine-id-setup.c
-# (pico_init_core) needs sd_id128_randomize()/sd_id128_to_string() and
-# id128_read_fd(), not the rest of libsystemd-compat (sd-bus, sd-journal,
-# ...), and vice versa libsystemd_compat must not depend on pico-init-core.
-# sha256.c/hmac-sha256.c ride along because they are sd-id128.c's own
-# -- sd_id128_get_app_specific()'s HMAC -- not a separate public API.
-# -Wno-error=nonnull-compare: sd-id128.c's char s[_SD_ARRAY_STATIC N]
-# parameters are real systemd's own upstream signature (_sd-common.h), and
-# the defensive `if (!s) return NULL;` alongside them is real systemd's own
-# style too -- GCC's nonnull-compare treats the [static N] bound as an
-# implicit nonnull contract and flags the very check that guards against a
-# caller violating it. Real behavior, not a bug; scoped to this one warning.
+# sd-id128.c split out the same way: machine-id-setup.c (pico_init_core) needs
+# sd_id128_randomize()/sd_id128_to_string() and id128_read_fd().
+# sha256.c/hmac-sha256.c are sd_id128_get_app_specific()'s HMAC.
+# -Wno-error=nonnull-compare: upstream's char s[_SD_ARRAY_STATIC N] signatures
+# (_sd-common.h) make GCC treat s as nonnull and flag upstream's own
+# `if (!s) return NULL;` guard.
 sd_id128_lib = static_library(
   'sd-id128',
   files(
@@ -98,13 +80,11 @@ pico_init_core_sources = files(
   # sequence, and the signal manager-startup.c gates preset application on).
   'src/machine-id-setup.c',
   # The GPT reader and the Discoverable-Partitions swap activation on top of
-  # it (plans/31, Slice A). In the core library rather than beside main.c
-  # because the parser half is meant to have a second consumer later.
+  # it. The parser half is also used by devd.
   'src/gpt-scan.c',
-  # The ext superblock reader (plan §10). Here rather than under src/devd/
-  # because it has two consumers that are two different binaries: devd names a
-  # removable partition from it, and PID 1's root check gates a filesystem
-  # checker on it.
+  # The ext superblock reader. Here rather than under src/devd/ because both
+  # devd (naming a removable partition) and PID 1's root check (gating a
+  # filesystem checker) use it.
   'src/ext-super.c',
   # Filesystem identity (UUID/LABEL) the way blkid reports it, one narrow
   # reader per on-disk format, for resolving fstab's UUID=/LABEL= sources.
@@ -115,9 +95,8 @@ pico_init_core_sources = files(
   'src/fsid-xfs.c',
   'src/fsid-btrfs.c',
   'src/fsid-ntfs.c',
-  # The root filesystem check and the remount that ends it (plan §10, R1).
-  # Beside gpt-scan.c for the same reason: it is boot-path code main.c calls
-  # once, and the two decision tables inside it are what the tests link.
+  # The root filesystem check and the remount that ends it; the two decision
+  # tables inside it are what the tests link.
   'src/root-check.c',
   # /etc/fstab: the parser, option table and outcome record, kept apart from
   # the half that mounts so the decisions can be tested as values.
@@ -132,45 +111,41 @@ pico_init_core_sources = files(
   # /dev/ubi_ctrl, for fstab's ubifs lines when UBI is a module.
   'src/ubi-attach.c',
   'src/unit.c',
-  # Template/instance name parsing (G2), split out of unit.c because it
-  # needs nothing from Unit itself -- unit.c calls into it, not vice versa.
+  # Template/instance name parsing, split out of unit.c because it needs
+  # nothing from Unit itself.
   'src/unit-name.c',
-  # %x-specifier substitution engine (G2): knows nothing about Unit, so it
-  # is its own file rather than folded into unit.c, mirroring v30's split.
+  # %x-specifier substitution engine; knows nothing about Unit.
   'src/specifier.c',
   'src/unit-load.c',
   'src/conf-scan.c',
   'src/unit-parse.c',
-  # daemon-reload (SIGHUP or the picoctl ctrl verb): re-parse each loaded fragment into a scratch
-  # unit, swap the directive values in only if it parsed cleanly.
+  # daemon-reload (SIGHUP or the picoctl ctrl verb): re-parse each loaded
+  # fragment into a scratch unit, swap the directive values in only if it
+  # parsed cleanly.
   'src/unit-reload.c',
   'src/unit-dependency.c',
   'src/unit-enable.c',
   'src/service.c',
   'src/service-exec.c',
   'src/target.c',
-  # Socket units (plan §1.6): a third unit type extending this same core,
-  # not a separate daemon.
+  # Socket units.
   'src/socket.c',
   'src/job.c',
-  # PID 1's own runtime state publisher, control socket, and sd_notify()
-  # listener (plan §1.7). All three are wired into unit.c/job.c/
-  # manager-loop.c/service-exec.c already; see their headers for why the
-  # hooks live at those choke points.
+  # PID 1's runtime state publisher, control socket, and sd_notify()
+  # listener.
   'src/manager-state.c',
   'src/manager-ctrl.c',
   'src/manager-notify.c',
-  # PID 1's hardware watchdog feeder. The per-service software watchdog
-  # (WatchdogSec=/Type=notify) is separate, deferred scope -- see
-  # manager-watchdog.h.
+  # PID 1's hardware watchdog feeder; the per-service software watchdog
+  # (WatchdogSec=) is not implemented, see manager-watchdog.h.
   'src/manager-watchdog.c',
   'src/cgroups-v2.c',
   'src/timer.c',
   'src/signal.c',
   'src/util.c',
   'src/compat.c',
-  # The boot console channel and the os-release lookup behind its greeting
-  # (plan §1.8). Separate from util.c's logging on purpose; status.h says why.
+  # The boot console channel and the os-release lookup behind its greeting.
+  # Separate from util.c's logging; see status.h.
   'src/status.c',
   'src/os-release.c',
 )
@@ -185,11 +160,9 @@ pico_init_core = static_library(
   link_with: [sd_event_lib, sd_id128_lib],
 )
 
-# link_whole, not link_with: a static library only contributes the object
-# files something references, which would silently drop any translation unit
-# PID 1 has not wired up yet (service-exec.c, compat.c) and make the M0
-# symbol-presence test below pass by omission. The binary should contain the
-# init it claims to be.
+# link_whole, not link_with: a static library only contributes referenced
+# objects, which would drop unreferenced translation units and make the
+# symbol-presence test below pass by omission.
 pico_init_exe = executable(
   'pico-init',
   'src/main.c',
@@ -200,8 +173,8 @@ pico_init_exe = executable(
   install_dir: get_option('sbindir'),
 )
 
-# M0 acceptance: the binary links, runs, exits 0 when not PID 1, and every
-# public symbol from src/*.h is present in the linked binary.
+# The binary links, runs, exits 0 when not PID 1, and every public symbol from
+# src/*.h is present in it.
 test(
   'm0-link-and-symbols',
   find_program('src/test-m0.sh'),
@@ -211,10 +184,7 @@ test(
 # Shared test scaffolding: temp unit trees, fixture writing, assertions.
 pico_test_sources = files('src/test-util.c')
 
-# Each entry becomes a test program linked against the core library. Every
-# milestone's test is registered here up front, placeholder or not, so that
-# adding one never means editing this file while another milestone is also
-# editing it.
+# Each entry becomes a test program linked against the core library.
 pico_tests = [
   'test-unit-dependency',
   'test-unit-name',
@@ -223,8 +193,7 @@ pico_tests = [
   'test-job',
   'test-boot-root',
   # First-boot detection and the /etc/machine-id fallback (read-only /etc,
-  # inside a private mount namespace), beside the manager-startup.c tests
-  # whose first-boot gating this feeds.
+  # inside a private mount namespace).
   'test-machine-id-setup',
   # /etc/timestamp parsing, the forward-only decision and the atomic save.
   'test-clock-persist',
@@ -234,17 +203,14 @@ pico_tests = [
   # Controller enabling, child-cgroup removal and stale-cgroup reset behind Delegate=.
   'test-cgroup-delegate',
   'test-boot',
-  # Socket activation (plan §1.6) and picoctl (plan §1.7), registered up
-  # front and placeholder-bodied for exactly the reason above.
   'test-socket',
   'test-manager-state',
   'test-picoctl',
   'test-manager-ctrl',
-  # The sd_notify() listener (plan §1.7 follow-on): attribution, key
-  # handling, env injection/scrub, teardown, and the not-fatal-to-boot policy.
+  # The sd_notify() listener: attribution, key handling, env injection/scrub,
+  # teardown, and the not-fatal-to-boot policy.
   'test-manager-notify',
-  # D0's five /dev symlinks (plan §1.8), and the fixture-driven unit-file
-  # parser test the §7 unit-test item asks for.
+  # The five /dev symlinks, and the fixture-driven unit-file parser.
   'test-dev-setup',
   'test-unit-parse',
   # SIGHUP reload: new directive values land, a bad or vanished file and a
@@ -253,11 +219,9 @@ pico_tests = [
   # The boot console channel: the os-release parser behind the greeting, and
   # the byte-level shape of what lands on the console.
   'test-status',
-  # The GPT reader (plans/31, Slice A), against real partition tables built
-  # byte by byte in the test itself.
+  # The GPT reader, against partition tables built byte by byte in the test.
   'test-gpt-scan',
-  # The ext superblock reader, moved here with the code it covers when that
-  # code left src/devd/ to gain its second consumer (plan §10).
+  # The ext superblock reader.
   'test-ext-super',
   # The shared half of the identity readers, and the dispatcher.
   'test-fsid',
@@ -271,8 +235,8 @@ pico_tests = [
   # The readers against real mkfs images, compared with blkid; SKIPs
   # without blkid, and skips each format whose mkfs is not installed.
   'test-fsid-real',
-  # The root check's two decision tables (plan §10, R1). The I/O half of it
-  # remounts "/" and is proven by a boot instead.
+  # The root check's two decision tables. The I/O half remounts "/" and is
+  # covered by booting instead.
   'test-root-check',
   # The fstab grammar, option routing, mount order and outcome record.
   'test-fstab',
@@ -299,12 +263,9 @@ pico_tests = [
   'test-manager-shutdown',
 ]
 
-# manager.h now pulls in sd-event.h, so every test that reaches it
-# (transitively, through manager.h/socket.h/cgroups-v2.h) needs
-# libsystemd_compat_includes on its own compile line too -- a quoted
-# #include inside manager.h resolves against manager.h's own directory
-# first, then the including translation unit's search path, never
-# pico_init_core's.
+# manager.h includes sd-event.h, so every test that reaches it (through
+# manager.h/socket.h/cgroups-v2.h) needs libsystemd_compat_includes on its own
+# compile line: include paths of pico_init_core do not propagate.
 foreach t : pico_tests
   exe = executable(
     t,
@@ -315,19 +276,18 @@ foreach t : pico_tests
   test(t, exe)
 endforeach
 
-# pico-color's own test: like test-netctl-rtnl/test-netctl-path below, built
-# from only the one file it tests -- no link to pico_init_core, so a bug
-# there can never be masked by (or blamed on) the rest of PID 1.
+# Built from only the file under test, like test-netctl-rtnl/-path below, so
+# no other code can mask or cause a failure.
 test_pico_color_exe = executable(
   'test-pico-color',
   ['src/test-pico-color.c', 'src/pico-color.c'] + pico_test_sources,
 )
 test('test-pico-color', test_pico_color_exe)
 
-# pico-unit-lint -- PID 1's own unit parser run over an installed unit tree
-# at build time, printing the degradation record each unit would carry in
-# `picoctl show`. It links pico-init-core so the verdict cannot drift from
-# the boot-time one. bindir, not sbindir: it is a check, not an init tool.
+# pico-unit-lint -- PID 1's unit parser run over an installed unit tree at
+# build time, printing the degradation record each unit would carry in
+# `picoctl show`. It links pico-init-core so the verdict matches the boot-time
+# one. bindir: it is a check, not an init tool.
 pico_unit_lint_exe = executable(
   'pico-unit-lint',
   'src/pico-unit-lint.c',
@@ -345,29 +305,18 @@ test(
 )
 
 # ---------------------------------------------------------------------------
-# netd -- the network daemon (plan §2). A second executable in the same tree,
-# built exactly like PID 1: one static library the tests link, one installed
-# binary. It lives here rather than in its own repo because the recipe already
-# fetches this one, and because one build means one test harness and one REUSE
-# tree.
-#
-# netd does not reimplement PID 1's event plumbing: it links timer.c, signal.c
-# and util.c out of pico-init-core, so the loop in src/netd/netd-loop.c is a
-# thin epoll wrapper over already-tested code rather than a second
-# implementation of the same thing.
+# netd -- the network daemon. Built like PID 1: one static library the tests
+# link, one installed binary. It links timer.c, signal.c and util.c out of
+# pico-init-core rather than reimplementing the event plumbing.
 # ---------------------------------------------------------------------------
 
 # 'src/netd' only, so the lifted files under src/netd/dhcp/ can say
 # "netd-compat.h" without a relative path.
 #
-# 'src' is deliberately NOT here, and that is not a style preference. GCC
-# searches -I directories for angle-bracket includes too, so putting src/ on
-# the include path makes netd's own `#include <signal.h>` resolve to this
-# project's src/signal.h -- which documents that it never includes the libc
-# header, and so hides SIGTERM from every netd translation unit. netd reaches
-# the shared code as "../util.h" / "../timer.h" / "../signal.h" instead, which
-# is explicit about crossing out of netd into the PID 1 core and cannot shadow
-# a system header.
+# 'src' must not be here: GCC searches -I directories for angle-bracket
+# includes too, so netd's `#include <signal.h>` would resolve to src/signal.h,
+# which never includes the libc header and so hides SIGTERM. netd reaches the
+# shared code as "../util.h" etc. instead.
 netd_includes = include_directories('src/netd')
 
 # netd's own code: GPL-2.0-or-later, like the rest of the project.
@@ -396,9 +345,6 @@ netd_own_sources = files(
 # name, so the quarry provenance stays legible; the combined netd binary is
 # GPL-2.0-or-later as a whole, the permitted linking direction.
 #
-# Placeholders at N0, and registered now on purpose: it means N2 and N3 add
-# code to files that already exist and are already built, instead of editing
-# this file while another milestone is also editing it.
 netd_dhcp_sources = files(
   'src/netd/dhcp/dhcp-message.c',
   'src/netd/dhcp/dhcp-protocol.c',
@@ -411,13 +357,11 @@ netd_dhcp_sources = files(
   'src/netd/dhcp/dhcp-server-request.c',
   'src/netd/dhcp/dhcp-server-send.c',
   'src/netd/dhcp/dhcp-server-lease.c',
-  # tlv-util is not optional: struct sd_dhcp_message embeds a TLV by value, so
-  # dhcp-message.c cannot compile without it. Missing from the plan's quarry
-  # table; found by the quarry-history review.
+  # struct sd_dhcp_message embeds a TLV by value, so dhcp-message.c cannot
+  # compile without tlv-util.
   'src/netd/dhcp/tlv-util.c',
-  # The flat-string DNS name subset. Options 12 and 15 still route through it
-  # even with 81/162/119 dropped, so dns-domain.c does not disappear entirely
-  # the way the plan assumed -- only its RFC 3397 compression decoder does.
+  # The flat-string DNS name subset, still needed by options 12 and 15. The
+  # RFC 3397 compression decoder (option 119) is not carried.
   'src/netd/dhcp/dns-name.c',
   # Third-party support, carried near-verbatim with its own licence:
   # siphash24.{c,h} is CC0-1.0. sparse-endian.h (MIT, Josh Triplett) and
@@ -431,10 +375,9 @@ netd_core = static_library(
   include_directories: netd_includes,
 )
 
-# link_whole for netd's own objects, for the reason spelled out above
-# pico-init-core; link_with for pico-init-core itself, which then contributes
-# only the shared util/timer/signal objects netd actually references and none
-# of PID 1.
+# link_whole for netd's own objects, as for pico-init-core above; link_with
+# for pico-init-core, which then contributes only the util/timer/signal objects
+# netd references.
 netd_exe = executable(
   'netd',
   'src/netd/netd.c',
@@ -445,14 +388,11 @@ netd_exe = executable(
   install_dir: get_option('sbindir'),
 )
 
-# networkctl -- a client for netd, not a second copy of it (see netctl.c's own
-# header). bindir, not sbindir: reading network status is not a privileged
-# operation, matching picolog's own reasoning; aliased as "networkctl" by the
-# recipe's ALTERNATIVE, same mechanism as picoctl -> systemctl. No link to
-# netd_core or pico_init_core at all -- it talks to the kernel directly
-# (sysfs + getifaddrs(3) + its own netctl-rtnl.c rtnetlink client, built from
-# netd-rtnl-core.c only, and its own netctl-path.c ID_PATH walk) and to netd's
-# pid only via SIGHUP, not through any of netd's own internals.
+# netctl, the networkctl equivalent: a client for netd (see netctl.c). bindir,
+# like picolog: reading network status is not privileged. It links neither
+# netd_core nor pico_init_core; it uses sysfs, getifaddrs(3), its own rtnetlink
+# client (netctl-rtnl.c over netd-rtnl-core.c) and ID_PATH walk (netctl-path.c),
+# and signals netd's pid with SIGHUP.
 netctl_exe = executable(
   'netctl',
   [
@@ -471,29 +411,17 @@ netctl_exe = executable(
   install_dir: get_option('bindir'),
 )
 
-# netd's own units (plan §2.7): $prefix/lib/systemd/system, not
-# $prefix/lib64 -- systemd's own convention for unit files even on a
-# multilib install, and the path meta-angstrom's recipe's FILES:netd already
-# expects (${nonarch_libdir}/systemd/system).
+# $prefix/lib/systemd/system, not lib64: systemd's convention for unit files
+# even on a multilib install.
 install_data(
   'src/netd/netd.service',
   'src/netd/network.target',
   install_dir: get_option('prefix') / 'lib' / 'systemd' / 'system',
 )
 
-# All of netd's tests, registered up front and placeholder-bodied, for exactly
-# the reason the PID 1 list above gives: N1 through N4 are independent of each
-# other, and none of them should have to touch this file.
-#
-# test-netd-codec is a fifth program where the plan (section 2.8) named four,
-# and the split is deliberate. That section asks for golden-byte codec tests
-# "so client and server can't silently share a mirrored wire-format bug", and
-# folding them into test-netd-dhcp would put the codec, the client and the
-# server in one file owned by three different implementers working in
-# parallel -- the precise file-collision shape the previous milestone's
-# retrospective asked to design out. test-netd-codec covers the wire format
-# against fixed bytes; test-netd-dhcp stays the end-to-end client-vs-server
-# pairing over a veth pair.
+# test-netd-codec checks the wire format against fixed golden bytes, so client
+# and server cannot silently share a mirrored encoding bug; test-netd-dhcp
+# drives the server end to end against a scripted client over a veth pair.
 netd_tests = [
   'test-netd-network',
   'test-netd-rtnl',
@@ -501,8 +429,8 @@ netd_tests = [
   'test-netd-dhcp',
   'test-netd-sntp',
   # Persistent-MAC generation for a random-hardware-address link
-  # (netd-link.c's link_apply_persistent_mac()) -- fixed siphash24 vectors
-  # against the documented upstream key, plus the exemption cases
+  # (netd_persistent_mac_derive() in netd-link.c): fixed siphash24 vectors
+  # against the hash key from systemd's netif-util.c, plus the exemption cases
   # (loopback, already up, NET_ADDR_PERM/SET/STOLEN, all-zero machine id).
   'test-netd-mac',
   # LLDP frame parser and builder: real frames, rejection rules, mutation run.
@@ -559,21 +487,16 @@ test_netctl_color_exe = executable(
 test('test-netctl-color', test_netctl_color_exe)
 
 # ---------------------------------------------------------------------------
-# devd -- the device hotplug daemon (plans/31, Part 2, milestone H1). A third
-# executable in the same tree, built exactly like netd, and a separate daemon
-# rather than PID 1 code by owner decision: its crash costs a unit restart
-# rather than the machine.
+# devd -- the device hotplug daemon. Built like netd, and a separate daemon
+# rather than PID 1 code so that a crash costs a unit restart, not the machine.
 #
-# It links pico-init-core for two different reasons at once. The event plumbing
-# (timer.c, signal.c, util.c) is the same share netd takes. gpt-scan.c and
-# ext-super.c are the other, and are the whole point of those files' two-consumer
-# split: PID 1's boot-time swap activation and devd's removable-media policy read
-# the same partition table through the same parser, and PID 1's root check and
-# devd's by-uuid/by-label naming read the same ext superblock through the same
-# decoder.
+# It links pico-init-core for the event plumbing (timer.c, signal.c, util.c)
+# and for gpt-scan.c and ext-super.c, which it shares with PID 1: boot-time swap
+# activation and removable-media policy read partition tables through one
+# parser, and the root check and by-uuid/by-label naming read ext superblocks
+# through one decoder.
 #
-# 'src/devd' only on the include path, never 'src' -- see netd_includes above
-# for what putting src/ there does to a daemon's own <signal.h>.
+# 'src/devd' only on the include path, never 'src'; see netd_includes above.
 # ---------------------------------------------------------------------------
 devd_includes = include_directories('src/devd')
 
@@ -584,10 +507,8 @@ devd_core_sources = files(
   'src/devd/devd-probe.c',
   'src/devd/devd-symlink.c',
   'src/devd/devd-media.c',
-  # H2, the rule engine: the parser, what a rule means, and the RUN+= child.
-  # Three files rather than one because they are three different kinds of
-  # code -- a tokenizer, a matcher that reads sysfs, and a fork/exec -- and
-  # each has its own test program.
+  # The rule engine: tokenizer, matcher (reads sysfs) and the RUN+= child
+  # (fork/exec), each with its own test program.
   'src/devd/devd-rules.c',
   'src/devd/devd-match.c',
   'src/devd/devd-run.c',
@@ -619,23 +540,19 @@ install_data(
   install_dir: get_option('prefix') / 'lib' / 'systemd' / 'system',
 )
 
-# devd's own rules file (H2), into the same directory usb-modeswitch-data's
-# already installs into -- /usr/lib/udev/rules.d under this distro's mandatory
-# usrmerge. Shipping a rules file rather than compiling the serial naming in is
-# the point: it is the same engine reading the same syntax as the vendor file
-# beside it.
+# devd's own rules file, installed beside usb-modeswitch-data's rules in
+# /usr/lib/udev/rules.d (usrmerge). Serial naming is a rules file rather than
+# compiled in, so it goes through the same engine as the vendor file.
 install_data(
   'src/devd/60-pico-serial.rules',
   install_dir: get_option('prefix') / 'lib' / 'udev' / 'rules.d',
 )
 
-# The four acceptance areas H1 is measured against: uevent parsing, the
-# debounce state machine, the GPT/ext4 field extraction, and the symlink
-# create/remove/reconcile lifecycle. H2 adds three: the rules tokenizer against
-# verbatim excerpts of the real shipped usb-modeswitch file, the matcher and
-# substitutions against a sysfs tree built in the test, and the async RUN+=
-# path end to end. Registered up front, same as netd's and PID 1's lists and
-# for the same reason.
+# Covered: uevent parsing, the debounce state machine, GPT/ext4 field
+# extraction, the symlink create/remove/reconcile lifecycle, the rules
+# tokenizer (against excerpts of the real usb-modeswitch rules file), the
+# matcher and substitutions (against a sysfs tree built in the test), and the
+# async RUN+= path.
 devd_tests = [
   'test-devd-uevent',
   'test-devd-block',
@@ -649,10 +566,8 @@ devd_tests = [
   'test-devd-udev-db',
 ]
 
-# PICO_SOURCE_DIR lets test-devd-match.c parse the very file meson installs
-# above, rather than a copy of its one rule pasted into the test. A rules file
-# that ships is only correct if the engine that ships with it reads it, and a
-# retyped copy could not catch an edit to one and not the other.
+# PICO_SOURCE_DIR lets test-devd-match.c parse the rules file that is
+# installed above rather than a copy of it.
 foreach t : devd_tests
   exe = executable(
     t,
@@ -666,11 +581,9 @@ endforeach
 
 # ---------------------------------------------------------------------------
 # pico-tmpfiles -- systemd-tmpfiles' --create, --clean and --remove over
-# tmpfiles.d (plans/38 §9.4). A fifth binary out of the same tree, a oneshot
-# rather than a daemon, and the thing that makes the tmpfiles.d snippets
-# oe-core packages already ship do something under pico-init. tmpfiles.h
-# lists exactly which line types are real and which are an explicit, logged
-# skip.
+# tmpfiles.d. A oneshot rather than a daemon; it makes the tmpfiles.d snippets
+# that oe-core packages ship take effect. tmpfiles.h lists which line types are
+# implemented and which are logged and skipped.
 #
 # It links pico-init-core for util.c's logging and os-release.c's reader
 # (behind the %o/%w/%A specifiers) and nothing else of PID 1. bindir, like
@@ -728,27 +641,22 @@ endforeach
 # picoctl is defined after logd below, because it links logd's ring reader.
 
 # ---------------------------------------------------------------------------
-# logd -- the log daemon, and picolog, its reader (plan §3).
+# logd -- the log daemon, and picolog, its reader.
 #
-# Same shape as netd: one static library the tests link, installed binaries
-# alongside. logd stores journald's documented plain-text EXPORT format in a
-# bounded /run ring; the binary on-disk journal format is deliberately NOT
-# built (plan §3.1), and full journalctl compatibility is reached off-device by
-# feeding `picolog -o export` to upstream's own systemd-journal-remote.
+# Same shape as netd. logd stores journald's plain-text export format in a
+# bounded /run ring; the binary journal format is not implemented. Full
+# journalctl compatibility is reached off-device by feeding `picolog -o export`
+# to upstream's systemd-journal-remote.
 #
-# No file here is lifted from upstream, so unlike src/netd/dhcp/ there is no
-# LGPL island: all of logd and picolog is GPL-2.0-or-later, this project's own
-# copyright, with upstream cited as a reference only.
+# Nothing here is lifted from upstream, so unlike src/netd/dhcp/ it is all
+# GPL-2.0-or-later.
 # ---------------------------------------------------------------------------
 logd_includes = include_directories('src/logd')
 
-# The ring reader (logd-read.c) is its own tiny static library, same shape
-# as sd_event_lib above: libsystemd-compat's sd-journal read side is built
-# on it and must not drag logd_core (whose writer/receiver need
-# pico_init_core's util.c) into every libsystemd consumer -- logd-read.c is
-# libc-only for exactly this reason. logd_core link_wholes it back in, so
-# picolog, picoctl and the logd tests keep seeing one archive with every
-# symbol it always had.
+# The ring reader (logd-read.c) is libc-only and its own static library: the
+# sd-journal read side of libsystemd-compat is built on it and must not pull
+# logd_core (whose writer/receiver need pico_init_core's util.c) into every
+# libsystemd consumer. logd_core link_wholes it back in.
 logd_read = static_library(
   'logd-read',
   files('src/logd/logd-read.c'),
@@ -795,8 +703,7 @@ picolog_exe = executable(
   install_dir: get_option('bindir'),
 )
 
-# logd's own units (plan §3.6). logd.socket is this distro's first real
-# .socket unit -- the concrete consumer socket activation exists for.
+# logd.socket makes logd socket-activated.
 install_data(
   'src/logd/logd.service',
   'src/logd/logd.socket',
@@ -821,22 +728,13 @@ foreach t : logd_tests
 endforeach
 
 # ---------------------------------------------------------------------------
-# picoctl -- the on-device systemctl equivalent (plan §1.7).
+# picoctl -- the on-device systemctl equivalent.
 #
-# It links pico-init-core rather than duplicating anything: the symlink verbs
-# (enable/disable/is-enabled/preset) operate on the very same .wants/ and
-# preset layouts unit-enable.c already reads at boot, so sharing that code is
-# what keeps the two halves from drifting apart and disagreeing about what
-# "enabled" means.
-#
-# It links logd-core too, for `picoctl status`'s per-unit log tail: that calls
-# logd_ring_read_filtered() directly rather than shelling out to picolog, which
-# is the whole reason the ring reader lives in its own translation unit instead
-# of inside picolog.c's main(). Defined here rather than next to the other
-# PID 1 targets because logd_core has to exist first.
-#
-# Installed to sbindir as part of the MAIN pico-init package, not a subpackage:
-# it is the init's own tool, not an optional daemon the way netd and logd are.
+# It links pico-init-core so that the enable/disable/is-enabled/preset verbs
+# share unit-enable.c with boot-time loading and cannot disagree about what
+# "enabled" means. It links logd-core for `picoctl status`'s per-unit log tail,
+# which calls logd_ring_read_filtered() directly. Defined after logd because
+# logd_core must exist first. Installed to sbindir: it is the init's own tool.
 # ---------------------------------------------------------------------------
 picoctl_exe = executable(
   'picoctl',
@@ -853,39 +751,20 @@ picoctl_exe = executable(
 )
 
 # ---------------------------------------------------------------------------
-# libsystemd-compat -- a from-scratch, ABI-compatible reimplementation of
-# real systemd's public libsystemd surface, for OE recipes that were built
-# assuming a real systemd is present. Lives under its own directory rather
-# than beside PID 1's own code because it is a library other packages link
-# against, not PID 1 code itself -- see sd-daemon.c's own header for why it
-# never calls into util.c/log.
+# libsystemd-compat -- an ABI-compatible reimplementation of real systemd's
+# public libsystemd surface, for recipes built assuming a real systemd. It is a
+# library other packages link against, so it lives apart from PID 1's code; see
+# sd-daemon.c for why it never calls into util.c.
 #
-# sd-daemon.h, sd-event.h, sd-id128.h and sd-journal.h are wired in so far;
-# other real headers this eventual shim will need to cover (sd-bus.h, ...)
-# get their own sources added to libsystemd_compat_sources as each one's
-# own family lands.
+# sd-event, sd-daemon and sd-id128 sources are in sd_event_lib and sd_id128_lib
+# above and link_whole'd below. event-internal.h is the private struct layout
+# shared by sd-event.c and sd-event-source.c, never installed.
 #
-# sd-event.c/sd-event-source.c split the sd_event_*() family in two: the
-# event object and its epoll-backed loop mechanics versus every
-# sd_event_source_*() property accessor. event-internal.h is the private
-# struct layout and helper set the two share; never installed, since a real
-# consumer only ever sees opaque sd_event/sd_event_source pointers. Both live
-# in sd_event_lib (above, defined ahead of pico_init_core) and are pulled
-# back into this library via link_whole below, not listed as sources here.
-#
-# sd-journal's own sources are split by concern rather than upstream's
-# single sd-journal.c: -send/-sendv (printf-shaped write API funnelling
-# into one real sd_journal_sendv() choke point over logd's /dev/log
-# socket), -stream (the separate /run/logd/stdout mechanism), -open/
-# -navigate/-data/-info (the read side, a snapshot reader over logd's own
-# ring -- src/logd/logd-read.h -- never the binary .journal format), and
-# -util (helpers shared across the read side). sd-journal-internal.h is
-# their private struct sd_journal layout, never installed.
-#
-# sd-id128.c/sha256.c/hmac-sha256.c live in sd_id128_lib (above, defined
-# ahead of pico_init_core for the same reason sd_event_lib is) and are
-# pulled back into this library via link_whole below, not listed as
-# sources here.
+# sd-journal is split by concern rather than into upstream's single file:
+# -send/-sendv (write API funnelling into sd_journal_sendv() over logd's
+# /dev/log socket), -stream (/run/logd/stdout), -open/-navigate/-data/-info
+# (a snapshot reader over logd's ring, src/logd/logd-read.h, never the binary
+# .journal format) and -util. sd-journal-internal.h is private.
 # ---------------------------------------------------------------------------
 libsystemd_compat_sources = files(
   'src/compat/libsystemd/sd-journal-util.c',
@@ -896,19 +775,14 @@ libsystemd_compat_sources = files(
   'src/compat/libsystemd/sd-journal-navigate.c',
   'src/compat/libsystemd/sd-journal-data.c',
   'src/compat/libsystemd/sd-journal-info.c',
-  # src/logd/logd-read.h's LogdEntry/LogdReadField views and its ring
-  # reader (logd_ring_read() et al) are what sd-journal-open.c/-navigate.c/
-  # -data.c build the whole read side on; logd_read is link_whole'd below.
-  #
-  # sd-bus.h/sd-login.h/sd-hwdb.h family: split by behavioral bucket, not
-  # upstream's file layout. sd-bus-validate.c/-path.c/-error.c are the
-  # corner of sd-bus with a real, bus-free answer; -open.c is every way to
-  # obtain an sd_bus* (all fail, since no wire protocol exists); -stubs.c/
-  # -noop.c are the ~270 remaining sd_bus_*() entry points that need a
-  # live bus/message/slot/track/creds object that can never exist.
-  # sd-login-resolve.c is the shared pid/pidfd/peer-fd resolver both
-  # sd-login-cgroup.c's real cgroup/unit/slice getters and sd-login.c's
-  # honest_failure getters build on.
+  # sd-bus, sd-login and sd-hwdb are split by behaviour, not by upstream's
+  # file layout. sd-bus-validate.c/-path.c/-error.c are the part of sd-bus
+  # that works without a bus; -open.c is every way to obtain an sd_bus* (all
+  # fail, since there is no wire protocol); -stubs.c/-noop.c are the ~270
+  # remaining sd_bus_*() entry points, which need a live bus object that
+  # cannot exist. sd-login-resolve.c is the pid/pidfd/peer-fd resolver shared
+  # by sd-login-cgroup.c (real cgroup/unit/slice getters) and sd-login.c
+  # (getters that report failure).
   'src/compat/libsystemd/sd-bus-validate.c',
   'src/compat/libsystemd/sd-bus-path.c',
   'src/compat/libsystemd/sd-bus-error.c',
@@ -919,18 +793,15 @@ libsystemd_compat_sources = files(
   'src/compat/libsystemd/sd-login-cgroup.c',
   'src/compat/libsystemd/sd-login.c',
   'src/compat/libsystemd/sd-hwdb.c',
-  # sd-device/sd-network: device-new.c (refcounting, every
-  # sd_device_new_from_*() constructor, the parent walk), device-attr.c
-  # (readlink-/grammar-based identity: subsystem, driver, sysname),
-  # device-uevent.c (the property table and its uevent-derived getters),
+  # sd-device/sd-network: device-new.c (refcounting, the
+  # sd_device_new_from_*() constructors, the parent walk), device-attr.c
+  # (subsystem, driver, sysname), device-uevent.c (the property table),
   # device-db.c (the /run/udev/data overlay devd writes for input devices),
   # device-property.c (iteration plus the always-empty tag family),
-  # device-devlink.c/-sysattr.c/-child.c/-trigger.c (one real mechanism
-  # each), device-enumerator.c and device-monitor.c (the two subsystems
-  # big enough for their own file). device-internal.h is their shared
-  # private struct layout, never installed. network-resolv.c/-state.c/
-  # -monitor.c mirror the same split for sd-network; network-internal.h
-  # is its equivalent private (test-root-prefix) header.
+  # device-devlink.c/-sysattr.c/-child.c/-trigger.c, device-enumerator.c and
+  # device-monitor.c. device-internal.h is the shared private struct layout.
+  # network-resolv.c/-state.c/-monitor.c are the sd-network equivalents;
+  # network-internal.h holds its test-root-prefix hook.
   'src/compat/libsystemd/device-new.c',
   'src/compat/libsystemd/device-attr.c',
   'src/compat/libsystemd/device-uevent.c',
@@ -959,16 +830,14 @@ libsystemd_compat = static_library(
   link_whole: [sd_event_lib, sd_id128_lib, logd_read],
 )
 
-# The installed artifact: ${libdir}/libsystemd.so.0.<minor>.<micro> with
-# DT_SONAME libsystemd.so.0 -- the name, path and SONAME real systemd's
-# libsystemd occupies, so package.bbclass's shlib pass and every
-# consumer's -lsystemd resolve to it with nothing downstream needing to
-# know. Two version numbers travel with the vendored libsystemd-v259.sym
-# and change together on a systemd bump: the library version is
-# upstream's own libsystemd_version at that tag, and the systemd release
-# number is what the .pc files report, since consumers gate on
-# `systemd >= N`. meson's default b_lundef makes an undefined symbol a
-# link error here rather than a load failure on the target.
+# The installed library, ${libdir}/libsystemd.so.0.<minor>.<micro> with SONAME
+# libsystemd.so.0: the name, path and SONAME of real systemd's libsystemd, so
+# consumers' -lsystemd resolves to it. Two version numbers go with the vendored
+# libsystemd-v259.sym and change together on a systemd bump: upstream's
+# libsystemd_version at that tag, and the systemd release number the .pc files
+# report, since consumers gate on `systemd >= N`. meson's default b_lundef makes
+# an undefined symbol a link error here rather than a load failure on the
+# target.
 libsystemd_version = '0.42.0'
 libsystemd_compat_systemd_version = '259'
 libsystemd_sym = files('src/compat/libsystemd/libsystemd.sym')
@@ -981,10 +850,10 @@ libsystemd = shared_library(
   install: true,
 )
 
-# Not a test: the Type=notify service test-service.c execs (found next to
-# the test binary via /proc/self/exe, test-picoctl.c's own idiom). Links the
-# shared library above so its READY=1 goes through the installed ABI, which
-# is why test-service itself is registered here rather than in pico_tests.
+# Not a test: the Type=notify service that test-service.c execs (found next to
+# the test binary via /proc/self/exe). Links the shared library so its READY=1
+# goes through the installed ABI, which is why test-service is registered here
+# rather than in pico_tests.
 test_notify_helper_exe = executable(
   'test-notify-helper',
   'src/test-notify-helper.c',
@@ -1043,13 +912,9 @@ systemd_pc = configure_file(
   install_dir: pkgconfig_dir,
 )
 
-# Real consumers expect "systemd/sd-daemon.h" (etc.) on their include path,
-# the same layout a real systemd-devel package ships. _sd-common.h rides
-# along unconditionally, same as real systemd's own src/systemd/meson.build
-# does (install_headers(systemd_headers, '_sd-common.h', subdir: 'systemd'))
-# -- any public sd-*.h that #includes "_sd-common.h" needs it installed
-# beside itself, since that's a quoted include and resolves against the
-# installed file's own directory, not the source tree's.
+# Consumers expect "systemd/sd-daemon.h" etc., the layout of a real
+# systemd-devel package. _sd-common.h is installed too, as upstream does: it is
+# a quoted include and resolves against the installed header's own directory.
 libsystemd_public_headers = files(
   'src/compat/libsystemd/sd-daemon.h',
   'src/compat/libsystemd/sd-event.h',
@@ -1066,14 +931,13 @@ libsystemd_public_headers = files(
 )
 install_headers(libsystemd_public_headers, subdir: 'systemd')
 
-# Symbol versions are real systemd's own, so a binary linked against real
+# Symbol versions are real systemd's, so a binary linked against real
 # libsystemd (sd_bus_message_append@LIBSYSTEMD_209) resolves against this
-# library too. libsystemd.sym is generated, not maintained: the pinned
-# upstream libsystemd.sym (libsystemd-v259.sym, verbatim from systemd's
-# v259 tag) intersected with what the archive defines, every symbol on its
-# upstream node, the sd_network_* family (never exported by upstream's
-# libsystemd, it lives in libsystemd-shared) on a trailing
-# PICO_LIBSYSTEMD_0. A systemd version bump is: replace the upstream file,
+# library too. libsystemd.sym is generated: the upstream libsystemd-v259.sym
+# (verbatim from systemd's v259 tag) intersected with what the archive
+# defines, each symbol on its upstream node, except the sd_network_* family
+# (not exported by upstream's libsystemd) on a trailing PICO_LIBSYSTEMD_0. A
+# systemd version bump is: replace the upstream file,
 # `ninja regen-libsystemd-sym`, review the diff. test-libsystemd-sym fails
 # on a stale committed file, on a public header declaring an undefined
 # function, and on an sd_*-named internal helper leaking out of the archive.
@@ -1165,11 +1029,9 @@ test_sd_journal_send_exe = executable(
 test('test-sd-journal-send', test_sd_journal_send_exe)
 
 
-# sd-bus.h/sd-login.h/sd-hwdb.h family tests. test-sd-bus-stubs/-noop
-# exhaustively call every function in their respective mechanical bucket
-# (see sd-bus-stubs.c/sd-bus-noop.c's own headers) -- generated the same
-# way the stub bodies were, so a slipped signature or return value in
-# either shows up as a real test failure, not just a build success.
+# sd-bus/sd-login/sd-hwdb tests. test-sd-bus-stubs/-noop call every function
+# in sd-bus-stubs.c/sd-bus-noop.c, so a wrong signature or return value fails
+# the test rather than only compiling.
 test_sd_bus_validate_exe = executable(
   'test-sd-bus-validate',
   ['src/compat/libsystemd/test-sd-bus-validate.c'] + pico_test_sources,
@@ -1218,9 +1080,8 @@ test_sd_bus_noop_exe = executable(
 )
 test('test-sd-bus-noop', test_sd_bus_noop_exe)
 
-# Real cgroups: creates/removes real /sys/fs/cgroup/system.slice/*.service
-# directories and moves a real forked child into them, so needs CAP_SYS_ADMIN
-# (root, same as every other privileged pico-init test already assumes).
+# Creates and removes real /sys/fs/cgroup/system.slice/*.service directories
+# and moves a forked child into them, so needs root.
 test_sd_login_cgroup_exe = executable(
   'test-sd-login-cgroup',
   ['src/compat/libsystemd/test-sd-login-cgroup.c'] + pico_test_sources,
@@ -1276,15 +1137,12 @@ endforeach
 # ---------------------------------------------------------------------------
 # libudev shim -- ${libdir}/libudev.so.1 with real libudev's SONAME, symbol
 # versions (libudev-v259.sym, all 92 exports on their upstream nodes) and
-# libudev.pc, for the DEPENDS = "udev" population that wants the library
-# rather than the daemon. Built the way upstream builds its own: every
-# udev_* entry point is a thin wrapper over sd_device_*, so the shared
-# object links libsystemd.so.0 and carries no device code of its own.
+# libudev.pc, for consumers that want the library rather than the daemon. As
+# upstream does, every udev_* entry point is a thin wrapper over sd_device_*,
+# so the shared object links libsystemd.so.0 and carries no device code.
 #
-# Scope is the read-only half: udev_device_*/udev_enumerate_*/
-# udev_list_entry_* are real. udev_monitor_* is the silent-but-successful
-# interim of libudev-monitor.c, kept until live uevent subscription lands;
-# udev_queue_*/udev_hwdb_* report the true no-udevd/no-hwdb state.
+# udev_device_*, udev_enumerate_*, udev_list_entry_* and udev_monitor_* are
+# real; udev_queue_*/udev_hwdb_* report the true no-udevd/no-hwdb state.
 # ---------------------------------------------------------------------------
 libudev_includes = include_directories('src/compat/libudev')
 libudev_sources = files(
@@ -1307,8 +1165,7 @@ libudev_compat = static_library(
   include_directories: libsystemd_compat_includes,
 )
 
-# Upstream's own libudev_version at v259, bumped together with the
-# vendored files on a systemd bump.
+# Upstream's libudev_version at v259; bump with the vendored files.
 libudev_version = '1.7.12'
 libudev_sym = files('src/compat/libudev/libudev.sym')
 libudev = shared_library(
@@ -1331,13 +1188,10 @@ libudev_pc = configure_file(
   install_dir: pkgconfig_dir,
 )
 
-# udev.pc, a SEPARATE package name from libudev.pc: real consumers doing
-# `pkg-config --variable=udevdir udev` (alsa-utils' PACKAGECONFIG[udev] is
-# the real one that surfaced this, 2026-09-13 -- no udev.pc meant no
-# udevdir, so its configure script fell back to a hardcoded non-usrmerge
-# /lib/udev/rules.d) look up the package literally named "udev", which
-# carries udevdir; "libudev" is the library and carries no such variable
-# upstream either. Real path matches devd's own rules install location.
+# udev.pc is a separate package from libudev.pc: consumers run
+# `pkg-config --variable=udevdir udev` (e.g. alsa-utils), and only "udev"
+# carries udevdir. Without it they fall back to a hardcoded /lib/udev/rules.d.
+# The path matches devd's rules install location.
 udev_pc = configure_file(
   input: 'src/compat/libudev/udev.pc.in',
   output: 'udev.pc',
@@ -1379,9 +1233,7 @@ test(
 )
 
 # test-libudev-device/-enumerate drive the wrappers against a fixture /sys
-# through the compat archives; test-libudev-monitor links the installed
-# shape (the .so) and pins the never-delivers monitor contract that
-# libusb_init() depends on.
+# through the compat archives; test-libudev-monitor links the installed .so.
 foreach t : ['test-libudev-device', 'test-libudev-enumerate']
   exe = executable(
     t,

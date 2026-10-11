@@ -2,20 +2,16 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * Position, seek, cursor and wakeup (inotify) functions. All real: they
- * walk the LogdRing sd_journal_open() (or the last sd_journal_process())
- * loaded, and the wakeup half watches logd's own ring directory for the
- * writer's renames/appends -- no binary journal format anywhere.
+ * Position, seek, cursor and wakeup (inotify) functions. They walk the
+ * LogdRing loaded by sd_journal_open() or the last sd_journal_process(); the
+ * wakeup half watches logd's ring directory for the writer's renames/appends.
  *
- * Cursor format is pico-native, not upstream's: "b=<32hex bootid>;m=<mono>;
- * r=<realtime>". A cursor is documented as an opaque string by the real
- * API (sd_journal_get_cursor(3)), so a foreign journalctl cursor simply
- * failing sd_journal_seek_cursor()'s parse (-EINVAL) is the correct,
- * honest behaviour, not a compatibility bug.
+ * Cursor format is pico-specific: "b=<32hex bootid>;m=<mono>;r=<realtime>".
+ * Cursors are opaque per sd_journal_get_cursor(3), so a journalctl cursor
+ * failing sd_journal_seek_cursor()'s parse with -EINVAL is expected.
  */
 
-/* asprintf() is a glibc extension; -std=gnu17 alone does not imply
- * _GNU_SOURCE (socket.c's own note, same reasoning here). */
+/* asprintf() is a GNU extension; -std=gnu17 alone does not imply _GNU_SOURCE. */
 #define _GNU_SOURCE
 
 #include "sd-journal-internal.h"
@@ -117,14 +113,9 @@ int sd_journal_next_skip(sd_journal *j, uint64_t skip) {
                 return -EINVAL;
 
         if (skip == 0) {
-                /* Real upstream (real_journal_next_skip()) still performs one
-                 * resolving step here when not already sitting on a discrete
-                 * entry -- skip==0 means "resolve position, advance nothing,"
-                 * not "no-op." A pending seek or BEFORE_HEAD/AFTER_TAIL
-                 * position is resolved via one real sd_journal_next(), but
-                 * the movement is never counted: upstream returns 0 for this
-                 * call either way. A prior version of this shim treated
-                 * skip==0 as a pure no-op, leaving position unresolved. */
+                /* As upstream (real_journal_next_skip()): skip==0 resolves a
+                 * pending seek or BEFORE_HEAD/AFTER_TAIL position via one
+                 * sd_journal_next() but counts no movement and returns 0. */
                 if (j->loc != SD_J_ON_ENTRY || j->seek_pending) {
                         int r = sd_journal_next(j);
 
@@ -154,8 +145,7 @@ int sd_journal_previous_skip(sd_journal *j, uint64_t skip) {
                 return -EINVAL;
 
         if (skip == 0) {
-                /* See sd_journal_next_skip()'s identical reasoning, mirrored
-                 * for the previous() direction. */
+                /* Mirror of sd_journal_next_skip() above. */
                 if (j->loc != SD_J_ON_ENTRY || j->seek_pending) {
                         int r = sd_journal_previous(j);
 
@@ -291,10 +281,8 @@ int sd_journal_get_cursor(sd_journal *j, char **ret) {
 }
 
 /* Shared by seek_cursor() and test_cursor(): parses "k=v;k=v;..." into the
- * three fields a pico-native cursor may carry. Returns 0, or -EINVAL for
- * anything that doesn't parse as this project's own cursor grammar --
- * including a real journalctl cursor, which has a different key set
- * entirely and is expected to fail here. */
+ * three fields a pico cursor may carry. Returns 0, or -EINVAL for anything
+ * outside that grammar, including a journalctl cursor. */
 typedef struct ParsedCursor {
         bool have_boot;
         char boot[33];

@@ -6,10 +6,8 @@
  * fork/exec + fd/cgroup setup.
  *
  * Type=simple, oneshot, exec, notify and forking are supported
- * (notify-reload loads as notify with a recorded degradation). oneshot is
- * not a luxury: nearly every real boot-plumbing unit is one, and an init
- * that cannot express "run once, then stay exited" cannot boot an
- * unmodified image. The five differ only in when the start job completes --
+ * (notify-reload loads as notify with a recorded degradation). The five
+ * differ only in when the start job completes --
  * simple counts as started the moment the process is forked, exec once
  * execve() has actually succeeded, notify once the process sends READY=1,
  * oneshot not until it has exited successfully, forking once the ExecStart=
@@ -28,9 +26,7 @@
 #include "unit.h"
 #include "util.h"
 
-/* Where a service's stdout/stderr go until the journal (plan §3) exists. Not
- * /dev/null, which would make early hardware bring-up on h2200 miserable, and
- * not syslog, which would be a dependency PID1's own milestones do not need. */
+/* Where a service's stdout/stderr go when logd is not available. */
 #define PICO_CONSOLE_PATH "/dev/console"
 
 /*
@@ -41,10 +37,8 @@
  * service_sigchld_event() recognizes them on a CLD_EXITED status and maps
  * every one of them to SERVICE_FAILURE_RESOURCES rather than treating them
  * as an ordinary nonzero ExecStart= exit, because they mean pico-init's own
- * setup failed, not the workload. Not every code here is currently
- * reachable (EXIT_CHDIR, EXIT_MEMORY: pico-init does none of
- * WorkingDirectory=/rlimits/MemoryLimit= yet) -- defined now so the mapping
- * table does not need revisiting when they become reachable.
+ * setup failed, not the workload. PICO_EXIT_CHDIR and PICO_EXIT_MEMORY are
+ * not currently produced (no WorkingDirectory=/rlimits/MemoryLimit=).
  */
 #define PICO_EXIT_CHDIR 200
 #define PICO_EXIT_FDS 202
@@ -70,11 +64,10 @@ typedef enum ServiceType {
 } ServiceType;
 
 /*
- * StandardInput=, the values real consumers need. socket (oe-core's
- * dropbear@.service): the accepted connection duped onto fd 0 (and, matching
- * upstream's own StandardOutput=inherit-from-stdin default for this case,
- * fd 1 too) instead of handed over via LISTEN_FDS. tty/tty-force/tty-fail
- * (getty units, oe-core's weston.service): TTYPath= (default /dev/console)
+ * StandardInput=. socket (e.g. dropbear@.service): the accepted connection
+ * duped onto fd 0 (and, matching upstream's StandardOutput=inherit-from-stdin
+ * default for this case, fd 1 too) instead of handed over via LISTEN_FDS.
+ * tty/tty-force/tty-fail (getty units, weston.service): TTYPath= (default /dev/console)
  * on fds 0-2 for ExecCondition=/ExecStartPre=/ExecStart=, as upstream's
  * EXEC_APPLY_TTY_STDIN; every other command gets /dev/null stdin and the tty
  * write-only on 1 and 2. The three differ only in TIOCSCTTY: tty-force
@@ -84,7 +77,7 @@ typedef enum ServiceType {
  * data, ...) falls through to the generic degraded-directive path.
  */
 typedef enum ServiceStandardInput {
-        SERVICE_STANDARD_INPUT_NULL, /* default: console, same as today */
+        SERVICE_STANDARD_INPUT_NULL, /* default: console */
         SERVICE_STANDARD_INPUT_SOCKET,
         SERVICE_STANDARD_INPUT_TTY,
         SERVICE_STANDARD_INPUT_TTY_FORCE,
@@ -148,7 +141,7 @@ typedef enum ServiceResult {
         SERVICE_FAILURE_TIMEOUT,     /* TimeoutStartSec=/TimeoutStopSec= elapsed */
         SERVICE_FAILURE_EXIT_CODE,   /* exited non-zero */
         SERVICE_FAILURE_SIGNAL,      /* killed by a signal */
-        SERVICE_FAILURE_START_LIMIT, /* B7: restarted too many times too fast, refusing */
+        SERVICE_FAILURE_START_LIMIT, /* restarted too many times too fast, refusing */
         SERVICE_FAILURE_PROTOCOL,    /* Type=notify main process exited cleanly before READY=1 */
         SERVICE_SKIP_CONDITION,      /* ExecCondition= exited 1-254: skipped, not failed */
         _SERVICE_RESULT_MAX,
@@ -272,7 +265,7 @@ typedef struct Service {
 
         /*
          * The last main-process exit, split rather than a packed waitpid()
-         * status (B2): main_exit_code is siginfo_t.si_code (CLD_EXITED /
+         * status: main_exit_code is siginfo_t.si_code (CLD_EXITED /
          * CLD_KILLED / CLD_DUMPED), main_exit_status is si_status. A packed
          * status cannot tell CLD_KILLED from CLD_DUMPED without WCOREDUMP,
          * and that distinction is load-bearing for pico_is_clean_exit() in
@@ -310,14 +303,11 @@ typedef struct Service {
         usec_t timeout_stop_usec;  /* TimeoutStopSec=; USEC_INFINITY means never time out */
 
         /*
-         * B7: start-rate limiting. v30 already had this (a quarrying
-         * regression to have dropped it, not a deferred feature -- see
-         * service.c); these four are deliberately not parseable unit-file
-         * settings, only upstream's hardcoded defaults (10s / 5 starts,
-         * still real upstream defaults today). start_limit_begin anchors a
-         * fixed window at the first attempt in it; start_limit_num counts
-         * attempts inside that window; a successful start does not reset
-         * either, only window expiry does.
+         * Start-rate limiting. These four are not parseable unit-file
+         * settings, only upstream's hardcoded defaults (10s / 5 starts).
+         * start_limit_begin anchors a fixed window at the first attempt in
+         * it; start_limit_num counts attempts inside that window; a
+         * successful start does not reset either, only window expiry does.
          */
         usec_t start_limit_interval;
         unsigned start_limit_burst;
@@ -375,7 +365,7 @@ void service_exec_stop_clear(Service *s);
 void service_exec_commands_free(ServiceExecCommand **cmds, unsigned *n);
 
 /*
- * B9/CVE-2021-4034-class load-time validation: refuse a unit whose
+ * CVE-2021-4034-class load-time validation: refuse a unit whose
  * ExecStart= or any other Exec*= line would reach execve() with a NULL or
  * empty argv[0] (the PwnKit primitive -- no PAM/seccomp/namespaces stand
  * between pico-init and it) or a non-absolute path. Called by unit_parse_file() once a
@@ -427,10 +417,8 @@ unsigned service_delegate_controller_from_string(const char *name);
 
 /* --- service-exec.c --- */
 
-/* A generous, fixed bound on how many fds one paired socket unit (or several
- * pairing to the same service) can hand to a single service start. No
- * pico-init consumer needs more than a handful; a fixed stack array here
- * keeps fd collection entirely allocation-free in the parent too. */
+/* Fixed bound on how many fds one service start can receive from its paired
+ * socket unit(s); a fixed stack array keeps fd collection allocation-free. */
 #define PICO_MAX_SOCKET_FDS 16
 
 /* fork/exec argv into s's cgroup with fds set up; child pid via ret_pid. 0 or -errno. */

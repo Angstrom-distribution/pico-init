@@ -7,16 +7,14 @@
  * GPL-2.0-or-later like the rest of netd's own source. See netd-rtnl.h for
  * why it is hand-rolled and why there are two sockets.
  *
- * N1: link enumerate/match, RTM_NEWLINK/DELLINK subscription, link up/down,
- * RTM_NEWADDR/DELADDR, RTM_NEWROUTE/DELROUTE including a default route.
- * Later addition: netd_rtnl_link_set_hwaddr() (persistent-MAC generation,
- * netd-link.c's link_apply_persistent_mac()).
+ * Link enumerate/match, RTM_NEWLINK/DELLINK subscription, link up/down,
+ * RTM_NEWADDR/DELADDR, RTM_NEWROUTE/DELROUTE including a default route, and
+ * netd_rtnl_link_set_hwaddr() for persistent-MAC generation.
  *
  * The low-level socket/message plumbing (request construction, send/recv,
- * NLMSG_ERROR decoding, the generic rtattr_get_* and rtattr_enter() getters) now
- * lives in netd-rtnl-core.c, shared with netctl-rtnl.c -- see that file's
- * header for why the split exists and what stays logging-free there. This
- * file keeps everything that is netd's own policy: the NetdRtnl struct,
+ * NLMSG_ERROR decoding, the generic rtattr_get_* and rtattr_enter() getters)
+ * lives in netd-rtnl-core.c, shared with netctl-rtnl.c. This file keeps
+ * netd's own policy: the NetdRtnl struct,
  * event-fd subscription, ADDED/CHANGED/REMOVED bookkeeping, nl_parse_link(),
  * every netd_rtnl_* writer, and every pico_log() call -- the core layer
  * decodes a kernel error into a string, this file is what logs it.
@@ -348,9 +346,8 @@ int netd_rtnl_enumerate_links(NetdRtnl *rtnl) {
                         m = (struct nlmsghdr *) rb.buf;
                         rem = (int) len;
 
-                        /* int rem, NLMSG_OK sign-compare: see this file's
-                         * predecessor's note, unchanged by the rtnl-core
-                         * split. */
+                        /* rem is an int because NLMSG_OK() compares it
+                         * against signed values. */
                         for (; NLMSG_OK(m, rem); m = NLMSG_NEXT(m, rem)) {
                                 if (m->nlmsg_seq != seq)
                                         continue;

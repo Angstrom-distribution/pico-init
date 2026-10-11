@@ -3,9 +3,7 @@
 
 /*
  * HMAC-SHA256 (RFC 2104, instantiated with the SHA-256 in sha256.h). The
- * one caller is sd_id128_get_app_specific() in sd-id128.c; the key/message
- * order that function passes in is what real libsystemd's own output
- * depends on, not anything in this file.
+ * one caller is sd_id128_get_app_specific() in sd-id128.c.
  */
 
 #pragma once

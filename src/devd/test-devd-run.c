@@ -4,7 +4,7 @@
 /*
  * RUN+=, run for real.
  *
- * The end-to-end case below goes through every piece of H2 in the order a
+ * The end-to-end case below goes through every piece of the rule engine in the order a
  * hotplugged modem would: a rules file is parsed, matched against a device,
  * `%k` is substituted into the command, the device's properties are turned into
  * an environment, a child is forked, and the child is reaped when it exits --
@@ -77,7 +77,7 @@ static char *read_all(const char *path) {
 static void test_split(void) {
         char argv[DEVD_RUN_ARGV_MAX][DEVD_RUN_ARG_MAX];
 
-        /* The shape 415 of usb-modeswitch's rules use, after substitution. The
+        /* The shape usb-modeswitch's rules use, after substitution. The
          * quotes group and are then gone -- the tool is handed /1-1, not
          * '/1-1'. */
         ASSERT_EQ_INT(devd_run_split("usb_modeswitch '/1-1'", argv, DEVD_RUN_ARGV_MAX), 2);
@@ -186,7 +186,7 @@ static void test_absolute_path_and_failure(void) {
         devd_run_init(&run);
 
         /* An absolute path is used as it stands -- the helper directory is
-         * still the default and is deliberately not consulted. */
+         * still the default and is not consulted. */
         ASSERT_TRUE(devd_run_spawn(&run, cmd, NULL) > 0);
         drain(&run, 5000);
         ASSERT_EQ_INT(run.n_reaped, 1);

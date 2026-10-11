@@ -111,9 +111,8 @@ static void test_ignores(void) {
         /* An action that is neither add nor remove. */
         ASSERT_EQ_INT(feed(&b, ev(DEVD_ACTION_OTHER, DISK_PATH, "sda", "disk"), 0), DEVD_BLOCK_IGNORED);
 
-        /* A kernel-synthesised device. Found by running the real daemon: a
-         * stock kernel puts sixteen ram* and eight loop* devices here before
-         * anything is plugged in, which filled the disk table by itself. */
+        /* A kernel-synthesised device. A stock kernel puts sixteen ram* and
+         * eight loop* devices here before anything is plugged in. */
         ASSERT_EQ_INT(feed(&b, ev(DEVD_ACTION_ADD, "/devices/virtual/block/ram0", "ram0", "disk"), 0),
                       DEVD_BLOCK_IGNORED);
         ASSERT_EQ_INT(feed(&b, ev(DEVD_ACTION_ADD, "/devices/virtual/block/loop0", "loop0", "disk"), 0),

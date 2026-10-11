@@ -3,38 +3,26 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * pico-init's own implementation of the sd-daemon.h ABI. Two different real
- * systemd trees inform the shape here, cited per function below:
+ * pico-init's own implementation of the sd-daemon.h ABI. The control flow
+ * follows systemd v30 (commit 501c92c, 2010, Lennart Poettering) for the
+ * functions that existed then; the API contract and the later functions
+ * (sd_pid_notify*, sd_notify_barrier*, sd_pidfd_get_inode_id,
+ * sd_watchdog_enabled, sd_is_socket_sockaddr, sd_listen_fds_with_names) come
+ * from current systemd main. Nothing is copied; the commit hashes cited
+ * below are upstream fixes reimplemented here.
  *
- *  - tag v30 (commit 501c92c, 2010, copyright Lennart Poettering) for
- *    control-flow SHAPE on the functions that existed back then -- this
- *    project's standing quarry source for GPL-era design, not text: nothing
- *    below is copied from it.
- *  - the current github.com/systemd/systemd main branch, read-only, for the
- *    real public API contract (signatures, error conventions) and for the
- *    functions v30 never had at all (sd_pid_notify*, sd_notify_barrier*,
- *    sd_pidfd_get_inode_id, sd_watchdog_enabled, sd_is_socket_sockaddr,
- *    sd_listen_fds_with_names). Every backport this file cites is a real
- *    commit hash in that tree, verified against `git log`/`git show` there,
- *    not copied code.
+ * The socket-activation producer is src/service-exec.c: build_exec_envp()
+ * exports LISTEN_FDS=<n> and scrubs any inherited LISTEN_*, child_exec()
+ * fills LISTEN_PID with its own pid after fork, and shift_fds()/flags_fds()
+ * renumber the fds into [3, n+2] with FD_CLOEXEC cleared. sd_listen_fds()
+ * re-arms FD_CLOEXEC, as the sd-daemon.h contract requires.
  *
- * pico-init's own producer for the socket-activation half is
- * src/service-exec.c: build_socket_envp() exports LISTEN_FDS=<n> and scrubs
- * any inherited LISTEN_* first, child_exec() fills LISTEN_PID with its own
- * getpid() post-fork, and shift_fds()+flags_fds() renumber the kept fds into
- * [3, n+2] with O_NONBLOCK/FD_CLOEXEC already cleared for the child's own
- * use -- sd_listen_fds() below re-arms FD_CLOEXEC per this header's own
- * documented contract, which is the one thing service-exec.c deliberately
- * leaves for the consumer to redo.
- *
- * Deliberately standalone: this is a library other packages link against,
- * not PID 1 code, so nothing here calls into pico-init's own util.c/log
- * helpers. Every allocation failure is a plain -ENOMEM, not a fatal log.
+ * This is a library other packages link against, so it calls nothing from
+ * pico-init's util.c or logging. Allocation failure is a plain -ENOMEM.
  */
 
 /* vasprintf(), pipe2(), ppoll() are GNU/glibc extensions; -std=gnu17 alone
- * does not imply _GNU_SOURCE (same reasoning src/socket.c already gives for
- * accept4()), so this has to be explicit and first. */
+ * does not imply _GNU_SOURCE, so it must be defined first. */
 #define _GNU_SOURCE
 
 #include "sd-daemon.h"
@@ -59,19 +47,14 @@
 #include <sys/vfs.h>
 #include <unistd.h>
 
-/* struct statx and STATX_INO: glibc >= 2.28 and musl >= 1.1.20 both expose
- * these from <sys/stat.h> directly; the <linux/stat.h> fallback is for a
- * toolchain old enough that they don't yet (matches this file's own
- * baseline assumption, same call as sd-daemon.c's mq_getattr note makes
- * about glibc >= 2.34/musl for that function). */
+/* struct statx and STATX_INO come from <sys/stat.h> on glibc >= 2.28 and
+ * musl >= 1.1.20; the <linux/stat.h> fallback is for older toolchains. */
 #ifndef STATX_INO
 #        include <linux/stat.h>
 #endif
 
-/* uapi/linux/magic.h's PID_FS_MAGIC ("PIDF"), verified against
- * main:src/include/uapi/linux/magic.h in the quarry checkout rather than
- * assumed to be in the build toolchain's own (possibly older) kernel
- * headers. */
+/* PID_FS_MAGIC ("PIDF") from uapi/linux/magic.h, which older kernel headers
+ * lack. */
 #ifndef PID_FS_MAGIC
 #        define PID_FS_MAGIC 0x50494446
 #endif
@@ -145,11 +128,8 @@ static int parse_strict_pid(const char *s, pid_t *ret) {
  * for its LISTEN_PIDFDID check.
  * --------------------------------------------------------------------- */
 
-/* No glibc wrapper assumption: pidfd_open() only landed in glibc 2.36, and
- * this project's OE toolchains span older ones. SYS_pidfd_open comes from
- * kernel headers, which is the one part of "does this kernel support it"
- * this shim can check at compile time; the runtime check is probe_pidfs()
- * below. */
+/* Raw syscall: glibc only has pidfd_open() from 2.36. SYS_pidfd_open is the
+ * compile-time check; the runtime check is probe_pidfs(). */
 static int raw_pidfd_open(pid_t pid, unsigned int flags) {
 #ifdef SYS_pidfd_open
         return (int) syscall(SYS_pidfd_open, pid, flags);
@@ -159,10 +139,8 @@ static int raw_pidfd_open(pid_t pid, unsigned int flags) {
 #endif
 }
 
-/* Cached: probing means opening a throwaway pidfd and an fstatfs(), and
- * every caller of sd_pidfd_get_inode_id()/sd_listen_fds() on one process
- * gets the same answer for the process's whole lifetime. -1 = not yet
- * probed, 0 = no pidfs (old kernel), 1 = pidfs present. */
+/* Cached for the process's lifetime, since probing opens a throwaway pidfd.
+ * -1 = not yet probed, 0 = no pidfs (old kernel), 1 = pidfs present. */
 static int probe_pidfs(void) {
         static int have = -1;
         int fd, ok;
@@ -206,10 +184,8 @@ int sd_pidfd_get_inode_id(int pidfd, uint64_t *ret) {
         return 0;
 }
 
-/* Cached the same way probe_pidfs() is: one process, one answer for its
- * whole lifetime. r < 0 means "couldn't get one" (old kernel, most likely)
- * -- sd_listen_fds()'s LISTEN_PIDFDID check treats that as "ignore the
- * variable", per this family's own spec. */
+/* Cached like probe_pidfs(). r < 0 means "couldn't get one" (old kernel,
+ * most likely); sd_listen_fds() then ignores LISTEN_PIDFDID. */
 static int own_pidfd_inode_id(uint64_t *ret) {
         static uint64_t cached_id;
         static int cached_r = 1; /* 1 = not yet computed (never a real errno) */
@@ -266,9 +242,8 @@ int sd_listen_fds(int unset_environment) {
                 goto finish;
         }
 
-        /* Modern addition, unused by pico-init's own producer today (it
-         * never sets LISTEN_PIDFDID) -- this only guards against a foreign
-         * init reusing the same pid across a wrapped exec. */
+        /* pico-init's producer never sets LISTEN_PIDFDID; this guards against
+         * a foreign init reusing a pid. */
         e = getenv("LISTEN_PIDFDID");
         if (e) {
                 uint64_t want, have = 0;
@@ -300,10 +275,8 @@ int sd_listen_fds(int unset_environment) {
                 goto finish;
         }
 
-        /* service-exec.c's child_exec() (step 5b, service-exec.c:279)
-         * deliberately clears FD_CLOEXEC before execve() so the child's own
-         * consumer inherits a plain fd -- this is the one flag this
-         * header's own contract says to re-arm here. */
+        /* service-exec.c clears FD_CLOEXEC before execve() so the fds survive
+         * it; the sd-daemon.h contract says to re-arm it here. */
         for (fd = SD_LISTEN_FDS_START; fd < SD_LISTEN_FDS_START + n; fd++) {
                 int flags = fcntl(fd, F_GETFD);
 
@@ -379,17 +352,13 @@ int sd_listen_fds_with_names(int unset_environment, char ***ret_names) {
         if (!ret_names)
                 return sd_listen_fds(unset_environment);
 
-        /* Read LISTEN_FDNAMES before sd_listen_fds() runs -- it may unset
-         * it. Own a copy rather than keep the getenv() pointer: relying on
-         * the string surviving past unsetenv() is not something this shim
-         * should assume across every libc it might run under. */
+        /* Copy LISTEN_FDNAMES before sd_listen_fds() runs, as it may unset it
+         * and the getenv() pointer would not survive that. */
         e = getenv("LISTEN_FDNAMES");
         if (e) {
                 raw = strdup(e);
                 if (!raw) {
-                        /* Still perform the unsetenv step before reporting
-                         * OOM -- same rule sd_notifyf()'s vasprintf failure
-                         * follows, for the same reason. */
+                        /* Still unset the environment before reporting OOM. */
                         (void) sd_listen_fds(unset_environment);
                         return -ENOMEM;
                 }
@@ -402,12 +371,9 @@ int sd_listen_fds_with_names(int unset_environment, char ***ret_names) {
         }
 
         /*
-         * pico-init's own build_socket_envp() (service-exec.c) scrubs
-         * LISTEN_FDNAMES on the way in and never re-exports it, so `raw ==
-         * NULL` here is the only path a pico-init-started service actually
-         * takes today; the split path exists for a caller run under some
-         * other producer that does set it, and for symmetry with the real
-         * header's own documented contract.
+         * pico-init's build_exec_envp() (service-exec.c) scrubs LISTEN_FDNAMES
+         * and never re-exports it, so `raw == NULL` is the normal case here;
+         * the split path serves other producers.
          */
         if (raw) {
                 r = split_colon_keep_empty(raw, &names, &n_names);
@@ -740,11 +706,10 @@ int sd_is_mq(int fd, const char *path) {
 /* ---------------------------------------------------------------------
  * sd_notify() family.
  *
- * Simplified from current systemd on purpose (real systemd also handles
- * AF_VSOCK and SOCK_STREAM/SOCK_SEQPACKET NOTIFY_SOCKET values): pico's own
- * listener (manager-notify.c) is AF_UNIX SOCK_DGRAM only, so an address
- * this code can't reach is an honest -EINVAL, not a guess at a protocol
- * nothing here implements.
+ * Narrower than current systemd, which also handles AF_VSOCK and
+ * SOCK_STREAM/SOCK_SEQPACKET NOTIFY_SOCKET values: pico's listener
+ * (manager-notify.c) is AF_UNIX SOCK_DGRAM only, so any other address is
+ * -EINVAL.
  * --------------------------------------------------------------------- */
 
 static void unsetenv_notify(bool unset_environment) {
@@ -812,10 +777,8 @@ static int notify_internal(pid_t pid, const char *state, const int *fds, unsigne
         msghdr.msg_iov = &iovec;
         msghdr.msg_iovlen = 1;
 
-        /* pico's own listener (manager-notify.c) attributes senders via
-         * SO_PASSCRED + SCM_CREDENTIALS + manager_get_unit_by_pid() -- this
-         * is the supported attribution channel for a non-zero pid, not
-         * decoration. The kernel itself enforces who may claim which pid. */
+        /* manager-notify.c attributes senders via SCM_CREDENTIALS; the kernel
+         * enforces who may claim which pid. */
         send_ucred = pid != 0 && pid != getpid();
 
         if (n_fds > 0 || send_ucred) {
@@ -951,16 +914,10 @@ int sd_pid_notifyf(pid_t pid, int unset_environment, const char *format, ...) {
 }
 
 /*
- * honest_failure: the only documented purpose of fds/n_fds is FDSTORE=1 --
- * the manager storing fds and handing them back on the service's next
- * invocation. pico-init has no fd store and none is planned (nothing under
- * src/ implements one), and manager-notify.c's own listener treats
- * FDSTORE=1 as deferred scope, closing any fd it receives rather than
- * storing it. Returning 1 while the
- * fds silently die would make a caller close its own copies expecting them
- * back after a restart -- real data loss from a fake success. -EOPNOTSUPP
- * says plainly "this manager cannot store fds"; a well-written daemon falls
- * back to keeping them itself.
+ * fds/n_fds exist only for FDSTORE=1, and pico-init has no fd store
+ * (manager-notify.c closes any fd it receives). Returning 1 would make the
+ * caller close its copies expecting them back after a restart, so this is
+ * -EOPNOTSUPP and the daemon can keep them itself.
  */
 int sd_pid_notify_with_fds(pid_t pid, int unset_environment, const char *state, const int *fds, unsigned n_fds) {
         int r;
@@ -974,10 +931,9 @@ int sd_pid_notify_with_fds(pid_t pid, int unset_environment, const char *state, 
         return r;
 }
 
-/* Same split as sd_pid_notify_with_fds() above, plus sd_notifyf()'s
- * vasprintf handling. Argument order (fds before format) and n_fds's width
- * (size_t here, unsigned above) are copied from the real header exactly --
- * a real asymmetry upstream carries, not a typo. */
+/* Same split as sd_pid_notify_with_fds() above, plus vasprintf handling.
+ * The argument order (fds before format) and n_fds's width (size_t here,
+ * unsigned above) match the upstream header. */
 int sd_pid_notifyf_with_fds(
                 pid_t pid, int unset_environment, const int *fds, size_t n_fds, const char *format, ...) {
         char *p = NULL;
@@ -1007,16 +963,12 @@ int sd_pid_notifyf_with_fds(
 }
 
 /*
- * Not FDSTORE=1: this fd is a synchronization token consumed at delivery,
- * never stored, so it does not contradict the -EOPNOTSUPP above. AF_UNIX
- * SOCK_DGRAM delivers datagrams in order, and when the receiver's
- * recvmsg() has no control-buffer space for SCM_RIGHTS the kernel closes
- * the undelivered fd at consumption time -- so the write end dies exactly
- * when the listener has consumed every earlier datagram, which is the
- * barrier's documented meaning ("synchronize against consumption, not
- * processing"). Works against pico's own listener (manager-notify.c) with
- * zero extra listener code, for exactly that reason. Quarry reference for shape only:
- * upstream added this as 4f07ddfa9b/0de3431871; reimplemented, not copied.
+ * The fd is a synchronization token consumed at delivery, not FDSTORE=1.
+ * AF_UNIX SOCK_DGRAM delivers in order, and a receiver whose recvmsg() has
+ * no SCM_RIGHTS buffer space makes the kernel close the fd, so the write end
+ * dies once every earlier datagram has been consumed: "synchronize against
+ * consumption, not processing". Works with manager-notify.c unchanged.
+ * Upstream: 4f07ddfa9b/0de3431871.
  */
 int sd_pid_notify_barrier(pid_t pid, int unset_environment, uint64_t timeout) {
         int pipe_fd[2];
@@ -1082,27 +1034,18 @@ int sd_notify_barrier(int unset_environment, uint64_t timeout) {
 
 int sd_booted(void) {
         /*
-         * "/run/pico-init/" mirrors PICO_RUNTIME_DIR (src/manager.h:56),
-         * duplicated as a literal here rather than including manager.h --
-         * this is a public shim library, and pulling in PID 1's own
-         * internal header would be exactly backwards, the same reasoning
-         * service-exec.c's PICO_LOGD_STDOUT_SOCKET_PATH comment gives for
-         * its own duplicated constant.
+         * Mirrors PICO_RUNTIME_DIR (src/manager.h), duplicated because this
+         * library must not include PID 1's headers.
          *
-         * manager_ctrl_setup() creates this directory (mkdir(0755),
-         * manager-ctrl.c:660) at manager_startup() step 0
-         * (manager-startup.c:154), before any unit can start, and /run is a
-         * fresh tmpfs (mount-setup.c) -- so the path reflects only the
-         * current boot. Real systemd made the identical move, for the
-         * identical reason, in 66e411811b (from the cgroup-hierarchy check
-         * v30 quarries below to /run/systemd/system/, created the same way
-         * at the same point in its own boot).
+         * manager_ctrl_setup() creates this directory early in
+         * manager_startup(), before any unit starts, and /run is a fresh
+         * tmpfs, so it exists only for the current boot. Upstream made the
+         * same move from a cgroup-hierarchy check to /run/systemd/system/ in
+         * 66e411811b.
          *
-         * /run/systemd/system does NOT exist under pico-init (nothing
-         * under src/ creates it, checked) and deliberately is not created:
-         * "booted with systemd" would be a lie this shim has no business
-         * telling, since pico-init has none of the D-Bus/systemctl surface
-         * a caller checking that path might assume comes with it.
+         * /run/systemd/system is not created here: "booted with systemd"
+         * would be false, as pico-init has none of the D-Bus/systemctl
+         * surface a caller checking that path might assume.
          */
         static const char pico_runtime_dir[] = "/run/pico-init/";
 
@@ -1112,9 +1055,8 @@ int sd_booted(void) {
 
         /* backport 21042737f0: report an unexpected error as -errno rather
          * than a false "not booted". manager_startup() treats a failed
-         * mkdir as non-fatal (read-only /run) -- in that case this honestly
-         * reports 0, matching the same caveat upstream's own check
-         * documents. */
+         * mkdir as non-fatal (read-only /run), in which case this returns 0,
+         * as upstream's check does. */
         if (errno == ENOENT || errno == ENOTDIR)
                 return 0;
 
@@ -1124,11 +1066,8 @@ int sd_booted(void) {
 /* ---------------------------------------------------------------------
  * sd_watchdog_enabled()
  *
- * Fully client-side protocol; pico-init sets neither variable today (a grep
- * across every .c/.h file under src/ finds no watchdog mechanism at all
- * beyond unrelated comment mentions), so this honestly returns 0 -- and
- * starts working with no shim change the day a service-exec.c watchdog
- * producer lands.
+ * Fully client-side protocol. pico-init sets neither WATCHDOG_USEC nor
+ * WATCHDOG_PID, so this returns 0 for its services.
  * --------------------------------------------------------------------- */
 
 int sd_watchdog_enabled(int unset_environment, uint64_t *usec) {

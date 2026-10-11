@@ -2,7 +2,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * .network file parsing, discovery and matching (plan §2.5).
+ * .network file parsing, discovery and matching.
  *
  * The line-level scanning (sections, comments, continuations, BOM, the
  * malformed-line-skips-line policy) is conf-scan.c's -- shared with
@@ -44,7 +44,7 @@ int network_new(Network **ret) {
         /*
          * The [DHCPv4] defaults, and the one that matters: UseTimezone
          * defaults to *yes* here where networkd defaults it to no. That is
-         * netd's founding requirement, not an oversight -- see netd-network.h.
+         * deliberate -- see netd-network.h.
          */
         nw->dhcp_use_dns = true;
         nw->dhcp_use_ntp = true;

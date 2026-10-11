@@ -1,11 +1,9 @@
 # SPDX-FileCopyrightText: 2026 Koen Kooi
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
-# Based on systemd's own .clang-format (github.com/systemd/systemd), trimmed
-# down: dropped the ForEachMacros and IncludeCategories lists tailored to
-# systemd's own codebase, since none of those macros/headers exist here yet.
-# Extend this file as real code grows, don't front-load it with rules for
-# code that doesn't exist.
+# Based on systemd's own .clang-format (github.com/systemd/systemd), without
+# its ForEachMacros and IncludeCategories lists, which name systemd-internal
+# macros and headers.
 #
 # Run: git ls-files 'src/*.[ch]' | xargs clang-format -i -style=file
 

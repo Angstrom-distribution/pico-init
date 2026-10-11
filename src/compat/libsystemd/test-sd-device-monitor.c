@@ -4,14 +4,10 @@
 /*
  * sd_device_monitor: filter-matching logic tested as a pure function
  * against fixture devices (device_monitor_filter_matches(), an internal
- * hook -- the same pure-function shape netd-sntp.c's tests use), plus one
- * real end-to-end test against a real kernel: open a real socket, trigger
- * a real uevent on the loopback interface, and confirm
- * sd_device_monitor_receive() decodes it correctly. Unlike
- * test-netd-rtnl.c's netns tests, this needs no CLONE_NEWNET/CLONE_NEWUSER
- * (a plain NETLINK_KOBJECT_UEVENT group-1 join needs no capability beyond
- * running as the container's own root), so it is not namespace-gated the
- * way that one is -- confirmed by hand against this exact container.
+ * hook), plus one end-to-end test: open a socket, trigger a uevent on the
+ * loopback interface, and confirm sd_device_monitor_receive() decodes it.
+ * Joining NETLINK_KOBJECT_UEVENT group 1 needs no CLONE_NEWNET/CLONE_NEWUSER,
+ * so the test is not namespace-gated like test-netd-rtnl.c's.
  */
 
 #include "sd-device.h"
@@ -135,11 +131,9 @@ static void test_deferred_event_family(void) {
         sd_device_monitor_unref(m);
 }
 
-/* Real socket, real kernel, real event: trigger a "change" on loopback
- * and confirm the whole receive path -- sender-credential check, header
- * parse, property overlay, action decode -- against what a real kernel
- * actually sends (verified independently against this exact container
- * with a throwaway recvmsg() program before writing device-monitor.c). */
+/* Triggers a "change" on loopback and checks the whole receive path (sender
+ * credential check, header parse, property overlay, action decode) against
+ * what the kernel sends. */
 static void test_real_receive(void) {
         sd_device_monitor *m = NULL;
         sd_device *dev = NULL;

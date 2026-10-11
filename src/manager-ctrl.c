@@ -2,10 +2,10 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The picoctl control socket (plan §1.7, milestone C2). See manager-ctrl.h
+ * The picoctl control socket. See manager-ctrl.h
  * for the contract; this is the real body.
  *
- * Wire protocol, deliberately tiny: one request per connection, a single
+ * Wire protocol: one request per connection, a single
  * text line "PICO1 <verb> <unit>[ --no-block]" parsed out of a fixed
  * PICO_CTRL_LINE_MAX-byte on-stack buffer with strict single-space
  * tokenization -- no allocation is ever derived from client bytes. Verbs:
@@ -144,8 +144,8 @@ static void ctrl_pending_unlink(struct pico_manager_ctrl *ctrl, struct ctrl_pend
  * here, safe even from inside this very connection's own dispatch. A still-
  * pending deferred reply loses its home right here: the job itself is
  * unaffected (nothing in job.c is tied to this connection), but nobody is
- * listening for the result any more, which is exactly "a client disconnect
- * just drops the pending record" (plan §1.7).
+ * listening for the result any more, so a client disconnect just drops the
+ * pending record.
  *
  * No dead-list, no deferred free: the shim's own source refcounting is the
  * deferral now. disable_unref() drops this connection's own ref; if the
@@ -162,7 +162,7 @@ static void ctrl_pending_unlink(struct pico_manager_ctrl *ctrl, struct ctrl_pend
  * manager_ctrl_notify_job_finished() reached via a SIGCHLD dispatch, while
  * conn's own EPOLLHUP sits pending later in the same batch), conn->source
  * holds no other ref and is unlinked from e->sources right here -- so that
- * later dispatch of the same batch, which walks the live list fresh, simply
+ * later dispatch of the same batch, which walks the live list fresh,
  * never finds it. Nothing dispatches into freed memory either way.
  */
 static void ctrl_conn_free(struct ctrl_conn *conn) {
@@ -318,7 +318,7 @@ static const char *ctrl_parse_request(const char *buf, size_t len, struct ctrl_r
         out->no_block = false;
         if (p < end) {
                 /* --no-block has nowhere to apply on an already-immediate
-                 * verb; a fourth token here is simply malformed. */
+                 * verb; a fourth token here is malformed. */
                 if (out->verb == CTRL_VERB_RESET_FAILED)
                         return "malformed";
                 if (!ctrl_next_word(&p, end, &w) || !ctrl_word_is(&w, "--no-block"))
@@ -335,8 +335,7 @@ static const char *ctrl_parse_request(const char *buf, size_t len, struct ctrl_r
 
 /*
  * There is no exported "clear FAILED" entry point in service.c/socket.c
- * (both frozen for this milestone, and neither has one -- service_set_
- * state()/socket_set_state() are file-static). This mirrors exactly what
+ * (service_set_state() and socket_set_state() are file-static). This mirrors exactly what
  * each would have done: recompute the active-state transition and call the
  * same unit_notify() they would have called, directly. Both FAILED-entry
  * paths already cancel any pending timer/close any fds before setting
@@ -442,10 +441,9 @@ static void ctrl_handle_request(struct ctrl_conn *conn, const char *buf, size_t 
         /*
          * The instancing entry point: "picoctl start serial-getty@ttyUSB0.
          * service" against a tty no unit file was ever shipped for. stop/
-         * reset-failed deliberately do not fall back -- loading a unit in
-         * order to stop or reset one that was never running is nonsense,
-         * and would otherwise let an unauthenticated-by-name typo silently
-         * create a table entry on every miss.
+         * reset-failed do not fall back: loading a unit just to stop or
+         * reset one that was never running would let a typo silently create
+         * a table entry on every miss.
          *
          * A template id never reaches here: ctrl_parse_request() already
          * validated req.unit through unit_name_is_valid(), and manager_
@@ -592,9 +590,8 @@ static int ctrl_accept(sd_event_source *es, int fd, uint32_t revents, void *user
                  * The peercred gate: compared against the manager's own
                  * euid, NOT a hardcoded 0. Identical in production, where
                  * PID 1 is uid 0 -- the difference is what makes this
-                 * milestone testable at all, since `meson test` runs as an
-                 * ordinary user and a hardcoded 0 would reject the test
-                 * suite's own client (plan §1.7's corrected text).
+                 * testable, since `meson test` runs as an ordinary user and a
+                 * hardcoded 0 would reject the test suite's own client.
                  */
                 if (getsockopt(cfd, SOL_SOCKET, SO_PEERCRED, &cred, &credlen) < 0 || cred.uid != geteuid()) {
                         ctrl_send_err(cfd, "permission-denied");
@@ -652,7 +649,7 @@ static int ctrl_conn_io_cb(sd_event_source *es, int fd, uint32_t revents, void *
                  * deferred reply means the client went away (or violated
                  * the one-message-per-connection protocol) -- either way,
                  * stop tracking it. The job itself is unaffected: it keeps
-                 * running to completion, and job_finish_full() will simply
+                 * running to completion, and job_finish_full() will
                  * find nothing left to notify.
                  */
                 ctrl_conn_free(conn);
@@ -738,8 +735,7 @@ int manager_ctrl_setup(Manager *m) {
         /*
          * The umask sandwich around bind(), not a chmod() after -- a chmod
          * leaves a real window in which the socket is live at its final
-         * path under the process's ambient umask (plan §1.7's own
-         * correction, the same reasoning as socket.c's SocketMode= fix).
+         * path under the process's ambient umask.
          * 0600: root-only; the SO_PEERCRED check in ctrl_accept() is the
          * second, defence-in-depth gate.
          */

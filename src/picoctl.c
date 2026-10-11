@@ -2,10 +2,10 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * picoctl -- the on-device systemctl equivalent (plan §1.7, milestone C1).
+ * picoctl -- the on-device systemctl equivalent.
  *
- * Two independent halves, per the plan: read verbs (status/list-units/
- * is-active/is-failed/show) source purely from the state files C0 publishes
+ * Three independent parts. Read verbs (status/list-units/is-active/is-failed/
+ * show) source purely from the state files manager-state.c publishes
  * under <root><runtime_dir>/units/ -- no IPC, no live manager, so these work
  * even when PID 1's loop is wedged. Symlink verbs (enable/disable/
  * is-enabled/preset) operate on <root>/etc/systemd/system's .wants/.requires
@@ -17,14 +17,12 @@
  * --root DIR (matching systemctl --root=) prefixes every filesystem path
  * this program touches, defaulting to "" (the real root) in production; it
  * is what lets the symlink verbs be tested against fixture trees without
- * root and without touching the host's real /etc, exactly as systemctl
- * --root is this project's compliance oracle for the same operations.
+ * root and without touching the host's real /etc.
  *
- * start/stop/restart/reset-failed (plan §1.7, milestone C2) are the third
- * half: a client for manager-ctrl.c's control socket. They are the only
- * verbs that need a live, unwedged manager -- everything above keeps
- * working even when PID 1's loop is stuck, which is the whole reason the
- * other two halves exist as files rather than IPC.
+ * start/stop/restart/reset-failed are the third part: a client for
+ * manager-ctrl.c's control socket. They are the only verbs that need a live,
+ * unwedged manager; the others keep working when PID 1's loop is stuck, which
+ * is why they are files rather than IPC.
  */
 
 /* accept4()'s AF_UNIX peers pull in struct sockaddr_un; -std=gnu17 alone
@@ -62,25 +60,16 @@
 /* --- colour helpers ---
  *
  * Every accessor below (pico_ansi_*()) returns "" when colours are off, so
- * every call site that uses them degrades to today's exact plain-text bytes
+ * every call site that uses them degrades to plain text
  * with no branching of its own -- same contract pico-color.h documents for
  * netctl/picolog.
  *
- * picoctl_error()/picoctl_notice() mirror real systemctl's own stderr
- * colouring, which comes from systemd's shared logging backend
- * (write_to_console(), src/basic/log.c): the colour wraps the rendered
- * message text only, reset *before* the line's own trailing newline, which
- * is itself never coloured. get_log_colors() (src/basic/terminal-util.c)
- * maps LOG_ERR (every "Failed to ..."/"... could not be found."/"Unknown
- * command verb" style message systemctl itself prints on a hard failure,
- * via log_error()/log_error_errno()) to ansi_highlight_red(), and LOG_NOTICE
- * (verb_enable()'s own "no installation config" explanation, via
- * log_notice()) to the plain ansi_highlight() bold/white, not red -- it is
- * not a failure. install.c's own per-symlink "Created symlink .../"Removed
- * ..." lines are log_info(), which get_log_colors() leaves uncoloured
- * (LOG_INFO falls in neither the NOTICE-or-brighter nor the DEBUG-or-dimmer
- * bucket) -- picoctl already prints those plain, so they need no helper and
- * are deliberately left alone here.
+ * picoctl_error()/picoctl_notice() mirror systemctl's stderr colouring
+ * (write_to_console(), src/basic/log.c): the colour wraps the message text
+ * only and is reset before the line's trailing newline. get_log_colors()
+ * (src/basic/terminal-util.c) colours LOG_ERR messages red and LOG_NOTICE
+ * messages bold/white. LOG_INFO messages, such as the per-symlink "Created
+ * symlink" lines, stay uncoloured, so picoctl prints those plain.
  */
 static void picoctl_error(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void picoctl_notice(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -114,13 +103,10 @@ static void picoctl_notice(const char *fmt, ...) {
 /* --- global options ---
  *
  * One getopt_long() pass over the whole command line, in main(), fills
- * these in before any verb runs -- matching real systemctl's own single
- * flat option parser (systemctl_parse_argv()): an option is global, not
- * tied to the verb it happens to sit next to, so it may appear before,
- * between or after the verb and unit arguments. Each cmd_*() below reads
- * the variable it needs directly rather than re-scanning its own argv, the
- * same split upstream keeps between systemctl_parse_argv() and each verb_*()
- * function.
+ * these in before any verb runs -- matching systemctl's single flat option
+ * parser (systemctl_parse_argv()): an option is global, so it may appear
+ * before, between or after the verb and unit arguments. Each cmd_*() reads
+ * the variable it needs directly rather than re-scanning its own argv.
  */
 static const char *arg_root = "";
 static bool arg_no_block = false;
@@ -151,8 +137,7 @@ static int path_join(char *buf, size_t bufsize, const char *suffix) {
  * by joining a root-prefixed search-path entry), so a symlink's target must
  * have that prefix stripped -- exactly install.c's skip_root(), which is why
  * `systemctl --root=X enable` writes symlinks pointing at the REAL absolute
- * path, not one still carrying X. Verified empirically against systemctl
- * --root in the verification container (see test-picoctl.c). */
+ * path, not one still carrying X (see test-picoctl.c). */
 static const char *strip_root(const char *path) {
         size_t len;
 
@@ -189,12 +174,9 @@ static void unit_state_set(char *field, size_t field_size, const char *value) {
 }
 
 /*
- * A missing file means the manager never published this unit -- either it
- * was never loaded (unit_load() failing leaves load_state UNIT_ERROR without
- * ever reaching a vtable start/stop call, so unit_notify() -- the sole
- * publish point -- never fires for it) or PID 1 simply is not running. Both
- * read as systemd's own "not-found": 0 with *st left at its not-found
- * defaults, never a hard failure the read verbs would have to special-case.
+ * A missing file means the manager never published this unit (it was never
+ * loaded) or PID 1 is not running. Both read as systemd's "not-found": 0 with
+ * *st left at its not-found defaults, never a hard failure.
  */
 static int read_unit_state(const char *unit_id, struct unit_state *st) {
         char rt[PATH_MAX];
@@ -340,9 +322,7 @@ static int name_cmp(const void *a, const void *b) {
         return strcmp(*(const char * const *) a, *(const char * const *) b);
 }
 
-/* "foo.service" -> "service"; NULL for a name with no '.' (never happens
- * for anything read_unit_state() publishes, but checked rather than
- * assumed). */
+/* "foo.service" -> "service"; NULL for a name with no '.'. */
 static const char *unit_type_suffix(const char *name) {
         const char *dot = strrchr(name, '.');
 
@@ -350,9 +330,7 @@ static const char *unit_type_suffix(const char *name) {
 }
 
 /* One substring of a comma-separated --type=/--state= value matches `word`
- * exactly -- strv_contains()'s own comma-split semantics (systemctl-util.c),
- * reimplemented narrowly rather than pulled in as a dependency for one
- * flag each. */
+ * exactly. */
 static bool csv_contains(const char *csv, const char *word) {
         const char *p = csv;
 
@@ -370,13 +348,10 @@ static bool csv_contains(const char *csv, const char *word) {
 }
 
 /*
- * output_units_list()'s own per-field colouring (systemctl-list-units.c),
- * minus the glyph/underline columns picoctl's flat printf table has no
- * equivalent of: on_loaded colours LOAD, on_active colours both UNIT and
- * ACTIVE, on_sub colours SUB. A failed unit always wins outright (overrides
- * load_state's own colour); otherwise load_state and active_state are each
- * decided independently, exactly as upstream computes on_loaded/on_active
- * before ever combining them.
+ * Per-field colouring as in output_units_list() (systemctl-list-units.c),
+ * minus the glyph/underline columns: on_loaded colours LOAD, on_active colours both UNIT and
+ * ACTIVE, on_sub colours SUB. load_state and active_state are decided
+ * independently, as upstream computes on_loaded/on_active.
  */
 static void list_units_row_colors(
                 const char *unit_id,
@@ -431,25 +406,18 @@ static int cmd_list_units(int argc, char *argv[]) {
         size_t i;
         const char *type_csv = arg_type, *state_csv = arg_state;
 
-        /* every option this verb takes is global now, see below */
+        /* every option this verb takes is global */
         (void) argc;
         (void) argv;
 
         /*
-         * --all/-a is accepted but is a true no-op here, not a pretended
-         * one: the published units/ directory this verb reads from already
-         * holds every unit the live manager knows about (there is no
-         * separate "inactive, hide by default" set to additionally reveal
-         * -- unlike upstream, which always knows about every *installed*
-         * unit file and hides the never-started ones without -a). --no-
-         * pager is a no-op for the same honest reason: there is no pager
-         * to ever invoke.
+         * --all/-a is accepted but a no-op: the published units/ directory
+         * already holds every unit the live manager knows about, with no
+         * hidden "inactive" set to reveal. --no-pager is a no-op because
+         * there is no pager.
          *
          * --type/--state come from main()'s getopt_long() pass (arg_type/
-         * arg_state): both the attached "--type=VALUE" and the two-token
-         * "-t VALUE"/"--type VALUE" forms now work, since getopt_long
-         * consumes the value as the option's own argument, before it can
-         * ever reach mangle_unit_arg().
+         * arg_state), so both "--type=VALUE" and "-t VALUE" work.
          */
 
         if (path_join(rt, sizeof(rt), PICO_RUNTIME_DIR) < 0)
@@ -501,8 +469,7 @@ static int cmd_list_units(int argc, char *argv[]) {
                 qsort(names, n, sizeof(char *), name_cmp);
 
         /* real output_units_list() has a JOB column between SUB and DESCRIPTION
-         * (systemctl-list-units.c table_new()); struct unit_state already
-         * carries job, it was just never shown here. */
+         * (systemctl-list-units.c table_new()). */
         if (!arg_no_legend)
                 printf("%-32s %-8s %-10s %-13s %-8s %s\n", "UNIT", "LOAD", "ACTIVE", "SUB", "JOB", "DESCRIPTION");
         for (i = 0; i < n; i++) {
@@ -563,17 +530,14 @@ static int cmd_list_units(int argc, char *argv[]) {
 /* --- is-system-running --- */
 
 /*
- * Real systemctl's own state machine (src/systemctl/systemctl.c
+ * systemctl's state machine (src/systemctl/systemctl.c
  * determine_ambiguous_result()) has more states than this -- initializing,
- * stopping, offline -- that all need info PID 1 does not publish yet
- * (a distinct pre-jobs-queued phase, a shutdown flag). What IS published is
- * enough for the two states that matter for a health check: NJobs>0 means
- * the boot's own start job (or any other job) has not settled yet, and a
- * failed unit among the published ones means degraded -- matching upstream's
- * own precedence (any job running trumps any failure, since a failure seen
- * mid-boot may still resolve). "offline" covers PID 1 not running at all
- * (no manager file), the same not-a-unit-problem case read_unit_state()'s
- * own not-found default already models for a single unit.
+ * stopping -- that need info PID 1 does not publish (a pre-jobs-queued phase,
+ * a shutdown flag). What is published covers the states a health check needs:
+ * NJobs>0 means a job has not settled yet, and a failed unit means degraded,
+ * with upstream's precedence (a running job trumps a failure, since a failure
+ * seen mid-boot may still resolve). "offline" is PID 1 not running (no
+ * manager file).
  *
  * An /etc/fstab line PID 1 skipped or failed to mount degrades the system
  * too, as a failed .mount unit does upstream. Those lines never become units
@@ -650,7 +614,7 @@ static int report_running_word(bool quiet, char *word_out, size_t word_out_size,
 }
 
 /* Split from cmd_is_system_running() so is-failed's own no-unit case
- * (cmd_is_failed(), below) -- and now print_system_status()'s "State:" row --
+ * (cmd_is_failed(), below) and print_system_status()'s "State:" row
  * can all read and report the exact same word, rather than re-deriving
  * "degraded" a second way. word_out/word_out_size are optional (NULL/0): the
  * two LSB-exit-code callers below don't need the word back, only its exit
@@ -698,10 +662,9 @@ static int cmd_is_system_running(int argc, char *argv[]) {
 /* --- is-active / is-failed: LSB init-script exit codes --- */
 
 /*
- * Shared by both verbs -- upstream's own check_unit_generic() is one
- * function for the same reason: both print every unit's ActiveState and
- * both use the same "any counts, then not-found, then the LSB code" exit
- * logic, only the target state and the LSB code differ. LSB (via
+ * Shared by both verbs, as upstream's check_unit_generic() is: both print
+ * every unit's ActiveState and use the same "any counts, then not-found, then
+ * the LSB code" exit logic; only the target state and the LSB code differ. LSB (via
  * systemctl-util.h in the real source): 0 running/ok, 1 dead, 3 not
  * running, 4 status unknown (unit never published == not-found here).
  */
@@ -710,8 +673,7 @@ static int cmd_is_state_generic(int argc, char *argv[], const char *want_state, 
         int i;
 
         /* -q/--quiet is global (arg_quiet, from main()'s getopt_long() pass)
-         * and never reaches this argv any more, so every entry here is a
-         * real unit name. */
+         * and never reaches this argv, so every entry here is a unit name. */
         if (argc == 0) {
                 picoctl_error("picoctl: missing unit name");
                 return 1;
@@ -741,14 +703,12 @@ static int cmd_is_active(int argc, char *argv[]) {
 
 /*
  * With a unit argument, this is check_unit_generic() like is-active. With
- * none at all, real is-failed instead reports the manager's own SystemState
- * property (verb_is_failed(), systemctl-is-active.c) -- the exact same
- * degraded/running/... word is-system-running prints, success (exit 0)
- * only for "degraded". Reusing cmd_is_system_running()'s own computation
- * keeps the two from ever being able to disagree about what "degraded"
- * means; -q suppresses the word, never the exit code, same as the per-unit
- * case above. arg_quiet is global (main()'s getopt_long() pass), so argc
- * here already counts only real unit names.
+ * none, real is-failed reports the manager's SystemState property
+ * (verb_is_failed(), systemctl-is-active.c): the same degraded/running/...
+ * word is-system-running prints, exit 0 only for "degraded", computed by the
+ * same code so the two cannot disagree. -q suppresses the word, never the
+ * exit code. arg_quiet is global (main()'s getopt_long() pass), so argc here
+ * counts only unit names.
  */
 static int cmd_is_failed(int argc, char *argv[]) {
         if (argc > 0)
@@ -761,23 +721,18 @@ static int cmd_is_failed(int argc, char *argv[]) {
 
 /*
  * Tree glyphs, byte for byte from upstream's glyph-util.c UTF-8 table
- * (GLYPH_TREE_BRANCH/_RIGHT/_VERTICAL) -- the same table cgroup-show.c's
- * show_pid_array()/show_cgroup_name() draw with. Locale/$TERM fallback to
- * the ASCII "`-"/"|-" forms is real upstream behaviour too (glyph_full()'s
- * emoji_enabled() check) but is bundled with colour support into a later
- * change; hardcoding UTF-8 keeps this one change's job to the row/tree
- * CONTENT, not terminal capability detection.
+ * (GLYPH_TREE_BRANCH/_RIGHT/_VERTICAL), which cgroup-show.c draws with.
+ * Upstream falls back to ASCII "`-"/"|-" by locale/$TERM (glyph_full()); this
+ * always emits UTF-8.
  */
 #define PICOCTL_TREE_BRANCH "\xe2\x94\x9c\xe2\x94\x80" /* UTF8("├─") */
 #define PICOCTL_TREE_RIGHT "\xe2\x94\x94\xe2\x94\x80"  /* UTF8("└─") */
 #define PICOCTL_TREE_VERTICAL "\xe2\x94\x82 "          /* UTF8("│ ") */
 
 /*
- * This walks live cgroupfs state of a shape nothing here controls (a
- * misbehaving delegate could nest arbitrarily), unlike every other status
- * row, which is bounded by picoctl's own finite unit list -- hence caps on
- * depth, on children read per directory, and on total lines printed, none
- * of which upstream itself needs.
+ * The cgroup walk reads live cgroupfs state of a shape nothing here controls
+ * (a misbehaving delegate could nest arbitrarily), hence caps on depth, on
+ * children read per directory, and on total lines printed. Upstream has none.
  */
 #define PICOCTL_CGROUP_MAX_DEPTH 8
 #define PICOCTL_CGROUP_MAX_CHILDREN 256
@@ -785,14 +740,12 @@ static int cmd_is_failed(int argc, char *argv[]) {
 
 static unsigned cgroup_lines_printed;
 
-/* Mirrors upstream's cg_is_empty() (src/basic/cgroup-util.c): without this,
- * every long-dead test/scope cgroup still sitting on disk clutters the tree
- * forever, which real `systemctl status` never shows. The kernel's own
- * "cgroup.events" "populated" field is already recursive -- 1 if this
- * cgroup or any descendant holds a live process, 0 otherwise -- so one read
- * decides whether to show (and recurse into) a child. Missing
- * cgroup.events (ENOENT, same as upstream's r == -ENOENT case) means empty:
- * a child mid-removal races the kernel, not a child to show. */
+/* Mirrors upstream's cg_is_empty() (src/basic/cgroup-util.c), so dead
+ * cgroups left on disk do not clutter the tree. The "populated" field of
+ * cgroup.events is recursive (1 if this cgroup or any descendant holds a live
+ * process), so one read decides whether to show and recurse into a child.
+ * Missing cgroup.events (ENOENT, as upstream) means empty: a child
+ * mid-removal is not one to show. */
 static bool cgroup_is_populated(const char *path) {
         char events_path[PATH_MAX + 32];
         FILE *f;
@@ -817,11 +770,9 @@ static bool cgroup_is_populated(const char *path) {
 }
 
 /* strlen+memcpy+clamp, not snprintf(dir "/" name): `name` is a dirent's
- * fixed-size d_name (cgroupfs child names are attacker/workload controlled,
- * not picoctl's own finite unit list), the exact shape gcc -Os's format-
- * truncation check already flagged once in this tree for ifname+ifindex
- * (netctl.c's ifaddr_to_string()) -- skip a child silently rather than ever
- * truncate into a wrong path. */
+ * fixed-size d_name (cgroupfs child names are workload-controlled), which
+ * gcc -Os's format-truncation check flags; a child that does not fit is
+ * skipped rather than truncated into a wrong path. */
 static bool cgroup_path_join(char *out, size_t out_size, const char *dir, const char *name) {
         size_t dlen = strlen(dir), nlen = strlen(name);
 
@@ -835,8 +786,7 @@ static bool cgroup_path_join(char *out, size_t out_size, const char *dir, const 
 }
 
 /* upstream's show_pid_array(): every pid in one cgroup.procs, in the same
- * fixed-capacity read-then-print shape print_cgroup_procs() always used
- * (plan §1.7) -- `more_after` is true when child cgroups will be printed
+ * fixed-capacity read-then-print shape -- `more_after` is true when child cgroups will be printed
  * below these pids, which is what decides branch-vs-corner glyph on the
  * last one. */
 static void print_cgroup_pids(const char *path, const char *prefix, bool more_after) {
@@ -888,9 +838,7 @@ static void print_cgroup_pids(const char *path, const char *prefix, bool more_af
  * upstream's show_cgroup_by_path() (src/shared/cgroup-show.c): this cgroup's
  * own pids, then every child cgroup depth-first, branch glyph on every line
  * but the very last at that level. Shared by print_cgroup_procs() (a single
- * unit's cgroup) and print_system_status()'s CGroup row (the root cgroup) --
- * the same code either way, per plan §1.7's "status <unit>" tree finally
- * growing real glyphs rather than a flat "|-" list.
+ * unit's cgroup) and print_system_status()'s CGroup row (the root cgroup).
  */
 static void print_cgroup_tree(const char *path, const char *prefix, unsigned depth) {
         DIR *d;
@@ -949,10 +897,9 @@ static void print_cgroup_tree(const char *path, const char *prefix, unsigned dep
 }
 
 /* The process list, read from cgroup.procs under the unit's cgroup -- the
- * same source upstream's own status block uses (plan §1.7). Best-effort: no
- * cgroup (never started, or supervision degraded per manager-state.h's own
- * "never cost the boot" rule) just means nothing to print here, not a
- * failure of the whole verb. */
+ * same source upstream's status block uses. Best-effort: no cgroup (never
+ * started, or supervision degraded) means nothing to print, not a failure of
+ * the verb. */
 static void print_cgroup_procs(const char *unit_id) {
         char cgroup_root[PATH_MAX];
         char unit_cgroup[PATH_MAX + 64];
@@ -976,12 +923,10 @@ static void print_cgroup_procs(const char *unit_id) {
 
 /*
  * journalctl's short format, matching picolog.c's print_short() field for
- * field -- deliberately not shared code (logd-read.h's own header explains
- * why the reader and the formatter live in separate translation units).
- * There is no -a here: plain `systemctl status`'s own log tail never passes
- * journalctl -a either, so a binary-safe MESSAGE always prints the "blob
- * data" placeholder, matching real journalctl's default rather than ever
- * writing raw bytes to a TTY.
+ * field -- not shared code, since logd-read.h formats nothing. There is
+ * no -a: `systemctl status` never passes journalctl -a either, so a
+ * binary-safe MESSAGE prints the "blob data" placeholder rather than raw
+ * bytes to a TTY.
  */
 static void print_log_line(const LogdEntry *e) {
         const LogdReadField *rt = logd_entry_field(e, "__REALTIME_TIMESTAMP");
@@ -1070,12 +1015,10 @@ static void print_log_tail(const char *unit_id) {
 /* --- status: no-argument system overview --- */
 
 /*
- * Boot time, real upstream's UserspaceTimestamp-via-bus equivalent, but read
- * from /proc/stat's own "btime" field -- a TRUE source independent of
- * pico-init (it is the kernel's, published whether or not PID 1 itself is
- * even picoctl's own manager) and not --root-relative, matching real
- * systemctl: `--root` retargets the filesystem picoctl reads unit/manager
- * state from, never the live kernel's own idea of when it booted.
+ * Boot time from /proc/stat's "btime" field, the kernel's own record of when
+ * it booted (upstream reads UserspaceTimestamp over the bus). Not
+ * --root-relative, as in systemctl: `--root` retargets the filesystem picoctl
+ * reads unit/manager state from, never the live kernel.
  */
 static bool read_proc_stat_btime(time_t *out) {
         FILE *f = fopen("/proc/stat", "re");
@@ -1100,11 +1043,10 @@ static bool read_proc_stat_btime(time_t *out) {
 
 /*
  * format_timestamp_style(TIMESTAMP_PRETTY) + format_timestamp_relative()
- * (src/basic/time-util.c), both reimplemented in whole seconds -- /proc/
- * stat's btime has no finer resolution, so there is nothing truthful a
- * microsecond field would add. Every threshold/wording below is copied from
- * format_timestamp_relative_full(), just usec constants turned into their
- * second equivalents (USEC_PER_YEAR=31557600s, USEC_PER_MONTH=2629800s).
+ * (src/basic/time-util.c), reimplemented in whole seconds since /proc/stat's
+ * btime has no finer resolution. Thresholds and wording are copied from
+ * format_timestamp_relative_full() with the usec constants converted to
+ * seconds (USEC_PER_YEAR=31557600s, USEC_PER_MONTH=2629800s).
  */
 static void format_since_relative(time_t boot, char *buf, size_t size) {
         long long d = (long long) time(NULL) - (long long) boot;
@@ -1213,14 +1155,12 @@ static void enable_state_colors(const char *enable_state, const char **on, const
 
 /*
  * systemctl-show.c's show_system_status(): the manager overview real
- * `systemctl status` (no unit, no filter) prints. Every row below has a
- * TRUE source -- the manager's own published state, /proc, or uname/
- * gethostname -- and a row with none is simply left out; see picoctl's own
- * change notes for exactly which upstream rows that is and why.
+ * `systemctl status` (no unit, no filter) prints. Every row has a real
+ * source (the manager's published state, /proc, or uname/gethostname); an
+ * upstream row with none is left out.
  *
- * Always exits 0: like upstream (verb_show() only propagates a hard bus
- * error, never the state word itself, as a failure), a degraded or even
- * offline system is successfully reported on, not a picoctl failure.
+ * Always exits 0: like upstream, a degraded or even offline system is
+ * reported on successfully, not a picoctl failure.
  */
 static void print_system_status(void) {
         char rt[PATH_MAX];
@@ -1263,9 +1203,8 @@ static void print_system_status(void) {
                 printf("    State: %s%s%s\n", on, word, off);
         }
 
-        /* Only printed once a manager has actually published something --
-         * an offline system has no truthful loaded/queued count, not a "0"
-         * (manager-state.c's own NUnits=/NJobs= are what these mirror). */
+        /* Only printed once a manager has published something: an offline
+         * system has no loaded/queued count, not a "0". */
         if (ms.found) {
                 printf("    Units: %u loaded (incl. loaded aliases)\n", ms.n_units);
                 printf("     Jobs: %u queued\n", ms.n_jobs);
@@ -1275,16 +1214,13 @@ static void print_system_status(void) {
         if (read_proc_stat_btime(&boot))
                 print_since_row(boot);
 
-        /* main.c's own boot banner ("pico-init " PICO_INIT_VERSION_STRING
-         * " running as PID 1") and `picoctl --version` both already use this
-         * label, not "systemd" -- "pico-init:" is coincidentally the same
-         * 10-column width upstream right-aligns every row label to. */
+        /* main.c's boot banner and `picoctl --version` use this label too,
+         * not "systemd"; "pico-init:" happens to have the 10-column width
+         * upstream right-aligns every row label to. */
         printf("pico-init: %s\n", PICO_INIT_VERSION_STRING);
 
-        /* Tainted: has no truthful source -- pico-init tracks no taint flags
-         * at all -- and real systemctl itself only prints this row when
-         * non-empty, so omitting it is consistent with upstream, not a gap
-         * in it. */
+        /* Tainted: pico-init tracks no taint flags, and real systemctl only
+         * prints this row when non-empty, so omitting it matches upstream. */
 
         if (path_join(cgroup_root, sizeof(cgroup_root), PICO_CGROUP_ROOT) == 0) {
                 DIR *d = opendir(cgroup_root);
@@ -1414,14 +1350,11 @@ static int cmd_status(int argc, char *argv[]) {
 
 /*
  * <etcdir>/<unit_id> itself (not a .wants/.requires subdirectory) is
- * `systemctl mask`'s own symlink target: a symlink there pointing at
- * /dev/null shadows the real unit everywhere, exactly as unit_find_
- * fragment() (unit-load.c) already honors at boot -- confirmed there
- * already sets UNIT_MASKED, so masking needs no engine change, only the
- * picoctl verbs to create/remove the symlink and read verbs that report it
- * correctly. Checked directly on the filesystem rather than through a
- * throwaway Manager: unlike enable/disable/preset, masking needs no
- * [Install] data and must work even for a unit no fragment exists for.
+ * `systemctl mask`'s symlink target: a symlink there pointing at /dev/null
+ * shadows the real unit everywhere, and unit_find_fragment() (unit-load.c)
+ * already sets UNIT_MASKED for it at boot. Checked directly on the
+ * filesystem rather than through a throwaway Manager, since masking needs no
+ * [Install] data and must work even for a unit with no fragment.
  */
 static bool unit_is_masked(const char *unit_id) {
         char etcdir[PATH_MAX];
@@ -1441,18 +1374,14 @@ static bool unit_is_masked(const char *unit_id) {
 }
 
 /*
- * Current upstream's exact log_notice() wording for carries_install_info ==
- * 0 (systemctl-enable.c verb_enable()): a plain informational line on
- * stderr, not a failure -- the one real behavior bug this audit found.
- * picoctl's previous text ("...is not meant to be enabled.", exit 1) dates
- * to an older systemd where this truly was an error; current systemctl
- * enable/disable/preset on a unit with no [Install] data succeeds (exit 0)
- * and creates no symlinks, it just explains why nothing happened.
+ * Current upstream's log_notice() wording for carries_install_info == 0
+ * (systemctl-enable.c verb_enable()): enable/disable/preset on a unit with
+ * no [Install] data succeeds (exit 0), creates no symlinks, and explains why
+ * on stderr.
  */
 static void print_no_install_info_notice(void) {
-        /* LOG_NOTICE, not LOG_ERR -- picoctl_notice() (bold/white), not
-         * picoctl_error() (red): see this function's own header comment,
-         * this is current systemd's explanation, not a failure. */
+        /* LOG_NOTICE, not LOG_ERR: picoctl_notice() (bold/white), not
+         * picoctl_error() (red); this is not a failure. */
         picoctl_notice("The unit files have no installation config (WantedBy=, RequiredBy=, UpheldBy=,\n"
                        "Also=, or Alias= settings in the [Install] section, and DefaultInstance= for\n"
                        "template units). This means they are not meant to be enabled or disabled using systemctl.\n"
@@ -1538,14 +1467,11 @@ static int enable_symlink_path(
 /*
  * Create (or repair) one <target>.wants|.requires/<unit> symlink pointing at
  * the unit's real absolute fragment path -- install.c's create_symlink(),
- * always force=true for .wants/.requires entries (install_info_symlink_
- * wants() passes force unconditionally; only linking the unit file itself
- * respects the CLI --force flag, which picoctl does not need since it never
- * links the fragment itself). The actual mkdir/readlink/symlink work is
- * unit-enable.c's unit_enable_create_symlink(), shared with boot-time
- * preset persistence so the two can never disagree about what a symlink
- * looks like. Verified byte-identical to `systemctl --root enable` in the
- * verification container, absolute target included -- see test-picoctl.c.
+ * always force=true for .wants/.requires entries (only linking the unit file
+ * itself respects --force, which picoctl never does). The mkdir/readlink/
+ * symlink work is unit-enable.c's unit_enable_create_symlink(), shared with
+ * boot-time preset persistence so the two cannot disagree about what a
+ * symlink looks like (see test-picoctl.c).
  */
 static int create_enable_symlink(const char *target, const char *suffix, Unit *u) {
         char etcdir[PATH_MAX];
@@ -1741,16 +1667,13 @@ static int cmd_disable(int argc, char *argv[]) {
 
 /*
  * One source of truth for "is this unit enabled on disk", read fresh from
- * the filesystem every call -- shared by is-enabled's own printed verdict
- * and, below, cmd_show()'s UnitFileState= field. A unit's published state
- * file (read_unit_state()'s UnitFileState) only ever reflects what the
- * manager saw at *load* time and is never updated by a later `picoctl
- * disable`/enable, so "show" used to keep reporting the unit's state as of
- * boot forever -- the exact same mistake upstream's own unit_file_state
- * round-trip to disk (never a live manager cache) never makes.
+ * the filesystem every call -- shared by is-enabled and cmd_show()'s
+ * UnitFileState= field. The published state file only reflects what the
+ * manager saw at load time and is not updated by a later `picoctl
+ * disable`/enable.
  *
- * Returns one of "masked"/"static"/"enabled"/"disabled"/"not-found" --
- * always one of these five literals, never NULL.
+ * Returns one of "masked"/"static"/"enabled"/"disabled"/"not-found",
+ * never NULL.
  */
 static const char *compute_unit_file_state(const char *unit_id) {
         Manager *m = NULL;
@@ -1873,15 +1796,13 @@ static int cmd_preset(int argc, char *argv[]) {
 
 /*
  * mask: a symlink at <etcdir>/<unit_id> (not under a .wants/.requires
- * subdirectory) pointing at /dev/null. Built directly on the filesystem via
- * unit-enable.c's own unit_enable_create_symlink() -- the same shared
- * helper create_enable_symlink() uses above, called with an empty
- * target/suffix pair so its "<etcdir>/<target><suffix>/<unit_id>" path
- * collapses to plain "<etcdir>/<unit_id>" -- never through a throwaway
- * Manager: masking needs no [Install] data, and must work even for a unit
- * no fragment exists for at all, exactly as real `systemctl mask` allows.
- * Idempotent: already-masked prints nothing, matching create_enable_
- * symlink()'s own "already correct" convention.
+ * subdirectory) pointing at /dev/null. Built via unit-enable.c's
+ * unit_enable_create_symlink(), the helper create_enable_symlink() uses,
+ * called with an empty target/suffix pair so its
+ * "<etcdir>/<target><suffix>/<unit_id>" path collapses to
+ * "<etcdir>/<unit_id>". No throwaway Manager: masking needs no [Install]
+ * data and must work for a unit with no fragment. Idempotent: already-masked
+ * prints nothing.
  */
 static int cmd_mask(int argc, char *argv[]) {
         int i, status = 0;
@@ -2083,26 +2004,18 @@ static void collect_unit_files_from(const char *dir, struct unit_file_entry **en
 }
 
 /*
- * STATE: masked (a /dev/null symlink shadows it), static (no [Install]
- * data at all -- never enabled/disabled, matches is-enabled's own
- * "static" case), or enabled/disabled, decided by whether a .wants/
- * .requires symlink exists -- the exact same check cmd_is_enabled() makes,
- * so the two verbs can never disagree. A fragment present but failed to
- * parse reads as "bad" (upstream's own UNIT_FILE_BAD). PRESET is shown
- * only for "disabled" (the one state a preset rule could still flip,
- * matching show_preset_for_state() upstream); every other row prints "-".
+ * STATE: masked (a /dev/null symlink shadows it), static (no [Install] data
+ * at all), or enabled/disabled, decided by whether a .wants/.requires symlink
+ * exists -- the same check cmd_is_enabled() makes. A fragment present but
+ * failed to parse reads as "bad" (upstream's UNIT_FILE_BAD). PRESET is shown
+ * only for "disabled", the one state a preset rule could still flip (as
+ * show_preset_for_state() upstream); every other row prints "-".
  */
 /*
- * output_unit_file_list()'s own STATE/PRESET colouring (systemctl-list-
- * unit-files.c), minus the underline-at-a-type-boundary case picoctl's flat
- * printf table has no equivalent of (on_unit_color there defaults to that
- * underline, never a real colour, when a state matches neither branch --
- * i.e. picoctl's "static"): masked/disabled/bad red, enabled green.
- * PRESET's own colour (preset_action_to_color()) only applies when a preset
- * verdict is actually shown (picoctl prints one only for "disabled", same
- * as show_preset_for_state()); the literal "-" shown for every other state
- * is upstream's TABLE_EMPTY cell rendered through its ersatz-dash string,
- * grey either way (upstream's own underline/no-underline grey fallback).
+ * STATE/PRESET colouring as in output_unit_file_list() (systemctl-list-
+ * unit-files.c), minus its underline case: masked/disabled/bad red, enabled
+ * green, "static" uncoloured. PRESET is coloured only when a verdict is
+ * shown; the "-" shown otherwise is grey.
  */
 static void list_unit_files_colors(
                 const char *state,
@@ -2215,19 +2128,15 @@ static int cmd_list_unit_files(int argc, char *argv[]) {
 
 /* --- start/stop/restart/reset-failed: the control-socket client half --- */
 
-/* Reply buffer: generous against manager-ctrl.c's own PICO_CTRL_LINE_MAX --
- * the two are not required to agree on an exact number, only for this one
- * to be at least as large as any reply the server actually sends, which is
- * always a single short line. */
+/* Reply buffer: at least as large as any reply the server sends, which is a
+ * single short line (manager-ctrl.c's PICO_CTRL_LINE_MAX). */
 #define PICOCTL_CTRL_REPLY_MAX 512
 
 /*
- * Connect to <root><runtime_dir>/control -- manager-ctrl.c's own path,
- * exactly. A missing socket (an image with no C2 control socket, or one
- * whose setup failed at boot) is a supported configuration, per manager-
- * ctrl.h -- this just fails with -ENOENT/-ECONNREFUSED like any other
- * connect() to nothing there, and the caller reports it like any other
- * error rather than treating it as special.
+ * Connect to <root><runtime_dir>/control (manager-ctrl.c's path). A missing
+ * socket (setup failed at boot, or an image without it) is a supported
+ * configuration: this fails with -ENOENT/-ECONNREFUSED like any connect() to
+ * nothing, and the caller reports it like any other error.
  */
 static int ctrl_connect(void) {
         char rt[PATH_MAX];
@@ -2325,10 +2234,9 @@ static const char *job_failure_explanation(const char *result) {
         return NULL;
 }
 
-/* "systemctl status"/"journalctl" below are not a typo for picoctl/picolog
- * -- picoctl.c's own header explains both are ALTERNATIVES-aliased to land
- * at those exact names on a real image, so upstream's literal hint text is
- * also literally correct advice here. */
+/* "systemctl status"/"journalctl" below are not a typo for picoctl/picolog:
+ * both are aliased to those names on a real image, so upstream's literal hint
+ * text is correct advice here. */
 static void print_job_failed(const char *unit) {
         struct unit_state st;
         const char *expl;
@@ -2351,13 +2259,10 @@ static void print_job_failed(const char *unit) {
 }
 
 /*
- * The handful of reasons manager-ctrl.c's wire protocol can send back
- * (its own header comment lists every one). "no-such-unit" has a clean
- * upstream equivalent and gets it; the rest (shutting-down, out-of-memory,
- * too-many-connections, enqueue-failed, permission-denied) are pico-init-
- * internal conditions a D-Bus-based systemctl has no equivalent single
- * error string for, so they are relayed honestly as themselves rather than
- * dressed up as an upstream quote that would not actually be one.
+ * The reasons manager-ctrl.c's wire protocol can send back. "no-such-unit"
+ * has a clean upstream equivalent and gets it; the rest (shutting-down,
+ * out-of-memory, too-many-connections, enqueue-failed, permission-denied)
+ * have no single systemctl error string, so they are relayed as themselves.
  */
 static void print_verb_failure(const char *verb, const char *unit, const char *reason) {
         if (strcmp(reason, "no-such-unit") == 0)
@@ -2368,24 +2273,20 @@ static void print_verb_failure(const char *verb, const char *unit, const char *r
 
 /*
  * start/stop/restart share everything except the wire verb sent to
- * manager-ctrl.c; `display_verb` is what upstream's own job_type string
- * (systemctl-start-unit.c's unit_actions[] table) would be for the verb the
- * person actually typed, which the error text uses -- for a plain verb the
- * two are the same string, for an alias (try-restart's own callers, below)
- * they differ. reset-failed (further down) does not take --no-block and
- * never fails with a job result, so it stays separate rather than a fourth
- * case squeezed in here.
+ * manager-ctrl.c; `display_verb` is upstream's job_type string
+ * (systemctl-start-unit.c's unit_actions[] table) for the verb the person
+ * typed, used in the error text. It differs from the plain verb for aliases
+ * (try-restart's callers, below). reset-failed takes no --no-block and never
+ * fails with a job result, so it stays separate.
  *
- * Silent on success, exit 0: real start/stop/restart print NOTHING when
- * the job finishes (or is merely queued, under --no-block) -- picoctl used
- * to printf the unit name here, which real systemctl never does.
+ * Silent on success, exit 0, like real start/stop/restart.
  */
 static int cmd_verb_generic(int argc, char *argv[], const char *wire_verb, const char *display_verb) {
         int i, status = 0;
 
         /* --no-block is global (arg_no_block, from main()'s getopt_long()
-         * pass) and never reaches this argv any more, so every entry here
-         * is a real unit name. */
+         * pass) and never reaches this argv, so every entry here is a
+         * unit name. */
         if (argc < 1) {
                 picoctl_error("picoctl %s: missing unit name", display_verb);
                 return 1;
@@ -2402,7 +2303,7 @@ static int cmd_verb_generic(int argc, char *argv[], const char *wire_verb, const
                         /* A transport-level failure (no control socket at
                          * all, a permission problem, ...): there is no bus
                          * call to have failed, so this is picoctl's own
-                         * honest wording, not a claimed upstream quote. */
+                         * wording, not an upstream quote. */
                         picoctl_error("Failed to %s %s: %s", display_verb, argv[i], strerror(-r));
                         status = 1;
                         continue;
@@ -2447,7 +2348,7 @@ static int cmd_restart(int argc, char *argv[]) {
 }
 
 /* condstop: legacy RH/ALTLinux alias, job_type "stop" (systemctl-start-
- * unit.c's unit_actions[] table) -- identical to plain stop. */
+ * unit.c's unit_actions[] table), identical to plain stop. */
 static int cmd_condstop(int argc, char *argv[]) {
         return cmd_verb_generic(argc, argv, "stop", "stop");
 }
@@ -2455,18 +2356,13 @@ static int cmd_condstop(int argc, char *argv[]) {
 /*
  * try-restart (TryRestartUnit)/condrestart (its legacy RH alias, same job
  * type): restart only a unit that is currently active; an inactive one is
- * left alone, silently, exit 0 -- never started, unlike plain restart.
+ * left alone, silently, exit 0.
  *
- * The honest gap: upstream can tell "loadable, but currently inactive"
- * apart from "no such unit at all", because it resolves the unit file
- * itself before deciding. picoctl's read verbs only ever see what the live
- * manager has already published a state file for (read_unit_state()'s own
- * not-found-default comment) -- a unit that is merely unpublished (loaded
- * at boot but never yet started) reads identically to one that does not
- * exist. So a try-restart/condrestart on a name that genuinely does not
- * exist is also, here, a silent no-op rather than the "Unit not found"
- * error real systemctl would give -- a narrow, documented simplification,
- * not a pretended success.
+ * Gap: upstream tells "loadable, but inactive" from "no such unit" by
+ * resolving the unit file; picoctl only sees units the manager has published
+ * a state file for, so a loaded-but-never-started unit reads like a missing
+ * one. A try-restart on a name that does not exist is therefore a silent
+ * no-op rather than upstream's "Unit not found" error.
  */
 static int cmd_try_restart_as(int argc, char *argv[], const char *display_verb) {
         char **active;
@@ -2508,12 +2404,8 @@ static int cmd_condrestart(int argc, char *argv[]) {
 
 /*
  * reload-or-restart (ReloadOrRestartUnit): reload if the unit supports it,
- * else restart. ExecReload= is never implemented in pico-init (no unit
- * ever "can reload" -- see cmd_reload()'s own comment), so the "else"
- * branch is the only branch that can ever run: this always, unconditionally,
- * restarts. That is the real, faithful behavior for this engine, not a
- * shortcut -- it is upstream's own fallback, just taken every time because
- * the other branch never applies here.
+ * else restart. ExecReload= is not implemented (see cmd_reload()), so this
+ * always restarts, which is upstream's own fallback.
  */
 static int cmd_reload_or_restart(int argc, char *argv[]) {
         return cmd_verb_generic(argc, argv, "restart", "reload-or-restart");
@@ -2522,26 +2414,20 @@ static int cmd_reload_or_restart(int argc, char *argv[]) {
 /*
  * try-reload-or-restart (ReloadOrTryRestartUnit) and its three legacy
  * spellings -- reload-or-try-restart, condreload, force-reload -- all share
- * one job_type string upstream ("reload-or-try-restart",
- * systemctl-start-unit.c's unit_actions[] table) and one behavior: reload if
- * supported, else try-restart. Same reasoning as reload-or-restart() above:
- * ExecReload= never exists here, so this always takes the try-restart
- * branch.
+ * one upstream job_type string ("reload-or-try-restart",
+ * systemctl-start-unit.c's unit_actions[] table) and behaviour: reload if
+ * supported, else try-restart. ExecReload= does not exist here, so this
+ * always takes the try-restart branch.
  */
 static int cmd_try_reload_or_restart(int argc, char *argv[]) {
         return cmd_try_restart_as(argc, argv, "reload-or-try-restart");
 }
 
 /*
- * reload (ReloadUnit): ExecReload= is not implemented anywhere in pico-init
- * -- no service ever reports being reloadable, and there is no JOB_RELOAD
- * in job.h to even enqueue (only START/STOP/RESTART) -- so this must fail
- * honestly, not pretend. This is exactly upstream's own error for a unit
- * with no ExecReload=: unit_can_reload() returning false maps to -EBADR,
- * which the bus layer turns into BUS_ERROR_JOB_TYPE_NOT_APPLICABLE, whose
- * text is "Job type %s is not applicable for unit %s." (src/core/
- * transaction.c) -- reachable live by running `systemctl reload` against
- * any real service with no ExecReload=.
+ * reload (ReloadUnit): ExecReload= is not implemented in pico-init and job.h
+ * has no JOB_RELOAD (only START/STOP/RESTART), so this fails like upstream
+ * does for a unit with no ExecReload=: "Job type %s is not applicable for
+ * unit %s." (BUS_ERROR_JOB_TYPE_NOT_APPLICABLE, src/core/transaction.c).
  */
 static int cmd_reload(int argc, char *argv[]) {
         int i;
@@ -2596,13 +2482,11 @@ static int cmd_reset_failed(int argc, char *argv[]) {
 }
 
 /*
- * daemon-reload: the one action verb with no unit argument at all. manager-
- * ctrl.c's wire grammar for it is just "PICO1 daemon-reload" (see its own
- * header), so this talks the socket directly rather than through
- * ctrl_roundtrip(), which always sends a unit token. Silent on success,
- * exit 0, matching daemon_reload()'s own bare `return 0;` on success
- * (systemctl-daemon-reload.c) -- and its error text, "%s daemon failed:
- * %s" with method "Reload", i.e. "Reload daemon failed: %s".
+ * daemon-reload: the one action verb with no unit argument. The wire grammar
+ * is just "PICO1 daemon-reload" (manager-ctrl.h), so this talks the socket
+ * directly rather than through ctrl_roundtrip(), which always sends a unit
+ * token. Silent on success, exit 0, as daemon_reload() (systemctl-daemon-
+ * reload.c); the error text is "Reload daemon failed: %s".
  */
 static int cmd_daemon_reload(int argc, char *argv[]) {
         static const char line[] = "PICO1 daemon-reload";
@@ -2652,20 +2536,16 @@ static int cmd_daemon_reload(int argc, char *argv[]) {
 
 /*
  * kill (KillUnit): signal the unit's processes directly. Self-contained in
- * picoctl rather than a new manager-ctrl.c wire verb -- everything it needs
- * (the published MainPID, the cgroup's cgroup.procs) is already read-only
- * state picoctl already reads for `status` (print_cgroup_procs()), so no
- * engine change is needed to make this real rather than a no-op.
+ * picoctl rather than a manager-ctrl.c wire verb: the published MainPID and
+ * the cgroup's cgroup.procs are already read-only state picoctl reads for
+ * `status` (print_cgroup_procs()).
  *
- * --kill-who=all (upstream's own default) signals every pid in the unit's
+ * --kill-who=all (upstream's default) signals every pid in the unit's
  * cgroup; --kill-who=main signals only the published MainPID. --signal/-s
  * takes SIGTERM (upstream's default), SIGKILL, SIGHUP, SIGINT or a bare
- * number -- the signals this project's own units actually get sent
- * (manager-loop.c, service.c); anything else is refused rather than guessed
- * at. Both options are global (arg_signal_name/arg_kill_who, from main()'s
- * getopt_long() pass): the value is consumed as the option's own argument,
- * so "-s KILL"/"--signal KILL" now work exactly like "--signal=KILL" --
- * mangle_unit_arg() never sees it either way.
+ * number; anything else is refused rather than guessed at. Both options are
+ * global (arg_signal_name/arg_kill_who, from main()'s getopt_long() pass), so
+ * "-s KILL", "--signal KILL" and "--signal=KILL" are equivalent.
  */
 static int signal_from_name(const char *s, int *ret) {
         if (strcmp(s, "SIGTERM") == 0 || strcmp(s, "TERM") == 0) {
@@ -2765,14 +2645,10 @@ static void usage(void) {
 
 /*
  * Real systemctl auto-appends ".service" to a bare unit name with no type
- * suffix (unit_name_mangle() in systemd's own src/shared/unit-name.c).
- * picoctl never did this: unit-name.c's unit_name_is_valid() requires a
- * recognised suffix and every verb below passes argv straight through to it
- * (via manager_load_unit(), load_install_info(), ctrl_roundtrip(), ...), so
- * "picoctl status bt-pan-client" looked for a unit literally named
- * "bt-pan-client" and reported not-found even with bt-pan-client.service
- * genuinely installed. Confirmed live on h2200 -- status, start and restart
- * all hit this identically, for bt-pan-client, usb-multi-gadget and gpe-dm.
+ * suffix (unit_name_mangle() in systemd's src/shared/unit-name.c). Without
+ * it, unit-name.c's unit_name_is_valid() rejects the bare name and
+ * "picoctl status bt-pan-client" reports not-found even with
+ * bt-pan-client.service installed.
  *
  * Returns NULL (meaning: use `arg` unchanged) for anything that is not a
  * bare identifier -- a flag (leading '-'), or an argument that already names
@@ -2797,22 +2673,19 @@ static char *mangle_unit_arg(const char *arg) {
 }
 
 /*
- * reboot/poweroff/halt/shutdown: a deliberate simplification, not what real
- * systemctl/reboot(8)/halt(8) actually do -- those go logind first, then a
- * D-Bus StartUnit on halt/poweroff/reboot.target, and only reach a raw
- * syscall with --force (src/systemctl/systemctl-compat-halt.c). kill(1, sig)
- * is PID 1's own signal convention (manager-loop.c's manager_dispatch_
- * signal(): SIGINT -> MANAGER_REBOOT, SIGRTMIN+3/+4 -> MANAGER_POWEROFF,
- * matching manager.c's target_table), reachable by anyone sending it, not
- * something systemctl itself calls -- picoctl goes straight there since it
- * has no logind/D-Bus to call through. No --force/--wtmp-only/--no-wall
- * flags either: every invocation acts immediately regardless (see usage()).
+ * reboot/poweroff/halt/shutdown: a simplification of what real systemctl/
+ * reboot(8)/halt(8) do -- those go through logind and a D-Bus StartUnit on
+ * halt/poweroff/reboot.target, reaching a raw syscall only with --force
+ * (src/systemctl/systemctl-compat-halt.c). Here kill(1, sig) uses PID 1's own
+ * signal convention (manager-loop.c's manager_dispatch_signal(): SIGINT ->
+ * MANAGER_REBOOT, SIGRTMIN+3/+4 -> MANAGER_POWEROFF, matching manager.c's
+ * target_table), since there is no logind/D-Bus to call. No
+ * --force/--wtmp-only/--no-wall flags: every invocation acts immediately
+ * (see usage()).
  *
  * /sbin/reboot, /sbin/poweroff, /sbin/halt and /sbin/shutdown are meant to
- * be ALTERNATIVE-aliased straight at this binary (the recipe's own
- * ALTERNATIVE_TARGET[reboot] etc., same mechanism as systemctl itself) --
- * main() below dispatches on argv[0]'s basename before any verb parsing,
- * exactly as real systemctl does for these same four names.
+ * be symlinked straight at this binary, like systemctl itself; main()
+ * dispatches on argv[0]'s basename before any verb parsing.
  */
 static int send_pid1_signal(int sig, const char *what) {
         if (kill(1, sig) < 0) {
@@ -2841,10 +2714,9 @@ static int cmd_halt(int argc, char *argv[]) {
 }
 
 /*
- * No scheduler and no wall(1) broadcast exist here -- `shutdown` only ever
- * accepts the immediate case, same spirit as every other "not implemented,
- * refuse rather than silently do something else" choice in this codebase.
- * -h/-P means poweroff (the default, matching real shutdown(8)), -r reboot.
+ * No scheduler and no wall(1) broadcast exist here, so `shutdown` only
+ * accepts the immediate case. -h/-P means poweroff (the default, as in real
+ * shutdown(8)), -r reboot.
  */
 static int cmd_shutdown(int argc, char *argv[]) {
         bool do_reboot = false;
@@ -2869,25 +2741,20 @@ static int cmd_shutdown(int argc, char *argv[]) {
 }
 
 /*
- * One getopt_long() pass, permuting (the default: no leading '+' in the
- * optstring, POSIXLY_CORRECT not set), over the *whole* argv -- matching
- * real systemctl's own systemctl_parse_argv(), which is why an option may
- * sit before, between or after the verb and unit arguments, "--" ends
- * option parsing, and both "--opt=value" and "--opt value"/"-o value" work.
- * Unknown options and missing required arguments get getopt_long's own
- * stderr message (opterr is left at its default, 1) and exit 1 -- this
- * never prints a second, redundant diagnostic of its own.
+ * One getopt_long() pass, permuting (no leading '+' in the optstring,
+ * POSIXLY_CORRECT not set), over the whole argv, as systemctl_parse_argv()
+ * does: an option may sit before, between or after the verb and unit
+ * arguments, "--" ends option parsing, and both "--opt=value" and "--opt
+ * value"/"-o value" work. Unknown options and missing arguments get
+ * getopt_long's own stderr message (opterr is left at 1) and exit 1.
  *
- * --system/--user/--global/-H/--host/-M/--machine are accepted here (so
- * they never fall through to "Unknown command verb") but only --system
- * actually matches reality: pico-init has exactly one manager, running as
- * PID 1, with no user instance and no remote/container transport, so the
- * other five refuse honestly rather than pretend to connect anywhere.
- * -f/--force and --no-pager/--no-wall are accepted-and-meaningless: real
- * systemctl's own force/no-wall behaviour for reboot/poweroff/halt/shutdown
- * only exists in this program via the argv[0] alias dispatch above (see
- * cmd_shutdown()'s own comment), which never reaches this parser at all;
- * there is no pager to ever disable either.
+ * --system/--user/--global/-H/--host/-M/--machine are accepted so they never
+ * fall through to "Unknown command verb", but only --system matches reality:
+ * pico-init has one manager, PID 1, with no user instance or remote/container
+ * transport, so the other five refuse. -f/--force and --no-pager/--no-wall
+ * are accepted and ignored: force/no-wall behaviour for reboot/poweroff/halt/
+ * shutdown exists only through the argv[0] alias dispatch (see
+ * cmd_shutdown()), and there is no pager.
  */
 static int picoctl_parse_options(int argc, char *argv[]) {
         enum {
@@ -3068,22 +2935,16 @@ int main(int argc, char *argv[]) {
                 {              "poweroff",              cmd_poweroff },
                 {                  "halt",                  cmd_halt },
                 /*
-                 * Deliberately NOT in this table, so they fall through to
-                 * "Unknown command verb" below rather than a pretended
-                 * success: get-default/set-default (no persisted "default
-                 * target" concept exists -- manager_startup()'s own
-                 * default_target is a boot-time argument, never written or
-                 * read back by picoctl) and isolate (would need a JOB_
-                 * ISOLATE job.h does not have, and the all-other-units-stop
-                 * transaction semantics that go with it -- out of scope
-                 * for this milestone, not merely unimplemented by oversight).
-                 * daemon-reexec, set-environment/unset-environment/show-
-                 * environment, edit, link, add-wants/add-requires,
-                 * list-dependencies/list-jobs/list-sockets/list-timers/
-                 * list-machines, and the various service-log-level/
-                 * watchdog/bind/mount-image/set-property verbs: no faithful
-                 * backing in pico-init at all (no D-Bus properties to set,
-                 * no sockets/timers/mounts tracked the way those verbs need).
+                 * Not in this table, so they fall through to "Unknown command verb" below
+                 * rather than a pretended success: get-default/set-default (no persisted
+                 * default target; manager_startup()'s default_target is a boot-time
+                 * argument), isolate (would need a JOB_ISOLATE and the stop-everything-else
+                 * transaction semantics), daemon-reexec, set-environment/unset-environment/
+                 * show-environment, edit, link, add-wants/add-requires, list-dependencies/
+                 * list-jobs/list-sockets/list-timers/list-machines, and the service-log-
+                 * level/watchdog/bind/mount-image/set-property verbs, which have no backing
+                 * in pico-init (no D-Bus properties, no sockets/timers/mounts tracked the
+                 * way those verbs need).
                  */
         };
         const char *prog0;

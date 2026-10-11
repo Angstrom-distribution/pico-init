@@ -3,15 +3,14 @@
 
 /*
  * Target units: a named synchronisation point with no process of its own.
- * Starting a target means nothing more than "everything it pulls in has been
- * started" -- all the real work is the job engine walking the target's
- * Wants=/Requires= and its ordering edges, so target.c is deliberately thin.
+ * Starting a target means "everything it pulls in has been started"; the job
+ * engine does the work by walking the target's Wants=/Requires= and ordering
+ * edges.
  *
  * Targets exist because the boot transaction needs a root. pico-init follows
- * upstream's model rather than a cut-down subset (see plans/29-pico-init.md,
- * "The decided scope"): default.target is the root, WantedBy= is honoured via
+ * upstream's model: default.target is the root, WantedBy= is honoured via
  * real .wants/ symlink directories, and preset files decide what is enabled by
- * default -- so unmodified upstream unit files behave the way they say they do.
+ * default, so unmodified upstream unit files behave as written.
  */
 
 #pragma once

@@ -3,46 +3,22 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 /*
- * Ported from src/libsystemd-network/dhcp-server-send.c + dhcp-server-
- * send.h (453 + 8 lines). Building and transmitting OFFER/ACK/NAK. No real
- * copyright line upstream.
+ * Ported from systemd v261.2 src/libsystemd-network/dhcp-server-send.c:
+ * building and transmitting OFFER/ACK/NAK.
  *
- * Quarry point: systemd v261.2, commit 4925d9f07f. History review
- * (4925d9f07f..main, plan §2.2): no fix in the 26-commit lift-set window
- * touches dhcp-server-send.c.
+ * Deviation: upstream's dhcp_server_send_message() has a fourth transport,
+ * dhcp_server_send_unicast_raw(), an AF_PACKET send with a hand-built
+ * Ethernet frame used when giaddr == 0, ciaddr == 0, the client's broadcast
+ * flag is unset and its hardware address is known (unicast by MAC to a host
+ * that has no IP yet). That would need a second raw-socket framer next to the
+ * client's, so dhcp_server_send_message() below always broadcasts when
+ * ciaddr == 0. This is RFC 2131 §4.1-legal (a server MAY always broadcast
+ * DHCPOFFER/DHCPACK) and clients listen on the UDP broadcast address anyway;
+ * the cost is a broadcast where a unicast would have done.
  *
- * DELIBERATE DEVIATION, recorded here because it is the one place this
- * milestone genuinely changes wire behaviour rather than just cutting
- * unused surface: upstream's dhcp_server_send_message() has a fourth
- * transport, dhcp_server_send_unicast_raw() -- an AF_PACKET send with a
- * hand-built Ethernet frame, used exactly when giaddr == 0, ciaddr == 0,
- * the client's broadcast flag is unset, and the client's hardware address
- * is known: i.e. "unicast to a host that doesn't have an IP yet, by MAC
- * address, because ARP can't resolve an address that isn't configured."
- * dhcp-message.h's own header (this milestone's shared codec, not owned by
- * this file) explicitly declines to carry dhcp_message_send_raw()/
- * send_udp(), assigning raw-socket I/O to "the client's own socket layer"
- * -- but the server needs exactly the same primitive for exactly the same
- * pre-lease reason, and building a second from-scratch AF_PACKET framer
- * here to duplicate what the client milestone (not owned by this one) will
- * already need is not a good trade for an MVP server whose entire target
- * deployment is a usb-gadget point-to-point link or a small LAN with one
- * server. dhcp_server_send_message() below always broadcasts when
- * ciaddr == 0, regardless of the client's broadcast flag or known hardware
- * address. This is RFC 2131 §4.1-legal (a server MAY always broadcast
- * DHCPOFFER/DHCPACK) and every real DHCP client -- including netd's own --
- * listens on the UDP broadcast address regardless of whether it could also
- * receive a raw unicast, so no compliant client is left unreachable; the
- * only real cost is a broadcast packet on segments where a unicast would
- * have done, which is immaterial at netd's target scale. Revisit if this
- * server ever needs to serve a LAN dense enough for that to matter.
- *
- * The other three transports (NAK broadcast, ciaddr-unicast, and the
- * giaddr-relay unicast) are kept in full-upstream shape except that the
- * giaddr branch is unreachable and therefore not carried: dhcp-server-
- * request.c's own header explains why giaddr is required to be
- * INADDR_ANY (no relay support, plan §2.9), so dhcp_server_send_message()
- * below never needs to route a reply to a relay's address.
+ * The NAK broadcast and ciaddr-unicast transports are kept. The giaddr relay
+ * transport is not carried, since giaddr must be INADDR_ANY (see
+ * dhcp-server-request.c).
  */
 
 #include "dhcp-server-lease-internal.h"
@@ -161,9 +137,8 @@ static int dhcp_server_new_reply(DhcpServer *server, DHCPRequest *req, uint8_t t
                         return r;
         }
 
-        /* DhcpLeaseServerType (dhcp-lease-internal.h, shared with the
-         * client side of this lift) only defines DNS/NTP/SIP -- POP3/SMTP/
-         * LPR are cut with it across the whole lift set, not just here. */
+        /* DhcpLeaseServerType (dhcp-lease-internal.h) only defines
+         * DNS/NTP/SIP; POP3/SMTP/LPR are cut. */
         static const uint8_t option_map[_DHCP_LEASE_SERVER_TYPE_MAX] = {
                 [DHCP_LEASE_DNS] = SD_DHCP_OPTION_DOMAIN_NAME_SERVER,
                 [DHCP_LEASE_NTP] = SD_DHCP_OPTION_NTP_SERVER,

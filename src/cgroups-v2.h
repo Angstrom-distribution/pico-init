@@ -82,9 +82,8 @@ bool cgroup_v2_kill_is_atomic(struct pico_cgroup *cg);
  * fork its way out from under it. That file only exists on Linux >= 5.14.
  *
  * The value is "1", not "all". cgroup.kill takes a boolean; "all" is rejected
- * with EIO. (plans/29-pico-init.md §1.2 says "all" -- it is wrong, verified
- * against a real 6.18 kernel: writing "all" fails every time, writing "1"
- * kills the members and flips cgroup.events to populated 0.)
+ * with EIO; writing "1" kills the members and flips cgroup.events to
+ * populated 0.
  *
  * Fallback, when it does not: read cgroup.procs and SIGKILL each pid, then
  * re-read until the cgroup is empty (bounded, so a pathological forker cannot

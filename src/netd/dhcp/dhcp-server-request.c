@@ -3,54 +3,30 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 /*
- * Ported from src/libsystemd-network/dhcp-server-request.c (671 lines). The
- * dhcp_server_process_{discover,request,decline,release}() handlers --
- * synchronous request -> reply functions, which is exactly why the server
- * ports so much more cleanly than the client (plan §2.1). No real
- * copyright line upstream.
+ * Ported from systemd v261.2 src/libsystemd-network/dhcp-server-request.c:
+ * the dhcp_server_process_{discover,request,decline,release}() handlers.
+ * DHCPINFORM has no handler upstream either; dhcp_server_process_message()
+ * ignores it like every other unhandled type.
  *
- * Quarry point: systemd v261.2, commit 4925d9f07f. History review
- * (4925d9f07f..main, plan §2.2): no fix in the 26-commit lift-set window
- * touches dhcp-server-request.c.
- *
- * ONE THING THE PLAN GOT WRONG, WORTH RECORDING: plan §2 repeatedly names
- * "dhcp_server_process_{discover,request,decline,release,inform}()" as the
- * five handlers this milestone ports. The real v261.2 source has no
- * dhcp_server_process_inform() at all -- DHCPINFORM falls through
- * dhcp_server_process_message()'s switch to `default: return 0` (ignored),
- * same as every other unhandled type. This file matches the real source,
- * not the plan's prose: four handlers, not five. Flagged in the final
- * report rather than silently "fixed" by inventing a fifth handler nothing
- * upstream has.
- *
- * Structural changes from upstream, all consequences of decisions recorded
- * in dhcp-server-internal.h's header (read that first):
+ * Structural changes from upstream (see dhcp-server-internal.h):
  *
  *  - No relay. dhcp_server_parse_message() requires giaddr == INADDR_ANY and
- *    rejects a nonzero one with -EBADMSG (upstream instead treats
- *    giaddr == server->address specifically as a malicious-message signal
- *    and otherwise forwards through it -- relay is out of scope here, so
- *    any giaddr at all means a device this server was never meant to talk
- *    to is on the wire).
- *  - server_guess_client_state() collapses upstream's SELECTING /
- *    RENEWING / REBINDING / INIT_REBOOT four-way (the middle two split by
- *    IP_PKTINFO destination-address inspection, itself only there to avoid
- *    a NAK disturbing a *different* DHCP server on a shared subnet) into
- *    SELECTING / RENEW-OR-REBIND / INIT_REBOOT. netd's deployment model is
- *    exactly one authoritative server per link (a usb-gadget point-to-point
- *    link or a small LAN this server itself owns), so there is no other
- *    server a NAK could disturb, and the collapsed state still NAKs every
- *    mismatch and ignores nothing.
- *  - No static-lease path (dhcp_server_get_static_lease() does not exist
- *    here) -- every DISCOVER/REQUEST is resolved against the dynamic pool
- *    only.
- *  - dhcp_server_process_discover()'s siphash-offset trick is kept in full
- *    (plan calls out this exact mechanism as worth carrying): even with no
- *    persistence, hashing the client-id into an offset into the pool means
- *    a client that DISCOVERs twice is likely offered the same address both
- *    times, without needing to remember anything. siphash24() (netd's
- *    trimmed dhcp/siphash24.h) replaces the incremental
- *    init/compress/finalize dance upstream uses for a single 16-byte input.
+ *    rejects a nonzero one with -EBADMSG (upstream treats
+ *    giaddr == server->address as a malicious-message signal and otherwise
+ *    forwards through it).
+ *  - server_guess_client_state() collapses upstream's SELECTING / RENEWING /
+ *    REBINDING / INIT_REBOOT four-way (RENEWING and REBINDING are split by
+ *    IP_PKTINFO destination-address inspection, to avoid a NAK disturbing a
+ *    different DHCP server on a shared subnet) into SELECTING /
+ *    RENEW-OR-REBIND / INIT_REBOOT. With one authoritative server per link
+ *    every mismatch is NAKed.
+ *  - No static-lease path: requests are resolved against the dynamic pool.
+ *  - dhcp_server_process_discover()'s siphash-offset trick is kept: hashing
+ *    the client-id into an offset into the pool makes a client that
+ *    DISCOVERs twice likely to be offered the same address both times,
+ *    without remembering anything. siphash24() (dhcp/siphash24.h) replaces
+ *    upstream's incremental init/compress/finalize for the single 16-byte
+ *    input.
  */
 
 #include "dhcp-server-lease-internal.h"
@@ -67,10 +43,9 @@
  * absent. */
 #define DHCP_MIN_MESSAGE_SIZE 576
 
-/* Generous ceiling for one incoming datagram: real DHCP packets are a few
- * hundred bytes; this is larger than any max_message_size a sane client
- * would request, so a legitimate packet is never truncated, and an
- * over-large one is simply dropped (MSG_TRUNC) rather than parsed partially. */
+/* Receive buffer ceiling: larger than any max_message_size a sane client
+ * requests; an over-large datagram is dropped (MSG_TRUNC) rather than parsed
+ * partially. */
 #define DHCP_SERVER_RECV_BUF_SIZE 2048
 
 static DHCPRequest *dhcp_request_free(DHCPRequest *req) {
@@ -160,9 +135,8 @@ static int dhcp_server_parse_message(DhcpServer *server, const struct iovec *iov
         if (r < 0)
                 return r;
 
-        /* No relay support (dhcp-server-internal.h's header) -- any giaddr
-         * at all means this packet came via, or claims to come via, a relay
-         * agent this server does not implement forwarding for. */
+        /* No relay support: any giaddr means the packet came via, or claims
+         * to come via, a relay agent. */
         netd_validate(message->header.giaddr == htobe32(INADDR_ANY), -EBADMSG);
 
         req = new0(DHCPRequest, 1);
@@ -173,8 +147,7 @@ static int dhcp_server_parse_message(DhcpServer *server, const struct iovec *iov
         req->max_message_size = DHCP_MIN_MESSAGE_SIZE;
 
         /* hlen/chaddr may be unset for a non-Ethernet interface (RFC 2131
-         * 4.1); dhcp_message_get_hw_addr() already validates hlen's bound
-         * against a real -EBADMSG (netd's codec layer, not this file). */
+         * 4.1); dhcp_message_get_hw_addr() bounds-checks hlen. */
         r = dhcp_message_get_hw_addr(req->message, &req->hw_addr);
         if (r < 0)
                 return r;
@@ -234,9 +207,8 @@ static int dhcp_server_process_discover(DhcpServer *server, DHCPRequest *req) {
         pico_log(PICO_LOG_DEBUG, "netd: dhcp-server: DISCOVER (0x%x)", be32toh(req->message->header.xid));
 
         if (existing_lease) {
-                /* The lease's own slot index *is* the address (dhcp-server-
-                 * lease-internal.h's design) -- reuse it directly rather
-                 * than re-deriving from a stored address field. */
+                /* The lease's slot index is the address (see
+                 * dhcp-server-lease-internal.h). */
                 ssize_t idx = existing_lease - server->leases;
                 be32_t candidate = htobe32(be32toh(server->subnet) | (server->pool_offset + (uint32_t) idx));
                 if (dhcp_server_address_is_in_pool(server, candidate))
@@ -285,8 +257,7 @@ static int dhcp_server_process_discover(DhcpServer *server, DHCPRequest *req) {
         return dhcp_server_send_reply(server, req, DHCP_OFFER);
 }
 
-/* Collapsed RENEW-OR-REBIND state -- see this file's header for why the
- * upstream RENEWING/REBINDING split does not apply here. */
+/* Collapsed RENEW-OR-REBIND state; see this file's header. */
 typedef enum RequestState {
         REQUEST_SELECTING,
         REQUEST_RENEW_OR_REBIND,
@@ -344,9 +315,7 @@ static int dhcp_server_process_request(DhcpServer *server, DHCPRequest *req) {
                                                                 "renew-or-rebind",
                  be32toh(req->message->header.xid));
 
-        /* Every mismatch NAKs -- no REBINDING-silently-ignore case, see this
-         * file's header for why that split does not apply to netd's
-         * one-server-per-link deployment. */
+        /* Every mismatch NAKs; there is no REBINDING silently-ignore case. */
 
         DhcpServerLease *held = dhcp_server_get_lease_by_address(server, address);
         if (held && held != existing_lease)
@@ -425,10 +394,8 @@ int dhcp_server_process_message(DhcpServer *server, const struct iovec *iov) {
         case DHCP_RELEASE:
                 return dhcp_server_process_release(server, req);
         default:
-                /* Includes DHCPINFORM, which upstream also does not handle
-                 * (see this file's header) -- and any type this milestone
-                 * simply does not implement (FORCERENEW has no caller,
-                 * dhcp-server-internal.h's header). */
+                /* Includes DHCPINFORM (see this file's header) and any other
+                 * unimplemented type (FORCERENEW has no caller). */
                 return 0;
         }
 }
@@ -451,16 +418,14 @@ int dhcp_server_io_callback(Netd *n, struct netd_epoll_tag *tag, uint32_t revent
                         return 0;
                 /* Not "%m": pico_log_internal() is declared with the ISO
                  * "printf" format archetype, and -Wpedantic rejects glibc's
-                 * %m extension against it (netd-time.c hit and documented
-                 * the same thing first). */
+                 * %m extension against it. */
                 log_dhcp_server_errno(server, r, "netd: dhcp-server: recv: %s", strerror(-r));
                 return 0;
         }
 
         if ((size_t) len > sizeof(buf)) {
-                /* MSG_TRUNC: kernel reports the true datagram length even
-                 * when it exceeds the buffer -- a real, oversized wire
-                 * packet, not netd's own bug. Drop it. */
+                /* MSG_TRUNC: the kernel reports the true datagram length even
+                 * when it exceeds the buffer. Drop it. */
                 pico_log(PICO_LOG_DEBUG,
                          "netd: dhcp-server: %s: oversized datagram (%zd bytes), dropped",
                          server->ifname ? server->ifname : "?",

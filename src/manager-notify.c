@@ -7,14 +7,12 @@
  * queued -- manager-loop.c's own re-poll rule), attribute via SO_PASSCRED +
  * manager_get_unit_by_pid(), apply recognized keys.
  *
- * Deliberately NOT adopted from real systemd's manager_setup_notify(), each
- * with a reason: fd_increase_rxbuf(fd, 8*U64_MB) -- this project's own J1
- * measurement (service-exec.c:473-476) found SO_RCVBUF has no effect on
- * AF_UNIX SOCK_DGRAM queue depth, so calling it here would be cargo cult
- * against our own data. SO_PASSPIDFD -- upstream's own code marks it a TODO
- * pending a kernel baseline this project does not assume yet; pico
- * attributes by plain pid_t everywhere (SIGCHLD, manager_get_unit_by_pid()),
- * and half-adopting pidfds would be false hardening.
+ * Not adopted from real systemd's manager_setup_notify(), each with a reason:
+ * fd_increase_rxbuf(fd, 8*U64_MB), because SO_RCVBUF does not change the queue
+ * depth of an AF_UNIX SOCK_DGRAM socket (net.unix.max_dgram_qlen does);
+ * SO_PASSPIDFD, because upstream marks it a TODO pending a kernel baseline,
+ * and pico attributes by plain pid_t everywhere (SIGCHLD,
+ * manager_get_unit_by_pid()), so half-adopting pidfds would be false hardening.
  */
 
 #define _GNU_SOURCE
@@ -46,7 +44,7 @@
 /* SCM_RIGHTS fds this listener will ever collect from one datagram --
  * generous for BARRIER=1's single pipe-write end; anything beyond this is
  * still received (the kernel does not truncate SCM_RIGHTS short of its own
- * control-buffer size) but simply not tracked past PICO_NOTIFY_FD_MAX. */
+ * control-buffer size) but not tracked past PICO_NOTIFY_FD_MAX. */
 #define PICO_NOTIFY_FD_MAX 8
 
 /* Upstream caps STATUS_TEXT_MAX the same way: bounded, not because a longer
@@ -71,9 +69,8 @@ struct pico_manager_notify {
  *
  * Every key not handled below (WATCHDOG*, STOPPING=1, RELOADING=1 excepted,
  * which are diagnosable-but-inert) is silently skipped -- see
- * manager-notify.h's DEFERRED SCOPE note and this file's own key-by-key
- * rationale in the design doc; an unknown or not-yet-implemented key must
- * never be an error, matching real systemd's own forward-compatible parser.
+ * manager-notify.h's list of what is not implemented; an unknown or
+ * unimplemented key must never be an error, matching real systemd's own forward-compatible parser.
  */
 static void notify_apply(Manager *m, Unit *u, const struct ucred *ucred, char *buf, size_t len) {
         Service *s;
@@ -153,8 +150,8 @@ static void notify_apply(Manager *m, Unit *u, const struct ucred *ucred, char *b
                          * Gated on ucred->uid == 0 rather than upstream's
                          * cgroup-membership check (service_is_suitable_
                          * main_pid(), src/core/service.c): every pico
-                         * service runs as root today, so this is honest for
-                         * an MVP and wrong the day user services land.
+                         * service runs as root, so this check is only correct
+                         * while there are no user services.
                          */
                         if (ucred->uid == 0) {
                                 char *end;
@@ -189,7 +186,7 @@ static void notify_apply(Manager *m, Unit *u, const struct ucred *ucred, char *b
 /*
  * The listener's io callback (EVENT_PRIORITY_NOTIFY). CALLBACK CONTRACT
  * (manager-loop.c's header): every path returns 0 except a hard recvmsg()
- * errno, where the source is disabled itself -- logged, deliberate, never a
+ * errno, where the source is disabled and the error logged, never a
  * silent < 0 propagation.
  */
 static int notify_io_cb(sd_event_source *es, int fd, uint32_t revents, void *userdata) {
@@ -225,7 +222,7 @@ static int notify_io_cb(sd_event_source *es, int fd, uint32_t revents, void *use
                 if (errno == EAGAIN || errno == EINTR)
                         return 0;
 
-                /* Deliberate, logged, self-inflicted: "this source must
+                /* Disable explicitly: "this source must
                  * never fire again" beats propagating < 0 and having the
                  * shim disable it silently (manager-loop.c's own contract). */
                 pico_log(PICO_LOG_ERR, "notify socket recvmsg: %s, disabling the listener", strerror(errno));
@@ -338,7 +335,7 @@ int manager_notify_setup(Manager *m) {
 
         /* Umask sandwich, not a chmod() after -- manager-ctrl.c's own
          * reasoning: a chmod leaves a window where the socket is live under
-         * the ambient umask. 0666 here (0111 mask), deliberately unlike
+         * the ambient umask. 0666 here (0111 mask), unlike
          * control's 0600: every service must be able to sendto(); the
          * kernel-filled SO_PASSCRED below is what stops a sender claiming a
          * foreign pid, not this socket's permissions. */

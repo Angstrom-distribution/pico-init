@@ -6,10 +6,8 @@
  * (get_device_first/next over real devices, get_subsystem_first/next over
  * the bus/class/module pseudo-devices).
  *
- * Both scans rescan on every _first call rather than trying to detect
- * whether a match changed since the last one: this runs on an embedded
- * board's /sys, which is small, and "always fresh, never stale" is a
- * simpler contract than a cache invalidation scheme with no measured need.
+ * Both scans rescan on every _first call; /sys on an embedded board is
+ * small, and this avoids any cache invalidation.
  */
 
 #include "sd-device.h"

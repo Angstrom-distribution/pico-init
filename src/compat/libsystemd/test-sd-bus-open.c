@@ -2,10 +2,9 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * Every way to obtain an sd_bus*: all fail, with the specific errno
- * depending only on ret==NULL and the real process environment
- * ($XDG_RUNTIME_DIR, $DBUS_STARTER_BUS_TYPE) -- never on any real bus
- * socket, since none of this shim's callers can create one.
+ * Every way to obtain an sd_bus*: all fail, with an errno that depends only
+ * on ret==NULL and the process environment ($XDG_RUNTIME_DIR,
+ * $DBUS_STARTER_BUS_TYPE), never on a bus socket.
  */
 
 #include "sd-bus.h"

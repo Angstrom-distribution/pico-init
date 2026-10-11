@@ -2,17 +2,14 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * pico-init's own implementation of the sd_journal_*() API (see sd-journal(3)
- * upstream). Function names, signatures, flag/enum values and the location-
- * macro behaviour below all match real libsystemd byte-for-byte -- that is
- * the compatibility contract, so a program written against the real header
- * builds unmodified against this one. The bodies behind them do not touch
- * the binary journal file format at all: they are real client code for
- * logd, this project's own log daemon (src/logd/). Where that genuinely
- * cannot mean the same thing on pico (no message catalog, no log
- * namespaces, no binary .journal files), the function fails honestly
- * instead of faking success -- see each .c file's own comment for exactly
- * what is real and what is a documented gap.
+ * pico-init's own implementation of the sd_journal_*() API (see
+ * sd-journal(3)). Function names, signatures, flag/enum values and the
+ * location-macro behaviour match real libsystemd, so a program written
+ * against the real header builds unmodified against this one. The bodies are
+ * client code for logd (src/logd/) and do not use the binary journal file
+ * format. Where logd has no equivalent (message catalog, log namespaces,
+ * binary .journal files) the function fails with an error; each .c file's
+ * comment says which.
  */
 
 #pragma once
@@ -49,12 +46,9 @@ int sd_journal_sendv_with_location(
                 const char *file, const char *line, const char *func, const struct iovec *iov, int n);
 int sd_journal_perror_with_location(const char *file, const char *line, const char *func, const char *message);
 
-/* Implicitly add the call site to every message sent, exactly as upstream
- * does -- CODE_FILE=/CODE_LINE=/CODE_FUNC= are accepted by sendv and then
- * dropped there (documented: logd has no field for them), so defining
- * SD_JOURNAL_SUPPRESS_LOCATION changes nothing observable on pico today,
- * but a program built against the real header expects it to compile either
- * way. */
+/* Implicitly add the call site to every message sent, as upstream does.
+ * CODE_FILE=/CODE_LINE=/CODE_FUNC= are dropped by sendv (logd has no field
+ * for them), so SD_JOURNAL_SUPPRESS_LOCATION has no observable effect here. */
 #ifndef SD_JOURNAL_SUPPRESS_LOCATION
 #        define sd_journal_print(priority, ...)                       \
                 sd_journal_print_with_location(                       \

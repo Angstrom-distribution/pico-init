@@ -3,16 +3,13 @@
 
 /*
  * Input device classification -- the ID_INPUT* properties upstream's
- * input_id builtin computes for every input device, which every input
- * consumer above the kernel keys on and which nothing on a pico image
- * produced.
+ * input_id builtin computes for every input device, which input consumers
+ * above the kernel key on.
  *
- * The consumer that made it a requirement is Xorg's config/udev backend: it
- * enumerates the input subsystem filtered on ID_INPUT=1 and decides what
- * driver class a device gets from ID_INPUT_KEYBOARD/_MOUSE/_TOUCHSCREEN/...
- * With none of them set, the h2200's touchscreen and gpio-keys are present,
- * their modules loaded (devd-modalias.h), their event nodes in /dev -- and
- * Xorg adds zero input devices, because to it there are none.
+ * Xorg's config/udev backend enumerates the input subsystem filtered on
+ * ID_INPUT=1 and decides a device's driver class from ID_INPUT_KEYBOARD/
+ * _MOUSE/_TOUCHSCREEN/... With none set, Xorg adds zero input devices even
+ * though the event nodes exist.
  *
  * The algorithm is upstream's src/udev/udev-builtin-input_id.c (GPL-2.0-or-
  * later, so ported directly rather than reimplemented) at systemd 041e70d7:
@@ -30,7 +27,7 @@
  *    ID_INPUT_TOUCHSCREEN and NOT ID_INPUT_KEY, which is the classification
  *    that keeps Xorg from opening it a second time as a keyboard.
  *
- * Two deliberate divergences: ID_INPUT_WIDTH_MM/HEIGHT_MM are not produced
+ * Two divergences: ID_INPUT_WIDTH_MM/HEIGHT_MM are not produced
  * (upstream gets them from EVIOCGABS on the event node, and devd stays
  * sysfs-only), and no rule is needed to trigger any of this -- devd-rules.c
  * skips IMPORT{builtin} whole, so classification runs unconditionally, before

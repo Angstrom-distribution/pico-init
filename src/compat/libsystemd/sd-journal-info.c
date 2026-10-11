@@ -2,10 +2,9 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * Per-entry timestamps, ring-wide cutoffs/usage, and the small honest-
- * failure group (get_seqnum, get_catalog*) that pico genuinely has no data
- * for. The ring is oldest-first by construction (logd-read.h), so cutoffs
- * are a plain first/last-entry read, never a scan.
+ * Per-entry timestamps, ring-wide cutoffs/usage, and the functions that
+ * always fail because logd has no such data (get_seqnum, get_catalog*). The
+ * ring is oldest-first (logd-read.h), so cutoffs read the first/last entry.
  */
 
 #include "sd-journal-internal.h"
@@ -191,5 +190,5 @@ int sd_journal_has_runtime_files(sd_journal *j) {
 
 int sd_journal_has_persistent_files(sd_journal *j) {
         (void) j;
-        return 0; /* genuinely true: the ring lives on /run tmpfs only, logd.h */
+        return 0; /* the ring lives on /run tmpfs only, logd.h */
 }

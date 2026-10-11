@@ -2,31 +2,22 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * S0-S2's acceptance tests (plan §1.6).
+ * Socket unit tests: parsing and pairing, real listen/trigger/fd-pass
+ * and lifecycle hardening.
  *
  * This binary does double duty. Run with no arguments it is the test suite;
  * run with one of a handful of "--helper" flags it instead behaves as a
  * tiny socket-activation CONSUMER, re-execed as a unit's own ExecStart= via
- * /proc/self/exe. That is what lets S1's "a test client reimplementing
- * sd_listen_fds()'s checks accepts the queued connection end-to-end"
- * criterion use a REAL forked, REAL exec'd, REAL socket-syscall process
- * rather than a shell script -- accept()/recv() have no portable shell
- * spelling, and a second meson-registered binary is not available to S0-S2
- * (meson.build is coordinator-owned; see plans/29-pico-init.md's file
- * ownership table).
+ * /proc/self/exe. That lets the "a test client reimplementing
+ * sd_listen_fds()'s checks accepts the queued connection end-to-end" test
+ * use a REAL forked, REAL exec'd, REAL socket-syscall process rather than a
+ * shell script -- accept()/recv() have no portable shell spelling, and a
+ * second binary would need its own meson registration.
  *
- * The other real gap this file works around: socket_notify_service_dead()
- * is designed to be called from service.c (frozen, owned by the
- * coordinator) at the two points a service reaches a genuinely terminal
- * state -- service_enter_dead() and service_do_start()'s start-limit-
- * exceeded branch (see socket.c's header for exactly which two lines). That
- * wiring has not landed yet. drive_step() below simulates it by calling
- * socket_notify_service_dead() itself right after draining a SIGCHLD batch,
- * which is the same point service_enter_dead() would have. Every other
- * piece exercised here -- socket_dispatch_io(), manager_dispatch_signal(),
- * service_sigchld_event(), socket_collect_fds()/socket_notify_service_
- * starting() via the real service_spawn() -- is the real, already-wired
- * production code path, not a mock.
+ * service.c calls socket_notify_service_dead() itself when a service reaches
+ * a terminal state (service_enter_dead() and the start-limit-exceeded branch
+ * of service_do_start()). The drive loop below additionally calls it from a
+ * timer tick, which is harmless when nothing died.
  */
 
 /* struct ucred / SCM_CREDENTIALS / SO_PASSCRED are Linux/glibc extensions;
@@ -269,8 +260,7 @@ finish:
         return rename(tmp_path, result_path) < 0 ? 92 : ret;
 }
 
-/* Exits immediately without ever touching fd 3 -- the crash-without-
- * draining shape H4/the datagram-livelock test needs: a service that keeps
+/* Exits immediately without ever touching fd 3: a service that keeps
  * getting (re-)triggered but never consumes what triggered it. */
 static int helper_instant_exit(void) {
         return 0;
@@ -458,7 +448,7 @@ static Manager *manager_for(const char *dir) {
         return m;
 }
 
-/* --- S0: unit type, parser, pairing --- */
+/* --- unit type, parser, pairing --- */
 
 static void test_pairing_same_basename(void) {
         Manager *m;
@@ -563,7 +553,7 @@ static void test_repeated_listen_lines(void) {
         ASSERT_EQ_INT(sock->load_state, UNIT_LOADED);
         s = SOCKET(sock);
 
-        /* declaration order preserved (H12) */
+        /* declaration order preserved (the order the ports are declared in the unit) */
         ASSERT_TRUE(s->ports != NULL);
         ASSERT_EQ_INT(s->ports->type, SOCK_STREAM);
         ASSERT_STREQ(s->ports->path, a);
@@ -692,7 +682,7 @@ static void test_no_listen_fails(void) {
 }
 
 /*
- * The coordinator's logd-review finding: SO_PASSCRED has to be set on a
+ * SO_PASSCRED has to be set on a
  * unix ListenDatagram= fd BEFORE bind(), because the kernel decides whether
  * to attach SCM_CREDENTIALS to a queued datagram based on the receiving
  * socket's SO_PASSCRED state at the moment it is queued -- not at whatever
@@ -777,29 +767,18 @@ static void test_datagram_passcred_set_before_bind(void) {
         free(dir);
 }
 
-/* --- S1: real listen, trigger, fd-pass --- */
+/* --- real listen, trigger, fd-pass --- */
 
 /*
- * The manager loop driver every S1/S2 test below uses.
+ * The manager loop driver every listen/trigger and lifecycle test below uses.
  *
- * An earlier version of this file hand-rolled its own epoll_wait()/dispatch
- * loop instead of calling manager_loop(). That was a real, found-by-running
- * bug, not a style choice: it never handled PICO_EPOLL_CGROUP wakeups, and a
- * cgroup.events fd that is never read back stays level-triggered-ready
- * forever, so epoll_wait() returned instantly on every call and the whole
- * "wait up to N iterations" budget burned through in microseconds, giving
- * the forked child no real wall-clock time at all before the test gave up
- * on it -- even though the underlying LISTEN_FDS/LISTEN_PID/trigger/re-arm
- * machinery was already fully correct (proven by inspecting the child's own
- * result file after the "failed" test process had already exited). Driving
- * the real manager_loop() instead avoids re-diagnosing that class of bug a
- * second time: it is the same, already-tested production event loop.
+ * It drives the real manager_loop() rather than a hand-rolled epoll loop: a
+ * cgroup.events fd that is never read back stays level-triggered-ready, so a
+ * loop that ignores PICO_EPOLL_CGROUP wakeups spins and burns its iteration
+ * budget before the forked child has run.
  *
- * The one piece manager_loop() cannot provide on its own is the pending
- * service.c hook (see this file's top-of-file comment): socket_notify_
- * service_dead() is simulated by calling it, unconditionally and harmlessly
- * when nothing died, from a repeating 5ms timer tick for the duration of
- * the drive. The same tick checks the caller's stopping condition and ends
+ * A repeating 5ms timer tick calls socket_notify_service_dead() (harmless
+ * when nothing died). The same tick checks the caller's stopping condition and ends
  * the loop via MANAGER_EXIT once satisfied, or after a generous tick budget
  * as a safety net against a genuine regression hanging the suite.
  */
@@ -909,7 +888,7 @@ static void write_helper_service(const char *dir, const char *name, const char *
         ASSERT_EQ_INT(test_write_file(dir, name, content), 0);
 }
 
-/* S1's done-when, half one: real bind, a real connect wakes the manager, and
+/* Socket activation, half one: real bind, a real connect wakes the manager, and
  * a test client reimplementing sd_listen_fds()'s checks (LISTEN_PID,
  * LISTEN_FDS, fd 3, FD_CLOEXEC clear) accepts the queued connection
  * end-to-end. */
@@ -983,7 +962,7 @@ static void test_stream_end_to_end(void) {
         free(dir);
 }
 
-/* S1's done-when, half two: a boot-ordered start (the socket already
+/* Socket activation, half two: a boot-ordered start (the socket already
  * listening, never triggered) collects the same fds the same way. */
 static void test_boot_ordered_collects_fds_without_trigger(void) {
         Manager *m;
@@ -1128,7 +1107,7 @@ static void test_socket_activation_with_unit_environment(void) {
 }
 
 /*
- * plans/41 E3's named hazard: service_spawn() recognizes the main command by
+ * service_spawn() recognizes the main command by
  * pointer identity, and a $VAR-expanded ExecStart= runs from a fresh copy.
  * The socket fds must still be handed over, alongside the expanded argv: a
  * bare $VAR split into two words, a ${VAR} substituted, an unset $VAR gone.
@@ -1196,7 +1175,7 @@ static void test_socket_activation_with_expanded_argv(void) {
         free(dir);
 }
 
-/* --- S2: lifecycle hardening --- */
+/* --- lifecycle hardening --- */
 
 /* kill-the-service -> re-listen -> next-connect-retriggers, repeated. */
 static void test_relisten_repeated_cycles(void) {
@@ -1327,12 +1306,12 @@ static void test_service_start_limit_yields_socket_failed(void) {
          * One real trigger, then the service's own crash/restart machinery
          * (fork fails -- ENOENT -- Restart=on-failure -- RestartSec=5ms --
          * repeat) runs entirely on its own via the timer, exactly as in
-         * test-service.c's B7 test, all inside the real manager_loop().
+         * test-service.c's start-rate-limit test, all inside the real manager_loop().
          * drive_until()'s own tick calls socket_notify_service_dead(svc_u)
          * every 5ms regardless -- including on the exact tick this
-         * predicate is satisfied, which is the pending service.c hook at
-         * service_do_start()'s start-limit branch (a DIFFERENT call site
-         * than service_enter_dead() -- see socket.c's header for both), so
+         * predicate is satisfied, which stands in for service_do_start()'s
+         * start-limit branch (a DIFFERENT call site than
+         * service_enter_dead()), so
          * by the time drive_until() returns the socket has already been
          * notified and should already be FAILED.
          */
@@ -1359,21 +1338,21 @@ static void test_service_start_limit_yields_socket_failed(void) {
  *
  * The two are not interchangeable in a fast/no-sleep test: socket_dispatch_
  * io() only ever fires while LISTENING, and a successful trigger unwatches
- * the fd immediately (H7) -- so in this project's design one socket-level
+ * the fd immediately -- so in this project's design one socket-level
  * trigger corresponds to exactly one service start attempt, and 5 < 20
  * means the service's own limiter always wins a real lockstep race,
  * regardless of how fast the cycle runs. That is a real, useful finding
- * (recorded in the coordinator report), not a bug: the two limiters guard
+ * not a bug: the two limiters guard
  * different things -- the service's own limit protects against a service
  * that keeps failing on its own even without repeated external triggers,
  * the socket's guards specifically against repeated DISTINCT trigger
  * events that do not each consume the service's budget (an already-
- * running/already-queued service, socket_trigger()'s H2 no-op branch).
+ * running/already-queued service, socket_trigger()'s no-op branch for a running service).
  * This test drives exactly that branch: the paired service is marked
  * SERVICE_RUNNING once, up front, so every one of socket_dispatch_io()'s
  * ratelimit-metered calls takes the "already active" no-op path and never
  * touches service_start_limit_check() at all -- isolating the mechanism
- * under test to the one this milestone actually asks for.
+ * under test.
  */
 static void test_connect_flood_bounded_by_socket_trigger_limit(void) {
         Manager *m;
@@ -1427,14 +1406,14 @@ static void test_connect_flood_bounded_by_socket_trigger_limit(void) {
 }
 
 /*
- * S2's explicit requirement: a ListenDatagram= socket whose service crashes
+ * Requirement: a ListenDatagram= socket whose service crashes
  * without draining must terminate in FAILED via a real, wired ratelimit
  * mechanism, not spin. Driven end to end through the real service state
  * machine (fork/exec via service_spawn(), real ENOENT-class or instant-exit
  * failures, real SIGCHLD reaping) -- unlike the isolated test above, this
  * one lets whichever limiter actually fires first in the real combined
  * system do so, because that IS the property being proven: SOMETHING stops
- * it, well short of "at fork/exec rate, forever" (H4).
+ * it, well short of "at fork/exec rate, forever".
  */
 static void test_datagram_livelock_terminates_failed(void) {
         Manager *m;
@@ -1456,7 +1435,7 @@ static void test_datagram_livelock_terminates_failed(void) {
         }
         /* --instant-exit: the datagram is NEVER recv()'d, so it stays
          * queued and the fd is readable again the instant it is re-armed --
-         * exactly H4's shape. Restart=no: each re-trigger is a genuinely
+         * exactly the livelock shape. Restart=no: each re-trigger is a genuinely
          * fresh socket-level trigger, not a Restart= reschedule. */
         write_helper_service(dir, "dloop.service", "--instant-exit", NULL);
         ASSERT_EQ_INT(manager_load_units(m, NULL), 0);

@@ -5,20 +5,18 @@
  * The low-level rtnetlink plumbing shared by netd-rtnl.c (netd's own policy
  * layer: link table, event dispatch, idempotent writers) and netctl-rtnl.c
  * (netctl's one-shot RTM_GETLINK client). Extracted so netctl can speak
- * rtnetlink for itself without linking netd_core/pico_init_core -- see
- * netctl.c's own header for why that link must not exist.
+ * rtnetlink for itself without linking netd_core/pico_init_core.
  *
- * Deliberately not logging anything: netd-rtnl.c logs through pico_log(),
+ * Does not log anything: netd-rtnl.c logs through pico_log(),
  * which pulls in "../util.h" and, transitively, PID 1's own shared code --
  * exactly what netctl's build must not depend on. Every function here
  * reports failure as -errno (and, for the one path that decodes a kernel
  * explanation, an optional caller-supplied buffer) and leaves logging to
  * whichever caller can afford it.
  *
- * ALIGNMENT and error-decoding reasoning: see netd-rtnl.c's file banner,
- * unchanged by this split -- every rule there (NLMSG_OK/RTA_OK bounds
- * checking, no kernel-controlled dispatch table, MSG_TRUNC's one-syscall
- * sizing) still applies to the code that moved here.
+ * ALIGNMENT and error-decoding reasoning: see netd-rtnl.c's file banner;
+ * every rule there (NLMSG_OK/RTA_OK bounds checking, no kernel-controlled
+ * dispatch table, MSG_TRUNC's one-syscall sizing) applies here too.
  */
 
 #pragma once
@@ -31,7 +29,7 @@
 #include <sys/types.h>
 
 /* See netd-rtnl.c's file banner: every request this layer builds is small
- * and fixed-shape; 512 bytes is generous headroom, not a tight fit. */
+ * and fixed-shape; 512 bytes is ample. */
 #define NL_REQUEST_BUFSZ 512
 
 /* Real rtnetlink traffic -- one event, one dump entry, or an ACK -- fits a

@@ -2,28 +2,19 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * Kernel module autoloading from a device's own MODALIAS -- the one thing
- * real systemd-udevd does unconditionally for every device, independent of
- * any rule file. devd's rule engine (devd-match.c's ENV{} matching) can read
- * a MODALIAS a rule already matched on, but nothing made the module load in
- * the first place: devd_rules_react() is a no-op with zero rules loaded or
- * zero rules matched, and the coldplug walks (devd.h's DEVD_COLDPLUG_*) only
- * ever look at block, USB and input devices.
+ * Kernel module autoloading from a device's own MODALIAS, which systemd-udevd
+ * does for every device independent of any rule file. devd's rule engine can
+ * match a MODALIAS but nothing else loads the module: devd_rules_react() is a
+ * no-op with zero rules loaded, and the coldplug walks (devd.h's
+ * DEVD_COLDPLUG_*) only look at block, USB and input devices.
  *
- * Confirmed missing live on h2200: resistive-adc-touch.ko and hamcop-adc.ko
- * both present under /lib/modules, neither loaded, `xinput list` showing no
- * touchscreen device at all and xinput-calibrator correctly reporting zero
- * calibratable devices -- not a calibration bug, a module that never loaded.
- * The HAMCOP ADC/touchscreen are devicetree platform devices, so their
- * kernel ADD uevent fires before devd's own socket is even open (same
- * ordering risk devd-uevent.h already documents for the block coldplug
- * walk) -- coldplug is the only path that ever sees them, not live hotplug.
+ * Platform devices (devicetree-described ones, e.g. an ADC or touchscreen) get
+ * their kernel ADD uevent before devd's socket is open, so coldplug is the only
+ * path that ever sees them.
  *
- * /sbin/modprobe is BusyBox's own applet (CONFIG_MODPROBE=y in oe-core's
- * default busybox defconfig; busybox is already on every pico image), so
- * this adds no new RDEPENDS. modprobe is idempotent for an already-loaded
- * or built-in symbol, so calling it redundantly costs a wasted fork and
- * nothing else -- this does not try to track what has already loaded.
+ * /sbin/modprobe is BusyBox's applet (oe-core's default busybox defconfig). It
+ * is idempotent for an already-loaded or built-in symbol, so a redundant call
+ * costs a wasted fork and nothing else; devd does not track what has loaded.
  */
 
 #pragma once
@@ -41,12 +32,8 @@ void devd_modalias_autoload_uevent(Devd *d, const DevdUevent *u);
 
 /*
  * Coldplug: every device already present under every <sys_root>/bus/<bus>/
- * devices/ directory that carries a modalias sysfs attribute, which covers
- * platform devices
- * (the HAMCOP ADC/touchscreen included) as well as every other bus devd's
- * own block/USB-only coldplug walk never looked at. Called once from
- * devd_coldplug(), before the block/USB-specific walks: a module a rule or
- * the block core is about to depend on should already be requested by the
- * time either runs, even though neither currently depends on one.
+ * devices/ directory that carries a modalias sysfs attribute: platform devices
+ * and every other bus the block/USB coldplug walks do not cover. Called once
+ * from devd_coldplug(), before those walks.
  */
 void devd_coldplug_modalias(Devd *d);

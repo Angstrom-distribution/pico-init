@@ -2,15 +2,16 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The interim udev_monitor contract, pinned because it is the piece most
- * easily gotten wrong by accident: udev_monitor_new_from_netlink() must
- * succeed with a real object (libusb_init() fails outright otherwise),
- * every call a consumer makes on it in the ordinary order -- filters,
- * enable_receiving, buffer size, get_fd, fcntl on the fd, poll, receive,
- * unref -- must return the success or the "nothing yet" answer, and the
- * fd must never become readable. Plus the queue and hwdb objects a
- * consumer may create alongside it. Linked against the built
- * libudev.so.1, so this exercises the installed shape.
+ * The udev_monitor contract consumers depend on:
+ * udev_monitor_new_from_netlink() must succeed with a real object
+ * (libusb_init() fails outright otherwise), and every call a consumer makes
+ * on it in the ordinary order -- filters, enable_receiving, buffer size,
+ * get_fd, fcntl on the fd, poll, receive, unref -- must return the success or
+ * the "nothing yet" answer. The monitor is a real netlink uevent socket, so
+ * the test only asserts the API contract (no crash, EAGAIN when idle), and
+ * that no event is pending in its short poll window on a quiet system.
+ * Plus the queue and hwdb objects a consumer may create alongside it. Linked
+ * against the built libudev.so.1, so this exercises the installed shape.
  */
 
 #include "libudev.h"
@@ -55,7 +56,7 @@ static void test_monitor_never_delivers(void) {
         ASSERT_EQ_INT(udev_monitor_filter_remove(m), 0);
         ASSERT_EQ_INT(udev_monitor_filter_add_match_subsystem_devtype(m, NULL, NULL), -EINVAL);
 
-        /* never readable: a bounded poll times out with no events */
+        /* a bounded poll times out with no events */
         pfd.fd = fd;
         pfd.events = POLLIN;
         pfd.revents = 0;
@@ -93,12 +94,8 @@ static void test_monitor_never_delivers(void) {
         udev_unref(udev);
 }
 
-/* "kernel" (group 1) and "udev" (group 2) currently produce byte-identical,
- * permanently-silent behaviour (libudev-monitor.c's top comment): neither
- * name is wired to a real netlink group yet. Pinned here so a future change
- * that makes one of them real (e.g. joining group 1 for the sd_device_monitor
- * receive path already used elsewhere) can't silently leave the other one
- * behind without a test noticing. */
+/* "kernel" and "udev" are both wired to netlink group 1 (libudev-monitor.c), so
+ * the two names must behave identically. */
 static void test_kernel_and_udev_names_are_equivalent(void) {
         struct udev *udev = udev_new();
         struct udev_monitor *km, *um;

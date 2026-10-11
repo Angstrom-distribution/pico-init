@@ -4,71 +4,34 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 /*
- * Ported from src/libsystemd-network/sd-dhcp-server.c (569 lines). The
+ * Ported from systemd v261.2 src/libsystemd-network/sd-dhcp-server.c. The
  * server object's lifecycle: construction, pool configuration, the option
- * setters netd's own `.network`-driven config actually has a use for, and
- * start/stop over netd-loop.h instead of sd-event. Carries a real 2013
- * Intel copyright line.
+ * setters a `.network`-driven DHCPServer=yes needs
+ * (address/router/dns/ntp/domain/timezone, plus the lease-time and
+ * rapid-commit defaults), and start/stop over netd-loop.h instead of
+ * sd-event. See dhcp-server-internal.h for what was cut.
  *
- * Quarry point: systemd v261.2, commit 4925d9f07f. History review
- * (4925d9f07f..main, plan §2.2): no fix in the 26-commit lift-set window
- * touches sd-dhcp-server.c *except* the one named next.
- *
- * BACKPORT APPLIED: 7bd9f0f805 ("network/dhcp-server: fix pool size
+ * Backport: systemd 7bd9f0f805 ("network/dhcp-server: fix pool size
  * calculation overflow"). v261.2's dhcp_server_configure_pool() computes
- * size_max in uint32_t *before* validating that offset is inside the
- * subnet:
+ * size_max in uint32_t before validating that offset is inside the subnet:
  *
  *   size_max = (broadcast_off + 1) - offset - 1;
  *   assert_return(size_max >= 1, -ERANGE);
  *
- * When offset > broadcast_off this underflows to near-UINT32_MAX, sails
- * through the >= 1 check, and the server hands out addresses outside its
- * own subnet (upstream's own repro: PoolOffset=256 on a /24 with
- * PoolSize=1). The fix reorders the check ahead of the subtraction and
- * removes the subtraction that could underflow:
+ * When offset > broadcast_off this underflows to near-UINT32_MAX, passes the
+ * >= 1 check, and the server hands out addresses outside its subnet. The fix
+ * checks the offset first and drops the subtraction that could underflow:
  *
  *   assert_return(offset < broadcast_off, -ERANGE);
  *   size_max = broadcast_off - offset;
  *
- * Applied verbatim below (as a real -ERANGE return per netd-compat.h's
- * assertion policy, not an assert -- offset/size are both attacker-shaped
- * only in the sense that they come from a `.network` file, not from the
- * wire, so this one stays assert_return-shaped like upstream, matching the
- * "internal invariant vs externally-supplied wire data" line netd-compat.h
- * draws; a malformed config file is an admin's bug to see immediately, not
- * something to silently ignore).
+ * Currently unreachable: netd-network.h has no PoolOffset=/PoolSize= fields,
+ * so offset is always 0 and becomes 1 before the arithmetic runs. It
+ * becomes reachable if `.network` gains those directives.
  *
- * LATENCY, RECORDED HONESTLY (plan §2.2's own instruction): this bug is
- * latent under netd's current `.network` subset. netd-network.h's Network
- * struct has no PoolOffset=/PoolSize= field at all (§2.5 never defined
- * them), so dhcp_server_configure_pool() below is only ever called with
- * offset == 0, which the "0 means default, skip to 1" branch turns into
- * offset = 1 before the vulnerable arithmetic runs -- 1 can never exceed
- * broadcast_off for any prefixlen <= 30 that leaves at least one usable
- * host address, so the underflow this backport prevents cannot be reached
- * today. It becomes reachable the moment `.network` gains PoolOffset=/
- * PoolSize= (a real, plausible future addition -- static leases already
- * skipped for exactly the same "no config surface yet" reason, see
- * dhcp-server-internal.h's header), at which point this fix is what stops
- * a misconfigured pool from silently handing out off-subnet addresses
- * instead of failing configuration. Taken now rather than deferred because
- * deferring a four-line fix until the bug is reachable means re-deriving
- * this exact analysis a second time.
- *
- * MISSING DEFECT UPSTREAM DOES NOT FIX (netd's own addition, not a
- * backport): DHCP_SERVER_DONT_DESTROY, applied to dhcp_server_stop() below
- * and to dhcp_server_on_lease_change() in dhcp-server-lease.c's caller path
- * -- see dhcp-server-internal.h's header for the full writeup, this is the
- * file that owns dhcp_server_stop().
- *
- * Cut on the way in, and why: see dhcp-server-internal.h's header for the
- * full list (lease-file persistence, static leases, relay, boot-server/
- * vendor-options passthrough, IPv6-only-preferred, forcerenew, POP3/SMTP/
- * LPR). What is left below covers every setter a `.network`-driven
- * DHCPServer=yes actually needs: address/router/dns/ntp/domain/timezone,
- * plus the lease-time and rapid-commit knobs upstream itself defaults
- * rather than requiring configuration for.
+ * DHCP_SERVER_DONT_DESTROY is netd's own addition, applied in
+ * dhcp_server_stop() and dhcp_server_on_lease_change(); see
+ * dhcp-server-internal.h.
  */
 
 #include "dhcp-server-lease-internal.h"
@@ -81,10 +44,7 @@
 #define DHCP_SERVER_DEFAULT_LEASE_TIME_USEC USEC_PER_HOUR
 #define DHCP_SERVER_MAX_LEASE_TIME_USEC (USEC_PER_HOUR * 12)
 
-/* util.h has no free_and_strdup() of its own (netd-compat.h's census only
- * added what the lift set actually calls elsewhere); this file is its only
- * user, so it stays local rather than growing a shared header for one
- * caller. */
+/* Local because util.h has no free_and_strdup() and this is its only user. */
 static int free_and_strdup_local(char **p, const char *s) {
         char *n = NULL;
 
@@ -144,10 +104,8 @@ int dhcp_server_configure_pool(
         if (offset == 0)
                 offset = 1;
 
-        /* 7bd9f0f805: check offset is inside the subnet *before* computing a
-         * pool size from it, and without the subtraction that could
-         * underflow uint32_t when it isn't. See this file's header for the
-         * v261.2 bug this replaces and why it is currently unreachable. */
+        /* 7bd9f0f805: check offset is inside the subnet before computing a
+         * pool size from it (see this file's header). */
         assert_return(offset < broadcast_off, -ERANGE);
         size_max = broadcast_off - offset; /* excludes the broadcast address */
 
@@ -163,13 +121,10 @@ int dhcp_server_configure_pool(
                 if (!leases)
                         return -ENOMEM;
 
-                /* The old pool's leases do not carry over: their slot
-                 * indices are meaningless against a different offset/size,
-                 * and persistence is dropped entirely anyway (dhcp-server-
-                 * internal.h's header) -- a reconfigure simply starts the
-                 * pool empty, exactly like a fresh dhcp_server_new(). Each
-                 * old slot's hostname is heap-owned and must be freed
-                 * individually before the array itself goes. */
+                /* The old pool's leases do not carry over: their slot indices
+                 * are meaningless against a different offset/size. Each old
+                 * slot's hostname is heap-owned and freed individually
+                 * before the array goes. */
                 if (server->leases)
                         FOREACH_ARRAY(lease, server->leases, server->pool_size)
                 dhcp_server_lease_clear(lease);
@@ -288,11 +243,8 @@ int dhcp_server_set_domain_name(DhcpServer *server, const char *domain_name) {
         return free_and_strdup_local(&server->domain_name, domain_name);
 }
 
-/* Light syntactic check only -- full zoneinfo validation is netd-time.c's
- * job when it *applies* a received timezone (plan §2.6); this is the
- * server's own emit-time sanity check, matching how little upstream's
- * timezone_is_valid() actually costs the server (it never opens
- * /usr/share/zoneinfo either). */
+/* Light syntactic check only; the zoneinfo lookup is netd-time.c's job when
+ * a received timezone is applied. */
 static bool timezone_looks_valid(const char *tz) {
         if (isempty(tz) || strlen(tz) > 255)
                 return false;
@@ -341,16 +293,9 @@ bool dhcp_server_is_running(DhcpServer *server) {
         return server && server->io_tag.registered;
 }
 
-/* The real teardown logic, shared by the public dhcp_server_stop() and by
- * dhcp_server_free() below. free() must NOT go through the public,
- * DONT_DESTROY-guarded dhcp_server_stop(): by the time DEFINE_TRIVIAL_REF_
- * UNREF_FUNC's generated dhcp_server_unref() calls this free function,
- * n_ref has already been decremented to 0, and DHCP_SERVER_DONT_DESTROY's
- * dhcp_server_ref() asserts n_ref > 0 -- taking a fresh ref on an object
- * mid-free is a use-after-free waiting to happen, not a safety net. This
- * mirrors sd-dhcp-client.c's own dhcp_client_free(), which calls the
- * unguarded client_initialize() rather than the guarded
- * sd_dhcp_client_stop(). */
+/* Teardown shared by dhcp_server_stop() and dhcp_server_free(). free() must
+ * not go through the DONT_DESTROY-guarded dhcp_server_stop(): n_ref is
+ * already 0 there and dhcp_server_ref() asserts n_ref > 0. */
 static int dhcp_server_stop_internal(DhcpServer *server) {
         bool running;
 
@@ -372,9 +317,7 @@ static int dhcp_server_stop_internal(DhcpServer *server) {
 static DhcpServer *dhcp_server_free(DhcpServer *server) {
         assert(server);
 
-        /* Idempotent and safe to call unconditionally (matches upstream's
-         * own sd_dhcp_server_free() -> _stop() call) -- but the internal,
-         * unguarded form; see that function's own comment for why. */
+        /* Idempotent; the unguarded form, see dhcp_server_stop_internal(). */
         (void) dhcp_server_stop_internal(server);
 
         for (DhcpLeaseServerType k = 0; k < _DHCP_LEASE_SERVER_TYPE_MAX; k++)

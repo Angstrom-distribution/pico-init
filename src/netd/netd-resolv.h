@@ -2,15 +2,12 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * /etc/resolv.conf (plan §2.7).
+ * /etc/resolv.conf.
  *
- * netd writes the real file directly. That is the whole reason this project's
- * `pico-resolv` recipe is retired rather than adapted: it exists only because
- * networkd refuses to write /etc/resolv.conf itself, and with it goes the
- * only Path unit in the image -- a unit type pico-init never has to grow.
+ * netd writes the real file directly, unlike networkd, which refuses to and
+ * needs a helper to do it.
  *
- * The rules encoded here are the ones the retired script already got right,
- * and each of them is a bug someone hit:
+ * Rules:
  *
  *   - atomic tmp + rename, never a truncate-and-rewrite, so no resolver ever
  *     reads a half-written file;

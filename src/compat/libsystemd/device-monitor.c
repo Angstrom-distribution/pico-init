@@ -3,26 +3,20 @@
 
 /*
  * sd_device_monitor: a NETLINK_KOBJECT_UEVENT group-1 socket, its
- * receive-side parser, and every filter -- all evaluated in userspace at
- * receive time, since there is no udev daemon here to have installed a
- * kernel BPF filter program in the first place.
+ * receive-side parser, and every filter. Filters run in userspace at receive
+ * time; there is no udev daemon to install a kernel BPF filter.
  *
- * The socket setup is devd-uevent.c's proven pattern (this project's own
- * code, adapted here rather than shared, since devd and this library are
- * two different binaries): group 1, the kernel's own broadcast group, never
- * group 2 (udev's rebroadcast, which nothing on this image writes to and
- * which carries a magic header this parser correctly refuses to misparse
- * as a device named "libudev").
+ * The socket setup follows devd-uevent.c (adapted, not shared, as devd and
+ * this library are separate binaries): group 1, the kernel's broadcast
+ * group, never group 2 (udev's rebroadcast, whose magic header this parser
+ * refuses to misparse as a device named "libudev").
  *
- * The sender check goes one step further than devd's own, and it is not
- * decoration: checked directly against a real running kernel while writing
- * this (SO_PASSCRED enabled, a real "change" uevent captured), a genuine
- * kernel-origin group-1 message carries an SCM_CREDENTIALS ancillary
- * message with uid/gid/pid all 0, in addition to nl_pid == 0 in the sender
- * address -- so both are checked, matching what was actually observed
- * rather than only what devd's simpler check already covers.
+ * The sender check goes one step further than devd's: a kernel-origin
+ * group-1 message carries an SCM_CREDENTIALS message with uid/gid/pid all 0
+ * (with SO_PASSCRED set) as well as nl_pid == 0 in the sender address, so
+ * both are checked.
  *
- * Also observed on that real kernel, and load-bearing for the parser: a
+ * Also load-bearing for the parser: a
  * uevent's body repeats ACTION= and DEVPATH= from the header line, and a
  * synthetic-uuid-capable kernel always sends SYNTH_UUID=, "0" when the
  * event was not synthesized with one. The header-parsed copies go straight
@@ -32,14 +26,13 @@
  * below, and device_ensure_properties()'s later synthesis of ACTION from
  * dev->action is therefore always a first-write-wins no-op in practice --
  * the two copies agree, since the kernel sends them that way.
- * device_id128_from_uuid_string() simply fails to parse "0" as a
- * 36-character uuid, which is exactly "no synthetic uuid on this event".
+ * device_id128_from_uuid_string() fails to parse "0" as a 36-character
+ * uuid, which is how "no synthetic uuid on this event" is detected.
  */
 
 /* struct ucred/SCM_CREDENTIALS are glibc extensions gated behind
- * _GNU_SOURCE; -std=gnu17 alone does not imply it (see socket.c's own
- * note), so this has to be explicit and first, before any header pulls in
- * features.h. */
+ * _GNU_SOURCE; -std=gnu17 alone does not imply it, so it must be defined
+ * first, before any header pulls in features.h. */
 #define _GNU_SOURCE
 
 #include "sd-device.h"
@@ -605,13 +598,10 @@ int sd_device_monitor_receive(sd_device_monitor *m, sd_device **ret) {
 /* --- deferred: sd-event integration --- */
 
 /*
- * Pure sd-event loop-integration -- attach_event() even creates a default
- * event loop when none is given, and is_running() delegates to
- * sd_event_source_get_enabled() on it. None of that exists here yet: this
- * shim's own sd-event family is a separate, not-yet-landed piece of
- * libsystemd-compat. fd-based consumption (get_fd()/get_events()/
- * receive() above) is fully real today, which is the loop-integration
- * path pico-init's own daemons use anyway.
+ * Pure sd-event loop integration (attach_event() creates a default event
+ * loop when none is given, is_running() asks the event source). Not
+ * implemented; fd-based consumption (get_fd()/get_events()/receive()
+ * above) is, and is what pico-init's own daemons use.
  */
 
 int sd_device_monitor_attach_event(sd_device_monitor *m, sd_event *event) {

@@ -3,8 +3,7 @@
 
 /*
  * netctl's own tiny RTM_GETLINK client. See netctl-rtnl.h for what it
- * fetches and why it exists as a separate, netd_core-free client rather than
- * reusing NetdRtnlLink.
+ * fetches and why it is a separate client.
  *
  * One socket, one request, one reply -- no event subscription, no dump, no
  * persistent state: `networkctl status <iface>` is a one-shot CLI, so
@@ -44,9 +43,8 @@
 
 /* --- netctl's own tiny NULL-terminated string vector ---
  *
- * Not systemd's strv.h (netctl-rtnl.h's own header explains why): this is
- * the one place in this file that needs a growable list at all, and it is
- * three lines of realloc doubling, not worth a dependency.
+ * Not systemd's strv.h: this is the one place that needs a growable list,
+ * and it is a few lines of realloc doubling.
  */
 static int strv_push(char ***arr, size_t *n, size_t *cap, char *s) {
         if (*n + 1 >= *cap) {

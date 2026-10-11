@@ -5,128 +5,88 @@
 /*
  * fork/exec + fd/cgroup child-side setup, quarried from the child-process
  * portion of systemd's ~2011-era src/execute.c (tag v30, commit 501c92c,
- * copyright 2010 Lennart Poettering, GPL-2.0-or-later). Structural context:
- * 75689fb2d4 (2023-09-01) later split this child-side path out of
- * execute.c into exec-invoke.c, and b30e2f4c18 (2012-04-11) moved src/ to
- * src/core/ -- neither changes the actual ordering rules below, which have
- * been stable since 2011. systemd's later systemd-executor architecture
- * (bb5232b6a3) is deliberately NOT adopted: it solves a problem a ~3000-line
- * PID1 does not have. What IS kept is the constraint that motivated it: the
+ * copyright 2010 Lennart Poettering, GPL-2.0-or-later). Upstream later moved
+ * this path to exec-invoke.c (75689fb2d4) and src/ to src/core/ (b30e2f4c18);
+ * neither changes the ordering rules below. systemd's later systemd-executor
+ * architecture (bb5232b6a3) is not adopted: it solves a problem a small PID 1
+ * does not have. What is kept is the constraint that motivated it: the
  * post-fork/pre-execve region is as close to async-signal-safe as this
  * project gets -- no malloc, no NSS, no dlopen, no allocating logger
- * (pico_log() uses vfprintf(), which is not async-signal-safe, so it is
- * never called after fork() below). Everything that can be computed in the
- * parent is computed there instead.
+ * (pico_log() uses vfprintf(), so it is never called after fork() below).
+ * Everything that can be computed in the parent is computed there.
  *
  * Backports (commit hashes from github.com/systemd/systemd), each at the
  * step of child_exec() it applies to:
  *
- *  - 7e0e6b50b4 -- take a start timestamp before fork(), not after: not
- *    plumbed through to a Service field in this MVP (no field exists to
- *    hold it and nothing yet consumes it), but the ordering itself costs
- *    nothing, so service_spawn() still calls fork() as its very next
- *    statement rather than doing any parent-side setup in between.
+ *  - 7e0e6b50b4 -- take a start timestamp before fork(), not after. No
+ *    Service field holds it, but service_spawn() still calls fork() as its
+ *    very next statement rather than doing parent-side setup in between.
  *  - 69339ae9f7 (CVE-2021-4034/PwnKit class) -- refuse to execve() with a
- *    NULL or empty argv[0]. Checked twice: once in the parent
- *    (service_spawn(), where a caller mistake never even forks) and once
- *    in the child (belt-and-braces, since a service.c bug could otherwise
- *    reach here directly).
- *  - ce30c8dcb4 -- reset every SIG_IGN'd signal to SIG_DFL. Both the
- *    process-wide signal mask (see signal.c) and a SIG_IGN disposition
- *    survive fork() *and* execve() -- only a *handled* signal is demoted to
- *    SIG_DFL by execve(). Skipping this step means every service starts
- *    with whatever pico-init itself happened to ignore, silently.
- *  - 353e12c2f4 -- (re-)ignore SIGPIPE after the reset above, matching
- *    systemd's own long-standing IgnoreSIGPIPE=yes default.
- *  - 4c253ed1ca -- sigprocmask(SIG_SETMASK, empty) after the signal-
- *    disposition reset: the signalfd block set in signal.c also survives
- *    fork()+execve(); without clearing it, every service starts with
- *    SIGTERM blocked and shutdown silently breaks.
+ *    NULL or empty argv[0]. Checked in the parent (service_spawn(), so a
+ *    caller mistake never forks) and again in the child.
+ *  - ce30c8dcb4 -- reset every SIG_IGN'd signal to SIG_DFL. A SIG_IGN
+ *    disposition and the signal mask both survive fork() and execve() (only
+ *    a *handled* signal is demoted to SIG_DFL), so without this every
+ *    service starts with whatever pico-init itself ignores.
+ *  - 353e12c2f4 -- re-ignore SIGPIPE after the reset above, matching
+ *    systemd's IgnoreSIGPIPE=yes default.
+ *  - 4c253ed1ca -- clear the signal mask after the disposition reset: the
+ *    signalfd block set from signal.c survives fork()+execve(), and without
+ *    clearing it every service starts with SIGTERM blocked.
  *  - 74129a1276 -- a failed fork() returns -errno, never a stale success
- *    value; the bug this fixes made the caller believe a child existed
- *    when fork() had actually failed.
+ *    value.
  *  - 171ceb4a00 -- open the console O_RDWR, not O_RDONLY: a read-only fd
- *    dup'd onto stdout/stderr gives every write() a silent EBADF.
- *  - 43efbc3959 -- never vhangup()/reset/lock the console. Every unit here
- *    shares PICO_CONSOLE_PATH, which makes clearing it out from under a
- *    concurrent writer a real boot deadlock, not a hypothetical one.
+ *    dup'd onto stdout/stderr makes every write() fail with EBADF.
+ *  - 43efbc3959 -- never vhangup()/reset/lock the console. Every unit shares
+ *    PICO_CONSOLE_PATH, so clearing it under a concurrent writer can
+ *    deadlock boot.
  *  - 1fb0682e78 -- TIOCSCTTY only on an actual tty (isatty() == 1 first):
- *    Linux reuses ioctl numbers across subsystems, so issuing it on
- *    anything else can hit an unrelated driver.
+ *    Linux reuses ioctl numbers across subsystems, so issuing it on anything
+ *    else can hit an unrelated driver.
  *
- * Deliberately not backported here: 78d17fa09/b5d742138 (UTF-8 argv
- * validation -- no specifier expansion exists in this MVP to need it) and
- * everything notify-protocol/PAM/SELinux-shaped, none of which service.h has
- * fields for.
+ * Not backported: 78d17fa09/b5d742138 (UTF-8 argv validation; there is no
+ * specifier expansion in exec lines to need it) and the notify-protocol, PAM
+ * and SELinux parts of upstream's exec path.
  *
- * Socket activation (plan §1.6, S1) landed on top of the above rather than
- * beside it, because it touches the exact region the constraint above is
- * about -- LISTEN_PID has to be the CHILD's own pid, so it is the one
- * variable-length string this file ever builds after fork(), and it is
- * built the only async-signal-safe way available: snprintf() into automatic
- * (stack) storage, no malloc. Everything else -- fd collection
- * (socket_collect_fds()), the LISTEN_FDS=<n> string, and the envp array
- * itself -- is built in the PARENT, before fork(), same as argv always was.
- * shift_fds()/flags_fds() below are v30's own execute.c:63-101, ported
- * verbatim (the algorithm, not just the citation: F_DUPFD's "lowest free fd
- * >= target" guarantee is what makes the restart-from-collision loop in
- * shift_fds() converge, and reimplementing it differently would be the kind
- * of edit this file's own opening paragraph warns against). This is also
- * why `execv()` becomes `execve()` here: passing fds by inherited-and-
- * renumbered file descriptor plus an explicit envp is the entire
- * LISTEN_FDS/LISTEN_PID protocol, and there is no third way to hand a
- * pre-opened listening socket to a process that has not yet called exec.
+ * Socket activation touches the same region. LISTEN_PID has to be the
+ * child's own pid, so it is the one string built after fork(), by snprintf()
+ * into stack storage. Everything else -- fd collection (socket_collect_fds()),
+ * the LISTEN_FDS=<n> string and the envp array -- is built in the parent.
+ * shift_fds()/flags_fds() are v30's execute.c:63-101 verbatim: F_DUPFD's
+ * "lowest free fd >= target" guarantee is what makes the restart loop in
+ * shift_fds() converge. execv() becomes execve() because the fds are passed
+ * as inherited, renumbered descriptors plus an explicit envp (the
+ * LISTEN_FDS/LISTEN_PID protocol).
  *
- * One more thing found and fixed while landing S1, not from the quarry:
- * step 5's fd sweep was a `close()` per fd number up to
- * sysconf(_SC_OPEN_MAX). That is fine at a traditional RLIMIT_NOFILE
- * (1024-4096), but a good few modern distros default it far higher --
- * measured at 1,048,576 in this project's own Ubuntu 24.04 container image
- * -- which turns EVERY service start (not just a socket-activated one) into
- * that many close() syscalls, several real seconds each, discovered because
- * it made this milestone's own multi-cycle S2 tests impractically slow, not
- * from inspection. pico_close_all_except() below uses close_range() (Linux 5.9+,
- * glibc >= 2.34, so no new floor beyond what this project already assumes)
- * to close whole gaps between kept fds in one syscall each, falling back to
- * the original per-fd loop if close_range() itself is unavailable at
- * runtime (an older kernel/glibc pairing) -- same fd set closed either way,
- * just not one syscall per number. The insertion sort it needs first is
- * hand-rolled rather than qsort(3): glibc's qsort can malloc a scratch
- * buffer for large-enough inputs, which this async-signal-safe region must
- * never do; n is at most PICO_MAX_SOCKET_FDS, where O(n^2) costs nothing.
+ * The step 5 fd sweep uses close_range() (Linux 5.9+, glibc >= 2.34) to
+ * close whole gaps between kept fds in one syscall. A close() per fd number
+ * up to sysconf(_SC_OPEN_MAX) costs seconds on every service start when
+ * RLIMIT_NOFILE defaults to 1048576, as in common container images. It falls
+ * back to the per-fd loop if close_range() is unavailable at runtime. The
+ * insertion sort it needs is hand-rolled because glibc's qsort can malloc a
+ * scratch buffer, which this region must never do; n is at most
+ * PICO_MAX_SOCKET_FDS + 2, where O(n^2) costs nothing.
  *
- * logd stdout/stderr capture (plan §3.2/§3.6, milestone J2) landed on top
- * of the above the same way S1 did: new pico-original code (not a
- * backport -- upstream's own equivalent, exec-invoke.c's SOCK_STREAM
- * handshake plus fd-store, is deliberately not adopted; see logd-write.h's
- * header for why) sharing the exact fork/exec region the file's opening
- * paragraph constrains. create_stdout_socket() runs in the PARENT, before
- * fork(): it creates a datagram socket, binds it to a unique Linux
- * abstract-namespace name (never a filesystem path -- no cleanup needed,
- * cannot collide with a real file), then connect()s it to logd's stdout
- * socket. Binding before connecting is the load-bearing step, not
- * decoration: the child cannot rebind an already-bound AF_UNIX socket (a
- * second bind() returns EINVAL), so every datagram this socket -- and
- * everything the child forks that inherits fd 1/2 from it -- ever sends
- * reports that SAME source address to logd's recvfrom(), which is the
- * whole basis logd-recv.h's corrected design rests on: fragment tails
- * keyed by stream identity, not by PID, immune to PID reuse and correct
- * for a service that spans several PIDs on one stream. child_exec() then
- * dup2()s it over stdout AND stderr in the exact slot the console fd used
- * to go alone -- stdin is unaffected, still the console always. Any
- * failure anywhere in this chain (socket()/bind()/connect() all
- * best-effort, logd not installed, its socket not present yet, whatever)
- * yields stdout_fd == -1 and child_exec() falls straight back to the
- * console path unmodified: degradation, never a spawn failure, so an
- * image without logd behaves exactly as one that never shipped this
- * feature would.
+ * logd stdout/stderr capture is pico-original code, not a backport
+ * (upstream's SOCK_STREAM handshake plus fd-store is not adopted; see
+ * logd/logd-write.h). create_stdout_socket() runs in the parent: it creates
+ * a datagram socket, binds it to a unique abstract-namespace name (no
+ * filesystem path to clean up or collide with), then connect()s it to logd's
+ * stdout socket. Binding first is load-bearing: a bound AF_UNIX socket cannot
+ * be rebound (EINVAL), so every datagram sent through it, including from
+ * children that inherit fd 1/2, carries the same source address in logd's
+ * recvfrom(). logd keys fragment tails on that stream identity rather than
+ * on the PID, which is immune to PID reuse and correct for a service that
+ * spans several PIDs. child_exec() dup2()s the socket over stdout and stderr;
+ * stdin stays the console. Any failure (logd not installed, its socket not
+ * yet present) yields stdout_fd == -1 and the console path is used instead,
+ * so a missing logd never fails a spawn.
  *
  * $VAR/${VAR} expansion in exec lines (v30's replace_env_argv()) runs in the
- * PARENT, against the finished envp, producing a freshly owned argv for the
- * child. v30 does it in the child (execute.c:1377), which this file's
- * no-malloc rule forbids; the result is the same, the environment is final
- * by then either way. argv[0] is kept verbatim: it is also the exec path,
- * which v30 never expanded either.
+ * parent against the finished envp and produces a freshly owned argv for the
+ * child. v30 expands in the child (execute.c:1377), which the no-malloc rule
+ * forbids; the result is the same. argv[0] is kept verbatim: it is also the
+ * exec path, which v30 never expanded either.
  */
 
 /* close_range() is a glibc >= 2.34 wrapper; -std=gnu17 alone does not imply
@@ -162,21 +122,9 @@
  * read by build_exec_envp() and by child_exec()'s NULL-envp fallback. */
 extern char **environ;
 
-/*
- * Renumber every fd in `fds` to a contiguous run starting at 3, in place --
- * v30's execute.c:63-101, ported verbatim. F_DUPFD(fd, i+3) always returns
- * the LOWEST free descriptor >= i+3, so when that target is already occupied
- * by one of our OWN not-yet-processed fds, the dup lands somewhere higher
- * instead; `restart_from` remembers the earliest index that happened to and
- * the outer loop retries from there once the rest of the pass has freed up
- * more of the low numbers. Converges because each retry pass strictly
- * shrinks the set of fds not yet at their target. Async-signal-safe:
- * fcntl()/close() only, no malloc. 0 or -errno.
- */
-
 /* Hand-rolled ascending insertion sort -- see this file's header for why
  * qsort(3) is not used here. `n` is at most PICO_MAX_SOCKET_FDS + 2 (the
- * socket-activation set, the logd stdout socket (J2), the Type=exec pipe). */
+ * socket-activation set, the logd stdout socket, the Type=exec pipe). */
 static void sort_fds_ascending(int *a, unsigned n) {
         unsigned i, j;
 
@@ -195,18 +143,12 @@ static void sort_fds_ascending(int *a, unsigned n) {
 /*
  * Closes every fd in [0, max_fd) except those in `keep` -- one close_range()
  * syscall per gap between kept fds, rather than one close() per fd number.
- * See this file's header for why: at a traditional RLIMIT_NOFILE this
- * hardly matters, but several modern distros default it into the six
- * figures, turning the naive loop into that many syscalls on every single
- * service start. Falls back to the original per-fd loop, from wherever
- * close_range() itself first failed, if the kernel does not have it
- * (pre-5.9) -- same fds end up closed either way. Async-signal-safe:
+ * See this file's header for why. Falls back to a per-fd loop, from wherever
+ * close_range() first failed, on kernels without it (pre-5.9). Async-signal-safe:
  * close_range()/close() only, plus the insertion sort above (no malloc).
  * `keep` may hold up to PICO_MAX_SOCKET_FDS + 2 entries -- the socket-
- * activation set, the logd stdout socket (J2) and the Type=exec pipe;
- * anything beyond that is silently clamped rather than overflowing `sorted`
- * below, which cannot happen in practice since every caller already bounds
- * n_keep itself, but the clamp is the honest contract regardless. */
+ * activation set, the logd stdout socket and the Type=exec pipe; anything
+ * beyond that is clamped so `sorted` cannot overflow. */
 void pico_close_all_except(const int *keep, unsigned n_keep, long max_fd) {
         int sorted[PICO_MAX_SOCKET_FDS + 2];
         unsigned i, n, next;
@@ -242,6 +184,17 @@ void pico_close_all_except(const int *keep, unsigned n_keep, long max_fd) {
                         close((int) next);
 }
 
+/*
+ * Renumber every fd in `fds` to a contiguous run starting at 3, in place --
+ * v30's execute.c:63-101, ported verbatim. F_DUPFD(fd, i+3) always returns
+ * the LOWEST free descriptor >= i+3, so when that target is already occupied
+ * by one of our OWN not-yet-processed fds, the dup lands somewhere higher
+ * instead; `restart_from` remembers the earliest index that happened to and
+ * the outer loop retries from there once the rest of the pass has freed up
+ * more of the low numbers. Converges because each retry pass strictly
+ * shrinks the set of fds not yet at their target. Async-signal-safe:
+ * fcntl()/close() only, no malloc. 0 or -errno.
+ */
 static int shift_fds(int *fds, unsigned n_fds) {
         int start, restart_from;
 
@@ -285,7 +238,7 @@ static int shift_fds(int *fds, unsigned n_fds) {
  * socket_open_fds() opens every listening socket SOCK_NONBLOCK for PID 1's
  * own epoll loop, but sd_listen_fds()'s documented default hands a consumer
  * a BLOCKING fd unless it asks otherwise (no NonBlocking= directive exists
- * in this MVP to override that). FD_CLOEXEC: opened SOCK_CLOEXEC for the
+ * to override that). FD_CLOEXEC: opened SOCK_CLOEXEC for the
  * same PID-1-hygiene reason execute.c:63-101's own fd sweep exists at all --
  * cleared here because this is the one fd this exact execve() must keep.
  * Async-signal-safe: fcntl() only. 0 or -errno.
@@ -521,21 +474,18 @@ static int expand_exec_argv(char **argv, char * const *env, char ***ret) {
 }
 
 /*
- * PID 1's own hardcoded knowledge of where logd listens for captured
- * stdout/stderr -- deliberately duplicated from logd.h's
- * LOGD_STDOUT_SOCKET_PATH rather than #include-d, so pico-init-core never
- * gains a build-time dependency on logd's own headers or library (plan
- * §3.2's whole point: logd runs completely independently of PID 1). Both
- * sides agree on this one path by convention; nothing else couples them.
+ * Where logd listens for captured stdout/stderr. Duplicated from logd.h's
+ * LOGD_STDOUT_SOCKET_PATH rather than included, so PID 1 has no build-time
+ * dependency on logd, which runs independently of it. The two sides agree on
+ * this one path by convention.
  */
 #define PICO_LOGD_STDOUT_SOCKET_PATH "/run/logd/stdout"
 
 /*
- * See this file's header for the full design. Best-effort throughout:
- * returns -1 (never fatal to the spawn) on any failure. `unit_id` is used
- * only to make the bound name legible in a socket listing for debugging --
- * logd itself never parses it, only compares the raw address bytes for
- * equality (logd-recv.h) -- so truncating a long one costs nothing real.
+ * See this file's header for the design. Returns -1 on any failure (never
+ * fatal to the spawn). `unit_id` only makes the bound name legible in a
+ * socket listing; logd compares the raw address bytes (logd-recv.h), so
+ * truncating a long one is harmless.
  */
 static int create_stdout_socket(const char *unit_id) {
         static unsigned invocation_counter = 0;
@@ -548,7 +498,7 @@ static int create_stdout_socket(const char *unit_id) {
                 return -1;
 
         /* Abstract namespace: sun_path[0] == '\0', unique per invocation via
-         * the counter -- unbind()/unlink() concerns simply do not apply. */
+         * the counter, so there is nothing to unlink. */
         memset(&addr, 0, sizeof(addr));
         addr.sun_family = AF_UNIX;
         n = snprintf(addr.sun_path + 1,
@@ -584,10 +534,9 @@ static int create_stdout_socket(const char *unit_id) {
                 return -1;
         }
 
-        /* Matches J1's own measured real receive-side default (212992
-         * bytes); SO_RCVBUF was found to have no effect on AF_UNIX
-         * SOCK_DGRAM's actual queue depth (net.unix.max_dgram_qlen governs
-         * that instead), so this is parity/hygiene, not load-bearing. */
+        /* Matches the usual receive-side default (212992 bytes). The queue
+         * depth of an AF_UNIX SOCK_DGRAM is governed by
+         * net.unix.max_dgram_qlen, so this is not load-bearing. */
         sndbuf = 212992;
         (void) setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 
@@ -595,12 +544,10 @@ static int create_stdout_socket(const char *unit_id) {
 }
 
 /*
- * User=/Group=/SupplementaryGroups= (plans/30 R6): the integers that cross
- * fork(). Resolved by exec_creds_resolve() in the PARENT --
- * getpwnam()/getgrnam()/getgrouplist() go through NSS, allocate, and are
- * nowhere near async-signal-safe -- and applied by child_exec() at step 10,
- * which reads nothing but these. `groups` is malloc'd here and freed by the
- * parent after fork(); the child sees it through its copy-on-write mapping,
+ * User=/Group=/SupplementaryGroups=: the integers that cross fork(). Resolved by exec_creds_resolve() in the
+ * PARENT -- getpwnam()/getgrnam()/getgrouplist() go through NSS, allocate, and are nowhere near
+ * async-signal-safe -- and applied by child_exec() at step 10, which reads nothing but these. `groups` is
+ * malloc'd here and freed by the parent after fork(); the child sees it through its copy-on-write mapping,
  * same as argv and cg->path. `set` is false when the unit names none of the
  * three directives, in which case the child never touches its ids at all.
  */
@@ -670,11 +617,9 @@ static int supplementary_group_to_gid(Service *s, const char *tok, gid_t *ret) {
 /*
  * Group= alone keeps the caller's uid and changes only the gid; User= alone
  * takes the account's primary group; both set, Group= wins; NEITHER set
- * keeps both the caller's uid AND gid (added for SupplementaryGroups=-only
- * units like picowl.service, which sets no User=/Group= at all -- see
- * upstream's own get_supplementary_groups()/enforce_groups(), called
- * unconditionally in exec-invoke.c regardless of whether User=/Group= were
- * given). The supplementary list starts as the account's full membership
+ * keeps both the caller's uid AND gid (for SupplementaryGroups=-only units;
+ * upstream's get_supplementary_groups()/enforce_groups() run unconditionally
+ * in exec-invoke.c too). The supplementary list starts as the account's full membership
  * from the group database, initgroups(3)-style, computed against the FINAL
  * gid exactly as systemd's own exec path does -- so a Group= override is in
  * the list and the passwd primary group is not, unless the database says
@@ -864,21 +809,16 @@ static void child_attach_cgroup(const char *dir) {
  * liberal" + exec-invoke.c's find_executable_full()): search a fixed
  * directory list for `name`, matching upstream's DEFAULT_PATH_WITH_FULL_SBIN
  * order (src/basic/path-util.c's default_PATH()/dir_is_split()) -- this
- * project's distro conf forces usrmerge with /usr/sbin kept separate from
- * /usr/bin (conf/distro/include/init-manager-pico-init.inc), i.e. exactly
- * upstream's "split sbin" case, always, so a static list is correct and
- * needs none of upstream's own runtime inode_same() detection between the
- * three possible layouts. Deliberately NOT searched: $PATH / the unit's own
- * Environment=PATH= (upstream's find_executable_full() call from
- * exec-invoke.c passes use_path_envvar=false for exactly this reason: PID1
- * must not let a unit's environment redirect what it execs) and
- * ExecSearchPath= (not a directive this MVP has a field for).
+ * project assumes usrmerge with /usr/sbin kept separate from /usr/bin
+ * (upstream's "split sbin" case), so a static list is correct and needs none
+ * of upstream's runtime inode_same() layout detection. Not searched: $PATH
+ * and the unit's own Environment=PATH= (upstream passes use_path_envvar=false
+ * too: PID 1 must not let a unit's environment redirect what it execs) and
+ * ExecSearchPath= (no field for it).
  *
- * Deliberately a stat()+access() probe per candidate rather than upstream's
- * open-and-check-execute-bit-via-the-open-fd (open_and_check_executable()):
- * both stat() and access() are on POSIX's async-signal-safe list, and this
- * function runs in the region child_exec()'s own header forbids malloc in --
- * `buf` is the caller's stack buffer, nothing here allocates. A directory
+ * A stat()+access() probe per candidate rather than upstream's
+ * open_and_check_executable(): both are async-signal-safe, and this runs in
+ * the no-malloc region (`buf` is the caller's stack buffer). A directory
  * (or other non-regular match, S_ISREG) does not stop the search, matching
  * upstream's own open_and_check_executable()+fd_verify_regular() behavior:
  * only a real, executable, regular file ends it. Writes the candidate into
@@ -934,7 +874,7 @@ static int find_in_default_path(const char *name, char *buf, size_t bufsize) {
  * build_exec_envp()'s own layout-invariant comment).
  * `stdout_fd` (create_stdout_socket(), also parent-built) is likewise
  * excluded from the sweep, then dup2()'d over stdout/stderr at step 8;
- * -1 means "logd unavailable", the console fallback (plan §3.6). `creds`
+ * -1 means "logd unavailable", the console fallback. `creds`
  * (exec_creds_resolve(), parent-built too) is the User=/Group= result the
  * child applies at step 10 -- integers only, nothing left to look up.
  * `exec_fd` is the write end of a Type=exec service's O_CLOEXEC readiness
@@ -1111,11 +1051,10 @@ static _Noreturn void
          *
          * Otherwise: O_RDWR, not O_RDONLY (171ceb4a00): a read-only console
          * dup'd onto stdin gives every read() a silent EBADF. Never
-         * vhangu()/reset/lock it (43efbc3959): every unit here shares this
-         * same console, and clearing it out from under a concurrent writer
-         * is a real boot deadlock in pico-init's design, not a hypothetical
-         * one. stdin always comes from the console (plan §3.6) -- opened
-         * first regardless of what stdout/stderr end up as below.
+         * vhangup()/reset/lock it (43efbc3959): every unit shares this
+         * console, and clearing it under a concurrent writer can deadlock
+         * boot. stdin always comes from the console, opened first
+         * regardless of what stdout/stderr end up as below.
          */
         if (stdin_socket) {
                 int cfd = sock_fds[0];
@@ -1178,13 +1117,11 @@ static _Noreturn void
                 /*
                  * stdout/stderr: logd's socket when create_stdout_socket()
                  * (the PARENT, before fork()) succeeded, else the same
-                 * console fd stdin just got -- the pre-J2 behaviour,
-                 * unchanged, so an image without logd (or one where it
-                 * simply is not listening yet) behaves exactly as before
-                 * (plan §3.6). Either way both descriptors point at the
-                 * SAME open file description, matching upstream's own
-                 * stdout==stderr default and this file's pre-J2 console
-                 * behaviour.
+                 * console fd stdin just got, so an image
+                 * without logd (or one where it is not listening yet) logs
+                 * to the console. Either way both descriptors share one
+                 * open file description, matching upstream's
+                 * stdout==stderr default.
                  */
                 if (stdout_fd >= 0) {
                         if (dup2(stdout_fd, STDOUT_FILENO) < 0)
@@ -1250,9 +1187,8 @@ static _Noreturn void
          * reuses ioctl numbers across subsystems. isatty() == 1 is the
          * guard; setsid() at step 6 is the other half of the precondition
          * (session leader, no controlling terminal yet). Not fatal on
-         * failure -- there is simply no job control for this service, and
-         * there is no async-signal-safe way to log that here, so it is
-         * silently tolerated rather than reported.
+         * failure -- the service just has no job control, and there is no
+         * async-signal-safe way to log it here.
          *
          * StandardInput= refines that, as upstream's acquire_terminal():
          * tty-force passes 1, stealing the terminal from another session
@@ -1293,12 +1229,10 @@ static _Noreturn void
          * silently keeps root's groups (the classic privilege-retention
          * bug). creds->set covers all three directives, including
          * SupplementaryGroups= alone with neither User= nor Group= given
-         * (picowl.service's own shape): setgid()/setuid() then just
-         * reassert this process's own current ids, a no-op but a harmless
-         * one. Placed after the cgroup attach (7) and the console open (8),
-         * both of which may need the privilege being given up here. Fatal:
-         * a unit that asked to drop privilege, or to add a supplementary
-         * group, must never run with more or less than it asked for.
+         * (neither User= nor Group=): setgid()/setuid() then just
+         * reassert this process's own current ids. Placed after the cgroup attach (7) and the console open
+         * (8), both of which may need the privilege being given up here. Fatal: a unit that asked to drop
+         * privilege, or to add a supplementary group, must never run with more or less than it asked for.
          */
         if (creds->set) {
                 if (setgroups((size_t) creds->n_groups, creds->groups) < 0)
@@ -1521,10 +1455,9 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
         if (expanded_argv)
                 argv = expanded_argv;
 
-        /* Every start, not only ExecStart= (plan §3.6: nothing scopes stdout
-         * capture to the main command the way LISTEN_FDS is scoped above).
-         * Best-effort: -1 on any failure just means "no logd, use the
-         * console" below, never a reason to fail the spawn itself. Not for
+        /* Every start, not only ExecStart=: stdout capture is not scoped to
+         * the main command the way LISTEN_FDS is above. -1 on any failure
+         * means "no logd, use the console". Not for
          * a tty* unit: its stdout follows stdin to the terminal (child_exec()
          * step 8). */
         stdout_fd = service_standard_input_is_tty(s->standard_input) &&

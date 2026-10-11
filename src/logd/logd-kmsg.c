@@ -2,14 +2,11 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The /dev/kmsg reader, with whole-ring backfill. See logd-kmsg.h for the
- * mechanism (a fresh open() starts at the ring's beginning, not "now") and
- * the journald-kmsg.c reference citation (plan §3.5).
+ * The /dev/kmsg reader, with whole-ring backfill. See logd-kmsg.h.
  *
- * Record format, confirmed against a real running kernel rather than
- * assumed: "<pri>,<seq>,<timestamp_usec>,<flags>[,extra];message\n", one
- * complete record per read(), e.g. b'6,0,0,-;Booting Linux on physical
- * CPU ...\n' as the very first record off a fresh open().
+ * Record format: "<pri>,<seq>,<timestamp_usec>,<flags>[,extra];message\n",
+ * one complete record per read(), e.g. "6,0,0,-;Booting Linux on physical
+ * CPU ...\n" as the first record off a fresh open().
  */
 
 #include "logd-kmsg.h"
@@ -24,8 +21,7 @@
 #include "../util.h"
 #include "logd-kmsg-internal.h"
 
-/* Generous over any real single kmsg record -- the kernel's own printk
- * ring caps a line well under this. */
+/* Well over the kernel's per-record printk limit. */
 #define KMSG_READ_BUF_SIZE ((size_t) 8192)
 
 struct LogdKmsg {
@@ -83,12 +79,9 @@ int logd_kmsg_parse_record(const char *buf, size_t n, char **ret_line, size_t *r
 
         /* "<pri>,<seq>,<timestamp>,<flags>[,extra];message" -- pri is a
          * bare leading decimal (facility*8+severity), no angle brackets,
-         * confirmed against a real kernel above. Only the severity
-         * (value & 7) is kept; pico's field set (plan §3.3) carries no
-         * facility. atoi() on anything unparseable returns 0, which masks
-         * to priority 0 (emerg) -- an over-severe default for a line this
-         * function otherwise still emits, but never a crash, and this
-         * format has not been observed to vary. */
+         * as in the format above. Only the severity
+         * (value & 7) is kept; the log entry has no facility field. An
+         * unparseable prefix yields priority 0 (emerg), not a failure. */
         priority = atoi(buf) & 7;
 
         msg_start = semi + 1;
@@ -119,9 +112,8 @@ int logd_kmsg_read(LogdKmsg *k, char **ret_line, size_t *ret_len, int *ret_prior
                 if (errno == EAGAIN)
                         return 0;
                 if (errno == EPIPE) {
-                        /* We fell behind and the kernel dropped records to
-                         * make room; the next read() resumes right after
-                         * the gap on its own, nothing to seek or reopen. */
+                        /* Records were dropped; the next read() resumes after
+                         * the gap. */
                         pico_log(PICO_LOG_WARNING,
                                  "logd: /dev/kmsg reader fell behind, some kernel messages were dropped");
                         return 0;

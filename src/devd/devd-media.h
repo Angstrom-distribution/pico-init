@@ -2,33 +2,27 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * Removable-media mount policy (plans/31, Part 2, Option A).
+ * Removable-media mount policy.
  *
- * A plain C function, deliberately, and that stays true once the H2 rule engine
- * exists: this needs the debounce state, the gpt-scan.c link and the
- * removable-versus-DPS distinction, none of which fit a stateless match line.
- * Rules trigger tools; for storage, this is the tool.
+ * This is C code rather than a rule because it needs the debounce state,
+ * gpt-scan.c and the removable-versus-DPS distinction, none of which fit a
+ * stateless match line.
  *
- * The policy is not DPS, and the difference is the whole reason both exist.
- * PID 1's dps_scan() is scoped to the boot disk precisely so a card someone
- * plugged in cannot get its swap-typed partition swapped onto or its root-typed
- * partition adopted as anything. This is the other half: partitions on disks
- * that are NOT the boot disk, of a data type only, mounted somewhere clearly
- * marked as removable and nowhere else. The two share gpt-scan.c as a parser
- * and share nothing as policy, and the boot-disk exclusion here is what keeps
- * them from ever meeting -- without it the root partition would come up
+ * This is not DPS. PID 1's dps_scan() is scoped to the boot disk so a card
+ * someone plugged in cannot get its swap-typed partition swapped onto or its
+ * root-typed partition adopted. This is the other half: data-type partitions on
+ * disks that are NOT the boot disk, mounted under /media and nowhere else. The
+ * two share gpt-scan.c as a parser and nothing as policy; the boot-disk
+ * exclusion keeps them apart, since without it the root partition would be
  * mounted a second time under /media.
  *
- * v1 scope, as signed off in the plan: GPT-prepared media only, ext-family
- * filesystems only. An MBR card or a FAT volume is recognised as "not something
- * devd mounts" and logged once, not half-handled.
+ * Scope: GPT-prepared media and ext-family filesystems only. An MBR card or a
+ * FAT volume is logged once as not mounted.
  *
- * The known stall: mount(2) on bad media can block for seconds inside the epoll
- * loop, and while it does, devd is deaf. The plan named forking or accepting it
- * as the two honest answers; v1 accepts it, and this is where that is written
- * down. It is bounded in practice by the boot-disk exclusion (the one device
- * guaranteed present is never mounted here) and by there being at most a
- * handful of slots on any pico board.
+ * Known stall: mount(2) on bad media can block for seconds inside the epoll
+ * loop, during which devd is deaf. This is accepted rather than forked; it is
+ * bounded by the boot-disk exclusion and by there being few slots on any
+ * board.
  */
 
 #pragma once

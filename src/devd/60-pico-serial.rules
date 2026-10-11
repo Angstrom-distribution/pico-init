@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Koen Kooi
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
-# Persistent names for USB serial adapters (plans/31, Part 2, H2).
+# Persistent names for USB serial adapters.
 #
 # /dev/ttyUSB0 is whichever adapter enumerated first, which is not a fact about
 # the adapter. This file gives each one a name derived from what it says about

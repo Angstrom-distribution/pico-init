@@ -2,11 +2,9 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * Real epoll/timerfd/signalfd/pidfd/inotify throughout -- no mocked kernel
- * objects. sd_event_new() has no PID-1 restriction to exercise here any
- * more: pico-init's own Manager is a real sd_event consumer now (see
- * src/manager.h and src/test-loop-order.c, which covers the manager-level
- * dispatch-order property this file cannot reach without a Manager).
+ * Uses real epoll/timerfd/signalfd/pidfd/inotify objects, no mocks.
+ * src/test-loop-order.c covers the manager-level dispatch order this file
+ * cannot reach without a Manager.
  */
 #define _GNU_SOURCE
 
@@ -21,10 +19,8 @@
 
 #include "sd-event.h"
 
-/* Same relative-path convention src/devd/test-devd-block.c uses for the
- * same shared scaffolding: quote-includes resolve against the including
- * file's own directory first, and this family's includes are the family's
- * own subdir, not the project root. */
+/* Quote-includes resolve against this file's own directory first, so the
+ * shared header is addressed by relative path (as in devd/test-devd-block.c). */
 #include "../../test-util.h"
 
 static int defer_exit_cb(sd_event_source *s, void *userdata) {
@@ -51,11 +47,8 @@ static void test_new_ref_unref(void) {
 }
 
 static void test_default_query_then_create(void) {
-        /* ret == NULL is a pure query: never creates, and reports whether
-         * one already exists (0 or 1), not a fixed value -- this is the
-         * one place this test suite deliberately follows the verified real
-         * behaviour over a looser paraphrase in the family's own design
-         * brief; see sd-event.c's sd_event_default(). */
+        /* ret == NULL is a pure query: it never creates, and reports whether
+         * a default loop exists (0 or 1); see sd_event_default() in sd-event.c. */
         ASSERT_EQ_INT(sd_event_default(NULL), 0);
 
         sd_event *e1 = NULL, *e2 = NULL;
@@ -131,19 +124,16 @@ static void test_io_pipe(void) {
 
         ASSERT_EQ_INT((int) write(fds[1], "x", 1), 1);
 
-        /* get_io_revents() is only meaningful in the window between a
-         * wait() that found the source ready and the dispatch() that
-         * clears `pending` again -- verified against real upstream's own
-         * source_dispatch(): it calls source_set_pending(s, false) BEFORE
-         * invoking s->io.callback(), so even real sd-event returns
-         * -ENODATA if a callback calls this on its own source. Exercise
-         * the window where it actually returns something, via manual
-         * prepare()/wait() steps instead of sd_event_loop().
+        /* get_io_revents() is only meaningful between a wait() that found
+         * the source ready and the dispatch() that clears `pending`; upstream's
+         * source_dispatch() clears it before invoking the callback, so a
+         * callback calling this on its own source gets -ENODATA. Drive that
+         * window with manual prepare()/wait() steps instead of
+         * sd_event_loop().
          *
-         * prepare() alone returns 0 here: nothing is pending yet (the byte
-         * sitting in the pipe is not "pending" until an actual epoll_wait()
-         * says so), which is exactly why sd_event_run() always follows a
-         * 0 from prepare() with a real wait() call. */
+         * prepare() alone returns 0 here: the byte in the pipe is not
+         * "pending" until epoll_wait() reports it, which is why sd_event_run()
+         * follows a 0 from prepare() with wait(). */
         ASSERT_EQ_INT(sd_event_prepare(e), 0);
         ASSERT_EQ_INT(sd_event_wait(e, 0), 1);
         ASSERT_EQ_INT(sd_event_source_get_io_revents(s, &got), 0);
@@ -292,12 +282,10 @@ static void test_prepare_priority_order(void) {
 
         ASSERT_EQ_INT(sd_event_new(&e), 0);
 
-        /* Deliberately added out of priority order, to prove the run is
-         * sorted rather than list-order. The DEFER source's own dispatch
-         * callback is a plain no-op here -- this test only ever drives
-         * sd_event_prepare(), never sd_event_dispatch(), so only each
-         * source's *prepare* callback (priority_log_cb, sharing the same
-         * userdata slot as the dispatch callback) ever runs. */
+        /* Added out of priority order to prove the run is sorted rather than
+         * list-ordered. Only sd_event_prepare() is driven, never
+         * sd_event_dispatch(), so only each source's prepare callback
+         * (priority_log_cb) runs. */
         ASSERT_EQ_INT(sd_event_add_defer(e, &hi, noop_cb, &log), 0);
         ASSERT_EQ_INT(sd_event_source_set_priority(hi, 100), 0);
         ASSERT_EQ_INT(sd_event_source_set_prepare(hi, priority_log_cb), 0);

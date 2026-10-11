@@ -3,111 +3,64 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 /*
- * Ported from src/libsystemd-network/dhcp-client-internal.h (109 lines): the
- * DHCPv4 client object's layout and the internal entry points
- * dhcp-client.c and dhcp-client-send.c share. Upstream's file carries no
- * copyright line of its own (verified against the real v261.2 file --
- * sd-dhcp-client.c does, this one does not), so only the project attribution
- * travels.
+ * Ported from systemd v261.2 src/libsystemd-network/dhcp-client-internal.h:
+ * the DHCPv4 client object's layout and the internal entry points
+ * dhcp-client.c and dhcp-client-send.c share.
  *
- * Quarry point: systemd v261.2, commit 4925d9f07f. History review
- * (4925d9f07f..main, plan §2.2 -- the window is "everything on main since the
- * v261 release", since 4925d9f07f sits on v261-stable and is not an ancestor
- * of main). Exactly two commits in that window touch sd-dhcp-client.c /
- * dhcp-client-send.c / dhcp-client-internal.h, and both are recorded here
- * because "nothing applies" is only a useful answer when it is shown:
- *
- *  - 05f790da8f "dhcp: drop unnecessary !!" -- drops the double negation in
- *    sd_dhcp_client_set_anonymize(). NOT CARRIED: netd does not implement
- *    RFC 7844 anonymize mode at all (see the cut list below), so the line
- *    the fix touches does not exist here.
- *  - 01e1303f9c "Rename basic-forward.h, sd-forward.h, and shared-forward.h
- *    to forward.h" -- a 674-file mechanical include rename. NOT CARRIED:
- *    netd carries none of those headers; netd-compat.h is what stands in for
- *    them.
- *
- * The window's one genuinely backport-worthy commit, 7bd9f0f805
- * ("dhcp-server: reject pool offsets beyond the subnet"), is in
- * sd-dhcp-server.c and belongs to the server milestone -- see
- * dhcp-lease-internal.h's header, which already forwards it.
- *
- * WHAT MAKES THESE THREE FILES A REWRITE RATHER THAN A PORT
- *
- * Upstream holds five sd_event_source pointers here (timeout_resend,
- * timeout_t1, timeout_t2, timeout_expire, receive_message) and reaches 18
- * distinct sd_event API entry points through them; 28.3% of
- * sd-dhcp-client.c's function-body lines are event plumbing, smeared across
- * ~9 of its ~35 functions rather than confined to a bottom layer (plan
- * §2.1). netd holds four PicoTimerEvent handles and one netd_epoll_tag
- * instead. src/timer.h's handle-lifetime contract is exactly what those four
- * need: the queue stores the address of the handle slot and clears it when
- * the event fires or is cancelled, so a handle is NULL precisely when its
- * event no longer exists, and every arm below passes the address of the
- * owning field (never a local). The corollary is the reason
+ * Upstream holds five sd_event_source pointers (timeout_resend, timeout_t1,
+ * timeout_t2, timeout_expire, receive_message). netd holds four
+ * PicoTimerEvent handles and one netd_epoll_tag instead. src/timer.h's
+ * handle-lifetime contract applies: the queue stores the address of the
+ * handle slot and clears it when the event fires or is cancelled, so a
+ * handle is NULL exactly when its event no longer exists, and every arm
+ * passes the address of the owning field (never a local). For that reason
  * dhcp_client_free() cancels all four before freeing anything.
  *
- * The protocol logic inside the rewritten functions is kept; only their
- * control flow is re-derived. Each one carries a comment naming the RFC 2131
- * requirement its upstream event code encoded -- that record, not the
- * typing, is this milestone's deliverable.
+ * The protocol logic is kept; the control flow around the timers is
+ * re-derived, and each rewritten function carries a comment naming the RFC
+ * 2131 requirement its upstream event code encoded.
  *
  * DHCP_CLIENT_DONT_DESTROY (below) and the `state == DHCP_STATE_STOPPED`
- * re-check after every client_notify() are carried verbatim in intent. They
- * look like refcount noise and are not: netd makes them *more* load-bearing
- * than upstream, because SIGHUP reconfigures every interface and lease
- * application is a direct call into netd-link.c, so a reconfigure reached
- * from inside a lease callback would free the client under its own stack
- * frame.
+ * re-check after every client_notify() are kept. SIGHUP reconfigures every
+ * interface and lease application is a direct call into netd-link.c, so a
+ * reconfigure reached from inside a lease callback would otherwise free the
+ * client under its own stack frame.
  *
- * Cut on the way in, relative to upstream:
+ * Cut relative to upstream:
  *  - RFC 7844 anonymize mode (`anonymize`, the anonymized parameter request
- *    list, and the last_addr/rapid-commit suppressions it drives): netd's
- *    `.network` subset (plan §2.5) has no Anonymize= directive, and the
- *    feature is only reachable through one.
+ *    list, and the last_addr/rapid-commit suppressions it drives): the
+ *    `.network` subset has no Anonymize= directive.
  *  - sd_device: netd has no udev dependency, so dhcp_identifier_set_iaid()
  *    takes no device (dhcp-client-id-internal.h). See the IAID note below.
  *  - Option 108 (IPv6-Only Preferred) and the REQUESTING delay built on it:
- *    netd does not request option 108 and the lease object carries no
- *    ipv6_only_preferred_usec field (dhcp-lease-internal.h), so
- *    sd_dhcp_client_is_waiting_for_ipv6_connectivity() has nothing to test.
+ *    netd does not request option 108 and the lease object has no
+ *    ipv6_only_preferred_usec field (dhcp-lease-internal.h).
  *  - MUD URL (161), User Class (77), Vendor Specific (43) sub-TLVs and the
  *    caller-supplied extra/vendor TLV blocks: no `.network` directive
- *    reaches any of them, and the sub-TLV append helpers they need were cut
- *    from the codec (dhcp-message.h).
- *  - The externally-supplied socket fd (`socket_fd`), which exists upstream
- *    only so test-dhcp-client.c can drive the client over a socketpair.
- *    netd's own end-to-end test runs a real veth pair in a network
- *    namespace (plan §2.8), so the escape hatch has no user.
- *  - ARPHRD_INFINIBAND: dhcp-protocol.h already sized HW_ADDR_MAX_SIZE for
- *    an explicitly infiniband-free netd, so dhcp_client_set_mac() rejects
- *    it rather than half-supporting it.
+ *    reaches them, and the sub-TLV append helpers were cut from the codec
+ *    (dhcp-message.h).
+ *  - The externally supplied socket fd (`socket_fd`), which exists upstream
+ *    only so its tests can drive the client over a socketpair.
+ *  - ARPHRD_INFINIBAND: HW_ADDR_MAX_SIZE (dhcp-protocol.h) is sized without
+ *    it, so dhcp_client_set_mac() rejects it.
  *
- * IAID DIVERGENCE, DOCUMENTED RATHER THAN FIXED. Upstream derives the IAID
- * inside the RFC 4361 client-id from a hash of the persistent interface name
- * when an sd_device is available, and falls back to hashing the MAC address
- * otherwise. netd has no sd-device and therefore always takes the MAC
- * branch. A board migrated from systemd-networkd to netd consequently
- * presents a *different* client identifier on the same interface, and a DHCP
- * server keyed on client-id may hand it a different address than it used to.
- * That is a visible behaviour change on exactly the boards this project
- * targets; it is recorded here rather than papered over, because the
- * alternative (reimplementing udev's persistent-name derivation) would pull
- * in the whole dependency netd declined.
+ * IAID divergence: upstream derives the IAID in the RFC 4361 client-id from
+ * a hash of the persistent interface name when an sd_device is available,
+ * and from the MAC address otherwise. netd always hashes the MAC. A board
+ * moved from systemd-networkd to netd therefore presents a different client
+ * identifier on the same interface, and a DHCP server keyed on client-id may
+ * hand it a different address.
  *
- * CLOCK DIVERGENCE. Upstream runs every DHCP timer on CLOCK_BOOTTIME, so
+ * Clock divergence: upstream runs every DHCP timer on CLOCK_BOOTTIME, so
  * time spent suspended counts against a lease. netd's shared timer queue is
- * CLOCK_MONOTONIC-only by design (src/timer.c), and dhcp-lease-internal.h
- * already fixed the lease timestamp to that clock for the same reason. On a
- * board that suspends, netd will therefore hold a lease across the suspend
- * that upstream would have expired. None of this project's targets suspend
- * (plan §2.9's scope), and moving the shared queue to CLOCK_BOOTTIME would
- * change PID 1's behaviour, so this is left as a known, bounded divergence.
+ * CLOCK_MONOTONIC (src/timer.c), as is the lease timestamp
+ * (dhcp-lease-internal.h), so a lease is held across a suspend that upstream
+ * would have expired. Suspend is not supported.
  */
 
 #pragma once
 
-/* Self-sufficient regardless of what a consumer includes first, matching
- * every other header under src/netd/dhcp/. */
+/* Self-sufficient, like every other header under src/netd/dhcp/. */
 #include "netd-compat.h"
 
 #include <net/if.h>
@@ -163,12 +116,9 @@ struct DhcpClient {
         int ifindex;
         char ifname[IFNAMSIZ]; /* for logging only */
 
-        /*
-         * The transplanted event sources. Four deadline-queue handles and
-         * one epoll registration replace upstream's five sd_event_source
-         * pointers. Every pico_timer_add() below is handed the address of
-         * one of these fields, per src/timer.h's contract.
-         */
+        /* Event sources: four timer handles and one epoll registration.
+         * Every pico_timer_add() is handed the address of one of these
+         * fields, per src/timer.h. */
         PicoTimerEvent *timeout_resend;
         PicoTimerEvent *timeout_t1;
         PicoTimerEvent *timeout_t2;
@@ -284,23 +234,18 @@ int dhcp_client_is_running(DhcpClient *client);
 int dhcp_client_get_state(DhcpClient *client);
 int dhcp_client_get_lease(DhcpClient *client, DhcpLease **ret);
 
-/* Force an immediate RENEWING cycle from BOUND. Upstream's
- * sd_dhcp_client_send_renew(); netd has no caller yet, but the link layer
- * needs it the moment a "renew now" hook exists. 0 when there is nothing to
- * do, which is not an error. */
+/* Force an immediate RENEWING cycle from BOUND (upstream's
+ * sd_dhcp_client_send_renew()). 0 when there is nothing to do. */
 int dhcp_client_send_renew(DhcpClient *client);
 
 /* RFC 2131 3.1.5: the address turned out to be in use. Sends DHCPDECLINE and
- * restarts the configuration process after the RFC's ten-second minimum --
- * see the divergence note in dhcp-client.c. */
+ * restarts the configuration process after the RFC's ten-second minimum
+ * (see dhcp-client.c). */
 int dhcp_client_send_decline(DhcpClient *client);
 
-/* Logging with the interface-name prefix netd-compat.h's log_dhcp_client()
- * deliberately drops (it discards the client argument, because the codec had
- * no interface name to print). The client does have one, and a board with
- * eth0 and usb0 both running a client is the normal case here, so the prefix
- * is worth the six lines. Defined in dhcp-client.c; used from
- * dhcp-client-send.c too. */
+/* Logging with an interface-name prefix, which netd-compat.h's
+ * log_dhcp_client() drops (it discards the client argument). Defined in
+ * dhcp-client.c; also used from dhcp-client-send.c. */
 void dhcp_client_log(DhcpClient *client, PicoLogLevel level, const char *fmt, ...) _printf_(3, 4);
 
 #define log_client_debug(client, ...) dhcp_client_log((client), PICO_LOG_DEBUG, __VA_ARGS__)
@@ -324,13 +269,8 @@ void dhcp_client_disable_io(DhcpClient *client);
  * can hand it to netd_loop_add_io(); nothing else should call it. */
 int dhcp_client_io_callback(Netd *netd, struct netd_epoll_tag *tag, uint32_t revents);
 
-/*
- * Stop the client because of `error` (a negative errno), notifying the link
- * layer on the way out. Exported only so dhcp-client-send.c's receive path
- * can report a hard failure the way upstream's client_receive_message() does
- * -- upstream has both halves in one file and calls the static client_stop()
- * directly.
- */
+/* Stop the client because of `error` (a negative errno), notifying the link
+ * layer. Exported for dhcp-client-send.c's receive path. */
 void dhcp_client_fail(DhcpClient *client, int error);
 
 /* Called by dhcp_client_io_callback() with one received DHCP payload (the
@@ -341,12 +281,8 @@ int dhcp_client_handle_message(DhcpClient *client, const struct iovec *payload);
 
 /* --- small helpers the two .c files share --- */
 
-/*
- * These belong in netd-compat.h with the rest of the shim, but that file is
- * another milestone's and editing it mid-stream is the kind of cross-agent
- * collision this project has already paid for once. They are function-like
- * rather than upstream's MIN/MAX/CLAMP macros so nothing is evaluated twice.
- */
+/* Functions rather than upstream's MIN/MAX/CLAMP macros so nothing is
+ * evaluated twice. */
 static inline usec_t usec_min(usec_t a, usec_t b) {
         return a < b ? a : b;
 }

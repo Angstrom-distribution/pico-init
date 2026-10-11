@@ -16,8 +16,8 @@
  */
 
 /* asprintf() is a glibc extension; -std=gnu17 alone does not imply
- * _GNU_SOURCE (see socket.c's own note), so this has to be explicit and
- * first, before any header pulls in features.h. */
+ * _GNU_SOURCE, so it must be defined first, before any header pulls in
+ * features.h. */
 #define _GNU_SOURCE
 
 #include "sd-device.h"
@@ -156,22 +156,14 @@ sd_device *sd_device_unref(sd_device *device) {
 }
 
 /*
- * Which parts of the sysfs tree are ever a legitimate sd_device syspath.
- *
- * The design this file follows started from "must resolve under
- * <root>/devices/", which is true for every device reached via an alias
- * (/sys/class/<x>/<y>, /sys/bus/<x>/devices/<y>, since those are always
- * symlinks and realpath() has already chased them down to their canonical
- * <root>/devices/... target by this point) -- but checking it against a
- * real kernel's /sys turned up two real, common exceptions that rule
- * cannot see: a bus's driver directory (/sys/bus/<bus>/drivers/<drv>, which
- * genuinely has its own "uevent" file for triggering a rebind, and is what
- * sd_device_new_from_subsystem_sysname()'s "drivers" special case has to
- * resolve to) and a module directory (/sys/module/<name>), neither of
- * which lives under /devices at all. Both are real, separate sysfs
- * subtrees, not symlinks into one. The bare subsystem/class/module
- * directories themselves (no specific driver or device) are the third
- * exception, needed for sd_device_enumerator_get_subsystem_first()'s
+ * Which parts of the sysfs tree are legitimate sd_device syspaths: anything
+ * under <root>/devices/ (devices reached through /sys/class or /sys/bus
+ * aliases are already resolved there by realpath()), plus three exceptions
+ * that live elsewhere: a bus driver directory (/sys/bus/<bus>/drivers/<drv>,
+ * which has its own "uevent" file and is what
+ * sd_device_new_from_subsystem_sysname()'s "drivers" case resolves to), a
+ * module directory (/sys/module/<name>), and the bare subsystem, class and
+ * module directories, for sd_device_enumerator_get_subsystem_first()'s
  * pseudo-devices.
  */
 static bool location_is_valid(const char *resolved, size_t rootlen) {
@@ -223,17 +215,10 @@ int device_new_from_syspath_internal(sd_device **ret, const char *syspath, bool 
         if (!realpath(syspath, resolved))
                 return errno == ENOENT ? -ENODEV : -errno;
 
-        /* device_sys_root() can itself sit behind a symlink -- never true
-         * for the real "/sys", but routine for a test fixture's tmpdir on
-         * a host where /tmp (or some ancestor) is one. realpath(syspath,
-         * ...) above already resolved through any such symlink, so
-         * comparing it against the raw, un-resolved root mismatches for no
-         * reason other than the two spellings of the same directory
-         * differing -- confirmed by reproducing the exact failure with a
-         * symlinked /tmp locally. Canonicalize root the same way; fall
-         * back to the raw string only if it does not exist yet (only
-         * possible mid-setup of a test fixture, and moot there since no
-         * syspath under it could resolve to a real file either). */
+        /* device_sys_root() can sit behind a symlink (a test fixture's tmpdir
+         * under a symlinked /tmp). realpath(syspath) above already resolved
+         * it, so canonicalize root the same way; fall back to the raw string
+         * if it does not exist. */
         canon_root = realpath(root, root_resolved) ? root_resolved : root;
         rootlen = strlen(canon_root);
 

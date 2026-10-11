@@ -57,12 +57,11 @@
  *    stable install order. Upstream measured ~100ms of boot jitter from
  *    getting this wrong on small embedded devices, which is this project's
  *    exact target.
- *  - 097537f07a -> cc479760b4 is deliberately NOT taken: upstream's "cleverer"
+ *  - 097537f07a -> cc479760b4 is not taken: upstream's "cleverer"
  *    redundancy test was reverted by every major distro and then by upstream
  *    itself. v30's naive state test is what it returned to.
  *
- * Deliberately not quarried, so the omissions are decisions rather than
- * oversights: JOB_NOP and job-type collapsing (e0209d83e7), try-restart and
+ * Not taken: JOB_NOP and job-type collapsing (e0209d83e7), try-restart and
  * reload types, job modes and the destructiveness check, isolate, job
  * timeouts, job garbage collection (only device units are collectable), the
  * Requisite=/BindsTo=/OnFailure= dependency families, every
@@ -441,7 +440,7 @@ int job_run(Job *j) {
                 return 0;
 
         /*
-         * An unmet start condition (unit.c). The unit is deliberately still
+         * An unmet start condition (unit.c). The unit is still
          * inactive, so the redundancy check below would not fire and nothing
          * called unit_notify() -- without this the job would sit in
          * JOB_RUNNING forever with everything ordered after it blocked.
@@ -472,10 +471,9 @@ int job_run(Job *j) {
          * forever too.
          *
          * transaction_drop_redundant() cannot have caught this, because it
-         * deliberately exempts the anchor job -- and the anchor is exactly what
-         * a direct request produces. `picoctl start` on an already-active unit
-         * and `picoctl stop` on an already-dead one are both this case, and
-         * they are the two commonest things anyone will ask.
+         * exempts the anchor job, which is what a direct request produces:
+         * `picoctl start` on an already-active unit and `picoctl stop` on an
+         * already-dead one are both this case.
          */
         /*
          * A restart is asked about its STOP half, not about itself.
@@ -692,7 +690,7 @@ int job_finish_full(Job *j, JobResult result, bool recursive) {
          * is the only point at which a job result becomes final, and it is
          * what makes `picoctl start`'s exit code the real job result rather
          * than a confirmation that it was enqueued. The RESTART conversion
-         * above deliberately does not reach here: a restart that has only
+         * above does not reach here: a restart that has only
          * stopped the unit is not finished, and replying there would report
          * success halfway through.
          */
@@ -716,11 +714,10 @@ int job_finish_full(Job *j, JobResult result, bool recursive) {
          *
          * JOB_DEPENDENCY, not this job's own `result`: upstream's job.h is
          * explicit that JOB_DEPENDENCY means "a required dependency job did
-         * not result in JOB_DONE", which is exactly what every job this
-         * reaches is -- `u` itself already got its own real result (JOB_FAILED,
-         * JOB_TIMEOUT, ...) from the call above/elsewhere. Passing `result`
-         * through unchanged used to relabel a dependent's job with a result
-         * that was never its own.
+         * not result in JOB_DONE", which is what every job this reaches
+         * is: `u` itself already got its own real result (JOB_FAILED,
+         * JOB_TIMEOUT, ...), so passing `result` through would give a
+         * dependent's job a result that was never its own.
          */
         if (result != JOB_DONE && recursive && type == JOB_START)
                 job_propagate_failure(m, u, JOB_DEPENDENCY);
@@ -864,7 +861,7 @@ static void transaction_detach(Transaction *tx, Job *j) {
 static int transaction_add_job_full(Transaction *tx, JobType type, Unit *u, bool with_dependencies, bool matters);
 
 /* Pull in u's Requires=/Wants= as start jobs. Requires= matters to the anchor,
- * Wants= deliberately does not -- that single distinction is the whole of the
+ * Wants= does not -- that single distinction is the whole of the
  * hard-versus-soft dependency semantics in this model. */
 static int transaction_add_start_deps(Transaction *tx, Unit *u) {
         size_t i;
@@ -944,7 +941,7 @@ static int transaction_add_stop_deps(Transaction *tx, Unit *u) {
  * the start matters, the stop is the job that gets dropped. The anchor
  * itself always matters, so it is never rewritten. Upstream
  * would then GC the start jobs the peer had already pulled in; pico has no
- * job GC (step 5), so those stay and simply start on their own, which is
+ * job GC (step 5), so those stay and start on their own, which is
  * harmless. Termination: the jobs added here are STOPs, and a STOP walks only
  * transaction_add_stop_deps(), never conflicts, so mutual Conflicts= ends
  * after one hop.
@@ -1273,9 +1270,8 @@ static int transaction_verify_order(Transaction *tx, unsigned *generation) {
 /*
  * Install in an order consistent with the ordering edges: Kahn's algorithm
  * over the transaction's jobs, breaking ties by unit id so the result is
- * reproducible boot to boot. Deterministic order is not cosmetic -- upstream
- * measured real boot-time jitter from leaving it to hash iteration order
- * (da8e178296), on devices much larger than this one.
+ * reproducible boot to boot. Upstream measured real boot-time jitter from
+ * leaving it to hash iteration order (da8e178296).
  */
 static int transaction_apply(Transaction *tx) {
         size_t remaining = tx->n_jobs;
@@ -1391,7 +1387,7 @@ int transaction_activate(Transaction *tx) {
                 /* 5. Collect garbage -- not implemented. The one way to
                  *    orphan a job here is a Conflicts= rewrite of a start
                  *    into a stop, leaving the start jobs it pulled in; they
-                 *    simply start on their own, which is harmless. */
+                 *    start on their own, which is harmless. */
         }
 
         /* 6-7. Merge jobs / collect garbage again -- N/A: merging happens at

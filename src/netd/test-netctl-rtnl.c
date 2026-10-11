@@ -4,16 +4,13 @@
 /*
  * Golden-byte tests for netctl_rtnl_decode_link() (netctl-rtnl.c): the
  * attribute decode netctl's own `status <iface>` relies on, fed hand-built
- * RTM_NEWLINK reply buffers rather than a real netlink socket -- the same
- * approach test-netd-codec.c uses for the DHCP wire format, so a decoder
- * bug cannot hide behind "well, the kernel happened to agree with us."
+ * RTM_NEWLINK reply buffers rather than a real netlink socket, as
+ * test-netd-codec.c does for the DHCP wire format.
  *
  * Fixtures are built with netd-rtnl-core.c's own nl_req_init()/nl_reserve()/
- * nl_add_attr() (this program links netd-rtnl-core.c, nothing else of
- * netd's) rather than literal byte arrays: that gets the NLMSG_ALIGN/
- * RTA_ALIGN padding right by construction instead of by hand arithmetic,
- * and exercises the exact same attribute-append path netctl-rtnl.c's own
- * one real request uses.
+ * nl_add_attr() (this program links netd-rtnl-core.c and nothing else of
+ * netd's) rather than literal byte arrays, so NLMSG_ALIGN/RTA_ALIGN padding
+ * is right by construction.
  */
 
 #include <errno.h>

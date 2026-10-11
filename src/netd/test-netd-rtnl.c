@@ -2,36 +2,27 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * N1's acceptance tests: the hand-rolled rtnetlink layer, and the milestone's
- * real done-when criterion from plan §2.10 -- "test-netd-rtnl passes in a
- * netns and a static .network file end-to-end configures a dummy interface,
- * reconfiguring on SIGHUP." The first half (test_netns_rtnl()) was already
- * here; test_netns_static_network_and_sighup() below is the second half.
+ * Tests for the hand-rolled rtnetlink layer and for a static .network file
+ * end to end: configuring a veth interface and reconfiguring on SIGHUP
+ * (test_netns_static_network_and_sighup()).
  *
- * Real network-namespace test (plan §2.8): unshare(CLONE_NEWUSER|CLONE_NEWNET)
- * -- a bare unshare(CLONE_NEWNET) fails here with EPERM, there is no
- * CAP_SYS_ADMIN in this container's default set, but a fresh user namespace
- * grants full capabilities within itself, and a net namespace created in the
- * same unshare() call is owned by it, so CAP_NET_ADMIN is available there
- * too. Failing to set up the namespace is fatal (exit(1) with a message),
- * never a silent pass: a test that cannot prove it ran isolated must not
- * report success. Each netns-using test function calls enter_test_netns()
- * itself (nested unshare()s are fine: each grants a fresh, independent user
- * and net namespace owned by the caller, who is root inside the one it is
- * already running in), so the test functions stay independent of each
- * other's ordering in main().
+ * Real network-namespace test: unshare(CLONE_NEWUSER|CLONE_NEWNET) -- a bare
+ * unshare(CLONE_NEWNET) fails with EPERM without CAP_SYS_ADMIN, but a fresh
+ * user namespace grants full capabilities within itself, and a net namespace
+ * created in the same unshare() call is owned by it, so CAP_NET_ADMIN is
+ * available there too. Failing to set up the namespace is fatal (exit(1) with
+ * a message), never a silent pass. Each netns-using test function calls
+ * enter_test_netns() itself (nested unshare()s are fine), so the test
+ * functions stay independent of each other's ordering in main().
  *
- * `dummy` interfaces are not available in this environment (no
- * /lib/modules), so every case that would use one uses a veth pair instead,
- * per this milestone's own investigation -- a veth's far end covers what
- * dummy would have.
+ * `dummy` interfaces may be unavailable (no /lib/modules), so every case
+ * that would use one uses a veth pair instead.
  *
- * The event-after-subscription case is the one worth calling out
- * specifically. The veth pair is created *after* netd_rtnl_new() has already
- * subscribed the event socket, with no dump in between, so its RTM_NEWLINK
- * has to arrive as a live event. It is the whole reason netd's own unit has
- * no After=eudev.service, and it is exactly what a dump-then-subscribe
- * implementation would pass every other test while silently getting wrong.
+ * The event-after-subscription case is the one worth calling out. The veth
+ * pair is created *after* netd_rtnl_new() has subscribed the event socket,
+ * with no dump in between, so its RTM_NEWLINK has to arrive as a live event.
+ * It is the reason netd's unit has no After=eudev.service, and what a
+ * dump-then-subscribe implementation would silently get wrong.
  *
  * The rest of the ADDED/CHANGED/REMOVED contract is exercised too: a dump
  * always reports ADDED (netd-rtnl.h is explicit that re-enumeration, netd's
@@ -301,15 +292,14 @@ static void test_netns_rtnl(void) {
         printf("test-netd-rtnl: netns subtest ok\n");
 }
 
-/* --- N1's real done-when criterion (plan §2.10) ---
+/* --- static .network file end to end, and SIGHUP ---
  *
- * A static .network file end-to-end configures an interface, and SIGHUP
- * reconfigures it. This drives the whole N1 stack through its real public
- * entry points -- netd_new()/netd_startup()/netd_loop_dispatch_signal()/the
- * reload handler -- against a temporary tree (netd's settable paths exist
- * exactly so a test never touches the container's real /etc, /run, /var),
- * inside the same kind of fresh netns as test_netns_rtnl() above, with a
- * veth pair standing in for the unavailable `dummy` interface.
+ * A static .network file configures an interface, and SIGHUP reconfigures
+ * it. This drives the whole stack through its real public entry points --
+ * netd_new()/netd_startup()/netd_loop_dispatch_signal()/the reload handler --
+ * against a temporary tree (netd's paths are settable so a test never
+ * touches the real /etc, /run, /var), inside a fresh netns as in
+ * test_netns_rtnl() above, with a veth pair standing in for `dummy`.
  */
 
 static void write_network_file(
@@ -477,16 +467,14 @@ static void test_netns_static_network_and_sighup(void) {
 }
 
 /*
- * A real DHCP lease, acquired end to end through netd-link.c's own wiring --
- * not test-netd-dhcp.c's job (that file drives DhcpClient/DhcpServer
- * directly; this is the one place that proves link_configure() actually
- * arms them and link_apply_lease() actually lands the result). One Netd
- * instance runs both ends of a veth pair: a DHCPServer=yes side with a
- * static Address= (the usb0-gadget shape from real usb0-server.network),
- * and a DHCP=yes client side with none. netd_loop_run() is the real loop,
- * unmodified -- a forked timer process sends this process a real SIGTERM
- * after a bounded wait so the (otherwise-blocking) loop returns the way it
- * would in production, not a hand-rolled dispatch stand-in.
+ * A real DHCP lease, acquired end to end through netd-link.c's wiring --
+ * test-netd-dhcp.c drives the server directly; this proves link_configure()
+ * arms the client and server and link_apply_lease() lands the result. One
+ * Netd instance runs both ends of a veth pair: a DHCPServer=yes side with a
+ * static Address= (the usb0 gadget shape), and a DHCP=yes client side with
+ * none. netd_loop_run() is the real loop; a forked timer process sends this
+ * process a SIGTERM after a bounded wait so the loop returns as in
+ * production.
  */
 static void test_netns_dhcp_end_to_end(void) {
         char *tmp;
@@ -587,9 +575,8 @@ static void test_netns_dhcp_end_to_end(void) {
 
         /*
          * A reload (SIGHUP, `networkctl reload`) must not throw the lease's
-         * address away: DHCP=yes with no Address= used to make the
-         * "no static address wanted" branch delete it, and nothing brought it
-         * back, so every reload left the link without IPv4.
+         * address away: DHCP=yes with no Address= must not take the
+         * "no static address wanted" branch and delete it.
          */
         ASSERT_TRUE(netd_reload(n) == 0);
         client_link = netd_find_link_by_name(n, "dhcpc0");

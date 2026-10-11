@@ -2,7 +2,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The by-* symlink families. devd-symlink.h has the lifecycle argument and why
+ * The by-* symlink families. devd-symlink.h has the lifecycle and why
  * removal reads the links rather than remembering them.
  */
 
@@ -114,10 +114,8 @@ static int link_make(const char *dev_root, const char *family, const char *value
         if (errno != EEXIST)
                 return -errno;
 
-        /* Replace. Not atomic, and deliberately not made so with a
-         * rename(2) dance: the window is between two events devd itself
-         * serialises, and an unlink that fails leaves the old link rather
-         * than no link. */
+        /* Replace. Not atomic: devd serialises events itself, and a failed
+         * unlink leaves the old link rather than no link. */
         if (unlink(path) < 0 && errno != ENOENT)
                 return -errno;
 

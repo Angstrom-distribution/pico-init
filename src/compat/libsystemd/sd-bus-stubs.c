@@ -10,41 +10,23 @@
  * same errno upstream's own assert_return(ptr, -EINVAL) gives a NULL
  * handle, touching no output parameter and invoking no callback.
  *
- * Three sections, matching the design doc's own grouping by first-argument
- * type -- sd_bus*, sd_bus_message*, or one of sd_bus_slot* / sd_bus_track* /
- * sd_bus_creds* -- respectively; the reply_method_errno(0)/method_error variants keep
- * -EINVAL too -- upstream's own "r==0 means success" shortcut is
- * unreachable when the message argument cannot exist).
+ * Three sections, grouped by first-argument type: sd_bus*,
+ * sd_bus_message*, and one of sd_bus_slot*, sd_bus_track* or
+ * sd_bus_creds*. The
+ * reply_method_errno(0) and method_error variants also return -EINVAL, since
+ * upstream's "r == 0 means success" shortcut is unreachable without a
+ * message.
  *
- * Three functions the design doc lists in this bucket are deliberately
- * NOT here, because their real return type cannot hold -EINVAL at all --
- * a plain type mismatch in the doc's own grouping, caught two different
- * ways below. Each moves to sd-bus-noop.c instead, next to the sibling
- * accessor it actually matches:
- *  - sd_bus_get_event() returns sd_event* -- the compiler rejects
- *    `return -EINVAL;` outright. Joins sd_bus_get_current_message() and
- *    friends (already true_noop, NULL).
- *  - sd_bus_track_contains() returns const char* -- same rejection.
- *    Joins sd_bus_track_first()/next() (already true_noop, NULL).
- *  - sd_bus_track_count() returns plain unsigned -- -EINVAL compiles (it
- *    silently becomes a huge unsigned value) but is not a real error
- *    channel: nothing distinguishes it from a legitimate huge count. Joins
- *    sd_bus_creds_get_mask()/get_augmented_mask() (already true_noop, 0)
- *    as the true, honest count: zero, since no sd_bus_track can exist.
- *
- * Mechanically generated from the real header's own signatures (every
- * parameter (void)-cast, matching this family's "touch no output
- * parameters" contract by construction) and cross-checked against the
- * design doc's function-name lists before being hand-reviewed -- exactly
- * the kind of 250-function boilerplate transcription where a slipped name
- * would otherwise go unnoticed.
+ * sd_bus_get_event(), sd_bus_track_contains() and sd_bus_track_count() are
+ * in sd-bus-noop.c instead: their return types (sd_event*, const char*,
+ * unsigned) cannot carry -EINVAL.
  */
 
 #include "sd-bus.h"
 
 #include <errno.h>
 
-/* BUCKET B (bus-arg) */
+/* sd_bus* functions */
 int sd_bus_start(sd_bus *bus) {
         (void) bus;
         return -EINVAL;
@@ -1038,7 +1020,7 @@ int sd_bus_emit_interfaces_removed(sd_bus *bus, const char *path, const char *in
         return -EINVAL;
 }
 
-/* BUCKET B (message) */
+/* sd_bus_message* functions */
 int sd_bus_message_new(sd_bus *bus, sd_bus_message **ret, uint8_t type) {
         (void) bus;
         (void) ret;
@@ -1471,7 +1453,7 @@ int sd_bus_message_sensitive(sd_bus_message *m) {
         return -EINVAL;
 }
 
-/* BUCKET B (slot/track/creds) */
+/* slot, track and creds functions */
 int sd_bus_slot_get_floating(sd_bus_slot *slot) {
         (void) slot;
         return -EINVAL;

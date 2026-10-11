@@ -8,8 +8,7 @@
  * live in sd-event-source.c; both files share event-internal.h.
  *
  * -std=gnu17 alone does not reliably expose gettid()/pidfd_*()/timerfd_*()
- * across glibc versions -- this project's other files hit the same gap (see
- * socket.c's own note) and always define _GNU_SOURCE explicitly, first.
+ * across glibc versions, so _GNU_SOURCE is defined explicitly, first.
  */
 #define _GNU_SOURCE
 
@@ -34,9 +33,7 @@
 #        define P_PIDFD 3 /* kernel-stable idtype value; not yet in every libc's <sys/wait.h> */
 #endif
 
-/* One epoll_wait() batch. Small and bounded, same reasoning as
- * manager-loop.c's MANAGER_MAX_EVENTS: draining more per call would just
- * mean a second immediate epoll_wait() picks up the rest. */
+/* One epoll_wait() batch; anything beyond it is picked up by the next call. */
 #define EVENT_MAX_EVENTS 32
 
 /* This thread's sd_event_default() loop. Weak: sd_event_unref() clears it
@@ -280,10 +277,8 @@ int sd_event_new(sd_event **ret) {
         e->epoll_fd = fd;
         e->state = SD_EVENT_INITIAL;
         e->original_pid = getpid();
-        /* Real systemd only records tid in sd_event_default(), not here in
-         * sd_event_new() -- recording it unconditionally is a harmless
-         * superset (sd_event_get_tid() reads the same field either way, and
-         * every real event in this shim is thread-confined already). */
+        /* Upstream records the tid only in sd_event_default(); recording it
+         * here too is harmless. */
         e->tid = gettid();
 
         *ret = e;
@@ -604,10 +599,8 @@ int sd_event_add_signal(
 static int child_options_valid(int options) {
         if (options == 0 || (options & ~(WEXITED | WSTOPPED | WCONTINUED | WNOWAIT)))
                 return -EINVAL;
-        /* pidfd polling only ever signals exit, and this shim deliberately
-         * has no SIGCHLD-stream infrastructure to observe a stop/continue
-         * transition -- an honest refusal rather than pretending to watch
-         * for something it structurally cannot see. */
+        /* pidfd polling only signals exit; stop/continue transitions cannot
+         * be observed. */
         if (options & (WSTOPPED | WCONTINUED))
                 return -EOPNOTSUPP;
         if (!(options & WEXITED))
@@ -973,10 +966,9 @@ int sd_event_add_exit(sd_event *e, sd_event_source **ret, sd_event_handler_t cal
 }
 
 /* The PSI pressure source needs the $MEMORY_PRESSURE_WATCH/cgroup PSI
- * protocol. Upstream itself documents and returns -EOPNOTSUPP when PSI is
- * unavailable, so every portable caller already handles exactly this
- * errno -- a fake success would promise pressure wakeups that never come,
- * for zero known pico-side callers. */
+ * protocol. Upstream returns -EOPNOTSUPP when PSI is unavailable, so
+ * portable callers already handle it; a fake success would promise wakeups
+ * that never come. */
 int sd_event_add_memory_pressure(sd_event *e, sd_event_source **ret, sd_event_handler_t callback, void *userdata) {
         (void) e;
         (void) ret;
@@ -1485,19 +1477,12 @@ int sd_event_set_watchdog(sd_event *e, int b) {
         }
 
         /*
-         * Reuses the real sd-daemon shim's own env parsing rather than
-         * re-deriving WATCHDOG_USEC/WATCHDOG_PID here a second time -- the
-         * two must never disagree about what "enabled, for us" means, and
-         * sd_watchdog_enabled() already gets the edge cases right (a
-         * WATCHDOG_USEC of "0" or "infinity" is -EINVAL, not silently
-         * accepted). unset_environment=0: this is a query, and clearing the
-         * variables out from under some other consumer of them is not this
-         * function's business.
+         * Uses sd_watchdog_enabled() so both agree on what "enabled, for us"
+         * means. unset_environment=0: this is a query and must not clear
+         * the variables for other consumers.
          *
          * r <= 0 (env absent, malformed, or naming a different pid) all
-         * collapse to the same "not enabled" answer -- sd_event_set_watchdog(3)
-         * only distinguishes "not enabled" from "enabled but unimplemented",
-         * and a malformed request is certainly not a real request to ping.
+         * mean "not enabled".
          */
         r = sd_watchdog_enabled(0, &usec);
         if (r <= 0) {
@@ -1505,12 +1490,10 @@ int sd_event_set_watchdog(sd_event *e, int b) {
                 return 0;
         }
 
-        /* Enabled, and for us: this is the one path pico-init does not yet
-         * actually implement. Real support needs an internal
-         * CLOCK_MONOTONIC timer at usec/2 calling sd_notify("WATCHDOG=1")
-         * above. An honest, visible failure here beats silently never
-         * pinging and getting killed by the supervisor. Unreachable on
-         * pico-init itself today: it sets no watchdog env (grep-verified). */
+        /* Enabled and for us, but pinging is not implemented (it would need a
+         * CLOCK_MONOTONIC timer at usec/2 calling sd_notify("WATCHDOG=1")).
+         * Failing visibly beats silently never pinging and being killed by
+         * the supervisor. */
         return -EOPNOTSUPP;
 }
 

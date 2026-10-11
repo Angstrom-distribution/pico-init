@@ -2,10 +2,9 @@
 # SPDX-FileCopyrightText: 2026 Koen Kooi
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
-# pico-unit-lint against a fixture tree: the two worked examples from the
-# design (an iiotool-shaped sandboxed service, a volatile-binds-shaped
-# template), a clean unit, a unit whose only condition is a now-honoured
-# negation (E2.5), and a Type= the parser refuses. Every expected line is
+# pico-unit-lint against a fixture tree: two worked examples (an iiotool-shaped sandboxed service, a
+# volatile-binds-shaped template), a clean unit, a unit whose only condition
+# is a negation that is honoured, and a Type= the parser refuses. Every expected line is
 # asserted verbatim, and so are the three exit statuses.
 set -eu
 
@@ -129,7 +128,7 @@ if printf '%s\n' "$out" | grep -q "network.target\|multi-user.target\|local-fs.t
         exit 1
 fi
 
-# cond.service's negated ConditionPathExists= is honoured (E2.5), not
+# cond.service's negated ConditionPathExists= is honoured, not
 # degraded, so it reports the same as any other clean unit: nothing without
 # --verbose.
 if printf '%s\n' "$out" | grep -q "^clean.service\|^forking.service\|^cond.service"; then

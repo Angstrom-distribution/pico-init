@@ -4,7 +4,7 @@
 /*
  * The dependency graph: edge insertion and ordering-cycle detection.
  *
- * Two relations that look alike are deliberately kept apart. Requires/Wants
+ * Two relations that look alike are kept apart. Requires/Wants
  * say *whether* another unit must be pulled in; Before/After say *when* it
  * runs relative to this one. Only the ordering relation can form a deadlock,
  * so only that one is walked for cycles -- a Requires= loop is merely two

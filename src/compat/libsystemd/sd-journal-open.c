@@ -2,15 +2,13 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * sd_journal_open() and friends: a snapshot reader over logd's own /run
- * ring (src/logd/logd-read.h), never the binary .journal file format.
+ * sd_journal_open() and friends: a snapshot reader over logd's /run ring
+ * (src/logd/logd-read.h), not the binary .journal format.
  *
- * open()/open_namespace() are real. Every other open_*() variant (directory,
- * directory_fd, files, files_fd, container) is an honest -EOPNOTSUPP: each
- * names a binary-journal-file input
- * this shim never reads, and pretending to open one and then reporting zero
- * entries would read to a caller as "directory empty" rather than "format
- * not supported" -- a much worse failure to hide behind.
+ * Every other open_*() variant (directory, directory_fd, files, files_fd,
+ * container) names a binary-journal input this shim cannot read and returns
+ * -EOPNOTSUPP; opening it and reporting zero entries would look like an
+ * empty directory.
  */
 
 #include "sd-journal-internal.h"

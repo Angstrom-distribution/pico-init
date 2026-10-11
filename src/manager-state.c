@@ -2,7 +2,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The state publisher (plan §1.7, milestone C0). See manager-state.h for the
+ * The state publisher. See manager-state.h for the
  * contract; this is the real body.
  *
  * Every write is tmp-file-then-rename() within <runtime_dir>/units/: rename()
@@ -152,10 +152,8 @@ static const char *unit_substate(Unit *u) {
         case UNIT_TARGET:
                 return target_state_to_string(TARGET(u)->state);
         case UNIT_SOCKET:
-                /* socket.c is still scaffolding (plan §1.6, S0-S2): no real
-                 * state machine exists yet, so this borrows target's
-                 * dead/active shape rather than inventing a socket-specific
-                 * one that would just be wrong once S0 lands. */
+                /* Sockets publish only target's coarse dead/active shape, not
+                 * SocketState. */
                 return unit_active_state(u) == UNIT_ACTIVE ? "active" : "dead";
         default:
                 return "dead";
@@ -164,10 +162,8 @@ static const char *unit_substate(Unit *u) {
 
 /*
  * ExecMainCode as service.c's own sigchld_code_to_string() renders it
- * (exited/killed/dumped), not the bare siginfo_t.si_code integer -- printing
- * the raw number is exactly the bug this project already found and fixed
- * once in service.c's own logging (see service.c's header comment), and a
- * published state file must not reintroduce it. main_exit_code is 0 before
+ * (exited/killed/dumped), not the bare siginfo_t.si_code integer -- the raw
+ * number would be meaningless in a published state file. main_exit_code is 0 before
  * the main process has ever exited, which is not a valid CLD_* value; that
  * case renders as the empty string, matching systemd's own ExecMainCode=
  * before a unit has ever run.
@@ -370,10 +366,9 @@ void manager_state_notify_unit(Unit *u) {
         publish_unit_file(u);
 
         /* Keep NUnits= (and, best-effort, Objective=) fresh without a
-         * dedicated hook: nothing outside this file calls
-         * manager_state_notify_manager() today (manager-loop.c/-shutdown.c
-         * are frozen for this milestone), and every unit transition is a
-         * convenient, frequent-enough point to refresh it from. */
+         * dedicated hook: nothing else calls
+         * manager_state_notify_manager() on a schedule, and every unit
+         * transition is a frequent-enough point to refresh it from. */
         manager_state_notify_manager(u->manager);
 }
 
@@ -440,7 +435,7 @@ void manager_state_notify_manager(Manager *m) {
          * NJobs/NInstalledJobs are the inputs to systemd's Manager.Progress
          * (v30 src/dbus-manager.c bus_manager_append_progress(): 1.0 minus
          * jobs/installed). PID 1 publishes the raw counters only -- the
-         * percentage arithmetic deliberately lives in the consumer
+         * percentage arithmetic lives in the consumer
          * (a separate binary), so the fraction's semantics can change
          * without touching PID 1.
          */

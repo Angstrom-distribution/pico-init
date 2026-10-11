@@ -25,7 +25,7 @@
 #define MEDIA_ROOT "/media"
 
 /* EFI System Partition type GUID (C12A7328-F81F-11D2-BA4B-00A0C93EC93B),
- * mixed-endian on disk like every other GUID here -- deliberately neither of
+ * mixed-endian on disk like every other GUID here -- neither of
  * the two GUIDs devd mounts, to prove is_data_type() is a real comparison
  * rather than "anything with a GUID". */
 static const GptGuid type_esp = {
@@ -81,7 +81,7 @@ static void test_mount_point_empty_label_falls_back(void) {
         ASSERT_STREQ(dir, MEDIA_ROOT "/sda1");
 }
 
-/* devname is trusted kernel input (plan's own scope), so nothing here
+/* devname is trusted kernel input, so nothing here
  * exercises it sanitizing to "." -- a real DEVNAME uevent property is never
  * ".", only ever a device node name like "sda1" or "mmcblk0p1". What this
  * checks is only that an unusable devname (sanitizes to nothing) is reported

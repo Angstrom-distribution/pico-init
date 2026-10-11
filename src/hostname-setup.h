@@ -9,9 +9,7 @@
  * (src/core/hostname-setup.c's hostname_setup()) -- every tool downstream
  * (the shell prompt, uname -n, gethostname(2)) just reflects whatever the
  * last sethostname(2) call set. Without this, an image can ship a real
- * /etc/hostname and still show "(none)" forever: confirmed live on h2200,
- * /etc/hostname containing "h2200" with the kernel hostname never leaving
- * its boot-time default.
+ * /etc/hostname and still show "(none)" forever.
  */
 
 #pragma once

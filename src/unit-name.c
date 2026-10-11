@@ -10,11 +10,7 @@
 
 #include "util.h"
 
-/*
- * strndup(), which util.h deliberately does not carry -- it is grown only
- * when another file actually needs it (that file's own rule), and this is
- * the only one that does.
- */
+/* strndup(), which util.h does not provide; this is the only user. */
 static char *unit_name_strndup(const char *s, size_t n) {
         char *r = malloc(n + 1);
 

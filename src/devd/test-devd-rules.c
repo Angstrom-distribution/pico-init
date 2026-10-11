@@ -6,27 +6,19 @@
  * image.
  *
  * The excerpt below is copied verbatim out of usb-modeswitch-data 20251207's
- * own 40-usb_modeswitch.rules (sha256 0bb12d64...bfa66, the sum meta-oe's
- * recipe pins), not retyped from the plan's description of it, because the
- * whole acceptance claim for this milestone is "devd parses the shipped file
- * unmodified" and a fixture written from a summary could not fail in the ways
- * the real file can. It carries every shape that file has: the two GOTO guards
- * -- one of them with the stray double comma a real parser has to shrug off --
- * the one rule that genuinely needs parent-chain matching, two of the 415
- * identical vendor:product lines, the LABEL at the end, and the one rule
- * (PROGRAM=/SYMLINK+="%c") that is out of devd's subset.
+ * own 40-usb_modeswitch.rules, so the fixture can fail in the ways the real
+ * file can. It carries every shape that file has: the two GOTO guards -- one of
+ * them with a stray double comma -- the one rule that needs parent-chain
+ * matching, two of the identical vendor:product lines, the LABEL at the end,
+ * and the one rule (PROGRAM=/SYMLINK+="%c") that is out of devd's subset.
  *
- * That last one is the load-bearing assertion here. It must be skipped WHOLE:
- * if its SYMLINK+= survived while its PROGRAM= was dropped, devd would create
- * a link on every ttyUSB device rather than on the modems the rule's author
- * checked for -- a rule firing more often than intended, which is the failure
- * mode "skip the clause you did not understand" produces and the reason this
- * engine does not do that.
+ * That last one must be skipped WHOLE: if its SYMLINK+= survived while its
+ * PROGRAM= was dropped, devd would create a link on every ttyUSB device rather
+ * than only on the modems the rule's author checked for.
  *
- * The whole 42,990-byte file is not embedded here; a test that carried 1,262
- * lines of vendor data would be a copy of that package rather than a test. The
- * real file is run through the same parser instead by pointing
- * PICO_TEST_USB_MODESWITCH_RULES at it, which the last case below picks up.
+ * The rest of the file is not embedded. The real file is run through the same
+ * parser by pointing PICO_TEST_USB_MODESWITCH_RULES at it, which the last case
+ * below picks up.
  */
 
 #include <errno.h>
@@ -116,9 +108,7 @@ static void test_usb_modeswitch_excerpt(void) {
 
         /*
          * Rule 1: the guard with the stray double comma. Three clauses, not
-         * four and not a parse failure -- an empty clause is separator noise,
-         * and a real parser has to say so, because this one line is in every
-         * copy of this file that has ever shipped.
+         * four and not a parse failure: an empty clause is separator noise.
          */
         ASSERT_EQ_INT(rs->rules[1].n_clauses, 3);
         ASSERT_EQ_INT(clause_at(rs, 1, 0)->key, DEVD_RULE_KEY_SUBSYSTEM);
@@ -140,7 +130,7 @@ static void test_usb_modeswitch_excerpt(void) {
         ASSERT_EQ_INT(clause_at(rs, 2, 4)->op, DEVD_RULE_OP_ADD);
         ASSERT_STREQ(devd_ruleset_string(rs, clause_at(rs, 2, 4)->value), "usb_modeswitch '%b/%k'");
 
-        /* Rules 3-5: the shape 415 of the file's rules share. */
+        /* Rules 3-5: the shape most of the file's rules share. */
         ASSERT_EQ_INT(rs->rules[3].n_clauses, 3);
         ASSERT_STREQ(devd_ruleset_string(rs, clause_at(rs, 3, 1)->value), "002a");
         ASSERT_STREQ(devd_ruleset_string(rs, clause_at(rs, 3, 2)->value), "usb_modeswitch '/%k'");
@@ -155,7 +145,7 @@ static void test_usb_modeswitch_excerpt(void) {
         ASSERT_TRUE(!ruleset_has_key(rs, DEVD_RULE_KEY_KERNEL));
 
         /*
-         * The 415 identical RUN values are one string. Asserted through the
+         * The identical RUN values are one string. Asserted through the
          * interning rather than by measuring the arena, because equal offsets
          * is also what makes GOTO label resolution an integer comparison.
          */
@@ -171,7 +161,7 @@ static void test_unsupported_keys_skip_whole(void) {
                         /* Every one of these is a key or an operator devd does
                          * not implement, and each is paired with an action that
                          * would fire on far too much if the clause devd did not
-                         * understand were simply dropped. */
+                         * understand were dropped. */
                         "PROGRAM==\"/bin/true\", SYMLINK+=\"everything\"\n"
                         "TEST!=\"/run/nope\", RUN+=\"do-it\"\n"
                         "IMPORT{builtin}=\"blkid\", SYMLINK+=\"by-uuid/x\"\n"
@@ -211,7 +201,7 @@ static void test_goto_must_point_forward(void) {
 
         /*
          * Refusing the whole file, where an unsupported key only loses its own
-         * rule. The asymmetry is deliberate: a guard whose GOTO silently stops
+         * rule. A guard whose GOTO silently stops
          * jumping does not disable one rule, it exposes every rule below it to
          * events the author excluded. Fail closed.
          */
@@ -219,7 +209,7 @@ static void test_goto_must_point_forward(void) {
         ASSERT_EQ_INT(rs->n_rules, 0);
 
         /* Backward jumps are a loop this engine has no answer for, so they are
-         * simply not labels it can see. */
+         * not labels it can see. */
         ASSERT_EQ_INT(devd_ruleset_load_string(rs, backward, "backward.rules"), -EINVAL);
         ASSERT_EQ_INT(rs->n_rules, 0);
 
@@ -335,8 +325,8 @@ static void test_symlink_dirs(void) {
  *
  * `meson test` runs this without the variable set and the case is a no-op;
  * PICO_TEST_USB_MODESWITCH_RULES=/usr/lib/udev/rules.d/40-usb_modeswitch.rules
- * (or the unpacked usb-modeswitch-data tarball's copy) turns it into the whole
- * milestone's acceptance check, run by exactly the code that runs on a board.
+ * (or the unpacked usb-modeswitch-data tarball's copy) turns it into a check
+ * of the real file, run by the code that runs on a board.
  */
 static void test_real_file_if_present(void) {
         const char *path = getenv("PICO_TEST_USB_MODESWITCH_RULES");

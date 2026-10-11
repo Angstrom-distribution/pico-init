@@ -2,16 +2,12 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * pico-init's own implementation of the sd-bus-protocol.h ABI surface:
- * message/primitive type constants, the org.freedesktop.DBus.Error.*
- * name macros, the sd_bus/sd_bus_message/sd_bus_slot/sd_bus_creds/
- * sd_bus_track opaque types, sd_bus_error/sd_bus_error_map, the creds/
- * name/dump flag enums, and the callback typedefs. Read from real
- * systemd's src/systemd/sd-bus-protocol.h (HEAD ded83144, 2026-08-23) for
- * the contract only -- function/macro/constant names and values match
- * byte-for-byte, since that IS the compatibility contract, but nothing
- * below is copied text from that LGPL-2.1-or-later source. Pure ABI
- * vocabulary, no function bodies live here.
+ * pico-init's sd-bus-protocol.h: message/primitive type constants, the
+ * org.freedesktop.DBus.Error.* name macros, the opaque sd_bus types,
+ * sd_bus_error/sd_bus_error_map, the creds/name/dump flag enums and the
+ * callback typedefs. Names and values match systemd's
+ * src/systemd/sd-bus-protocol.h (HEAD ded83144), written from that contract
+ * rather than copied. No function bodies.
  */
 
 #pragma once
@@ -61,8 +57,7 @@ enum {
         SD_BUS_TYPE_DICT_ENTRY_END = '}'
 };
 
-/* Well-known errors -- a sanitized subset, matching upstream's own claim
- * about this table. */
+/* Well-known errors: a subset of upstream's table. */
 
 #define SD_BUS_ERROR_FAILED "org.freedesktop.DBus.Error.Failed"
 #define SD_BUS_ERROR_NO_MEMORY "org.freedesktop.DBus.Error.NoMemory"

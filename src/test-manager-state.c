@@ -2,13 +2,12 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The state publisher (plan §1.7, C0): files matching every unit's reported state through a real fixture
+ * The state publisher: files matching every unit's reported state through a real fixture
  * boot, FAILED/Result=/NRestarts= fidelity, removal with the unit, no partial file ever observable
  * during transition churn, and an unwritable /run costing picoctl its verbs but never the boot.
  *
- * Real fork()/execve() throughout, driven through the actual manager_loop() and its real signalfd --
- * same discipline test-boot.c and test-service.c already established, because the property under test
- * (files matching reality) is only proven by reality actually happening.
+ * Real fork()/execve() throughout, driven through the actual manager_loop() and its real signalfd,
+ * as in test-boot.c and test-service.c.
  */
 
 #include <errno.h>
@@ -138,8 +137,7 @@ static bool unit_file_exists(const char *runtime_dir, const char *unit_id) {
  * test-picoctl.c's own real-boot fixture, and `meson test` runs different
  * test binaries concurrently -- so without a per-test cgroup root, two
  * processes both defaulting to /sys/fs/cgroup/system.slice/console.service
- * race each other for the same real cgroup, exactly the flake this project's
- * own "run things, don't reason about them" discipline caught here. `tag`
+ * race each other for the same real cgroup. `tag`
  * (plus this process's own pid, which test-boot.c's identical pattern also
  * uses) is enough to keep every test binary and every test run apart.
  */
@@ -638,7 +636,7 @@ static void test_reader_never_sees_partial_file(void) {
         rtdir = test_tmpdir_new();
         ASSERT_TRUE(unitdir != NULL && rtdir != NULL);
 
-        /* Fast, real crash/restart churn, bounded by B7's own start-limit
+        /* Fast, real crash/restart churn, bounded by the start limit
          * (5 attempts / 10s) -- real transitions, not a synthetic write
          * loop calling the publisher directly. */
         ASSERT_EQ_INT(test_write_file(unitdir,
@@ -691,8 +689,7 @@ static void test_reader_never_sees_partial_file(void) {
         }
 
         /* Parent: pump the real state machine through as many crash/restart
-         * cycles as B7's start limit allows, exactly test-service.c's
-         * test_b7_start_limit_stops_the_loop() pattern. */
+         * cycles as the start limit allows, as in test-service.c. */
         ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
 
         for (iterations = 0; iterations < s->start_limit_burst * 4 && s->state != SERVICE_FAILED;
@@ -719,9 +716,7 @@ static void test_reader_never_sees_partial_file(void) {
                                          * first gets silently consumed and
                                          * discarded ("not ours"), leaving the
                                          * other side's later waitpid() an
-                                         * ECHILD. Reproduced by running this
-                                         * test under load (five concurrent
-                                         * copies) before this fix.
+                                         * ECHILD.
                                          */
                                         if (s->main_pid > 0) {
                                                 siginfo_t info;
@@ -748,9 +743,8 @@ static void test_reader_never_sees_partial_file(void) {
         }
 
         ASSERT_EQ_INT(s->state, SERVICE_FAILED);
-        /* B7's start-limit rejection is itself the final failure, not the
-         * last crash's exit code -- matches test-service.c's own
-         * test_b7_start_limit_stops_the_loop(). */
+        /* the start-limit rejection is the final failure, not the last
+         * crash's exit code */
         ASSERT_EQ_INT(s->result, SERVICE_FAILURE_START_LIMIT);
 
         /* Let the reader run out its own time budget before checking it, so

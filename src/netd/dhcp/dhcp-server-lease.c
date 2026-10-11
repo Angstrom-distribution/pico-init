@@ -3,23 +3,14 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 /*
- * Ported from src/libsystemd-network/sd-dhcp-server-lease.c (573 lines,
- * ~390 of it lease-table logic -- the rest is the sd-json persistence
- * block cut entirely, see dhcp-server-internal.h's header). No real
- * copyright line upstream.
+ * Ported from systemd v261.2 src/libsystemd-network/sd-dhcp-server-lease.c,
+ * minus the sd-json persistence block (see dhcp-server-internal.h).
  *
- * Quarry point: systemd v261.2, commit 4925d9f07f. History review
- * (4925d9f07f..main, plan §2.2): no fix in the 26-commit lift-set window
- * touches sd-dhcp-server-lease.c.
- *
- * Rewritten onto the flat lease array (dhcp-server-lease-internal.h's
- * header has the full rationale): dhcp_server_put_lease()'s two
- * hashmap_ensure_put() calls become one array-index write;
- * dhcp_server_set_lease()'s "find existing lease, update in place, or
- * allocate a new hashmap entry" becomes "find or claim a slot"; and
- * dhcp_server_cleanup_expired_leases() drops its sd_event_now()
- * dependency for now_monotonic() (util.h), matching dhcp-lease-internal.h's
- * own monotonic-only choice on the client side.
+ * Rewritten onto the flat lease array (dhcp-server-lease-internal.h):
+ * dhcp_server_put_lease()'s two hashmap_ensure_put() calls become one array
+ * write, dhcp_server_set_lease() finds or claims a slot, and
+ * dhcp_server_cleanup_expired_leases() uses now_monotonic() (util.h) instead
+ * of sd_event_now(), as the client side does.
  */
 
 #include "dhcp-server-lease-internal.h"

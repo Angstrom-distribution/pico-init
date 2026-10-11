@@ -2,30 +2,24 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The write side, against a real receiving socket wherever one is needed --
- * never a mocked transport. Two real sockets stand in for logd's own:
+ * The write side, against real receiving sockets standing in for logd's:
  *
- *   - a SOCK_DGRAM bound at the literal path "/dev/log" for the syslog
- *     transport sd_journal_sendv() always addresses; this doubles as the
- *     compliance oracle for the ENOENT-is-silent-success case, which is
- *     tested FIRST, before that socket exists.
+ *   - a SOCK_DGRAM bound at "/dev/log" for the syslog transport
+ *     sd_journal_sendv() addresses; the ENOENT-is-silent-success case is
+ *     tested first, before that socket exists.
  *   - a SOCK_DGRAM bound at "/run/logd/stdout" for sd_journal_stream_fd(),
- *     matching LOGD_STDOUT_SOCKET_PATH exactly (that path is not
- *     overridable, unlike logd's own runtime dir -- see logd.h).
+ *     matching LOGD_STDOUT_SOCKET_PATH (not overridable, see logd.h).
  *
- * Both need real filesystem paths outside this test's own tmpdir, so the
- * whole file skips (exit 77) rather than fails when not running as root
- * (the pico-init-build container always is; a stray local run may not be).
+ * Both paths are outside the test's tmpdir, so the file skips (exit 77)
+ * when not running as root.
  */
 
-/* program_invocation_short_name is a glibc/GNU extension; -std=gnu17 alone
- * does not imply _GNU_SOURCE (socket.c's own note, same reasoning here). */
+/* program_invocation_short_name is a GNU extension; -std=gnu17 alone does
+ * not imply _GNU_SOURCE. */
 #define _GNU_SOURCE
 
-/* Exercise the plain sd_journal_print()/send()/sendv()/perror() symbols
- * themselves in most of this file -- test_with_location_variants() below
- * calls the four *_with_location() functions directly instead, so both the
- * macro-suppressed and macro-redirected paths get real coverage. */
+/* Most of this file calls the plain sd_journal_print()/send()/sendv()/perror()
+ * symbols; test_with_location_variants() calls the *_with_location() ones. */
 #define SD_JOURNAL_SUPPRESS_LOCATION
 
 #include "sd-journal.h"
@@ -61,10 +55,8 @@ static int bind_dgram(const char *path) {
         return fd;
 }
 
-/* Non-blocking recv with a short real wait: the datagram is sent by a
- * plain sendto() on a connectionless socket, so it is either already
- * queued or never coming -- a brief poll is only to absorb scheduling
- * jitter between the sender and this recv, not a real timeout budget. */
+/* Non-blocking recv with a short wait: the datagram is either already queued
+ * or never coming; the poll only absorbs scheduling jitter. */
 static ssize_t recv_one(int fd, char *buf, size_t bufsize, struct sockaddr_un *peer, socklen_t *peer_len) {
         for (int tries = 0; tries < 200; tries++) {
                 ssize_t n = recvfrom(fd, buf, bufsize - 1, MSG_DONTWAIT, (struct sockaddr *) peer, peer_len);
@@ -92,13 +84,9 @@ static bool nothing_arrived(int fd) {
 static void test_enoent_is_silent_success(void) {
         struct stat st;
 
-        /* Only meaningful if nothing is already listening there -- true in
-         * this project's own build container, checked rather than assumed.
-         * A leftover SOCK_DGRAM socket file from an earlier run of this
-         * same binary that exited before reaching its own unlink("/dev/log")
-         * at the bottom of main() (an assertion failure part-way through,
-         * say) is cleaned up here rather than treated as a real listener --
-         * anything else there is left alone and the case is skipped. */
+        /* Only meaningful if nothing is listening there. A stale socket file
+         * from an earlier run that failed before its unlink("/dev/log") is
+         * removed; anything else is left alone and the case skipped. */
         if (stat("/dev/log", &st) == 0) {
                 if (S_ISSOCK(st.st_mode))
                         unlink("/dev/log");
@@ -161,12 +149,11 @@ static void test_printv_grows_past_stack_buffer(void) {
         ASSERT_STREQ(buf, expect);
 }
 
-/* Exercises advance_va() on a field whose OWN format uses a precision
- * float, a length-modified integer and a string all in one conversion
- * list, immediately followed by a second real field -- if advance_va()
- * mis-consumed the first field's args, the second field's format string
- * argument would be read from the wrong slot and this would either send
- * the wrong message or crash interpreting a double/long as a pointer. */
+/* Exercises advance_va() on a field whose format has a precision float, a
+ * length-modified integer and a string, followed by a second field. If
+ * advance_va() mis-consumed the first field's arguments, the second format
+ * string would be read from the wrong slot, sending a wrong message or
+ * crashing. */
 static void test_send_variadic_scanning(void) {
         char buf[512];
         char expect[600];
@@ -277,13 +264,9 @@ static void test_perror(void) {
         ASSERT_STREQ(buf, expect);
 }
 
-/* Calls the four *_with_location() symbols directly (this file suppresses
- * the header's macro redirection above, so a plain sd_journal_print() etc.
- * exercises the undecorated function -- this is the only place the
- * with_location entry points themselves get called). CODE_FILE=/CODE_LINE=/
- * CODE_FUNC= must be accepted and then simply not appear in the
- * transmitted text -- sendv drops them, same as any other untransportable
- * field. */
+/* Calls the four *_with_location() symbols directly (the header's macro
+ * redirection is suppressed above). CODE_FILE=/CODE_LINE=/CODE_FUNC= must be
+ * accepted and not appear in the transmitted text; sendv drops them. */
 static void test_with_location_variants(void) {
         char buf[512];
         struct iovec iov = { (void *) "MESSAGE=direct sendv", strlen("MESSAGE=direct sendv") };

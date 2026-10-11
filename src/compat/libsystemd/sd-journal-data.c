@@ -4,9 +4,8 @@
 /*
  * Per-entry field access (get_data/enumerate_data), match filtering
  * (add_match and friends), and the two ring-wide dedup scans
- * (enumerate_unique, enumerate_fields). All real, all built directly on
- * logd-read.h's LogdEntry/LogdReadField views -- nothing here touches a
- * binary journal file.
+ * (enumerate_unique, enumerate_fields), built on logd-read.h's
+ * LogdEntry/LogdReadField views.
  */
 
 #include "sd-journal-internal.h"
@@ -196,7 +195,7 @@ int sd_journal_add_match(sd_journal *j, const void *data, size_t size) {
 
 int sd_journal_add_disjunction(sd_journal *j) {
         (void) j;
-        return -EOPNOTSUPP; /* v1 filter is flat AND-of-ORs; no OR-of-groups tree */
+        return -EOPNOTSUPP; /* the filter is a flat AND of ORs; no OR-of-groups tree */
 }
 
 int sd_journal_add_conjunction(sd_journal *j) {

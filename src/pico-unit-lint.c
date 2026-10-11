@@ -181,7 +181,7 @@ int main(int argc, char *argv[]) {
         }
 
         /* A bad directory is fatal; a bad unit file is a finding, so
-         * manager_load_units()'s first-error return is deliberately not
+         * manager_load_units()'s first-error return is not
          * treated as one. */
         (void) manager_load_units(m, NULL);
         for (i = 0; dirs[i]; i++)

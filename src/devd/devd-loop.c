@@ -5,19 +5,14 @@
  * The Devd object's whole lifecycle, the epoll loop, startup and coldplug, and
  * the two reactions themselves.
  *
- * It lives here rather than next to main() for the build-graph reason netd's
- * own loop file documents at length: meson.build links this file into every
- * devd test binary through devd-core, and deliberately never links devd.c --
- * the same exclusion main.c gets from pico-init-core, so no test executable
- * ends up with two main()s. A symbol defined only in devd.c would be invisible
- * to every test. devd.c holds main() and nothing else.
+ * It lives here rather than next to main() because meson.build links this file
+ * into every devd test binary through devd-core and never links devd.c, so no
+ * test executable ends up with two main()s. devd.c holds main() and nothing
+ * else.
  *
- * The reactions are at the bottom, and the shape they take is the one thing
- * here that is not a copy of netd. A settled disk is read ONCE --
- * gpt_scan_all() over the whole table -- and every partition of it is named and
- * mounted from that one read. That is the debounce paying for itself: reacting
- * per event would mean one open() and one table read per partition, on media
- * that is slow and may be about to be pulled.
+ * A settled disk is read once -- gpt_scan_all() over the whole table -- and
+ * every partition of it is named and mounted from that one read, rather than
+ * one open() and table read per partition on slow, removable media.
  */
 
 #include "devd.h"
@@ -142,12 +137,9 @@ Devd *devd_free(Devd *d) {
                 return NULL;
 
         /*
-         * Mounts are deliberately left mounted. devd stopping is not the card
-         * going away, and pulling /media out from under whatever is reading it
-         * because a daemon was restarted would be the wrong kind of tidy. The
-         * mount table is devd's memory of them, and the next start's coldplug
-         * walk rebuilds it -- mount(2) reporting EBUSY for one already there is
-         * exactly why devd-media.c treats that as success.
+         * Mounts are left mounted: devd stopping is not the card going away.
+         * The next start's coldplug walk rebuilds the mount table, and
+         * devd-media.c treats EBUSY from mount(2) as success.
          */
 
         if (d->settle_event)
@@ -337,11 +329,9 @@ static void rule_apply_perms(Devd *d, const DevdRuleDevice *dev, const DevdRuleR
 /*
  * Run the ruleset over one device and carry out what it decided.
  *
- * The remove case is split out rather than folded in, and the split is the
- * substance: on a remove the node is already gone, so permissions and new
- * symlinks are meaningless and the links devd made for it are what has to
- * happen. RUN+= still fires -- a rule that wants to hear about a device
- * leaving is a rule, not a mistake.
+ * On a remove the node is already gone, so permissions and new symlinks are
+ * meaningless; only the links devd made for it are dropped. RUN+= still
+ * fires.
  */
 static void devd_rules_react(Devd *d, DevdRuleDevice *dev) {
         DevdRuleResult res;
@@ -844,7 +834,7 @@ static void coldplug_input_walk(Devd *d) {
         (void) closedir(dd);
 }
 
-/* Drop rule-made symlinks whose device is gone, the H2 counterpart of
+/* Drop rule-made symlinks whose device is gone, the counterpart of
  * devd_symlink_reconcile(). Which directories to look in comes from the rules
  * themselves, so this stays true for a rules file nobody here wrote. */
 static void coldplug_sweep_rule_links(Devd *d) {
@@ -886,11 +876,8 @@ static int devd_coldplug(Devd *d) {
 
         coldplug_sweep_rule_links(d);
 
-        /* Before anything else below: a module a rule or the block core is
-         * about to depend on should already be requested by the time either
-         * runs, even though neither currently depends on one. See
-         * devd-modalias.h for why this exists and why it is not scoped to
-         * block/USB the way the two walks below are. */
+        /* First, so modules are requested before the walks below run. Not
+         * scoped to block/USB; see devd-modalias.h. */
         devd_coldplug_modalias(d);
 
         /* Modules the step above asked for load asynchronously, and the input
@@ -928,10 +915,9 @@ static int devd_coldplug(Devd *d) {
         (void) closedir(dd);
 
         /*
-         * Everything already present is settled now, not in a quarter of a
-         * second: the burst this window exists to absorb happened before devd
-         * started. USEC_INFINITY as the clock is how "close every window" is
-         * spelled -- no deadline can be later than it.
+         * Everything already present is settled now: the burst the window
+         * absorbs happened before devd started. USEC_INFINITY as the clock
+         * closes every window.
          */
         while ((disk = devd_block_take_settled(&d->block, USEC_INFINITY)))
                 react_disk(d, disk, NULL);
@@ -988,11 +974,8 @@ int devd_startup(Devd *d) {
         devd_find_boot_disk(d);
 
         /*
-         * Rules before the socket, because loading them is the one startup step
-         * that can fail on a file rather than on the kernel, and a devd that
-         * discovers that after subscribing has already started buffering events
-         * it may be about to exit over. Zero rules is not a failure: it is what
-         * an image with no rules files installed looks like, and devd is still
+         * Rules before the socket, so a failure loading them happens before
+         * events start buffering. Zero rules is not a failure; devd still runs
          * the block core.
          */
         r = devd_ruleset_load_dirs(d->rules, rules_dirs);
@@ -1002,9 +985,8 @@ int devd_startup(Devd *d) {
                 pico_log(PICO_LOG_INFO, "devd: %d udev rule(s) loaded, %u skipped", r, d->rules->n_skipped);
 
         /*
-         * Subscribe first. See devd.h and devd-uevent.h: a card inserted
-         * between the walk below and the subscription would be missed by both
-         * paths, forever, and there is nothing underneath devd to notice.
+         * Subscribe first: a card inserted between the walk below and the
+         * subscription would be missed by both paths.
          */
         r = devd_uevent_open();
         if (r < 0) {

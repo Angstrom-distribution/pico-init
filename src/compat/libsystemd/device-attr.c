@@ -9,9 +9,8 @@
  * subsystem and driver_subsystem both special-case a syspath grammar rather
  * than only readlink()ing a "subsystem" symlink: a real kernel's
  * /sys/bus/<bus>/drivers/<drv> and /sys/module/<name> have no such symlink
- * at all (checked directly against a running kernel's /sys while writing
- * this), so the grammar check is not an optimisation, it is the only way
- * either object ever gets a subsystem.
+ * at all, so the grammar check is the only way either object gets a
+ * subsystem.
  */
 
 #include "sd-device.h"

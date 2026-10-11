@@ -18,8 +18,8 @@
  * child's mountinfo: no block device under it, so the check takes the
  * "device could not be identified" arm on a read-only root and the early arm on
  * a read-write one -- both of which end in the remount under test. The fsck
- * half still needs a damaged ext4 filesystem and is proven by a qemuarmv5 boot
- * through the read-only window instead.
+ * half still needs a damaged ext4 filesystem and is left to booting on a target
+ * through the read-only window.
  */
 
 #define _GNU_SOURCE

@@ -2,37 +2,33 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The SNTP client (plan §2.6 step 4, §2.2's "SNTP client" row).
+ * The SNTP client.
  *
- * This replaces systemd-timesyncd outright, at about a twentieth of its size,
- * by keeping only the part that decides whether a reply may be believed and
- * dropping everything that decides how hard to ask. Kept in full, because
- * each one rejects a class of wrong answer: source-address match, the
- * origin-timestamp nonce echo (the anti-off-path-spoofing check), pending-
- * request correlation, leap != 3, stratum not 0 and not >= 16, version 3 or 4
- * only, mode == server, and the root-distance bound. Dropped: adaptive
- * poll-interval doubling, the eight-sample jitter/spike statistics, and
- * server-list/DNS iteration -- sd-resolve is gone entirely, so servers arrive
- * here as addresses, from [Network] NTP= or from DHCP option 42.
+ * This replaces systemd-timesyncd by keeping only the part that decides
+ * whether a reply may be believed and dropping everything that decides how
+ * hard to ask. Kept, because each rejects a class of wrong answer:
+ * source-address match, the origin-timestamp nonce echo (the
+ * anti-off-path-spoofing check), pending-request correlation, leap != 3,
+ * stratum not 0 and not >= 16, version 3 or 4 only, mode == server, and the
+ * root-distance bound. Dropped: adaptive poll-interval doubling, the
+ * eight-sample jitter/spike statistics, and server-list/DNS iteration --
+ * servers arrive as addresses, from [Network] NTP= or from DHCP option 42.
  *
- * Two checks the history review found missing from plan §2.6's own summary
- * are carried anyway, because dropping them would be exactly the failure the
- * review exists to prevent: a short-packet reject (NETD_SNTP_REJECT_MALFORMED
- * on a datagram smaller than the header), and an epoch floor
- * (NETD_SNTP_REJECT_EPOCH) that rejects recv_time/trans_time claiming a time
- * before this build's compiled-in epoch (netd-time.h's NETD_TIME_EPOCH_SEC) --
- * the only thing stopping a hostile or broken server from walking an
- * RTC-less board's clock back past the day it was built.
+ * Two further checks are carried: a short-packet reject
+ * (NETD_SNTP_REJECT_MALFORMED on a datagram smaller than the header), and an
+ * epoch floor (NETD_SNTP_REJECT_EPOCH) that rejects recv_time/trans_time
+ * claiming a time before this build's compiled-in epoch (netd-time.h's
+ * NETD_TIME_EPOCH_SEC) -- the only thing stopping a hostile or broken server
+ * from walking an RTC-less board's clock back past the day it was built.
  *
  * The packet layout below is netd's own, written from RFC 5905 §7.3 rather
  * than lifted, which is why this file is GPL-2.0-or-later with no systemd
  * attribution: an on-the-wire header has exactly one legal shape.
  *
  * The validation and offset-computation entry points are pure functions over
- * a buffer -- no socket, no clock, no side effects. That is what lets
- * test-netd-sntp exercise every rejection path and assert the computed
- * step/slew decision without ever calling clock_adjtime(), which is process-
- * global and would still be global inside a network namespace.
+ * a buffer -- no socket, no clock, no side effects -- so test-netd-sntp can
+ * exercise every rejection path and the step/slew decision without calling
+ * clock_adjtime(), which is process-global even inside a network namespace.
  */
 
 #pragma once
@@ -63,7 +59,7 @@ typedef struct NetdSntp NetdSntp;
 /* NTP timestamps count seconds from 1900-01-01, POSIX time from 1970. */
 #define NETD_NTP_OFFSET_1900_1970 UINT64_C(2208988800)
 
-/* Fixed resync interval: no adaptive backoff (§2.6). 2048s is upstream's own
+/* Fixed resync interval: no adaptive backoff. 2048s is upstream's own
  * maximum poll, and on a board that gets its time from DHCP anyway there is
  * nothing to gain from asking more often. */
 #define NETD_SNTP_POLL_INTERVAL_USEC ((usec_t) (2048ULL * USEC_PER_SEC))
@@ -130,10 +126,8 @@ typedef enum NetdSntpReject {
         NETD_SNTP_REJECT_NONCE,          /* origin timestamp != our transmit nonce */
         NETD_SNTP_REJECT_ZERO_TIMESTAMP, /* transmit timestamp 0: nothing to compute from */
         /*
-         * History-review addition (plan §2.2 prose, §2.6): recv_time or
-         * trans_time claims a time before this build's epoch floor. Kept in
-         * full even though it was missing from §2.6's own summary list --
-         * it is the entire reason a broken or hostile server cannot walk an
+         * recv_time or trans_time claims a time before this build's epoch
+         * floor: the reason a broken or hostile server cannot walk an
          * RTC-less board's clock backwards past the build date. Checked after
          * ZERO_TIMESTAMP so an all-zero reply (trivially before any epoch)
          * gets the more specific reason.

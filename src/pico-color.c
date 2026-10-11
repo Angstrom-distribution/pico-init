@@ -2,8 +2,8 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * See pico-color.h for the rules this mirrors and the two deliberate
- * simplifications. ANSI_* literal values below are quarried byte-for-byte
+ * See pico-color.h for the rules this mirrors and the two
+ * simplifications. ANSI_* literal values below are copied byte-for-byte
  * from systemd's src/basic/ansi-color.h, main as of commit
  * 4c63532c28094aeba6dccc5afb9690e02fd98d66 (2026-10-04).
  */

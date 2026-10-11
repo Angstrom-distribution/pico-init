@@ -306,7 +306,7 @@ static void test_missing_tree(void) {
 }
 
 /*
- * The links a SYMLINK+= rule names (H2), which differ from the five families in
+ * The links a SYMLINK+= rule names, which differ from the five families in
  * one way that matters: their path comes out of a rules file rather than out of
  * this code, so the depth of the relative target is computed rather than fixed,
  * and the name has to be checked before it is used as one.

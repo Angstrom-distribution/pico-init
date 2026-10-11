@@ -2,19 +2,15 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * Every way to obtain an sd_bus*, all of them honest_failure: this shim
- * has no wire protocol, so no sd_bus can ever exist (sd-bus-stubs.c's
- * entire giant -EINVAL family depends on that invariant holding).
+ * Every way to obtain an sd_bus*; all fail, since there is no wire protocol
+ * and so no sd_bus can exist (sd-bus-stubs.c relies on that).
  *
- * -ENOENT is what real libsystemd itself returns connecting to a
- * never-created /run/dbus/system_bus_socket -- byte-identical to a real
- * dbus-less machine, deliberately never -ECONNREFUSED (socket present,
- * daemon not listening: a transient condition this shim must never
- * suggest, since nothing here ever becomes non-transient). -ENOMEDIUM is
- * upstream's own synthetic errno for "no $XDG_RUNTIME_DIR" (sd-bus.c:1387).
- * -EOPNOTSUPP marks a transport/feature this library build has no code
- * for at all (remote/container transports, the sd_bus/sd_bus_creds
- * constructors), distinct from "no local bus".
+ * -ENOENT is what real libsystemd returns on a machine where
+ * /run/dbus/system_bus_socket was never created. -ECONNREFUSED is avoided
+ * because it suggests a transient condition. -ENOMEDIUM is upstream's
+ * errno for "no $XDG_RUNTIME_DIR" (sd-bus.c:1387). -EOPNOTSUPP marks a
+ * transport or feature with no code at all (remote/container transports,
+ * the sd_bus/sd_bus_creds constructors), as distinct from "no local bus".
  *
  * An image that ships a real dbus-daemon must link real libsystemd
  * instead of this shim.

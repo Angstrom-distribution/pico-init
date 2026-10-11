@@ -2,15 +2,13 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * .network files: discovery, parsing and matching (plan §2.5).
+ * .network files: discovery, parsing and matching.
  *
- * The syntax is systemd.network(5)'s, and the subset below is deliberately
- * small -- but it is a subset, not a dialect: every directive netd implements
- * means exactly what networkd means by it, and every directive it does not
- * implement is accepted as valid INI and dropped at debug level rather than
- * failing the file. That is the same drop-in tolerance rule unit-parse.c
- * already applies to unit files, and it is what lets the two real files this
- * project already ships (usb0.network, usb0-server.network) parse unmodified.
+ * The syntax is systemd.network(5)'s, and the subset below is small but not a
+ * dialect: every directive netd implements means what networkd means by it,
+ * and every directive it does not implement is accepted as valid INI and
+ * dropped at debug level rather than failing the file. unit-parse.c applies
+ * the same drop-in tolerance rule to unit files.
  *
  * Implemented in netd-network.c, whose line-level scanner follows
  * unit-parse.c's conventions: [Section] headers, '#'/';' comments, backslash
@@ -28,11 +26,9 @@ typedef struct Netd Netd;
 typedef struct Network Network;
 
 /*
- * The search path, highest priority first. Three entries, not two: /run is
- * what makes runtime reconfiguration possible once the rootfs or /etc is
- * read-only, which is exactly the state a pico image ships in, and it costs
- * one array entry. These are networkd's real directories, deliberately --
- * netd is a drop-in for the files, not a new location for them.
+ * The search path, highest priority first. /run allows runtime
+ * reconfiguration when the rootfs or /etc is read-only. These are networkd's
+ * own directories: netd is a drop-in for the files, not a new location.
  */
 #define NETD_NETWORK_DIR "/etc/systemd/network"
 #define NETD_RUNTIME_NETWORK_DIR "/run/systemd/network"
@@ -43,7 +39,7 @@ typedef struct Network Network;
 /*
  * DHCP=. Upstream's value is an address-family selector, not a boolean, and
  * netd parses the whole set so a file written for networkd keeps its meaning
- * -- but only the v4 half does anything (§2.9: all of IPv6 is out of scope).
+ * -- but only the v4 half does anything (IPv6 is not implemented).
  * A file saying DHCP=ipv6 parses cleanly, logs at debug, and configures
  * nothing, which is a better answer than refusing to load.
  */
@@ -88,7 +84,7 @@ struct Network {
 
         /*
          * [Match] Name= -- a space-separated list of fnmatch(3) globs, the
-         * only match key in the MVP (§2.9). NULL means the file has no
+         * only match key supported. NULL means the file has no
          * [Match] Name= at all, which matches *nothing*: an unconditional
          * catch-all that silently claimed every interface would be a far
          * worse failure mode than a file that does nothing.
@@ -98,12 +94,7 @@ struct Network {
         /* --- [Network] --- */
         NetworkDHCP dhcp;
 
-        /*
-         * Address= accumulates rather than overriding, matching networkd. A
-         * scalar here would have been enough for both real usb0 files, and
-         * would also have baked the wrong semantics into the parser contract
-         * for whoever writes the second one.
-         */
+        /* Address= accumulates rather than overriding, matching networkd. */
         NetworkAddress *addresses;
         size_t n_addresses;
 
@@ -127,10 +118,9 @@ struct Network {
         bool dhcp_use_ntp; /* UseNTP=, default yes */
 
         /*
-         * UseTimezone=, default *yes*. This is a deliberate, owner-confirmed
-         * divergence from networkd, whose default is no: bringing the
-         * DHCP-supplied timezone back is netd's founding requirement (§2.5,
-         * §2.6). An explicit UseTimezone=no is honoured.
+         * UseTimezone=, default *yes*. This deliberately diverges from
+         * networkd, whose default is no: applying the DHCP-supplied timezone is
+         * a core netd feature. An explicit UseTimezone=no is honoured.
          */
         bool dhcp_use_timezone;
 };

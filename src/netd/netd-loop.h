@@ -4,19 +4,16 @@
 /*
  * netd's event loop: one epoll fd multiplexing the shared signalfd, the
  * shared timerfd, the rtnetlink event socket, and every DHCP/SNTP socket the
- * link layer opens (plan §2.3 -- "literally a thin epoll wrapper" over
- * pico-init's own timer.c/signal.c).
+ * link layer opens, on top of pico-init's own timer.c/signal.c.
  *
  * Registrations are callback-carrying, not switch-dispatched. The manager's
  * loop can afford a switch over PicoEpollSource because PID 1 has three fixed
  * source kinds; netd's sources are dynamic (a DHCP client socket per link, a
- * server socket per link, an SNTP socket) and, more to the point, arrive from
- * four independently-implemented milestones. A dispatch switch here would
- * mean N2, N3 and N4 each editing this file to add a case. The callback in
- * the tag means they never touch it: they hand netd_loop_add_io() their own
- * function and own their fd end to end.
+ * server socket per link, an SNTP socket). A dispatch switch would need a new
+ * case for each; with the callback in the tag, a subsystem hands
+ * netd_loop_add_io() its own function and owns its fd end to end.
  *
- * netd deliberately does not reuse struct pico_epoll_tag: its PicoEpollSource
+ * netd does not reuse struct pico_epoll_tag: its PicoEpollSource
  * enumeration names PID 1's sources (cgroup events) and not netd's, and
  * util.h belongs to the PID 1 core. The dispatch rule is the same one util.h
  * spells out, and it is not optional here either -- every registration in
@@ -80,15 +77,11 @@ struct netd_epoll_tag {
 };
 
 /*
- * The reload callback netd.c installs on the Netd object (netd_new()) and
+ * The reload callback netd_new() installs on the Netd object and
  * netd_loop_run() invokes instead of calling netd_reload() directly.
  *
- * netd_reload() is defined in netd.c, which meson.build deliberately never
- * links into netd-core or any test executable -- a second main() would
- * collide with every test's own, exactly the reason pico-init-core excludes
- * main.c. A direct call from here would leave every netd-core-linked test
- * program with an unresolved symbol at link time. This indirection is what
- * lets a test drive netd_loop_run() with its own reload handler, or leave
+ * netd_reload() is defined in netd-loop.c; the indirection lets a test drive
+ * netd_loop_run() with its own reload handler, or leave
  * the field NULL to skip reload handling entirely -- while keeping the
  * deferred-until-after-the-batch contract below entirely inside this file.
  */

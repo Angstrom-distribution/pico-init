@@ -2,38 +2,27 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * sd_journal_sendv(): the one real choke point every write-side function
- * funnels through. Translates the iovec[] "NAME=value" pairs upstream's
- * journal wire format uses into one syslog(3)-shaped datagram addressed to
- * logd's /dev/log socket (src/logd/logd.h, src/logd/logd-recv.c) -- pico's
- * client-side half of the syslog transport logd's receive loop already
- * parses on the other end.
+ * sd_journal_sendv(): every write-side function funnels through here.
+ * Translates the iovec[] "NAME=value" pairs into one syslog(3)-shaped
+ * datagram sent to logd's /dev/log socket (src/logd/logd.h,
+ * src/logd/logd-recv.c).
  *
- * Fidelity, by construction: only MESSAGE, PRIORITY, SYSLOG_FACILITY and
- * SYSLOG_IDENTIFIER survive the trip -- everything else a caller sets
- * (CODE_FILE=, MESSAGE_ID=, ERRNO=, arbitrary application fields) is
- * dropped here, not lost silently: it never claimed to travel past this
- * function. _PID/_UID/_GID/_COMM/_SYSTEMD_UNIT are added on the other end
- * by logd itself from the kernel-verified SCM_CREDENTIALS and a /proc
- * cgroup walk (logd-recv.c), so per-process attribution is fully real
- * despite none of it being any of this function's own business.
+ * Only MESSAGE, PRIORITY, SYSLOG_FACILITY and SYSLOG_IDENTIFIER are
+ * transported; other fields (CODE_FILE=, MESSAGE_ID=, ERRNO=, application
+ * fields) are dropped. _PID/_UID/_GID/_COMM/_SYSTEMD_UNIT are added by logd
+ * from SCM_CREDENTIALS and a /proc cgroup walk (logd-recv.c).
  *
- * Absent-vs-transient, mirroring journal-send.c's own documented contract:
- * sendto() failing ENOENT (no /dev/log at all -- logd never started) is a
- * silent 0, so a program on a logd-less system keeps running exactly as it
- * would against a real, absent journald; every other errno (ECONNREFUSED --
- * the path exists but logd died; ENOBUFS; EMSGSIZE; ...) propagates as
- * -errno, never disguised as success.
+ * As in upstream's journal-send.c, sendto() failing with ENOENT (no
+ * /dev/log, logd never started) returns 0 so programs run unchanged without
+ * a journal; every other errno (ECONNREFUSED, ENOBUFS, EMSGSIZE, ...)
+ * propagates as -errno.
  */
 
-#define SD_JOURNAL_SUPPRESS_LOCATION /* see sd-journal-send.c's file comment for why */
+#define SD_JOURNAL_SUPPRESS_LOCATION /* see sd-journal-send.c */
 
-/* program_invocation_short_name and asprintf() are glibc/GNU extensions;
- * -std=gnu17 alone does not imply _GNU_SOURCE (socket.c's own note, same
- * reasoning here). This also flips glibc's strerror_r overload from the
- * XSI int-returning form to the GNU char*-returning one -- see
- * xpg_strerror_r()'s own comment below for why this file calls the XSI
- * algorithm directly instead of through that ambiguous name. */
+/* program_invocation_short_name and asprintf() are GNU extensions;
+ * -std=gnu17 alone does not imply _GNU_SOURCE. This also switches glibc's
+ * strerror_r() to the GNU char*-returning form; see xpg_strerror_r() below. */
 #define _GNU_SOURCE
 
 #include "sd-journal.h"
@@ -51,16 +40,11 @@
 #include "../../logd/logd.h"
 
 /*
- * glibc exports both a POSIX/XSI strerror_r(3) (int return, always fills
- * `buf`, ERANGE if `buflen` was too small) and its own older GNU one (char*
- * return, may hand back a static string instead of using `buf` at all);
- * which one the plain name `strerror_r` resolves to depends on the exact
- * combination of feature-test macros in force at the call site, and this
- * file needs _GNU_SOURCE for other reasons (above). __xpg_strerror_r is the
- * real symbol glibc's own <string.h> redirects the plain name to when the
- * XSI form is selected -- calling it directly makes the choice explicit
- * rather than depending on macro interaction, which is exactly what
- * build_perror_message()'s grow-on-ERANGE loop below is written against.
+ * glibc has both a POSIX/XSI strerror_r(3) (int return, always fills `buf`,
+ * ERANGE if too small) and a GNU one (char* return, may return a static
+ * string). With _GNU_SOURCE (needed above) the plain name is the GNU form;
+ * __xpg_strerror_r is the XSI symbol, which build_perror_message()'s
+ * grow-on-ERANGE loop relies on.
  */
 extern int __xpg_strerror_r(int errnum, char *buf, size_t buflen);
 
@@ -92,9 +76,9 @@ static bool identifier_chars_ok(const char *s, size_t len) {
         return true;
 }
 
-/* logd's own syslog_parse_tag() grammar (logd-recv.c) is a non-whitespace
- * run ending ':' -- an identifier containing any of those bytes would not
- * round-trip through it, so this shim never sends one that wouldn't. */
+/* logd's syslog_parse_tag() (logd-recv.c) takes a non-whitespace run ending
+ * ':', so an identifier containing such bytes would not round-trip and is
+ * not sent. */
 static int validate_iov(const struct iovec *iov, int n, ParsedFields *out) {
         bool have_message = false, have_identifier_field = false;
 
@@ -174,10 +158,8 @@ static int validate_iov(const struct iovec *iov, int n, ParsedFields *out) {
         return 0;
 }
 
-/* Process-wide cached client socket, installed exactly once regardless of
- * how many threads race to create it: each loser closes its own fd and
- * re-reads the winner's, so every caller ends up sharing one real socket()
- * rather than leaking one per losing thread. */
+/* Process-wide cached client socket. Threads racing to create it: each
+ * loser closes its own fd and uses the winner's. */
 static int get_client_fd(void) {
         static int fd_plus_one = 0;
         int cur = __atomic_load_n(&fd_plus_one, __ATOMIC_ACQUIRE);
@@ -236,8 +218,8 @@ int sd_journal_sendv(const struct iovec *iov, int n) {
                 }
         }
 
-        /* "<NNN>" is at most 5 bytes (facility 0-23 << 3 | severity 0-7 tops
-         * out at 191); 8 leaves a little headroom rather than cutting it exactly. */
+        /* "<NNN>" is at most 5 bytes (facility 0-23 << 3 | severity 0-7 is at
+         * most 191); 8 leaves headroom. */
         cap = 8 + pf.identifier_len + 2 + message_len;
         composed = malloc(cap > 0 ? cap : 1);
         if (!composed) {
@@ -393,10 +375,8 @@ int sd_journal_perror_with_location(const char *file, const char *line, const ch
                 return r;
         }
 
-        /* msg_text is unbounded (caller-supplied message plus strerror()'s
-         * own text) -- a fixed-size buffer here would silently truncate it,
-         * exactly the class of loss this shim exists to avoid elsewhere
-         * (see sd_journal_printv()'s own stack-then-heap growth). */
+        /* msg_text is unbounded (caller message plus strerror() text), so it
+         * is sized exactly rather than truncated into a fixed buffer. */
         {
                 size_t msg_field_len = strlen("MESSAGE=") + strlen(msg_text) + 1;
 
@@ -451,9 +431,7 @@ int sd_journal_perror(const char *message) {
                 return r;
         }
 
-        /* See sd_journal_perror_with_location()'s identical comment: msg_text
-         * is unbounded, so it is sized exactly rather than snprintf'd into a
-         * fixed buffer that would silently truncate it. */
+        /* msg_text is unbounded; see sd_journal_perror_with_location(). */
         {
                 size_t msg_field_len = strlen("MESSAGE=") + strlen(msg_text) + 1;
 

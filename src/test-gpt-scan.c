@@ -28,9 +28,8 @@
  * What is NOT covered, on purpose and following the same split as
  * test-dev-setup.c: swapon(2) itself, and the sysfs walk from a partition
  * number back to a device node. Both need a real kernel with a real block
- * device, so they are proven by a qemuarmv5 boot capture showing /proc/swaps
- * with the discovered partition in it, not by a unit test that would have to
- * mount something on the machine running it. The two sysfs-resolving cases
+ * device and would have to mount something on the machine running the test,
+ * so they are left to booting on a target. The two sysfs-resolving cases
  * below skip themselves rather than fail where the machine running the test has
  * no block device of the kind they need.
  */
@@ -51,9 +50,8 @@
 
 /*
  * The fixture disk: 1 MiB, 512-byte blocks, header at LBA 1, a 128 x 128-byte
- * entry array at LBA 2. Exactly the layout wic writes for this project's own
- * qemuarmv5 image, which is what makes these tables representative rather than
- * merely legal.
+ * entry array at LBA 2. The layout wic writes for the qemuarmv5 image, which
+ * makes these tables representative rather than merely legal.
  */
 #define FIX_BS 512u
 #define FIX_SIZE (1024u * 1024u)
@@ -73,9 +71,9 @@
 #define H_ARRAY_CRC 88u
 
 /* 69dad710-2ce4-4e3c-b16c-21a1d49abed3 -- the Discoverable Partitions Spec's
- * root type for 32-bit ARM, which is what this project's own wks file stamps
- * onto the qemuarmv5 rootfs partition. Present here as the realistic neighbour
- * a swap search has to walk past. */
+ * root type for 32-bit ARM, which the qemuarmv5 image stamps onto its rootfs
+ * partition. Present here as the realistic neighbour a swap search has to walk
+ * past. */
 static const GptGuid type_root_arm = {
         { 0x10, 0xd7, 0xda, 0x69, 0xe4, 0x2c, 0x3c, 0x4e, 0xb1, 0x6c, 0x21, 0xa1, 0xd4, 0x9a, 0xbe, 0xd3 }
 };
@@ -578,8 +576,8 @@ static bool find_real_block_device(bool want_partition, char *ret, size_t size) 
  *
  * The other half -- resolving /sys/dev/block/<maj>:<min> through its parent
  * directory to the containing disk, and finding the partition's node again from
- * its number -- needs a real disk with real partitions, and is proven by the
- * qemuarmv5 boot capture instead.
+ * its number -- needs a real disk with real partitions, and is left to booting
+ * on a target.
  */
 static void test_boot_disk(void) {
         char node[PATH_MAX], devno[64];
@@ -725,9 +723,8 @@ static void test_root_read_only(void) {
 }
 
 /*
- * The partition node, which is the other half of R0: the same call that hands
- * dps_scan() the containing disk hands the root check the partition the
- * filesystem is actually on.
+ * The partition node: the same call that hands dps_scan() the containing disk
+ * hands the root check the partition the filesystem is actually on.
  *
  * Both halves need a real sysfs to resolve against, so each is skipped where
  * the machine running the test has nothing of that kind -- a build host

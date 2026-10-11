@@ -6,8 +6,7 @@
  * sd_event_source_*() except the constructors (those are sd_event_add_*()
  * in sd-event.c, since each is really an sd_event method that happens to
  * return a source). Shares event-internal.h's struct layout and helpers
- * with sd-event.c; see that file's own top comment for the family's
- * provenance note.
+ * with sd-event.c.
  */
 #define _GNU_SOURCE
 
@@ -421,17 +420,15 @@ int sd_event_source_get_inotify_path(sd_event_source *s, const char **ret) {
         return 0;
 }
 
-/* ---- pressure: never real, see sd-event.c's add_memory_pressure() ------------- */
+/* ---- pressure: never supported, see sd_event_add_memory_pressure() ------------- */
 
 int sd_event_source_set_memory_pressure_type(sd_event_source *s, const char *ty) {
         (void) ty;
         if (!s)
                 return -EINVAL;
-        /* Genuinely correct, not just convenient: this call is only ever valid
-         * on a memory-pressure source, and this shim can never create one
+        /* Only valid on a memory-pressure source, which cannot be created
          * (sd_event_add_memory_pressure() is -EOPNOTSUPP), so any source
-         * handed in here is by construction the wrong type. -EDOM is
-         * upstream's own wrong-source-type errno. */
+         * here is the wrong type: -EDOM. */
         return -EDOM;
 }
 int sd_event_source_set_memory_pressure_period(sd_event_source *s, uint64_t threshold_usec, uint64_t window_usec) {
@@ -511,19 +508,16 @@ int sd_event_source_set_exit_on_failure(sd_event_source *s, int b) {
         return 0;
 }
 
-/* ---- ratelimiting: never real, see the design note on every function here ------ */
+/* ---- ratelimiting: never supported ------ */
 
 int sd_event_source_set_ratelimit(sd_event_source *s, uint64_t interval_usec, unsigned burst) {
         (void) interval_usec;
         (void) burst;
         if (!s)
                 return -EINVAL;
-        /* Real ratelimiting needs a token bucket plus transparent temporary
-         * off-arming and a re-arm expiry timer -- genuine complexity for
-         * zero known pico-side callers (its heavy users are systemd's own
-         * daemons, which pico replaces). -EOPNOTSUPP is unambiguous and
-         * permanent, unlike a fake success that promises storm protection
-         * that never arrives. */
+        /* Ratelimiting needs a token bucket, temporary off-arming and a
+         * re-arm timer, and nothing here uses it. -EOPNOTSUPP rather than a
+         * fake success that promises storm protection. */
         return -EOPNOTSUPP;
 }
 
@@ -534,15 +528,13 @@ int sd_event_source_get_ratelimit(sd_event_source *s, uint64_t *ret_interval_use
                 return -EINVAL;
         if (s->type == SOURCE_POST || s->type == SOURCE_EXIT)
                 return -EDOM;
-        return -ENOEXEC; /* "no ratelimit configured" -- genuinely always true, since set_ratelimit() always fails */
+        return -ENOEXEC; /* "no ratelimit configured": always true, set_ratelimit() always fails */
 }
 
 int sd_event_source_is_ratelimited(sd_event_source *s) {
         if (!s)
                 return -EINVAL;
-        /* A genuinely computed truth, not a stub: no source can ever be
-         * ratelimited in this shim, so "not currently ratelimited" is
-         * always the correct answer. */
+        /* No source can be ratelimited here. */
         return 0;
 }
 
@@ -550,21 +542,14 @@ int sd_event_source_set_ratelimit_expire_callback(sd_event_source *s, sd_event_h
         (void) callback;
         if (!s)
                 return -EINVAL;
-        /* Same reasoning as set_ratelimit(): the callback could never fire
-         * when ratelimiting can never be configured, so accepting and
-         * storing it would itself be a misleading fake success. */
+        /* The callback could never fire, so accepting it would be a fake
+         * success. */
         return -EOPNOTSUPP;
 }
 
 int sd_event_source_leave_ratelimit(sd_event_source *s) {
         (void) s;
-        /*
-         * Upstream contract: 0 means "was not ratelimited, nothing to
-         * leave" (positive means it was just lifted). Since no source is
-         * ever ratelimited here, doing nothing and returning 0 is the
-         * exactly correct answer for every possible call -- the one
-         * genuine no-op in this family, deliberately not dereferencing s
-         * at all.
-         */
+        /* Upstream: 0 means "was not ratelimited, nothing to leave". s is
+         * not dereferenced. */
         return 0;
 }

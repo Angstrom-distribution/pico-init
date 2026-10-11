@@ -4,17 +4,13 @@
 /*
  * sd_network_get_dns()/_get_search_domains()/_get_route_domains()/_get_ntp():
  * the one real data source this family has, netd's own /etc/resolv.conf
- * (netd-resolv.h), read back under the same provenance rule netd-resolv.c
- * writes it under.
+ * (netd-resolv.h), read back under the provenance rule netd-resolv.c writes it
+ * under.
  *
- * This deliberately does NOT #include netd's own headers (src/netd/netd.h,
- * netd-resolv.h): those pull in the whole Netd object and netd's private
- * include-path conventions for a daemon binary, none of which this shared
- * library should depend on. NETD_RESOLV_CONF and NETD_RESOLV_MAX_NAMESERVERS
- * are mirrored here as plain constants instead, with netd-resolv.h named as
- * the source of truth in the comment beside each -- if that file's values
- * ever change, this one has to be updated by hand, which is the accepted
- * cost of not coupling a library to a daemon's private headers.
+ * netd's headers (src/netd/netd.h, netd-resolv.h) are not included: they
+ * pull in the whole Netd object, which a shared library must not depend on.
+ * NETD_RESOLV_CONF and NETD_RESOLV_MAX_NAMESERVERS are mirrored below and
+ * must be kept in sync with netd-resolv.h by hand.
  */
 
 #include "sd-network.h"
@@ -230,13 +226,9 @@ int sd_network_get_ntp(char ***ret) {
 
         /*
          * The effective NTP server set (static NTP= merged with DHCP
-         * option 42 under UseNTP= gating) lives only inside netd's
-         * in-memory NetdSntp -- never written anywhere this shim could
-         * read it back from. Dependency: a netd link-state publisher that
-         * includes the effective SNTP server list. See this family's
-         * design note on -ENODATA vs -EOPNOTSUPP for why this is the
-         * latter: pico permanently cannot answer this today, not merely
-         * "not yet".
+         * option 42 under UseNTP= gating) lives only in netd's in-memory
+         * NetdSntp and is written nowhere this library could read it.
+         * -EOPNOTSUPP rather than -ENODATA, which callers would retry.
          */
         return -EOPNOTSUPP;
 }

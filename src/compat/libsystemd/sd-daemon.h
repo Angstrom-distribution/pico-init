@@ -2,19 +2,14 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * pico-init's own sd-daemon.h: a from-scratch header matching the real
- * public API contract (function signatures, macro values, documented
- * semantics) that github.com/systemd/systemd ships at src/systemd/sd-daemon.h
- * (read there for reference only -- nothing here is copied from that LGPL
- * text; the declarations below are pico's own words for an uncopyrightable
- * ABI). See sd-daemon.c for what each function actually does under
- * pico-init and where it deviates from a real systemd-managed system.
+ * pico-init's sd-daemon.h, matching the function signatures, macro values
+ * and documented semantics of systemd's src/systemd/sd-daemon.h; written
+ * from that contract, not copied. See sd-daemon.c for what each function
+ * does under pico-init.
  *
- * Absent-vs-transient convention, held everywhere in this shim: "genuinely
- * not running under an init that provides this" is always a plain 0, no
- * errno; a real, transient failure is always a negative errno. 0 means "run
- * standalone"; <0 means "something is actually wrong" -- callers can treat
- * the two identically to how they'd treat real libsystemd.
+ * Convention throughout: "not running under an init that provides this" is
+ * a plain 0; a real failure is a negative errno. So 0 means "run
+ * standalone" and <0 means something is wrong, as with real libsystemd.
  */
 
 #pragma once
@@ -70,14 +65,11 @@ int sd_pid_notifyf(pid_t pid, int unset_environment, const char *format, ...) _P
 
 /*
  * The fd-array pair. n_fds == 0 is real (routes to the same path as
- * sd_notify()/sd_pid_notify()); n_fds > 0 is -EOPNOTSUPP -- pico-init has no
- * fd store (no FDSTORE=1 mechanism exists), so returning success while
- * silently dropping the caller's fds would be a real, disguised bug. See
- * sd-daemon.c for the full reasoning.
+ * sd_notify()/sd_pid_notify()); n_fds > 0 is -EOPNOTSUPP, as pico-init has
+ * no fd store and returning success would silently drop the caller's fds.
  *
- * Note the asymmetry versus sd_pid_notifyf_with_fds() below: n_fds is
- * unsigned here, size_t there. Copied verbatim from the real header --
- * it's a real inconsistency upstream carries, not a typo in this one.
+ * n_fds is unsigned here but size_t in sd_pid_notifyf_with_fds() below, as
+ * in the upstream header.
  */
 int sd_pid_notify_with_fds(pid_t pid, int unset_environment, const char *state, const int *fds, unsigned n_fds);
 int sd_pid_notifyf_with_fds(

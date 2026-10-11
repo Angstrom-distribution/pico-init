@@ -2,7 +2,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * M2's acceptance test: "A-after-B-after-C queues as [C,B,A] with no deadlock
+ * Job engine tests: "A-after-B-after-C queues as [C,B,A] with no deadlock
  * across multi-job transactions", plus regressions for the backports in job.c.
  *
  * Targets are used throughout rather than services. A target reaches its state
@@ -124,7 +124,7 @@ static size_t run_queue_ids(Manager *m, const char **out, size_t max) {
 }
 
 /*
- * M1's "Done when", at the job layer: a.target is ordered after b.target which
+ * a.target is ordered after b.target which
  * is ordered after c.target, so a start job for a must queue them c, b, a.
  */
 static void test_ordering_c_b_a(void) {
@@ -458,7 +458,7 @@ static void test_redundant_anchor_job_finishes(void) {
         /* Already active: redundant, but it is the anchor so it is not dropped. */
         ASSERT_EQ_INT(manager_add_job(m, JOB_START, a, NULL), 0);
         manager_dispatch_run_queue(m);
-        ASSERT_TRUE(a->job == NULL); /* stuck in JOB_RUNNING before the fix */
+        ASSERT_TRUE(a->job == NULL); /* the anchor job finished */
         ASSERT_EQ_INT(unit_active_state(a), UNIT_ACTIVE);
 
         ASSERT_EQ_INT(manager_add_job(m, JOB_STOP, a, NULL), 0);
@@ -536,15 +536,10 @@ static void test_superseded_job_is_finished(void) {
 }
 
 /*
- * A restart must actually restart. unit_notify()'s JOB_RESTART arm was a bare
- * break, so nothing ever reported the stop half reaching INACTIVE, so
- * job_finish_full()'s restart-conversion block -- carefully written, carefully
- * commented -- was unreachable dead code. A restart stopped the unit and left
- * the job in JOB_RUNNING forever.
- *
- * Invisible to every test that existed, because none of them ever finished a
- * restart job: test_restart_pulls_start_deps() only checks what a restart
- * transaction pulls in, never that it completes.
+ * A restart must complete: unit_notify() must report the stop half reaching
+ * INACTIVE so job_finish_full()'s restart-conversion block runs; otherwise the
+ * job stays in JOB_RUNNING forever. test_restart_pulls_start_deps() only
+ * checks what a restart transaction pulls in, not that it completes.
  */
 static void test_restart_completes(void) {
         Manager *m;
@@ -583,8 +578,7 @@ static void test_restart_completes(void) {
          * until the process is actually reaped.
          *
          * Two dispatches: harmless if the first already finished
-         * everything; before the fix the unit stayed INACTIVE and a->job
-         * never cleared regardless. */
+         * everything. */
         manager_dispatch_run_queue(m);
         manager_dispatch_run_queue(m);
 
@@ -608,8 +602,8 @@ static void test_restart_completes(void) {
  * A real service gives that boundary: unit_stop() only sends SIGTERM and
  * returns, so the job sits in JOB_RUNNING -- still installed, uncounted as
  * done -- until the process is actually reaped and unit_notify() drives
- * job_finish_full()'s JOB_RESTART/JOB_DONE conversion. This is the plan's
- * "n_jobs/n_installed_jobs unchanged across the conversion" case.
+ * job_finish_full()'s JOB_RESTART/JOB_DONE conversion. n_jobs and
+ * n_installed_jobs must be unchanged across the conversion.
  */
 static void test_restart_conversion_counters(void) {
         char cgroup_root[PATH_MAX];
@@ -744,11 +738,9 @@ static void test_restart_conversion_counters(void) {
 
 /*
  * Every verb against every starting state must terminate. Six combinations,
- * because covering only the ones that obviously work is what let a real bug
- * through: the first version of this file tested restart on an ACTIVE unit --
- * which genuinely stops, so unit_notify() fires and the conversion runs -- and
- * never tested restart on an INACTIVE one, where unit_stop() is a silent
- * no-op, nothing notifies, and the job hung forever.
+ * because the cases differ: restart on an ACTIVE unit genuinely stops, so
+ * unit_notify() fires and the conversion runs, but on an INACTIVE one
+ * unit_stop() is a silent no-op, nothing notifies, and the job would hang.
  *
  * Three dispatches each: enough for a restart's stop half, its conversion and
  * its start half, and harmless for the cases that finish sooner.
@@ -814,9 +806,8 @@ static void test_all_verb_state_combinations(void) {
 /*
  * Drop a unit from the manager's table the way a SIGHUP reload will have to.
  *
- * The reload path does not exist yet (manager-loop.c still carries its TODO),
- * so the removal is done here rather than through it -- but the thing under
- * test is unit_free() itself, which is the call reload will make, unchanged.
+ * The test removes the unit itself rather than going through
+ * manager_reload(); the thing under test is unit_free(), which reload calls.
  */
 static void manager_forget_unit(Manager *m, Unit *u) {
         size_t i;
@@ -834,9 +825,8 @@ static void manager_forget_unit(Manager *m, Unit *u) {
 /*
  * Freeing a unit that still has a job must not leave the job behind.
  *
- * unit_free() used to ignore u->job entirely, so the job stayed installed --
- * queued, and holding a borrowed j->unit pointing straight at the freed
- * allocation. The next manager_dispatch_run_queue() would then run it and
+ * Otherwise the job stays installed, holding a borrowed j->unit that points at
+ * the freed allocation, and the next manager_dispatch_run_queue() would
  * dispatch unit_start() through a dangling pointer.
  *
  * Two cases, because they fail differently. A WAITING job is observable
@@ -845,10 +835,7 @@ static void manager_forget_unit(Manager *m, Unit *u) {
  * job has already been unlinked from the queue, so nothing in-process can see
  * it any more -- with the fix reverted it shows up only under
  * -Db_sanitize=address,undefined, as the still-installed job leaking with its
- * unit freed underneath it. That is the same measured-rather-than-asserted
- * check C2's connection leak uses, and the reason both cases are here: the
- * observable half proves the mechanism, the sanitizer half covers the state
- * the observable half cannot reach.
+ * unit freed underneath it.
  */
 static void test_unit_free_cancels_its_job(void) {
         Manager *m;
@@ -924,7 +911,7 @@ static void test_unit_free_cancels_its_job(void) {
  * targets so nothing here forks: a Requires=/After= dependent of a unit
  * whose condition is unmet still reaches ACTIVE, and the skipped unit's own
  * job completes DONE rather than sitting in JOB_RUNNING forever -- the
- * regression job.c's job_run() -EALREADY mapping guards. This is the direct
+ * case job.c's job_run() -EALREADY mapping guards. This is the direct
  * analogue of usb-multi-gadget-dhcp-fallback.service's real Requires= on
  * usb-multi-gadget.service on a UDC-less machine.
  */
@@ -974,7 +961,7 @@ static void test_condition_skipped_job_completes_done(void) {
 }
 
 /*
- * E2.5: a '!'-negated ConditionPathExists= inverts the stat() result, proven
+ * A '!'-negated ConditionPathExists= inverts the stat() result, proven
  * both ways through the same job-dispatch path as the un-negated case above
  * -- the direct analogue of oe-core's dropbearkey.service, whose
  * "ConditionPathExists=!/etc/dropbear/dropbear_rsa_host_key" is meant to skip
@@ -1248,7 +1235,7 @@ static void test_start_not_dropped_over_installed_stop(void) {
  * /etc/systemd/system/default.target -> multi-user.target, a oneshot that
  * fails, and a oneshot WantedBy=default.target ordered After= both
  * multi-user.target and the failing one. Every job must complete and the
- * boot must settle; the quit unit's start job used to stay installed forever.
+ * boot must settle.
  */
 static void test_alias_boot_runs_ordered_oneshot(void) {
         char path[PATH_MAX], text[PATH_MAX + 256], cgroup_root[PATH_MAX];

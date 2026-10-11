@@ -25,7 +25,7 @@
  *    by an OS that only rewrites the directory entry) the directory entry is
  *    the one blkid reports, and so the one a by-label link or `mount -L` goes
  *    by. The FAT32 root directory is a cluster chain, followed for at most 99
- *    clusters as blkid follows it. One deliberate narrowing: the scan stops at
+ *    clusters as blkid follows it. One narrowing: the scan stops at
  *    the end-of-directory marker, which blkid only honours within a cluster.
  *    Past that marker the FAT specification says nothing is a live entry, so
  *    the two only differ on a corrupt directory.

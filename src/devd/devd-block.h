@@ -2,7 +2,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The disk/partition debounce state machine (plans/31, Part 2, H1).
+ * The disk/partition debounce state machine.
  *
  * The problem it exists for: inserting one card produces a burst of separate
  * uevents -- an `add` for the disk, then one `add` per partition -- with no
@@ -24,7 +24,7 @@
  * repartitioned in place, or an event the coldplug walk raced -- is not an
  * error and does not reopen the window: it is acted on immediately, on its own.
  *
- * This file deliberately knows nothing about GPT, mounting or symlinks. It
+ * This file knows nothing about GPT, mounting or symlinks. It
  * takes parsed uevents and a clock and returns what happened, which is what
  * makes the settle behaviour testable without a block device: test-devd-block.c
  * drives it with synthetic bursts and a fake clock. The reactions live in
@@ -53,18 +53,16 @@
 #define DEVD_MAX_PARTS 16
 
 /*
- * Kernel-synthesised block devices, which devd deliberately does not track.
+ * Kernel-synthesised block devices, which devd does not track.
  *
- * Not a name heuristic -- it is where the kernel puts a device that has no
- * physical parent: ramdisks, loop devices, device-mapper. None of them is
- * removable, none of them hotplugs, and none of them has a bus identity to
- * build a by-id link out of. Excluding them is not a tidiness preference
- * either: CONFIG_BLK_DEV_RAM alone puts sixteen ram* devices on every system
- * before anything is plugged in, which measured out at more than the whole disk
- * table on a first run of the real daemon.
+ * Matched by sysfs path, not by name: it is where the kernel puts a device
+ * with no physical parent (ramdisks, loop devices, device-mapper). None is
+ * removable or has a bus identity to build a by-id link from, and
+ * CONFIG_BLK_DEV_RAM alone creates sixteen ram* devices before anything is
+ * plugged in, more than the disk table holds.
  *
- * The named cost: a loop device carrying a GPT gets no by-* links here, where
- * upstream udev would name its partitions. v1 is prepared removable media.
+ * Cost: a loop device carrying a GPT gets no by-* links, where upstream udev
+ * would name its partitions.
  */
 #define DEVD_VIRTUAL_PREFIX "/devices/virtual/"
 

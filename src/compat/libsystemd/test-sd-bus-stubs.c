@@ -2,11 +2,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * Exhaustively calls every function in sd-bus-stubs.c's honest_failure
- * bucket and asserts -EINVAL -- generated the same mechanical way the
- * stub bodies themselves were (see that file's header), so a slipped
- * name or a wrong return value in either place shows up here as a real
- * test failure rather than a silent mismatch nobody happens to exercise.
+ * Calls every function in sd-bus-stubs.c and asserts -EINVAL.
  */
 
 #include "sd-bus.h"
@@ -16,9 +12,8 @@
 
 #include "../../test-util.h"
 
-/* Several of the calls below deliberately exercise a _PICO_SD_DEPRECATED_
- * entry point (real libsystemd deprecates them too, but they are still
- * part of the real ABI and still need a real, tested answer here). */
+/* Several calls below use _PICO_SD_DEPRECATED_ entry points; they are still
+ * part of the ABI and need a tested answer. */
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 
 static sd_id128_t zero_id128;
@@ -88,7 +83,7 @@ static void call_plain_einval_variants(void) {
         ASSERT_EQ_INT(sd_bus_pending_method_calls(NULL), -EINVAL);
         ASSERT_EQ_INT(sd_bus_attach_event(NULL, NULL, 0), -EINVAL);
         ASSERT_EQ_INT(sd_bus_detach_event(NULL), -EINVAL);
-        /* sd_bus_get_event() is not here -- see sd-bus-stubs.c's header. */
+        /* sd_bus_get_event() is in sd-bus-noop.c; see its header. */
         ASSERT_EQ_INT(sd_bus_get_method_call_timeout(NULL, NULL), -EINVAL);
         ASSERT_EQ_INT(sd_bus_set_method_call_timeout(NULL, 0), -EINVAL);
         ASSERT_EQ_INT(sd_bus_get_n_queued_read(NULL, NULL), -EINVAL);
@@ -202,8 +197,7 @@ static void call_plain_einval_variants(void) {
         ASSERT_EQ_INT(sd_bus_track_remove_sender(NULL, NULL), -EINVAL);
         ASSERT_EQ_INT(sd_bus_track_add_name(NULL, NULL), -EINVAL);
         ASSERT_EQ_INT(sd_bus_track_remove_name(NULL, NULL), -EINVAL);
-        /* sd_bus_track_count()/track_contains() are not here -- see
-         * sd-bus-stubs.c's header. */
+        /* sd_bus_track_count()/track_contains() are in sd-bus-noop.c. */
         ASSERT_EQ_INT(sd_bus_track_count_sender(NULL, NULL), -EINVAL);
         ASSERT_EQ_INT(sd_bus_track_count_name(NULL, NULL), -EINVAL);
         ASSERT_EQ_INT(sd_bus_track_get_destroy_callback(NULL, NULL), -EINVAL);

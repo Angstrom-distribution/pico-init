@@ -13,7 +13,7 @@
  * parser returns by mounting filesystems and creating symlinks as root, and the
  * messages arrive on a socket any process can write to -- so the sender check,
  * the libudev-format rejection and the unterminated-buffer case are each
- * exercised deliberately rather than left to a board to discover.
+ * exercised rather than left to a board to discover.
  *
  * The socket itself (devd_uevent_open(), devd_uevent_recv()) is not covered
  * here, following the same split test-gpt-scan.c and test-dev-setup.c use:
@@ -118,7 +118,7 @@ static void test_remove_and_other(void) {
                 NULL,
         };
 
-        /* A medium change on a card reader. Recognised, deliberately not
+        /* A medium change on a card reader. Recognised, but not
          * classified as add or remove -- see devd-block.c on why v1 does not
          * act on it. */
         static const char * const change[] = {

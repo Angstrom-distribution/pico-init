@@ -2,15 +2,11 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * No hwdb.bin reader exists in this build. Real udev's hardware database
- * exists to attach static vendor/model properties (USB IDs, keyboard
- * layouts, PCI class strings, ...) to a uevent by modalias lookup; pico's
- * devd (src/devd/devd-match.c, devd-rules.c) matches purely on sysfs
- * attributes and its own rules file instead, so nothing in this build ever
- * needed a hwdb to begin with -- sd_hwdb_new() failing is not a missing
- * feature, it is the truthful "no hwdb.bin anywhere" real libsystemd
- * itself reports (sd-hwdb.c:384-415, HEAD ded83144) on any system that
- * hasn't built one, which describes every pico image, permanently.
+ * No hwdb.bin reader exists in this build. devd (src/devd/devd-match.c,
+ * devd-rules.c) matches on sysfs attributes and its own rules file instead
+ * of a modalias-keyed hardware database, so sd_hwdb_new() failing is the
+ * same "no hwdb.bin" answer real libsystemd gives (sd-hwdb.c:384-415, HEAD
+ * ded83144) on a system that has not built one.
  */
 
 #include "sd-hwdb.h"
@@ -24,10 +20,9 @@ int sd_hwdb_new(sd_hwdb **ret) {
         return -ENOENT;
 }
 
-/* Unlike sd_hwdb_new(), `path` may genuinely exist -- there is simply no
- * trie/hwdb.bin reader in this library build to open it with. -ENOENT
- * would claim the file is missing, which could be a lie; -EOPNOTSUPP
- * states the true condition instead. */
+/* Unlike sd_hwdb_new(), `path` may exist; there is no
+ * hwdb.bin reader in this build to open it with. -ENOENT would wrongly
+ * claim the file is missing, so report -EOPNOTSUPP. */
 int sd_hwdb_new_from_path(const char *path, sd_hwdb **ret) {
         if (!path || !ret)
                 return -EINVAL;

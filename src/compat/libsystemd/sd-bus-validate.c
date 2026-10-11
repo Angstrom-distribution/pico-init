@@ -2,10 +2,9 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * Naming validators for sd-bus.h. These are the one corner of the sd-bus
- * family that needs no bus at all -- pure string checks against the D-Bus
- * specification's grammar (message-protocol-names) -- so unlike
- * everything else under sd-bus-*.c they can be, and are, genuinely real.
+ * Naming validators for sd-bus.h: pure string checks against the D-Bus
+ * specification's grammar (message-protocol-names). Unlike most of
+ * sd-bus-*.c they need no bus and are fully implemented.
  */
 
 #include "sd-bus.h"

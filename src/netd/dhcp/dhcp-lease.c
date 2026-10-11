@@ -4,31 +4,21 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 /*
- * Ported from src/libsystemd-network/sd-dhcp-lease.c (831 lines): lease
+ * Ported from systemd v261.2 src/libsystemd-network/sd-dhcp-lease.c: lease
  * construction from a DHCPACK/BOOTREPLY, and the accessors for every option
- * netd uses -- including option 42 (NTP servers) and option 101 (TZDB
- * timezone name), the reason netd exists at all (plan §2.6).
+ * netd uses, including option 42 (NTP servers) and option 101 (TZDB timezone
+ * name). See dhcp-lease-internal.h for the API boundary
+ * (DhcpLeaseParseParams instead of a client object).
  *
- * Quarry point and history review: see dhcp-lease-internal.h's header --
- * same window, same one (not-carried-here) backport, same API-boundary
- * redesign this file implements (DhcpLeaseParseParams instead of a client
- * object).
+ * Upstream defines SD_DHCP_OPTION_POSIX_TIMEZONE = 100 but never parses it;
+ * only 101 is implemented here.
  *
- * Note on option 100 vs 101 (plan §2.6 point 1): upstream defines
- * SD_DHCP_OPTION_POSIX_TIMEZONE = 100 but has never parsed it anywhere;
- * only 101 is implemented here, matching upstream's actual behaviour
- * rather than its unused constant.
- *
- * Assertion policy: dhcp_lease_new_from_message() below reads option data
- * that already passed dhcp-message.c's own get_option_*() validation (which
- * itself validates against tlv-util.c's wire bounds), so what remains here
- * is protocol-level cross-checks (T1 < T2 < lifetime, a mandatory yiaddr)
- * on values a malicious server fully controls -- every one of those is a
- * real -EBADMSG/log-and-fall-back path, not an assert, matching upstream's
- * own choice (upstream did not assert on these either; the T1 < T2 <
- * lifetime asserts that follow are on values this function *just
- * recomputed* into a known-valid range two lines above, i.e. an internal
- * invariant on netd's own arithmetic, not on server-supplied bytes).
+ * Assertion policy: option data reaching dhcp_lease_new_from_message() has
+ * passed dhcp-message.c's get_option_*() validation. The protocol-level
+ * cross-checks left here (T1 < T2 < lifetime, a mandatory yiaddr) are on
+ * server-controlled values, so they are -EBADMSG or log-and-fall-back paths,
+ * not asserts. The asserts on T1 < T2 < lifetime are on values this function
+ * just recomputed into a valid range.
  */
 
 #include "netd-compat.h"

@@ -3,28 +3,22 @@
 
 /*
  * pico-init's own implementation of the sd_event_*() ABI surface, matching
- * the real function signatures and documented semantics of systemd's
- * sd-event.h (read from a current upstream checkout for the contract only --
- * see src/compat/libsystemd/event-internal.h for the implementation notes
- * and provenance). This file is pico's own independent write-up of that
- * public contract, not a copy of the LGPL-2.1-or-later original.
+ * the function signatures and documented semantics of systemd's sd-event.h.
+ * See event-internal.h for implementation notes.
  *
- * What real sd_event does that this shim does not: it multiplexes every
- * timer of a given clock onto one shared timerfd and coalesces wakeups
- * system-wide. This shim gives every timer source its own timerfd instead
- * (event-internal.h says why); a coalescing scheduler serves systemd's own
- * many-daemon boot, not a handful of standalone helper tools.
+ * Unlike real sd_event, which multiplexes every timer of a clock onto one
+ * shared timerfd and coalesces wakeups system-wide, every timer source here
+ * gets its own timerfd (event-internal.h says why).
  *
- * Not part of this shim at all: sd_event_add_memory_pressure() and
- * sd_event_source_set_ratelimit() (plus its expire-callback companion) are
- * declared here for ABI completeness but always fail -- see sd-event.c.
+ * sd_event_add_memory_pressure() and sd_event_source_set_ratelimit() (plus
+ * its expire-callback companion) are declared for ABI completeness but
+ * always fail; see sd-event.c and sd-event-source.c respectively.
  *
- * PID 1 is a first-class consumer: pico-init's own Manager embeds one
- * sd_event as its main loop (src/manager.h), the same architecture as
- * modern systemd's PID 1. One owning event loop per process is a
- * convention, not an enforced guard -- whoever owns the process's signal
- * mask and child reaping owns the loop, and a second sd_event in the same
- * process must not add sources for resources the main loop owns.
+ * pico-init's Manager embeds one sd_event as its PID 1 main loop
+ * (src/manager.h). One owning event loop per process is a convention, not
+ * an enforced guard: whoever owns the process's signal mask and child
+ * reaping owns the loop, and a second sd_event in the same process must not
+ * add sources for resources the main loop owns.
  */
 
 #pragma once

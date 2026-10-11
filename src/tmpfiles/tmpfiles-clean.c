@@ -6,9 +6,8 @@
  *
  * One walker does both, as upstream's dir_cleanup() does: --clean passes
  * the line's age as a cutoff, --remove passes "everything is old enough".
- * Either way the walk honours the same exceptions, and they are the part
- * that keeps a running system intact rather than a detail: an entry that
- * has a line of its own or matches any glob line (x/X among them) is left
+ * Either way the walk honours the same exceptions: an entry that has a
+ * line of its own or matches any glob line (x/X among them) is left
  * alone, as are sticky files, device nodes, AF_UNIX sockets something is
  * still listening on, and anything another process holds a BSD lock on.
  * The walk never crosses into another filesystem, is bounded in depth, and
@@ -16,7 +15,7 @@
  * cleanup never makes a directory look freshly used.
  */
 
-/* O_NOATIME and GLOB_BRACE are glibc extensions (tmpfiles-create.c's note). */
+/* O_NOATIME and GLOB_BRACE are glibc extensions. */
 #define _GNU_SOURCE
 
 #include "tmpfiles.h"

@@ -17,16 +17,13 @@
  * and a flat array of fixed-size entries -- no per-filesystem superblock zoo,
  * no probe ladder. Everything below is offset arithmetic over two read buffers.
  *
- * Two halves live in this file, and the seam between them is deliberate:
+ * Two halves live in this file:
  *
- *  - gpt_scan()/gpt_scan_all() and their helpers are the parser, and are the
- *    reusable half. devd (plans/31, Part 2, milestone H1) is the second
- *    consumer, for removable-media policy and for the
- *    /dev/disk/by-partuuid|by-partlabel families that come out of the same
- *    entry this already reads.
+ *  - gpt_scan()/gpt_scan_all() and their helpers are the parser, shared with
+ *    devd (removable-media policy and the /dev/disk/by-partuuid|by-partlabel
+ *    links come out of the same entries) and fstab-resolve.c.
  *  - dps_scan() is PID 1's own boot-time consumer: find the boot disk, find the
- *    Discoverable-Partitions-Spec swap partitions on it, swapon() them. When
- *    that second consumer arrives, this is the half that stays behind.
+ *    Discoverable-Partitions-Spec swap partitions on it, swapon() them.
  *
  * Everything here is best-effort in mount-setup.c's sense. A disk with no GPT,
  * a corrupt header, an unreadable device: all of them are a boot that continues
@@ -64,8 +61,7 @@ typedef struct GptGuid {
 /*
  * The Discoverable Partitions Specification's Linux swap type,
  * 0657fd6d-a4ab-43c4-84e5-0933c84b4f4f (uapi-group.org). Architecture
- * independent, unlike the root GUIDs -- there is one swap type for every
- * machine this project will ever build.
+ * independent, unlike the root GUIDs.
  */
 extern const GptGuid gpt_type_linux_swap;
 
@@ -134,7 +130,7 @@ int gpt_scan(const char *device, const GptGuid *type, GptPartition **ret, size_t
  * devd wants this and gpt_scan() does not fit it. A hotplug daemon has to name
  * every partition it sees (by-partuuid, by-partlabel) before it decides what to
  * do with any of them, and it has to see a no-auto partition in order to
- * deliberately not mount it -- a search that silently drops entries can only
+ * decide not to mount it -- a search that silently drops entries can only
  * answer questions about one type at a time.
  */
 int gpt_scan_all(const char *device, GptPartition **ret, size_t *ret_n);
@@ -203,10 +199,8 @@ int gpt_boot_disk(const char *mountinfo, char *ret_node, size_t node_size, char 
  * the three things this needs -- /proc for the mountinfo, /sys for the block
  * topology, /dev for the node to swapon() -- exist by the time it runs.
  *
- * Deliberately a plain function and not a unit type. The whole runtime action
- * is one swapon(2) per partition, so a Swap unit would buy only picoctl
- * visibility into it; that is a real thing to want later and a poor reason to
- * grow a fourth unit type now (plans/31, Slice B).
+ * A plain function and not a unit type: the whole runtime action is one
+ * swapon(2) per partition, so a Swap unit would buy only picoctl visibility.
  *
  * Restricted to the boot disk on purpose, following upstream's own generator: a
  * removable card carrying its own swap-typed partition must not be swapped onto

@@ -5,16 +5,12 @@
 /*
  * The INI line scanner, shared by every config parser in this project.
  *
- * This exists because netd's `.network` parser needs exactly the same
- * line-level behaviour unit files already get, and a second copy would not
- * keep getting it. unit-parse.c's header records eleven backported upstream
- * fixes, and at least four are properties of this scanner rather than of
- * unit-file semantics: unbounded getline() so a long line is never silently
- * truncated, a malformed line skipping just that line instead of failing the
- * whole file, the comment-line-ending-in-backslash and
- * blank-line-terminates-continuation pair, and the flush of an unterminated
- * final continuation. A copy inherits those today and then silently stops
- * inheriting them; the twelfth fix should land in one file, not two.
+ * netd's `.network` parser needs exactly the same line-level
+ * behaviour as unit files, and a second copy would stop inheriting upstream
+ * fixes: unbounded getline() so a long line is never truncated, a malformed
+ * line skipping just that line instead of failing the whole file, the
+ * comment-line-ending-in-backslash and blank-line-terminates-continuation
+ * pair, and the flush of an unterminated final continuation.
  *
  * The scanner knows about sections, comments, continuations, the UTF-8 BOM
  * and the key/value split. It knows nothing about what any key means -- that
@@ -30,7 +26,7 @@
  * that wants to keep either must copy it.
  *
  * Return 0 to continue, or -errno to abort the whole file. Returning an error
- * for an unrecognized key is a policy choice this project deliberately does
+ * for an unrecognized key is a policy choice this project does
  * not make: both unit files and .network files accept unknown directives as
  * valid syntax and drop them at debug level.
  */

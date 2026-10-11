@@ -2,12 +2,10 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * Applying time: the clock, the timezone, and the boot-time clock floor
- * (plan §2.6 steps 3, 5 and 6).
+ * Applying time: the clock, the timezone, and the boot-time clock floor.
  *
- * This is the half of netd that exists because of the founding requirement --
- * a DHCP server that hands out a timezone (option 101) should set the
- * timezone. Upstream needs networkd, a state file, inotify, timesyncd, D-Bus
+ * A DHCP server that hands out a timezone (option 101) sets the timezone.
+ * Upstream needs networkd, a state file, inotify, timesyncd, D-Bus
  * and timedated to get that from the wire to /etc/localtime; here it is a
  * function call from netd-link.c.
  *
@@ -35,19 +33,15 @@ typedef struct Netd Netd;
 #define NETD_CLOCK_FILE "clock" /* relative to Netd.state_dir */
 
 /*
- * Upstream's TIME_EPOCH (plan §2.6 step 6, and the SNTP epoch-floor
- * rejection the history review added -- see NETD_SNTP_REJECT_EPOCH in
- * netd-sntp.h). Used two ways: as the floor netd_time_clock_floor_apply()
- * will not let CLOCK_REALTIME sit below, and as the floor netd_sntp_validate()
- * will not accept a reply's recv_time/trans_time claiming a time before.
+ * Upstream's TIME_EPOCH. Used two ways: as the floor
+ * netd_time_clock_floor_apply() will not let CLOCK_REALTIME sit below, and as
+ * the floor netd_sntp_validate() will not accept a reply's
+ * recv_time/trans_time claiming a time before (NETD_SNTP_REJECT_EPOCH in
+ * netd-sntp.h).
  *
- * Upstream derives this at build time from `git log` on the latest tag (or,
- * failing that, NEWS's mtime) via meson -- see meson.build's `time_epoch`.
- * meson.build is not this milestone's file to edit, so there is no build-
- * system plumbing for a computed value here: this is a fixed calendar
- * constant instead, chosen at implementation time. It only ever needs to move
- * forward, never back, and only if a real netd release manages to postdate
- * it, which has ample headroom.
+ * Upstream derives this at build time from `git log` on the latest tag (or
+ * NEWS's mtime) via meson. Here it is a fixed calendar constant; it only needs
+ * to move forward, and only if a release postdates it.
  */
 #define NETD_TIME_EPOCH_SEC ((int64_t) 1767225600) /* 2026-01-01T00:00:00Z */
 
@@ -71,13 +65,11 @@ typedef enum NetdClockAdjust {
  * which of the two kinds of adjustment it is. Pure: no syscall, no clock
  * read.
  *
- * Split out from netd_time_adjust_clock() precisely so it can be tested.
- * clock_adjtime() is process-global -- it stays global inside a network
- * namespace, so the netns trick that makes the rtnl and DHCP tests safe does
- * nothing for this one, and a test that actually stepped the clock would be a
- * test that broke the machine running it (§2.8).
+ * Split out from netd_time_adjust_clock() so it can be tested.
+ * clock_adjtime() is process-global even inside a network namespace, so a
+ * test that actually stepped the clock would break the machine running it.
  *
- * STA_UNSYNC is deliberately left clear in the slew case: that is what lets
+ * STA_UNSYNC is left clear in the slew case: that is what lets
  * the kernel's own 11-minute mode write the RTC, so netd never touches
  * /dev/rtc on the sync path at all.
  *
@@ -104,17 +96,13 @@ bool netd_time_timezone_is_valid(Netd *n, const char *tz);
  * Compute the struct timezone netd_time_set_timezone() would push into the
  * kernel for the zone *currently loaded by tzset()*, without calling
  * settimeofday(). Split out for the same reason netd_time_build_timex() is:
- * settimeofday() needs CAP_SYS_TIME, which the netns-capable but otherwise
- * unprivileged-for-clock-purposes test container does not grant even to
- * root (verified directly: EPERM), and it mutates a piece of real kernel
- * state a test cannot safely apply regardless of privilege.
+ * settimeofday() needs CAP_SYS_TIME, which a test container may not grant,
+ * and it mutates kernel state a test cannot safely apply.
  *
- * It is also the hook that makes the tzset()-before-this-computation
- * ordering testable at all: call tzset() to load a known zone (or don't) and
- * compare what this returns -- reading tm_gmtoff off localtime_r() only
- * reflects the zone tzset() most recently loaded, so a caller that got the
- * order backwards is directly observable through this function without ever
- * touching /etc/localtime or the kernel.
+ * It also makes the tzset()-before-this-computation ordering testable:
+ * tm_gmtoff off localtime_r() only reflects the zone tzset() most recently
+ * loaded, so a caller that got the order backwards is observable through this
+ * function without touching /etc/localtime or the kernel.
  *
  * 0 or -errno.
  */
@@ -158,16 +146,15 @@ int netd_time_set_timezone(Netd *n, const char *tz);
  * Malloc'd. */
 char *netd_time_get_timezone(Netd *n);
 
-/* --- the clock floor (§2.6 step 6) --- */
+/* --- the clock floor --- */
 
 /*
  * The max(TIME_EPOCH, clock-file mtime) floor decision and step target,
  * without calling clock_settime() -- split out for the same reason as
- * netd_time_build_tz() above: clock_settime() needs CAP_SYS_TIME (denied in
- * the test container, verified directly) and mutates real wall-clock time a
- * test cannot safely apply. `clock_file_mtime_usec` is 0 when the clock file
- * does not exist yet (first boot: TIME_EPOCH is the only floor there is,
- * plan §2.6 prose). Pure function of its three arguments.
+ * netd_time_build_tz() above: clock_settime() needs CAP_SYS_TIME and mutates
+ * real wall-clock time. `clock_file_mtime_usec` is 0 when the clock file
+ * does not exist yet (first boot: TIME_EPOCH is the only floor). Pure
+ * function of its three arguments.
  *
  * Returns true (and fills *ret_target_usec, the floor plus one second,
  * matching upstream's "restore to n+1 so as not to report the same time
@@ -182,8 +169,8 @@ bool netd_time_clock_floor_decide(usec_t clock_file_mtime_usec, usec_t now_usec,
  * exists, so nothing has yet stamped a file or validated a certificate
  * against 1970.
  *
- * Harmless where the RTC is real (h2200 has one): the condition is simply
- * false. 0 when nothing was needed, 1 when the clock was moved, or -errno.
+ * Harmless where the RTC is real: the condition is simply false. 0 when nothing was needed, 1 when the clock
+ * was moved, or -errno.
  */
 int netd_time_clock_floor_apply(Netd *n);
 
@@ -191,9 +178,8 @@ int netd_time_clock_floor_apply(Netd *n);
  * Bump the mtime of the clock file to now, retrying at increasing offsets
  * (1us, 10us, ... up to 10s) when the filesystem's timestamp granularity is
  * too coarse to record a smaller bump -- ported from timesyncd.c's
- * advance_tstamp(), directly relevant on the JFFS2/UBIFS-class rootfs this
- * project's h2200 target would use. Called after each accepted sync. 0 or
- * -errno.
+ * advance_tstamp(), relevant on flash filesystems with coarse timestamps. Called after each accepted sync. 0
+ * or -errno.
  */
 int netd_time_clock_floor_touch(Netd *n);
 

@@ -2,11 +2,9 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * Straight FIPS 180-4 SHA-256: 64-byte blocks, big-endian words throughout
- * (message schedule, compression, and the final digest bytes), no
- * byte-swap-at-the-end trick. Verified against the FIPS 180-4 one-block and
- * two-block message test vectors in test-sd-id128.c (via hmac_sha256(),
- * this file's only real caller).
+ * SHA-256 per FIPS 180-4: 64-byte blocks, big-endian words throughout.
+ * Checked against the FIPS 180-4 one-block and two-block test vectors in
+ * test-sd-id128.c (via hmac_sha256(), its only caller).
  */
 
 #include "sha256.h"

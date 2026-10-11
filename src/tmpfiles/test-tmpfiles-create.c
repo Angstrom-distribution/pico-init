@@ -4,12 +4,11 @@
 /*
  * Real fixtures, real inodes: a tmpfiles.d tree under a --root, applied, and
  * every result read back with lstat()/readlink()/read(). The override case
- * is asserted on the filesystem too -- the /usr/lib line's directory must
- * not exist afterwards, which is what distinguishes an override from a
- * merge once and for all.
+ * is asserted on the filesystem too: the /usr/lib line's directory must not
+ * exist afterwards, which distinguishes an override from a merge.
  *
- * Ownership assertions need CAP_CHOWN; they run when the test is root (the
- * verification container) and are skipped, not faked, otherwise.
+ * Ownership assertions need CAP_CHOWN; they run when the test is root and
+ * are skipped otherwise.
  *
  * The last case runs the built pico-tmpfiles binary itself, found next to
  * this test via /proc/self/exe as test-picoctl.c does, so the command line

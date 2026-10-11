@@ -2,8 +2,8 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The uevent socket and its parser. devd-uevent.h has the three deltas from
- * netd's rtnetlink socket and why the sender check is not optional.
+ * The uevent socket and its parser. devd-uevent.h has the differences from
+ * netd's rtnetlink socket and why the sender check is required.
  */
 
 #include "devd-uevent.h"
@@ -18,10 +18,10 @@
 #include "../util.h"
 
 /*
- * Matching NETD_RTNL_RCVBUF's reasoning: uevents arrive in bursts (a disk and
- * every one of its partitions in one go) and the default socket buffer is
- * small enough that a slow reaction can lose the tail of a burst. Best-effort
- * -- a kernel that refuses the size still works, it just resyncs more often.
+ * Uevents arrive in bursts (a disk and every one of its partitions in one go)
+ * and the default socket buffer is small enough that a slow reaction can lose
+ * the tail of a burst. Best-effort: a kernel that refuses the size still works,
+ * it just resyncs more often.
  */
 #define DEVD_UEVENT_RCVBUF (1024 * 1024)
 
@@ -85,10 +85,8 @@ int devd_uevent_parse(const char *buf, size_t n, DevdUevent *ret) {
 
         /*
          * Every field below is read as a C string out of `buf`, so the buffer
-         * must end in a NUL for that to be safe at all. The kernel always
-         * sends one; a message that does not have one did not come from the
-         * kernel, and that is the whole check -- refusing it here means the
-         * strlen()/strcmp() calls that follow cannot run off the end.
+         * must end in a NUL. The kernel always sends one; refusing a message
+         * without it keeps the strlen()/strcmp() calls below in bounds.
          */
         if (buf[n - 1] != '\0')
                 return -EINVAL;
@@ -117,9 +115,8 @@ int devd_uevent_parse(const char *buf, size_t n, DevdUevent *ret) {
 
         /*
          * The properties. ACTION= and DEVPATH= are repeated here by the kernel
-         * and deliberately ignored: the header line already said both, and
-         * believing the second copy would mean a message could disagree with
-         * itself about which device it is.
+         * and ignored: the header line is authoritative, so a message cannot
+         * disagree with itself about which device it is.
          */
         for (off = first + 1; off < n; off += strlen(buf + off) + 1) {
                 const char *p = buf + off, *eq;
@@ -136,7 +133,7 @@ int devd_uevent_parse(const char *buf, size_t n, DevdUevent *ret) {
                  * Kept verbatim as well as decoded, for the rule engine. The
                  * bound is applied a whole pair at a time: half a KEY=VALUE is
                  * not a property, and a truncated MODALIAS that still matched a
-                 * glob would be worse than one that is simply not there.
+                 * glob would be worse than one that is not there.
                  */
                 if (u.props_len + len + 1 <= sizeof(u.props)) {
                         memcpy(u.props + u.props_len, p, len + 1);
@@ -177,10 +174,8 @@ int devd_uevent_open(void) {
         addr.nl_family = AF_NETLINK;
 
         /*
-         * nl_groups left at 0 and the membership added afterwards, netd's own
-         * shape. Subscribing through bind() would work too; doing it with
-         * NETLINK_ADD_MEMBERSHIP keeps the group a thing that can be dropped
-         * again, and keeps the two sockets in this project looking alike.
+         * nl_groups is left at 0 and the membership added afterwards, as netd
+         * does, so the group can be dropped again.
          */
         if (bind(fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
                 e = errno;
@@ -227,9 +222,7 @@ int devd_uevent_recv(int fd, DevdUevent *ret) {
         }
 
         if (!devd_uevent_sender_is_kernel(sa.nl_pid, sa.nl_groups)) {
-                /* The reason this check exists. Worth a line every time: an
-                 * unprivileged process aiming forged uevents at devd is not
-                 * something to notice only in aggregate. */
+                /* Forged uevents from an unprivileged process: log each one. */
                 pico_log(PICO_LOG_WARNING,
                          "devd: uevent from pid %u groups %u is not the kernel, dropped",
                          (unsigned) sa.nl_pid,

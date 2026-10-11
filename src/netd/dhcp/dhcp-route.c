@@ -3,14 +3,9 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 /*
- * Ported near-verbatim from src/libsystemd-network/dhcp-route.c (29 lines,
- * not the 153 this file's own placeholder guessed -- the RFC 3442 compact
- * encode/decode logic it described actually lives in dhcp-message.c, as it
- * does upstream; verified against the real v261.2 tree).
- *
- * Quarry point: systemd v261.2, commit 4925d9f07f. History review
- * (4925d9f07f..main, plan §2.2): no fix in the 26-commit lift-set window
- * touches this file.
+ * Ported near-verbatim from systemd v261.2
+ * src/libsystemd-network/dhcp-route.c. The RFC 3442 compact encode/decode
+ * logic lives in dhcp-message.c, as upstream.
  */
 
 #include "netd-compat.h"

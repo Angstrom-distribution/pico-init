@@ -2,30 +2,19 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The ring reader (plan §3.4, milestone J3). Shared by picolog and picoctl
- * -- picoctl's per-unit log tail (plan §1.7, C1) reuses exactly this reader
- * out of the shared static library, so it must not be locked inside a
- * CLI's translation unit. Nothing here formats output: that is picolog.c's
- * job (short format, blob-data/-a handling), and it stays that way so
- * picoctl can build its own display from the same parsed fields without
- * carrying picolog's journalctl-shaped text.
+ * The ring reader, shared by picolog and picoctl (per-unit log tail). It
+ * formats nothing: output is picolog.c's job.
  *
- * No file is lifted -- reference only, same as logd-write.h:
- *   - docs/JOURNAL_EXPORT_FORMATS.md / src/shared/journal-importer.c for the
- *     format this reads back: field lines, the binary-safe
- *     FIELD\n<8-byte-LE-len><data>\n encoding, the blank-line separator.
+ * Not lifted from systemd; the reference for the format this reads back is
+ * docs/JOURNAL_EXPORT_FORMATS.md and src/shared/journal-importer.c.
  *
- * Named LogdReadField, not LogdField, deliberately: logd-write.h already
- * owns that name for the (different, input-shaped) struct a caller builds
- * an entry to append from, and giving the two distinct types the same tag
- * is exactly the kind of silent redefinition C is happy to let two
- * translation units disagree about.
+ * LogdReadField is distinct from LogdField (logd-write.h), which is the
+ * input-shaped struct for appending an entry.
  *
- * Every LogdReadField/LogdEntry below is a *view* into a buffer some owning
- * object (LogdRing, or one follow batch) holds -- never a copy, never
- * NUL-terminated (a value may legitimately contain an embedded NUL, same
- * reasoning as LogdField in logd-write.h). Comparisons use the explicit
- * length, never strcmp/strlen on `value`.
+ * Every LogdReadField/LogdEntry below is a view into a buffer held by the
+ * owning object (LogdRing, or one follow batch), and is not NUL-terminated
+ * (a value may contain an embedded NUL). Compare with the explicit length,
+ * never strcmp/strlen on `value`.
  */
 
 #pragma once
@@ -79,9 +68,8 @@ typedef struct LogdRing LogdRing;
  * Read every complete entry currently in rotated-then-active ring files
  * under `runtime_dir`, oldest first (rotated file's content, then the
  * active file's). A missing ring -- nothing written yet -- is not an
- * error and yields zero entries. A trailing incomplete entry (a crash mid-
- * append, per logd-write.c's own crash-safety reasoning) is silently
- * dropped rather than surfaced as a partial/garbled record. 0 or -errno.
+ * error and yields zero entries. A trailing incomplete entry (a crash mid-append) is
+ * dropped. 0 or -errno.
  */
 int logd_ring_read(const char *runtime_dir, LogdRing **ret);
 LogdRing *logd_ring_free(LogdRing *r);
@@ -90,12 +78,9 @@ size_t logd_ring_n_entries(const LogdRing *r);
 const LogdEntry *logd_ring_entry(const LogdRing *r, size_t index); /* index must be < logd_ring_n_entries() */
 
 /*
- * The plain function call picoctl's status verb needs (plan §1.7's C1): a
- * full ring read, filtered to _SYSTEMD_UNIT == `unit` (NULL for no unit
- * filter), keeping at most the last `max_entries` of those (0 for
- * unlimited). One call, no separate object model for the caller to learn
- * beyond LogdRing's own three accessors above -- picoctl indexes
- * logd_ring_entry(0..n) exactly as picolog does. 0 or -errno.
+ * A full ring read for picoctl's status verb, filtered to
+ * _SYSTEMD_UNIT == `unit` (NULL for no unit filter), keeping at most the
+ * last `max_entries` of those (0 for unlimited). 0 or -errno.
  */
 int logd_ring_read_filtered(const char *runtime_dir, const char *unit, size_t max_entries, LogdRing **ret);
 
@@ -113,9 +98,7 @@ LogdFollow *logd_follow_free(LogdFollow *f);
  * One non-blocking poll: read whatever complete new entries have appeared
  * since the last call (or since logd_follow_new(), on the first one), and
  * transparently reopen the active file if rotation replaced it underneath
- * -- detected by (st_dev, st_ino) changing at the same path, never by
- * trusting the path alone to still name the same file, which is exactly
- * the hazard rotation exists to be honest about (logd-write.c). A still-
+ * (detected by (st_dev, st_ino) changing at the same path). A still-
  * incomplete trailing record is left unread and is picked up whole on a
  * later call once it completes -- it is never delivered partial.
  *

@@ -2,20 +2,16 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * picolog -- the on-device log reader (plan §3.4), the journalctl half of the
- * owner's on-device-tooling requirement. Named to avoid colliding with
- * BusyBox `logread`. It needs nothing from the daemon -- it reads the files
- * -- and the reading itself lives in logd-read.c so picoctl (plan §1.7, C1)
+ * picolog -- the on-device log reader, the journalctl equivalent. Named to
+ * avoid colliding with BusyBox `logread`. It reads the ring files directly
+ * and needs nothing from the daemon. Reading lives in logd-read.c so picoctl
  * can reuse it; this file is CLI parsing and display only.
  *
- * -b needs no flag: a /run ring only ever holds the current boot.
+ * There is no -b: a /run ring only ever holds the current boot.
  *
- * LOGD_RUNTIME_DIR (the env var, not the logd.h macro of the same name)
- * overrides the compiled-in ring location -- test-picolog.c points this at
- * a fixture tree so tests need neither root nor a real /run, the same
- * manager-owned-path idea the rest of this project's tests use, here as an
- * env var rather than a setter because there is no daemon object for a
- * one-shot CLI to hang one off of. Production never sets it.
+ * The LOGD_RUNTIME_DIR environment variable (not the logd.h macro of the
+ * same name) overrides the compiled-in ring location, so test-picolog.c can
+ * point it at a fixture tree. Production never sets it.
  */
 
 #include "logd-read.h"
@@ -68,20 +64,12 @@ static int parse_priority(const char *s) {
 }
 
 /*
- * --- colour: mirrors real journalctl's own rules exactly ------------------
- *
- * get_log_colors() (src/basic/terminal-util.c, systemd main as of commit
- * 4c63532c28094aeba6dccc5afb9690e02fd98d66, 2026-10-04), the priority-based
- * on/off wrap logs-show.c's output_short()/print_multiline() apply to the
- * message text. Upstream also returns a third "highlight" colour for
- * --grep's matched substring; picolog has no --grep, so only on/off exist
- * here. Upstream's LOG_INFO case falls through with on/off left at the
- * caller's "" pre-init -- i.e. no colour -- reproduced the same way below.
- *
- * Only the message text is wrapped: real output_short() never colours the
- * timestamp/hostname/identifier/pid columns either (those are plain in
- * every "-o short*" mode; only "-o verbose" underlines the timestamp and
- * greys the cursor, a mode picolog doesn't implement).
+ * Colour follows journalctl: get_log_colors() (src/basic/terminal-util.c,
+ * systemd commit 4c63532c28094aeba6dccc5afb9690e02fd98d66), the
+ * priority-based on/off wrap that logs-show.c's output_short() applies to the
+ * message text. There is no --grep highlight colour here. LOG_INFO gets no
+ * colour. Only the message text is wrapped; the timestamp, hostname,
+ * identifier and pid columns are plain, as in upstream's "-o short".
  */
 static void log_colors_for(int priority, const char **on, const char **off) {
         if (priority <= 3) { /* LOG_EMERG..LOG_ERR */
@@ -102,10 +90,9 @@ static void log_colors_for(int priority, const char **on, const char **off) {
         }
 }
 
-/* Same default (LOG_INFO) and same single-digit-only parse real
- * output_short() uses for its own PRIORITY= field (logs-show.c:
- * "priority_len == 1 && *priority >= '0' && *priority <= '7'") -- a
- * missing or malformed field never colours a line red/grey by accident. */
+/* Defaults to LOG_INFO and accepts a single digit only, like
+ * output_short()'s PRIORITY= parse (logs-show.c), so a missing or malformed
+ * field never colours a line. */
 static int entry_priority(const LogdEntry *e) {
         const LogdReadField *f = logd_entry_field(e, "PRIORITY");
         const unsigned char *v = f ? f->value : NULL;
@@ -118,14 +105,13 @@ static int entry_priority(const LogdEntry *e) {
 
 static void hostname_buf(char *buf, size_t len) {
         if (gethostname(buf, len) < 0 || buf[0] == '\0')
-                snprintf(buf, len, "(none)"); /* this board's own observed hostname when unset, plan Status */
+                snprintf(buf, len, "(none)"); /* the kernel's name for an unset hostname */
 
         buf[len - 1] = '\0';
 }
 
-/* -a's non-printable escaping: \xNN for anything outside printable ASCII,
- * never a raw byte reaching the terminal (logd-write.h's same UTF-8/control
- * concern, applied on the way back out). */
+/* -a's escaping: \xNN for anything outside printable ASCII, so no raw byte
+ * reaches the terminal. */
 static void print_escaped(const void *value, size_t len) {
         const unsigned char *p = value;
 
@@ -139,11 +125,9 @@ static void print_escaped(const void *value, size_t len) {
         }
 }
 
-/* journalctl's short format: "MMM dd HH:MM:SS host identifier[pid]: message"
- * (plan §3.4). A binary-safe MESSAGE prints as the fixed "blob data"
- * placeholder unless -a was given (plan's 2026-08-24 addition), matching
- * real journalctl's own default rather than ever writing raw bytes to a
- * TTY. */
+/* journalctl's short format: "MMM dd HH:MM:SS host identifier[pid]: message".
+ * A binary-safe MESSAGE prints as a "blob data" placeholder unless -a was
+ * given, as journalctl does. */
 static void print_short(const LogdEntry *e, bool show_all) {
         const LogdReadField *rt = logd_entry_field(e, "__REALTIME_TIMESTAMP");
         const LogdReadField *msg = logd_entry_field(e, "MESSAGE");
@@ -169,9 +153,8 @@ static void print_short(const LogdEntry *e, bool show_all) {
                 sec = (time_t) (usec / 1000000ULL);
         }
 
-        /* real output_timestamp_realtime() skips the entry entirely when no
-         * valid realtime timestamp exists (logs-show.c), never prints a
-         * placeholder in its place. */
+        /* Like output_timestamp_realtime() (logs-show.c), skip the entry when
+         * there is no valid realtime timestamp. */
         if (sec <= 0 || !localtime_r(&sec, &tmv))
                 return;
         strftime(timebuf, sizeof(timebuf), "%b %d %H:%M:%S", &tmv);
@@ -183,7 +166,7 @@ static void print_short(const LogdEntry *e, bool show_all) {
         else if (comm)
                 fwrite(comm->value, 1, comm->value_len, stdout);
         else
-                fputs("unknown", stdout); /* real's fallback text (logs-show.c), not "-" */
+                fputs("unknown", stdout); /* journalctl's fallback text (logs-show.c) */
 
         if (pid && !pid->binary) {
                 putchar('[');
@@ -193,12 +176,9 @@ static void print_short(const LogdEntry *e, bool show_all) {
 
         fputs(": ", stdout);
 
-        /* Coloured like real print_multiline(): wrapped on/off around the
-         * message text, for both the plain-printable case and -a's raw-byte
-         * case (upstream's OUTPUT_SHOW_ALL still runs print_multiline, so
-         * still colours). The blob-data placeholder is upstream's own
-         * unconditional plain fprintf() outside that wrap -- never coloured,
-         * with or without -a. */
+        /* Coloured like print_multiline(): wrapped around the message
+         * text in both the plain and the -a case. The blob-data placeholder
+         * is never coloured. */
         if (msg && !msg->binary) {
                 fputs(color_on, stdout);
                 fwrite(msg->value, 1, msg->value_len, stdout);
@@ -208,15 +188,13 @@ static void print_short(const LogdEntry *e, bool show_all) {
                 print_escaped(msg->value, msg->value_len);
                 fputs(color_off, stdout);
         } else if (msg)
-                printf("[%zu bytes blob data]",
-                       msg->value_len); /* real's FORMAT_BYTES() wording (logs-show.c) */
+                printf("[%zu bytes blob data]", msg->value_len); /* journalctl's wording (logs-show.c) */
 
         putchar('\n');
 }
 
-/* -o export's byte-for-byte passthrough: the entry's exact on-disk bytes,
- * never re-serialized from parsed fields, so a filtered subset still feeds
- * systemd-journal-remote unmodified (plan §3.4). */
+/* -o export passes the entry's on-disk bytes through unchanged, so a
+ * filtered subset still feeds systemd-journal-remote. */
 static void print_export(const LogdEntry *e) {
         fwrite(e->raw, 1, e->raw_len, stdout);
 }

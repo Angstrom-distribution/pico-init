@@ -2,13 +2,9 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * A small, self-contained SHA-256 (FIPS 180-4), written directly from the
- * public standard rather than vendored from any existing source file.
- *
- * hmac-sha256.c is the only planned caller (sd_id128_get_app_specific()
- * needs HMAC-SHA256), so this stays minimal on purpose: no streaming
- * convenience wrappers, no HMAC of its own -- that is hmac-sha256.c's job,
- * kept separate so this file stays a plain, auditable hash primitive.
+ * A small, self-contained SHA-256 (FIPS 180-4). hmac-sha256.c is its only
+ * caller (for sd_id128_get_app_specific()), so it has no streaming wrappers
+ * and no HMAC of its own.
  */
 
 #pragma once

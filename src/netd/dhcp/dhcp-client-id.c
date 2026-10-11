@@ -3,27 +3,20 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 /*
- * Ported from src/libsystemd-network/sd-dhcp-client-id.c (199 lines) and
- * sd-dhcp-duid.c (290 lines). See dhcp-client-id-internal.h's header for
- * the quarry point, history-review result and full cut list (DUID-UUID,
- * the hashmap key-ops pair, sd_device support in dhcp_identifier_set_iaid()).
+ * Ported from systemd v261.2 src/libsystemd-network/sd-dhcp-client-id.c and
+ * sd-dhcp-duid.c. See dhcp-client-id-internal.h for the cut list.
  *
- * The one real adaptation beyond the cuts: sd_id128_get_machine() becomes
- * netd_machine_id() (netd-compat.h), a small /etc/machine-id reader -- all
- * upstream's version is, underneath caching machinery netd does not need.
- * Test-mode machine ID substitution (dhcp_duid_set_en() below) uses
- * NETD_TEST_MODE=1 in the environment as netd's equivalent of upstream's
- * network_test_mode_enabled(), which this lift does not otherwise carry.
+ * sd_id128_get_machine() becomes netd_machine_id() (netd-compat.h), a small
+ * /etc/machine-id reader. NETD_TEST_MODE=1 in the environment substitutes a
+ * fixed machine ID in dhcp_duid_set_en(), standing in for upstream's
+ * network_test_mode_enabled().
  *
- * The offsetof() calls below say __typeof__ where upstream says typeof.
- * Same operator, reserved spelling -- clang counts the bare one as a
- * -Wlanguage-extension-token, which this project builds with -Werror.
+ * The offsetof() calls say __typeof__ where upstream says typeof: clang
+ * treats the bare spelling as -Wlanguage-extension-token, and the build uses
+ * -Werror.
  *
- * sd_dhcp_duid_set_llt()'s time_from_2000y is a uint16_t despite writing
- * into a 32-bit wire field -- verified against the real v261.2 source
- * (sd-dhcp-duid.c:113-124): this is upstream's own code, not a lift
- * artifact, and the reviewed history window carries no fix for it, so it
- * is carried exactly as upstream has it rather than "corrected" here.
+ * sd_dhcp_duid_set_llt()'s time_from_2000y is a uint16_t despite writing into
+ * a 32-bit wire field. That is upstream's own code and is kept as is.
  */
 
 #include <byteswap.h>
@@ -247,7 +240,7 @@ int dhcp_duid_set_en(DhcpDuid *duid) {
                 if (r < 0)
                         return r;
         } else
-                /* Reproducibility for tests/fuzzers (plan §2.8's golden vector):
+                /* Reproducibility for tests/fuzzers:
                  * 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10. */
                 machine_id = (NetdId128){
                         .bytes = { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10 }
@@ -264,10 +257,8 @@ int dhcp_duid_set_en(DhcpDuid *duid) {
         duid->size = offsetof(Duid, en.id) + sizeof(hash);
 
         if (test_mode)
-                /* Internal invariant, not packet input: this is netd's own
-                 * fixed test machine ID, and the point of the assert is to
-                 * catch a regression in SipHash/HASH_KEY/byte order/DUID-EN
-                 * layout at test time -- plan §2.8's golden vector. */
+                /* Golden vector: catches a regression in SipHash, HASH_KEY, byte
+                 * order or the DUID-EN layout. */
                 assert(memcmp(&duid->duid,
                               (const uint8_t[]){ 0x00,
                                                  0x02,
@@ -321,9 +312,7 @@ int dhcp_identifier_set_iaid(const struct hw_addr_data *hw_addr, bool legacy_uns
         assert(hw_addr);
         assert(ret);
 
-        /* No sd_device/persistent-name source (this file's header); always
-         * derive from the MAC, which is what the plan's own test vector
-         * (dhcp_identifier_set_iaid() over MAC "ABC123") exercises. */
+        /* No sd_device/persistent-name source; always derive from the MAC. */
         id = siphash24(hw_addr->bytes, hw_addr->length, HASH_KEY.bytes);
 
         id32 = (uint32_t) ((id & 0xffffffff) ^ (id >> 32));

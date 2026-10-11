@@ -11,8 +11,7 @@
  * This is a documented partial: a SYMLINK+= rule link devd created
  * somewhere else entirely (devd-rules.h) is invisible here, because devd
  * tracks those only in its own memory (devd.h's DevdRuleLink), not
- * anywhere on disk this scan can read. Full coverage needs devd to persist
- * that list somewhere -- not scoped here.
+ * anywhere on disk this scan can read.
  */
 
 #include "sd-device.h"
@@ -42,8 +41,7 @@ void device_set_dev_root_for_tests(const char *root) {
         (void) snprintf(dev_root_buf, sizeof(dev_root_buf), "%s", root);
 }
 
-/* The five by-* families plus their rule-link home, in the order devd-
- * symlink.h documents them. */
+/* The by-* directories, in the order devd-symlink.h documents them. */
 static const char * const devlink_families[] = {
         "disk/by-partuuid", "disk/by-partlabel", "disk/by-uuid",
         "disk/by-label",    "disk/by-id",        "serial/by-id",

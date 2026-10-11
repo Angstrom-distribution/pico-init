@@ -2,7 +2,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * Evaluating a parsed ruleset against one device (plans/31, Part 2, H2).
+ * Evaluating a parsed ruleset against one device.
  *
  * devd-rules.c turns text into rules; this file is what a rule means. Three
  * pieces, in the order an event goes through them:
@@ -18,8 +18,7 @@
  *     RUN+= -- collected rather than performed, so a test can assert what a rule
  *     decided without the test host growing device nodes.
  *
- * Two details of the matching are easy to get subtly wrong and are worth
- * stating, because getting either wrong changes which devices a rule fires on:
+ * Two details of the matching change which devices a rule fires on:
  *
  *  - ALL the ATTRS{} clauses of one rule must be satisfied by the SAME ancestor,
  *    not by any ancestor each. usb-modeswitch's Huawei catch-all is exactly this
@@ -32,10 +31,8 @@
  *    rule and not a convenient default: a device that does not have the
  *    attribute at all is not the device the rule was written to exclude.
  *
- * `sys_root` and `dev_root` are parameters for the same reason they are in
- * devd-probe.h and devd-symlink.h: the tests build a USB card reader and a
- * serial adapter out of directories, and neither is plugged into the machine
- * running them.
+ * `sys_root` and `dev_root` are parameters so tests can build a device out of
+ * directories (as in devd-probe.h and devd-symlink.h).
  */
 
 #pragma once
@@ -50,7 +47,7 @@
  * The device property table. A kernel uevent carries about a dozen properties;
  * 32 leaves room for the ENV{} assignments rules add on top, including the
  * dot-prefixed private ones (upstream's `.PART_SUFFIX` idiom) that exist only
- * for a later $env{} to read back and are deliberately never exported to a
+ * for a later $env{} to read back and are never exported to a
  * RUN+= child.
  */
 #define DEVD_PROP_MAX 32
@@ -151,12 +148,10 @@ int devd_rule_device_set_property(DevdRuleDevice *d, const char *key, const char
  *
  * $attr{} looks at the ATTRS-matched ancestor first when there is one, then
  * walks the chain from the device upwards, and sanitises what it finds with
- * devd_sanitize(). That sanitiser is a deliberate, stated divergence from
- * upstream's own $attr{} handling, which only strips trailing whitespace: the
- * consumer here is a /dev/serial/by-id/ name, and upstream reaches that name
- * through the usb_id builtin, which applies exactly this sanitiser. Reproducing
- * upstream's link names is the point; reproducing its raw substitution
- * semantics would not produce them.
+ * devd_sanitize(). This differs from upstream's $attr{} handling, which only
+ * strips trailing whitespace: upstream builds /dev/serial/by-id/ names through
+ * the usb_id builtin, which applies this sanitiser, so it is needed to
+ * reproduce those link names.
  */
 size_t devd_rules_substitute(const DevdRuleDevice *d, const char *in, char *out, size_t size);
 

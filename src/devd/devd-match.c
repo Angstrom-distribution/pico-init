@@ -28,10 +28,9 @@
  * the widest real ones and they are far shorter. */
 #define DEVD_MATCH_ATTR_VALUE_MAX 256
 
-/* One line of a sysfs `uevent` file. Wider than a property table entry on
- * purpose: an input device's MODALIAS runs to several hundred bytes, and a
- * short buffer would not truncate it so much as split it into a second,
- * nonsense line. */
+/* One line of a sysfs `uevent` file. Wider than a property table entry: an
+ * input device's MODALIAS runs to several hundred bytes, and a short buffer
+ * would split it into a second, nonsense line. */
 #define DEVD_UEVENT_LINE_MAX 1024
 
 /* --- the property table --- */

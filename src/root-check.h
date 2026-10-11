@@ -14,8 +14,7 @@
  * different read-only detection) is machinery this project does not have and
  * does not want.
  *
- * Three deliberate divergences from upstream, each one a decision rather than a
- * simplification:
+ * Three divergences from upstream:
  *
  *  - **Read-only is read, not probed.** Upstream decides whether root is
  *    read-only by trying to write to it (a utimensat() on "/"). This asks the
@@ -33,7 +32,7 @@
  *    read-only boot that reaches a getty is strictly more useful than an
  *    emergency shell nobody is sitting in front of.
  *
- * Everything here is best-effort in mount-setup.c's sense, with exactly one
+ * Everything here is best-effort (see mount-setup.c), with exactly one
  * exception: a filesystem the checker says it could not repair does NOT get
  * remounted read-write. Every other failure -- an unidentifiable device, an
  * unreadable superblock, a checker that is not installed, a checker that itself
@@ -59,13 +58,12 @@
 #include "fstab.h"
 
 /*
- * What pico_root_check() concluded. Deliberately a return value and not an
- * action: the reboot belongs to main(), which already owns the one
- * sync()/reboot() path this init has, and PID 1's "must never return" rule is
- * that file's to enforce rather than this one's to duplicate.
+ * What pico_root_check() concluded. A return value and not an action: the reboot belongs to main(), which
+ * already owns the one sync()/reboot() path this init has, and PID 1's "must never return" rule is that
+ * file's to enforce rather than this one's to duplicate.
  */
 typedef enum PicoRootResult {
-        /* Boot on. Root is read-write, or is deliberately staying read-only. */
+        /* Boot on. Root is read-write, or is staying read-only. */
         PICO_ROOT_CONTINUE = 0,
 
         /* The checker repaired a filesystem the running kernel has cached

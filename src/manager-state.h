@@ -2,7 +2,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The state publisher (plan §1.7, milestone C0): PID 1 writes one
+ * The state publisher: PID 1 writes one
  * `Property=value` text file per unit under <runtime_dir>/units/<id>, plus one
  * <runtime_dir>/manager file, so picoctl's read verbs need no IPC at all.
  *

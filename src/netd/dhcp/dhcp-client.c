@@ -4,30 +4,15 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 /*
- * Ported from src/libsystemd-network/sd-dhcp-client.c (1,445 lines), whose
- * real `Copyright © 2013 Intel Corporation. All rights reserved.` line is
- * carried above -- verified against the v261.2 file rather than taken on
- * trust (plan §2.11 names six such files; this is one of them).
+ * Ported from systemd v261.2 src/libsystemd-network/sd-dhcp-client.c, whose
+ * Intel copyright line is carried above.
  *
  * The DHCPv4 client state machine: INIT -> SELECTING -> REQUESTING -> BOUND,
  * with RENEWING/REBINDING off T1/T2, expiry, INIT-REBOOT, DECLINE and NAK.
  *
- * Quarry point: systemd v261.2, commit 4925d9f07f. History review
- * (4925d9f07f..main, plan §2.2): two commits in the window touch this file's
- * upstream original, and both are recorded with their keep-or-backport call
- * in dhcp-client-internal.h's header -- 05f790da8f (drops a `!!` on a field
- * netd does not carry) and 01e1303f9c (a 674-file forward-header rename netd
- * has no equivalent of). Neither is carried. The window's one
- * backport-worthy commit, 7bd9f0f805, is server-side.
- *
- * THE REWRITE, FUNCTION BY FUNCTION
- *
- * Upstream reaches 18 distinct sd_event entry points through five event
- * sources per client, and 28.3% of its function-body lines are that plumbing
- * (plan §2.1). Every one of those functions is re-derived here against
- * src/timer.c's shared deadline queue, and each keeps a comment naming the
- * RFC 2131 requirement the original encoded, because that is the part a
- * reader cannot recover from the code alone:
+ * Upstream's sd_event plumbing is re-derived against src/timer.c's shared
+ * deadline queue. Each rewritten function keeps a comment naming the RFC
+ * 2131 requirement the original encoded:
  *
  *   client_timeout_resend()      §4.1 backoff, §3.1.5 restart, §4.4.5 halving
  *   client_timeout_t1()          §4.4.5 BOUND -> RENEWING, unicast
@@ -39,38 +24,30 @@
  *   client_start_delayed()       §4.1 new xid + 'secs' base per cycle
  *   client_restart()             §3.1.5 revert to INIT after NAK/no reply
  *
- * TIMER-HANDLE DISCIPLINE. src/timer.h stores the *address* of the handle
- * slot and NULLs it when the event fires or is cancelled, so a non-NULL
- * handle means a live event and nothing else. Every arm below passes
- * &client->timeout_*; nothing passes a local. client_disable_timers() is
- * therefore the whole of "cancel what may be armed", and dhcp_client_free()
- * calls it before releasing the client, because the queue would otherwise
- * write a NULL into freed memory when a still-queued event fired.
+ * Timer handles: src/timer.h stores the address of the handle slot and NULLs
+ * it when the event fires or is cancelled, so a non-NULL handle means a live
+ * event. Every arm passes &client->timeout_*, never a local.
+ * client_disable_timers() cancels whatever may be armed, and
+ * dhcp_client_free() calls it first, because the queue would otherwise write
+ * a NULL into freed memory when a still-queued event fired.
  *
- * DONT_DESTROY AND THE POST-CALLBACK STATE RE-CHECK. Nine upstream functions
- * take DHCP_CLIENT_DONT_DESTROY(client); so do their counterparts here, and
- * every client_notify() that is not the last statement of its function is
- * followed by `if (client->state == DHCP_STATE_STOPPED) return ...`. Both
- * mechanisms survive the transplant unchanged, and netd needs them more than
- * upstream does: lease application is a direct call into netd-link.c, and
- * SIGHUP reconfigures every interface, so a reconfigure reached from inside
- * a lease callback would free this object while the frame that raised the
- * callback is still running. The one place the transplant changed the shape
- * is client_timeout_*(): a timer callback returns void here, so where
- * upstream propagated an error into the event loop, these stop the client
- * and return.
+ * DHCP_CLIENT_DONT_DESTROY is taken where upstream takes it, and every
+ * client_notify() that is not the last statement of its function is followed
+ * by `if (client->state == DHCP_STATE_STOPPED) return ...`. Lease
+ * application is a direct call into netd-link.c and SIGHUP reconfigures
+ * every interface, so a reconfigure reached from inside a lease callback
+ * would free this object while the callback's frame is still running.
+ * Timer callbacks return void here, so where upstream propagated an error
+ * into the event loop, these stop the client and return.
  *
- * DELIBERATE DIVERGENCES FROM UPSTREAM (each argued at its call site):
+ * Divergences from upstream (each argued at its call site):
  *  - The 'secs' field is re-based when a renewal begins, not only when an
  *    acquisition does. See client_timeout_t1().
  *  - DHCPDECLINE restarts after RFC 2131 §3.1.5's ten-second minimum rather
  *    than upstream's one second. See dhcp_client_send_decline().
  *  - A missing or unreadable /etc/machine-id falls back to DUID-LL instead
  *    of failing the start. See client_ensure_client_id().
- * Divergences forced by decisions taken before this milestone (the
- * monotonic-vs-boottime clock, the MAC-only IAID, the dropped features) are
- * recorded in dhcp-client-internal.h's header instead, so they are stated
- * once.
+ * The clock, IAID and cut-feature divergences are in dhcp-client-internal.h.
  */
 
 #include "dhcp-client-internal.h"
@@ -82,18 +59,11 @@
 
 #include "dns-name.h"
 
-/* RFC 791: the smallest MTU every IPv4 host must handle. Upstream keeps this
- * in src/basic/missing-network.h, which is not in the lift set. */
+/* RFC 791: the smallest MTU every IPv4 host must handle. */
 #define IPV4_MIN_MTU 68
 
-/*
- * Linux TC_PRIO_CONTROL, from <linux/pkt_sched.h>. Upstream reaches it
- * through tos_to_priority(), which mirrors the kernel's own
- * rt_tos2priority() mapping of IP precedence to socket priority; for
- * IPTOS_CLASS_CS6 -- the class DHCP uses -- that mapping yields
- * TC_PRIO_CONTROL and nothing else, so netd states the answer rather than
- * carrying the whole table for one input.
- */
+/* Linux TC_PRIO_CONTROL (<linux/pkt_sched.h>): what upstream's
+ * tos_to_priority() yields for IPTOS_CLASS_CS6, the class DHCP uses. */
 #define NETD_TC_PRIO_CONTROL 7
 
 /*
@@ -125,17 +95,14 @@
 #define TRANSIENT_FAILURE_ATTEMPTS 3
 
 /*
- * The parameter request list netd asks for by default. Upstream's five
- * (1, 3, 6, 12, 15) plus the two that are netd's entire reason for existing
- * (plan §2.6): 42, NTP servers, and 101, the TZDB timezone name.
+ * Default parameter request list: upstream's five (1, 3, 6, 12, 15) plus 42
+ * (NTP servers) and 101 (TZDB timezone name).
  *
- * Not option 100 (POSIX timezone string): upstream defines the constant and
- * has never parsed it anywhere -- only 101 is implemented, in the lease
- * object -- so requesting it would produce bytes nothing can consume.
+ * Not option 100 (POSIX timezone string): upstream never parses it, only 101
+ * is implemented in the lease object.
  *
- * The NetdU8Set bitmap emits these in ascending numeric order regardless of
- * insertion order, which is what makes the golden-byte tests of plan §2.8
- * possible at all; upstream's Set* emitted them in hash order.
+ * The NetdU8Set bitmap emits options in ascending numeric order regardless
+ * of insertion order, which makes the wire bytes reproducible.
  */
 static const uint8_t default_req_opts[] = {
         SD_DHCP_OPTION_SUBNET_MASK,        /* 1 */
@@ -167,14 +134,9 @@ void dhcp_client_log(DhcpClient *client, PicoLogLevel level, const char *fmt, ..
 
 /* --- randomness --- */
 
-/*
- * getrandom() is the only entropy source netd uses (netd-sntp.c already
- * does). The fallback matters more than it looks: it is reached only when
- * the kernel has no getrandom() at all, and an xid that is predictable --
- * or worse, identical on every interface -- lets an off-path attacker forge
- * replies. Mixing the monotonic clock with the address of a stack object and
- * the pid is weak, but it is not constant and it is not zero.
- */
+/* The fallback is reached only when getrandom() fails. A predictable or
+ * per-interface-identical xid lets an off-path attacker forge replies; the
+ * clock/stack-address/pid mix is weak but neither constant nor zero. */
 static uint64_t client_random_u64(void) {
         uint64_t v = 0;
 
@@ -191,18 +153,13 @@ static uint32_t client_random_u32(void) {
         return (uint32_t) (client_random_u64() & UINT32_MAX);
 }
 
-/*
- * RFC 2131 4.1: "retransmission delays should include -1 to +1 sec of random
- * 'fuzz'". The value is subtracted from the computed timeout, so a positive
- * fuzz shortens and a negative one lengthens -- upstream's sign convention,
- * kept because the distribution is symmetric and changing it would only make
- * a diff against the original harder to read.
- */
+/* RFC 2131 4.1: "retransmission delays should include -1 to +1 sec of random
+ * 'fuzz'". Subtracted from the computed timeout (upstream's sign convention). */
 static int64_t client_random_fuzz(void) {
         return (int64_t) (client_random_u64() % (2 * USEC_PER_SEC)) - (int64_t) USEC_PER_SEC;
 }
 
-/* --- timer-queue plumbing (this is the whole of what sd-event used to do) --- */
+/* --- timer-queue plumbing --- */
 
 static void client_timer_disarm(DhcpClient *client, PicoTimerEvent **slot) {
         assert(client);
@@ -221,10 +178,8 @@ static int client_timer_arm(DhcpClient *client, PicoTimerEvent **slot, usec_t de
 
         client_timer_disarm(client, slot);
 
-        /* pico_timer_add() refuses USEC_INFINITY outright ("never" is not a
-         * deadline). Every caller here has already handled the infinite-lease
-         * case, so reaching this with USEC_INFINITY would be a netd bug, not
-         * something a server can provoke. */
+        /* pico_timer_add() refuses USEC_INFINITY; callers have already
+         * handled the infinite-lease case. */
         return pico_timer_add(client->netd->timer, deadline, cb, client, slot);
 }
 
@@ -281,17 +236,15 @@ static void client_set_state(DhcpClient *client, DHCPState state) {
                 break;
 
         default:
-                /* INIT/SELECTING/INIT_REBOOT deliberately keep the counters:
-                 * INIT -> SELECTING and INIT_REBOOT -> REBOOTING are
-                 * fallthroughs inside one retransmission sequence. */
+                /* INIT/SELECTING/INIT_REBOOT keep the counters: INIT -> SELECTING
+                 * and INIT_REBOOT -> REBOOTING continue one retransmission
+                 * sequence. */
                 break;
         }
 
-        /* Upstream additionally invokes a separate state_callback here, used
-         * by networkd to coordinate the DHCPv4 and DHCPv6 clients. netd has
-         * no DHCPv6 client (plan §2.9), and upstream's own FIXME at that call
-         * site warns the hook can re-enter the state machine, so it is not
-         * carried. */
+        /* Upstream also invokes a state_callback here, which networkd uses to
+         * coordinate its DHCPv4 and DHCPv6 clients. netd has no DHCPv6 client
+         * and the hook can re-enter the state machine, so it is not carried. */
 }
 
 static int client_notify(DhcpClient *client, int event) {
@@ -343,10 +296,9 @@ static void client_stop(DhcpClient *client, int error) {
                 (void) client_notify(client, error);
         }
 
-        /* No state re-check is needed after these notifies: client_initialize()
-         * below drives the client to STOPPED unconditionally, which is where a
-         * callback that stopped us would have put it anyway. The DONT_DESTROY
-         * ref is what makes the line safe if the callback unreffed us. */
+        /* No state re-check after these notifies: client_initialize() drives
+         * the client to STOPPED unconditionally. DONT_DESTROY keeps it valid
+         * if the callback unreffed us. */
         client_initialize(client);
 }
 
@@ -381,9 +333,8 @@ static usec_t client_compute_request_timeout(uint64_t attempt) {
  * retransmitting; in REBINDING, one-half of the remaining lease time on the
  * same floor.
  *
- * No fuzz here, and that is deliberate rather than an oversight: §4.4.5 asks
- * for fuzz on the initial T1/T2 values (client_set_lease_timeouts() adds it)
- * and says nothing about the retries.
+ * No fuzz: §4.4.5 asks for it on the initial T1/T2 values
+ * (client_set_lease_timeouts() adds it), not on the retries.
  */
 static usec_t client_compute_reacquisition_timeout(usec_t now_usec, usec_t expire) {
         return usec_max(usec_sub_unsigned(expire, now_usec) / 2, 60 * USEC_PER_SEC);
@@ -392,19 +343,13 @@ static usec_t client_compute_reacquisition_timeout(usec_t now_usec, usec_t expir
 /* --- the resend timer: RFC 2131 4.1 backoff, 3.1.5 restart, 4.4.5 halving --- */
 
 /*
- * Upstream's client_timeout_resend() is the biggest function in the file
- * (122 lines) and interleaves three things: deciding the next interval,
- * rescheduling itself, and transmitting. The interleaving is not incidental
- * and is kept: the timer is re-armed *before* the message is sent, so a send
- * that fails still leaves a retransmission scheduled. Inverting the two --
- * the obvious "send, then schedule" shape -- would let one transient
- * ENETDOWN end the retransmission sequence entirely, which RFC 2131 4.1's
- * "the client retransmits" plainly does not allow.
+ * Decides the next interval, reschedules itself, then transmits. The timer
+ * is re-armed *before* the send, so a failed send (e.g. a transient
+ * ENETDOWN) still leaves a retransmission scheduled.
  *
- * The transplant: upstream returns an error into sd_event, which stops the
- * event loop's dispatch of this source. A pico_timer callback returns void,
- * so the error paths call client_stop()/client_restart() directly and fall
- * out. The DONT_DESTROY ref covers both, since client_stop() notifies.
+ * A pico_timer callback returns void, so the error paths call
+ * client_stop()/client_restart() directly. DONT_DESTROY covers both, since
+ * client_stop() notifies.
  */
 static void client_timeout_resend(void *userdata, usec_t now_usec) {
         DhcpClient *client = ASSERT_PTR(userdata);
@@ -523,10 +468,8 @@ restart:
         if (r >= 0)
                 return;
 
-        /* Fall through carrying client_restart()'s own error rather than a
-         * generic one: client_stop() is about to hand it to the link layer,
-         * and "could not open a socket" and "timed out" want different
-         * responses there. */
+        /* Keep client_restart()'s own error: the link layer reacts
+         * differently to "could not open a socket" and "timed out". */
 
 error:
         client_stop(client, r);
@@ -648,16 +591,10 @@ static void client_timeout_t2(void *userdata, usec_t now_usec) {
         DhcpClient *client = ASSERT_PTR(userdata);
         DHCP_CLIENT_DONT_DESTROY(client);
 
-        /*
-         * RFC 2131 4.4.5: at T2 the client "enters the REBINDING state and
+        /* RFC 2131 4.4.5: at T2 the client "enters the REBINDING state and
          * sends a DHCPREQUEST message... to the 0xffffffff IP broadcast
-         * address". Dropping the unicast socket here is what makes that a
-         * real transition rather than a label: it is bound to the leased
-         * address and connected to one server, and from T2 onward a reply
-         * from that server alone must not be able to satisfy the rebind.
-         * Upstream closes it for exactly this reason, in the failure path as
-         * much as the success path.
-         */
+         * address". The unicast socket is bound to the leased address and
+         * connected to one server, so it is dropped here. */
         dhcp_client_disable_io(client);
 
         client_set_state(client, DHCP_STATE_REBINDING);
@@ -675,32 +612,22 @@ static void client_timeout_t1(void *userdata, usec_t now_usec) {
          * the state is this function's. */
         client_set_state(client, DHCP_STATE_RENEWING);
 
-        /*
-         * DIVERGENCE FROM UPSTREAM, toward the RFC. RFC 2131 §2 defines
-         * 'secs' as "seconds elapsed since client began address acquisition
-         * *or renewal* process". Upstream only ever sets start_time in
-         * client_start_delayed(), so a renewal reports the seconds since the
-         * original DISCOVER -- on a 24-hour lease that is 43200, and on a
-         * lease longer than about 36 hours it saturates at 65534. Re-basing
-         * it here makes the renewal report what the field is defined to
-         * mean. The value is deliberately *not* re-based again at T2:
-         * REBINDING is a continuation of the same renewal process, not a new
-         * one.
-         */
+        /* Divergence from upstream, toward the RFC: RFC 2131 §2 defines 'secs'
+         * as "seconds elapsed since client began address acquisition *or
+         * renewal* process". Upstream sets start_time only in
+         * client_start_delayed(), so a renewal reports the time since the
+         * original DISCOVER (saturating at 65534 on long leases). Not
+         * re-based again at T2: REBINDING continues the same renewal. */
         client->start_time = now_monotonic();
 
         client_timeout_resend(client, now_usec);
 }
 
 /*
- * Rebuild T1, T2 and expiry from the lease. The load-bearing property, and
- * the reason upstream reaches for sd_dhcp_lease_get_*_timestamp() rather
- * than adding durations to the current time, is that all three deadlines are
- * derived from the moment the lease was *acquired*. A lease whose ACK sat in
- * a socket buffer, or whose application took a while, must still expire when
- * the server thinks it expires. netd's lease object stamps itself at parse
- * time (dhcp-lease-internal.h), so dhcp_lease_get_t1_timestamp() and friends
- * carry that property here unchanged.
+ * Rebuild T1, T2 and expiry from the lease. All three deadlines derive from
+ * the moment the lease was acquired (the lease object stamps itself at parse
+ * time, dhcp-lease-internal.h), not from "now", so a lease whose ACK sat in
+ * a socket buffer still expires when the server thinks it does.
  */
 static int client_set_lease_timeouts(DhcpClient *client) {
         usec_t now_usec;
@@ -709,9 +636,8 @@ static int client_set_lease_timeouts(DhcpClient *client) {
         assert(client);
         assert(client->lease);
 
-        /* RFC 2131 3.3: a lease of 0xffffffff seconds is infinite. Nothing to
-         * arm, and arming anything would be wrong -- an infinite lease is
-         * never renewed and never expires. */
+        /* RFC 2131 3.3: a lease of 0xffffffff seconds is infinite: never
+         * renewed, never expires, so nothing is armed. */
         if (client->lease->lifetime == USEC_INFINITY) {
                 client_timer_disarm(client, &client->timeout_t1);
                 client_timer_disarm(client, &client->timeout_t2);
@@ -731,16 +657,10 @@ static int client_set_lease_timeouts(DhcpClient *client) {
         if (r < 0)
                 return r;
 
-        /*
-         * RFC 2131 4.4.5: "Times T1 and T2 SHOULD be chosen with some random
+        /* RFC 2131 4.4.5: "Times T1 and T2 SHOULD be chosen with some random
          * 'fuzz' around a fixed value, to avoid synchronization of client
-         * reacquisition." The RFC does not say how much; §4.1's -1..+1 second
-         * is what upstream borrows, and it is the only figure in the document.
-         *
-         * On a board where several interfaces come up together -- eth0 and a
-         * usb gadget, the normal case here -- this is what stops both of them
-         * renewing in the same millisecond forever.
-         */
+         * reacquisition." The RFC gives no amount; like upstream, use §4.1's
+         * -1..+1 second. */
         client->t1_time = usec_sub_signed(client->t1_time, client_random_fuzz());
         client->t2_time = usec_sub_signed(client->t2_time, client_random_fuzz());
 
@@ -752,14 +672,10 @@ static int client_set_lease_timeouts(DhcpClient *client) {
         if (r < 0)
                 return r;
 
-        /*
-         * A deadline already in the past is armed anyway -- pico_timer fires
-         * it on the next dispatch, which is the correct behaviour for a lease
-         * that expired while it was being applied. But an *earlier* deadline
-         * that has also passed is not armed: firing T1 and T2 and expiry all
-         * at once would put the client through RENEWING and REBINDING for no
-         * purpose. Upstream draws the line in exactly these two places.
-         */
+        /* A deadline already in the past is armed anyway (pico_timer fires it
+         * on the next dispatch), but an earlier deadline that has also passed
+         * is skipped, so a long-expired lease does not run through RENEWING
+         * and REBINDING first. */
         if (client->expire_time <= now_usec)
                 return 0;
 
@@ -799,19 +715,11 @@ static int client_set_lease_timeouts(DhcpClient *client) {
  * RFC 2131 3.1/4.3.2: an OFFER has been accepted, so the client moves to
  * REQUESTING and sends a DHCPREQUEST naming the chosen server.
  *
- * Upstream ends this function by arming the resend timer at a zero-ish
- * relative timeout, which fires on the next event-loop iteration -- the
- * DHCPREQUEST is not sent from here. That indirection is kept rather than
- * simplified into a direct dhcp_client_send_message() call, because it is
- * what makes the retransmission counting correct: the REQUEST and all of its
- * retries then come from one place (client_timeout_resend()), each one
- * incrementing request_attempt and re-arming, so RFC 2131 3.1.5's "after
- * employing the retransmission algorithm" has a single implementation
- * instead of a first attempt that is special.
- *
- * (Upstream additionally delays this timer by the lease's IPv6-Only
- * Preferred interval, RFC 8925. netd does not request option 108 and the
- * lease object has no such field, so the delay is always zero here.)
+ * The resend timer is armed to fire on the next dispatch rather than
+ * sending from here, so the REQUEST and all its retries come from
+ * client_timeout_resend() and the retransmission counting has one
+ * implementation. (Upstream also delays this by the IPv6-Only Preferred
+ * interval, RFC 8925; not carried, see dhcp-client-internal.h.)
  */
 static int client_enter_requesting(DhcpClient *client) {
         assert(client);
@@ -909,16 +817,13 @@ static int client_enter_bound(DhcpClient *client, DhcpLease *lease) {
 /* --- receiving: message-type dispatch and state validation --- */
 
 /*
- * This is the half of upstream's dhcp_client_parse_message() that could not
- * live in the lease object: dhcp-lease-internal.h's API boundary takes a
- * DhcpLeaseParseParams instead of the client, precisely so the lease does not
- * have to know the client's layout. So the message-type dispatch and every
- * "is this message legal in this state?" test are here, and only the
- * option-decoding half is the codec's.
+ * The half of upstream's dhcp_client_parse_message() that cannot live in the
+ * lease object (which takes a DhcpLeaseParseParams, not the client): message
+ * type dispatch and every "is this message legal in this state?" test. The
+ * option decoding is the codec's.
  *
- * Return value follows upstream: the DHCP message type on success, negative
- * errno on anything else. All of these are packet-input checks, so they are
- * -EBADMSG returns and never assertions (netd-compat.h's assertion policy).
+ * Returns the DHCP message type, or a negative errno. These are packet-input
+ * checks, so they return -EBADMSG and never assert.
  */
 
 static int client_parse_bootreply(DhcpClient *client, DhcpMessage *message, DhcpLease **ret) {
@@ -968,9 +873,8 @@ static int client_parse_ack(DhcpClient *client, DhcpMessage *message, DhcpLease 
         switch (client->state) {
         case DHCP_STATE_SELECTING:
                 /* RFC 4039: an ACK straight after DISCOVER is only legal when
-                 * we asked for Rapid Commit and the server echoed option 80.
-                 * Without both tests a server (or an off-path attacker) could
-                 * skip the REQUEST leg of the exchange at will. */
+                 * we asked for Rapid Commit and the server echoed option 80;
+                 * otherwise the REQUEST leg could be skipped at will. */
                 if (!client->rapid_commit) {
                         log_client_debug(client, "unexpected DHCPACK in SELECTING, ignoring");
                         return -EBADMSG;
@@ -1063,14 +967,9 @@ static int client_parse_nak(DhcpClient *client, DhcpMessage *message, DhcpLease 
                 return -EBADMSG;
         }
 
-        /*
-         * These two tests are the client's whole defence against a forged
-         * NAK, and a forged NAK is the cheapest possible denial of service --
-         * it tears down a working lease. A NAK with no Server Identifier is
-         * refused outright, and one whose Server Identifier is not the server
-         * holding our lease is refused too. Upstream encodes both; they are
-         * easy to read as redundant option-parsing and are not.
-         */
+        /* Defence against a forged NAK, which would tear down a working lease:
+         * refuse a NAK with no Server Identifier, or with one that is not the
+         * server holding our lease. */
         r = dhcp_message_get_option_address(message, SD_DHCP_OPTION_SERVER_IDENTIFIER, &a);
         if (r < 0) {
                 log_client_debug(client, "DHCPNAK without Server Identifier option, ignoring");
@@ -1099,14 +998,9 @@ static int client_parse_message(DhcpClient *client, const struct iovec *iov, Dhc
         assert(iov);
         assert(ret);
 
-        /*
-         * The codec's own correlation checks: op == BOOTREPLY, xid matches
-         * ours, hardware type and chaddr match this interface. Passing
-         * &client->xid here is what keeps another client's reply on a shared
-         * segment from being taken as ours -- the AF_PACKET BPF filter tests
-         * the same fields in the kernel, but the UDP path has no filter, so
-         * this is not belt-and-braces.
-         */
+        /* The codec's correlation checks: op == BOOTREPLY, xid matches ours,
+         * hardware type and chaddr match this interface. The AF_PACKET BPF
+         * filter tests the same fields, but the UDP path has no filter. */
         r = dhcp_message_parse(iov, BOOTREPLY, &client->xid, client->arp_type, &client->hw_addr, &message);
         if (r < 0)
                 return r;
@@ -1150,13 +1044,10 @@ int dhcp_client_handle_message(DhcpClient *client, const struct iovec *payload) 
         switch (r) {
 
         case DHCP_OFFER:
-                /*
-                 * RFC 2131 4.4.1: the client collects OFFERs and "selects one"
-                 * -- the selection policy is explicitly the client's own.
-                 * netd's, like networkd's, is first acceptable offer wins, and
-                 * the link layer gets a veto through the SELECTING callback
-                 * (a negative return means "not this server").
-                 */
+                /* RFC 2131 4.4.1 leaves the offer selection policy to the client.
+                 * Like networkd, the first acceptable offer wins, and the link
+                 * layer can veto through the SELECTING callback (a negative
+                 * return means "not this server"). */
                 client_set_lease(client, lease);
 
                 if (client_notify(client, DHCP_CLIENT_EVENT_SELECTING) < 0)
@@ -1211,9 +1102,7 @@ int dhcp_client_set_mac(
                 break;
 
         case ARPHRD_INFINIBAND:
-                /* dhcp-protocol.h sized HW_ADDR_MAX_SIZE for an
-                 * infiniband-free netd on purpose; refusing here is honest
-                 * where half-supporting it would not be. */
+                /* HW_ADDR_MAX_SIZE (dhcp-protocol.h) excludes infiniband. */
                 return -EOPNOTSUPP;
 
         case ARPHRD_RAWIP:
@@ -1326,10 +1215,8 @@ int dhcp_client_set_hostname(DhcpClient *client, const char *hostname) {
         assert_return(client, -EINVAL);
         assert_return(!dhcp_client_is_running(client), -EBUSY);
 
-        /* Option 12 carries a single label here: FQDN (81) is cut, so
-         * dhcp_message_append_option_hostname() rejects anything else with
-         * -EOPNOTSUPP. Catching it at configuration time gives a better error
-         * than discovering it on the first DISCOVER. */
+        /* Option 12 carries a single label here (FQDN, 81, is cut); catch
+         * anything else now rather than on the first DISCOVER. */
         if (hostname && (dns_name_is_valid(hostname) <= 0 || !dns_name_is_single_label(hostname)))
                 return -EINVAL;
 
@@ -1360,8 +1247,7 @@ int dhcp_client_set_vendor_class_identifier(DhcpClient *client, const char *vci)
 int dhcp_client_set_mtu(DhcpClient *client, uint32_t mtu) {
         assert_return(client, -EINVAL);
 
-        /* Deliberately callable while running: upstream notes the MTU may be
-         * changed by an acquired lease. */
+        /* Callable while running: an acquired lease may change the MTU. */
         if (mtu < IPV4_MIN_MTU)
                 return -ERANGE;
 
@@ -1444,29 +1330,18 @@ int dhcp_client_set_socket_priority(DhcpClient *client, int priority) {
 /* --- identity --- */
 
 /*
- * FINDING 3 FROM THE HISTORY REVIEW, ADDRESSED HERE. Upstream's
- * sd_dhcp_client_start() constructs an RFC 4361 client-id from a DUID-EN,
- * which is derived from sd_id128_get_machine(), and propagates the failure.
- * On an image where /etc/machine-id is absent or unreadable -- a read-only
- * pico rootfs, or any first boot before the ID is generated -- that turns
- * into a client that never starts, and the symptom the operator sees is a
- * *start error*, not a DHCP timeout, on a board whose only management
- * interface is the console.
- *
- * netd will not fail a start for this. The fallback ladder is:
+ * Upstream's sd_dhcp_client_start() builds an RFC 4361 client-id from a
+ * DUID-EN derived from the machine ID and fails the start if /etc/machine-id
+ * is absent or unreadable (read-only rootfs, first boot). Here the fallback
+ * ladder is:
  *   1. DUID-EN over the machine ID (upstream's, and the stable choice);
- *   2. DUID-LL over the interface's own MAC (RFC 8415 11.4 -- explicitly
- *      intended for devices with a permanently attached interface and no
- *      stable storage, which is exactly the failing case);
- *   3. an RFC 2132 §9.14 hardware-type client-id, the plainest thing that
- *      can be put in option 61.
- * Only a client with no hardware address at all can still fail, and
- * dhcp_client_set_mac() already refuses that.
- *
- * The cost is honest and worth stating: the identifier a board presents on
- * its first boot (no machine-id) differs from the one it presents afterwards,
- * so a server may offer it a different address once. The alternative is no
- * address at all.
+ *   2. DUID-LL over the interface's own MAC (RFC 8415 11.4, intended for
+ *      devices with a permanently attached interface and no stable storage);
+ *   3. an RFC 2132 §9.14 hardware-type client-id.
+ * Only a client with no hardware address can still fail, and
+ * dhcp_client_set_mac() refuses that. The identifier presented on a board's
+ * first boot therefore differs from later boots, so a server may offer a
+ * different address once.
  */
 static int client_ensure_client_id(DhcpClient *client) {
         DhcpDuid duid;
@@ -1550,27 +1425,15 @@ int dhcp_client_start(DhcpClient *client) {
         if (r < 0)
                 return r;
 
-        /*
-         * RFC 2131 4.4.2 (INIT-REBOOT): a client that remembers a previously
-         * assigned address may skip DISCOVER and ask for that address
-         * directly. netd-link.c supplies the remembered address from
-         * /run/netd/leases/<ifindex>, which is what makes a netd restart
-         * cheap -- it reconfirms the lease it already had instead of
-         * renumbering the interface.
-         *
-         * Not done in BOOTP mode: BOOTP has no REQUEST.
-         */
+        /* RFC 2131 4.4.2 (INIT-REBOOT): a client that remembers its address
+         * may skip DISCOVER and ask for it directly. netd-link.c supplies it
+         * from /run/netd/leases/<ifindex>, so a netd restart reconfirms the
+         * lease instead of renumbering. Not in BOOTP mode: no REQUEST. */
         if (client->last_addr != INADDR_ANY && !client->bootp)
                 client_set_state(client, DHCP_STATE_INIT_REBOOT);
 
-        /*
-         * Not implemented, and upstream does not either: RFC 2131 4.4.1's
-         * "the client SHOULD wait a random time between one and ten seconds
-         * to desynchronize the use of DHCP at startup". On a board with two
-         * interfaces it would only add up to ten seconds to every boot; the
-         * desynchronisation the RFC is protecting is a campus-scale power
-         * cycle, not this.
-         */
+        /* Not implemented (nor upstream): RFC 2131 4.4.1's random one-to-ten
+         * second wait to desynchronise DHCP at startup. */
         r = client_start(client);
         if (r >= 0)
                 log_client_debug(client, "started on ifindex %i", client->ifindex);
@@ -1636,20 +1499,12 @@ int dhcp_client_send_decline(DhcpClient *client) {
         if (r < 0)
                 return r;
 
-        /*
-         * DIVERGENCE FROM UPSTREAM, toward the RFC. RFC 2131 3.1.5: "The
+        /* Divergence from upstream, toward the RFC. RFC 2131 3.1.5: "The
          * client SHOULD wait a minimum of ten seconds before restarting the
          * configuration process to avoid excessive network traffic in case of
          * looping." Upstream restarts through client_restart(), whose backoff
-         * starts at one second, so the very case the RFC names -- two hosts
-         * fighting over one address -- loops ten times faster than it says it
-         * should. netd passes the ten-second floor explicitly.
-         *
-         * There is no caller today: address-conflict detection is ACD/IPv4LL,
-         * a defined post-MVP bolt-on (plan §2.9). The function exists so that
-         * bolt-on does not have to invent the state transition, and getting
-         * the delay right now costs one argument.
-         */
+         * starts at one second; here the ten-second floor is passed
+         * explicitly. There is no caller yet (no address-conflict detection). */
         return client_restart_full(client, RESTART_AFTER_DECLINE_USEC);
 }
 
@@ -1659,14 +1514,10 @@ static DhcpClient *dhcp_client_free(DhcpClient *client) {
         if (!client)
                 return NULL;
 
-        /*
-         * src/timer.h's contract, and the reason this is not optional: the
-         * queue holds the address of each timeout_* field, so an event still
-         * queued when this memory goes away would write a NULL into freed
-         * storage the next time the queue fired or was cancelled.
-         * client_initialize() cancels all four and drops the socket
-         * registration.
-         */
+        /* The queue holds the address of each timeout_* field, so an event
+         * still queued when this memory goes away would write a NULL into
+         * freed storage. client_initialize() cancels all four and drops the
+         * socket registration. */
         client_initialize(client);
 
         free(client->hostname);
@@ -1705,12 +1556,8 @@ int dhcp_client_new(Netd *netd, int ifindex, const char *ifname, DhcpClient **re
         client->ip_service_type = IPTOS_CLASS_CS6;
         client->socket_priority = NETD_TC_PRIO_CONTROL;
 
-        /*
-         * netd-loop.h keys "is this tag live" off `registered`, whose correct
-         * initial value is calloc()'s own zero, precisely so no allocation
-         * path has to remember a sentinel. `fd` is maintained for logging
-         * only, and -1 is what it means when nothing is registered.
-         */
+        /* netd-loop.h keys tag liveness off `registered`, whose initial value
+         * is calloc()'s zero. `fd` is for logging only; -1 means none. */
         client->io_tag.fd = -1;
 
         if (ifname) {

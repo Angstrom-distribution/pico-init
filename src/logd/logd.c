@@ -2,7 +2,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * logd -- pico-init's log daemon (plan §3), main() and the event loop.
+ * logd -- pico-init's log daemon: main() and the event loop.
  *
  * logd is a supervised Type=simple service in its own cgroup, restarted on
  * failure -- the netd model, for the same reasons: PID 1 must never block on
@@ -15,23 +15,14 @@
  * the respawned logd gets the same fds back through LISTEN_FDS and drains the
  * backlog. Every service's connected stdout fd stays valid throughout.
  *
- * FACTOR-OR-COPY DECISION (plan §3.2, recorded here as asked): netd's
- * generic, callback-tagged epoll wrapper (netd-loop.c's ~155-line pattern)
- * is neither factored into a shared library nor copied here. netd needed
- * genericity because its source count grows across milestones (rtnl,
- * timer, DHCP client/server sockets, SNTP...); logd's is fixed and small --
- * a signalfd plus the two datagram sockets today, /dev/kmsg the only
- * addition J2 brings -- closer in shape to PID 1's own three-hardcoded-arms
- * loop (manager-loop.c) than to netd's registry. The loop below is that:
- * a plain switch on which of a handful of known fds fired, reusing
- * signal.c from the shared static library (already linked here, same as
- * netd links timer.c/signal.c/util.c) rather than reimplementing
- * signalfd handling a third time.
+ * The event loop is a plain dispatch over a fixed set of fds (signalfd, the
+ * two datagram sockets, /dev/kmsg), not netd's generic callback-tagged epoll
+ * wrapper (netd-loop.c): the source set never grows.
  */
 
 /* logd-recv.h declares struct ucred in its own signatures (via
  * <sys/socket.h>), which needs _GNU_SOURCE visible before that header is
- * first pulled in -- see logd-recv.c's identical comment. */
+ * first pulled in. */
 #define _GNU_SOURCE
 
 #include <errno.h>
@@ -52,18 +43,15 @@
 
 #define LOGD_EPOLL_MAX_EVENTS 8
 
-/* sd_listen_fds()'s own contract, which plan §1.6's socket activation
- * follows: passed fds start at 3. */
+/* sd_listen_fds() contract: passed fds start at 3. */
 #define LOGD_LISTEN_FDS_START 3
 
 /*
- * LISTEN_PID/LISTEN_FDS (plan §1.6): true with stdout_fd/syslog_fd (the
- * out-parameters) set to fd 3/4 (logd.socket's declared Listen* order --
- * stdout first, /dev/log second) if this process was socket-activated;
- * false (both left at -1) otherwise, which is not an error -- standalone
- * operation (no S3/J4 image wiring yet, or a developer running logd by
- * hand) binds its own sockets
- * instead, below.
+ * LISTEN_PID/LISTEN_FDS: true with stdout_fd/syslog_fd (the out-parameters)
+ * set to fd 3/4 (logd.socket's declared Listen* order -- stdout first,
+ * /dev/log second) if this process was socket-activated; false (both left
+ * at -1) otherwise, which is not an error -- standalone operation binds its
+ * own sockets instead, below.
  */
 static bool get_listen_fds(int *stdout_fd, int *syslog_fd) {
         const char *pid_s = getenv("LISTEN_PID");
@@ -136,11 +124,10 @@ int main(int argc, char *argv[]) {
 
         /* Best-effort and independent of the datagram sockets below: a
          * kernel with no /dev/kmsg, or a run with no CAP_SYSLOG, just means
-         * no kernel transport this time, never a reason to refuse to start
-         * (plan §3.2). Opened before anything else logs, so the very first
-         * drain -- right here, not deferred to the epoll loop -- picks up
-         * the whole ring from seq 0, including whatever the kernel itself
-         * logged before logd existed. */
+         * no kernel transport this time, never a reason to refuse to start.
+         * The first drain happens here, not in the epoll loop, and picks up
+         * the whole ring from seq 0, including what the kernel logged
+         * before logd existed. */
         r = logd_kmsg_new(&kmsg_ctx);
         if (r < 0) {
                 pico_log(PICO_LOG_WARNING,
@@ -194,10 +181,8 @@ int main(int argc, char *argv[]) {
                         syslog_fd = -1;
                 }
         } else {
-                /* Already bound and SO_PASSCRED'd by PID 1 in production,
-                 * but set it again anyway -- harmless there, and it is what
-                 * keeps a hand-fed fd correct under test too
-                 * (logd-recv.h). */
+                /* PID 1 already sets SO_PASSCRED; set it again for fds
+                 * passed in by hand (logd-recv.h). */
                 (void) logd_recv_ensure_passcred(stdout_fd);
                 (void) logd_recv_ensure_passcred(syslog_fd);
         }

@@ -2,8 +2,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The /dev/disk/by-* symlink families and their lifecycle (plans/31, Part 2,
- * "Persistent symlinks").
+ * The /dev/disk/by-* symlink families and their lifecycle.
  *
  * Five families, three sources, one lifecycle:
  *
@@ -11,24 +10,17 @@
  *   by-uuid, by-label           the ext superblock ext-super.c reads
  *   by-id                       the sysfs bus walk devd-probe.c does
  *
- * The lifecycle is why this belongs to a daemon and not to PID 1's boot-time
- * scan. Creating links at boot is the easy third of it; the other two are
- * removing them when the card is pulled, and reconciling at coldplug so links
- * left behind by an unclean stop do not outlive the device they name. A
- * boot-only writer has no remove half at all, and /dev/disk/by-uuid slowly
- * fills with links to devices that are not there.
+ * Links are created when a device appears, removed when it goes, and
+ * reconciled at coldplug so links left by an unclean stop do not outlive their
+ * device.
  *
- * Removal is deliberately done by reading the links rather than by remembering
- * what was written. devd can be restarted, killed, or started after the device
- * was already there, and in every one of those cases its memory of what it
- * created is empty while the links are still on disk. What is on disk is
- * therefore the authoritative record, and both remove and reconcile work from
- * it -- which also makes reconcile a plain special case of remove rather than a
- * second mechanism.
+ * Removal reads the links on disk rather than remembering what was written:
+ * devd may have been restarted or started after the device was already there,
+ * so its memory is empty while the links are not. Reconcile is therefore a
+ * special case of remove.
  *
- * `dev_root` is a parameter everywhere for the same reason devd-probe.c takes a
- * sys_root: creating and unlinking things under the test host's real /dev is
- * not a test anyone can run twice.
+ * `dev_root` is a parameter everywhere so tests can use a fixture directory
+ * instead of the real /dev.
  */
 
 #pragma once
@@ -89,7 +81,7 @@ int devd_symlink_remove(const char *dev_root, const char *devname);
 int devd_symlink_reconcile(const char *dev_root);
 
 /*
- * The same three operations for a link a SYMLINK+= rule named (H2), where the
+ * The same three operations for a link a SYMLINK+= rule named, where the
  * path is whatever the rule said rather than one of the five known families.
  *
  * `link` is relative to `dev_root` and may name directories that do not exist

@@ -3,23 +3,17 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 /*
- * Ported from src/libsystemd-network/dhcp-message.c (1,794 lines). See
- * dhcp-message.h's header for the quarry point, the history-review result,
- * and the full cut list (FQDN/81, DNR/162, Domain Search/119, sd-json,
- * 6RD/212, option-82 sub-TLV, send_udp()/send_raw()).
+ * Ported from systemd v261.2 src/libsystemd-network/dhcp-message.c. See
+ * dhcp-message.h for the cut list.
  *
- * Assertion policy (netd-compat.h, and the highest-severity finding of the
- * plan's history review): every assert() upstream wrote in the functions
- * kept here turns out, on inspection, to already be an internal-invariant
- * check -- a non-NULL out-param, an enum value netd's own call sites
- * dispatched on, a post-condition on a loop the same function just ran
- * (e.g. dhcp_message_append_option_static_routes()'s `assert(count == 2 *
- * n_routes)`) -- never a bound straight off the wire. The wire-format
- * bounds (tag, length, remaining-buffer checks) all live one layer down,
- * in tlv-util.c's tlv_parse(), and are netd_validate()/-EBADMSG there. This
- * file's own parse-adjacent checks (dhcp_message_verify_header()'s header-
- * length and hlen bounds) were already plain `return -EBADMSG` upstream,
- * not assert() -- nothing to convert.
+ * Assertion policy (netd-compat.h): every assert() kept from upstream guards
+ * an internal invariant (a non-NULL out-param, an enum value the callers
+ * dispatched on, a post-condition on a loop the same function just ran, e.g.
+ * `assert(count == 2 * n_routes)`), never a bound taken off the wire. Wire
+ * bounds (tag, length, remaining-buffer) are checked one layer down in
+ * tlv-util.c's tlv_parse() and return -EBADMSG. The header-length and hlen
+ * checks in dhcp_message_verify_header() are plain `return -EBADMSG`, as
+ * upstream.
  */
 
 #include "netd-compat.h"
@@ -28,9 +22,7 @@
 #include "dhcp-message.h"
 #include "dns-name.h"
 
-/* Not in netd-compat.h; a one-line macro three files in this lift need. */
 #define FLAGS_SET(flags, flag) (((flags) & (flag)) == (flag))
-
 
 #define DIV_ROUND_UP(n, d) (((n) + (d) - 1) / (d))
 
@@ -39,10 +31,8 @@
  * TLV parsing would otherwise accept. */
 #define DHCP_UDP_PAYLOAD_MAX_SIZE 65527U
 
-/* --- time <-> wire seconds (network-common.c's usec_to_be32_sec()/
- * be32_sec_to_usec(), not in the lift set -- two lines each, not worth a
- * separate file for). UINT32_MAX maps to/from USEC_INFINITY, matching
- * upstream's "some settings treat UINT32_MAX as infinity" convention. --- */
+/* --- time <-> wire seconds (upstream's network-common.c usec_to_be32_sec()/
+ * be32_sec_to_usec()). UINT32_MAX maps to/from USEC_INFINITY. --- */
 
 static be32_t usec_to_be32_sec(usec_t t) {
         if (t == USEC_INFINITY)
@@ -62,11 +52,9 @@ static usec_t be32_sec_to_usec(be32_t t, bool max_as_infinity) {
         return (usec_t) s * USEC_PER_SEC;
 }
 
-/* --- string safety (upstream's string_is_safe(), src/basic/string-util.c,
- * trimmed to the one property that matters for wire-derived option text:
- * no raw control bytes, so a hostname/domain string can never inject a
- * terminal escape or a stray newline into a log line or a config file this
- * value is later written into). --- */
+/* --- string safety (upstream's string_is_safe(), trimmed to: no raw control
+ * bytes, so wire-derived text cannot inject escapes or newlines into logs or
+ * config files). --- */
 
 static bool string_is_safe(const char *s) {
         if (!s)
@@ -397,10 +385,8 @@ int dhcp_message_append_option_parameter_request_list(DhcpMessage *message, cons
         if (!buf)
                 return -ENOMEM;
 
-        /* FOREACH_U8SET already iterates in ascending option order, so the
-         * emitted list is deterministic with no separate sort step needed
-         * (netd-compat.h's header calls this out as the one behavioural
-         * difference from upstream's hash-ordered Set). */
+        /* FOREACH_U8SET iterates in ascending option order, so the list is
+         * deterministic (upstream's Set is hash-ordered). */
         size_t i = 0;
         FOREACH_U8SET(v, prl)
         buf[i++] = v;
@@ -826,8 +812,7 @@ int dhcp_message_parse(
                 return r;
 
         /* Option 52 (Overload): the sname/file header fields may carry more
-         * options. This is the only fixture in test/fuzz/fuzz-dhcp-client/
-         * that exercises this path (overload-file-roundtrip). */
+         * options. */
         uint8_t overload = DHCP_OVERLOAD_NONE;
         (void) dhcp_message_get_option_u8(message, SD_DHCP_OPTION_OVERLOAD, &overload);
 

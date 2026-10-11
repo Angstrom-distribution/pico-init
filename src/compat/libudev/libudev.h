@@ -10,11 +10,10 @@
  * libudev too.
  *
  * Scope: the read-only half (udev_device_*, udev_enumerate_*,
- * udev_list_entry_*) is real. udev_monitor_* creates a valid monitor that
- * never delivers an event -- see libudev-monitor.c for why that, and not
- * a failing constructor, is the interim answer while live subscription is
- * roadmap work. udev_queue_* and udev_hwdb_* report the true state of a
- * system with no udevd and no hwdb.bin.
+ * udev_list_entry_*) is real. udev_monitor_* receives kernel uevents
+ * from the group-1 netlink socket (see libudev-monitor.c). udev_queue_* and
+ * udev_hwdb_* report the true state of a system with no udevd and no
+ * hwdb.bin.
  */
 
 #ifndef _LIBUDEV_H_

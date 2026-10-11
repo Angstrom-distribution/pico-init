@@ -3,23 +3,13 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 /*
- * Ported from src/libsystemd-network/dhcp-protocol.c (204 lines): option
- * code / message-type / state name tables, used only for log messages
- * (dhcp-lease.c logs every option it fails to parse by name).
+ * Ported from systemd v261.2 src/libsystemd-network/dhcp-protocol.c: option
+ * code / message-type / state name tables, used for log messages.
  *
- * Quarry point: systemd v261.2, commit 4925d9f07f. History review
- * (4925d9f07f..main, plan §2.2): no fix in the 26-commit lift-set window
- * touches this file. See dhcp-protocol.h's header for the one backport in
- * the window (7bd9f0f805, sd-dhcp-server.c, not carried here).
- *
- * Upstream builds these tables with DECLARE/DEFINE_STRING_TABLE_LOOKUP_TO_
- * STRING from src/basic/string-table.h, which is not in the lift set (it
- * pulls in nothing netd needs otherwise, so lifting a whole header for
- * three lookup functions did not seem worth it). The table shape and
- * out-of-range-returns-NULL semantics are kept exactly; only the lookup
- * mechanism -- a small local helper instead of the macro pair -- differs.
- * Trimmed to the option codes dhcp-protocol.h declares (see that file's
- * header for what was cut and why).
+ * Upstream builds these with the string-table macros from
+ * src/basic/string-table.h; a small local helper replaces them here. Table
+ * shape and out-of-range-returns-NULL semantics are the same. Limited to the
+ * option codes dhcp-protocol.h declares.
  */
 
 #include "netd-compat.h"

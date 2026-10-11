@@ -9,16 +9,12 @@
  * shape: search a path for "<id>", hand a found file to the INI parser,
  * resolve to UNIT_LOADED, UNIT_ERROR or UNIT_MASKED. The 2011 original searched
  * several directories (/etc, /run, /usr/lib) with per-directory drop-in
- * merging; this MVP searches the manager's own unit path, which defaults to
- * two entries -- PICO_UNIT_DIR (admin overrides) then PICO_PACKAGED_UNIT_DIR
- * (where packages actually install units, given angstrom-pico-init's usrmerge
- * decision -- see plans/29-pico-init.md "The decided scope").
+ * merging; this searches the manager's own unit path, which defaults to two
+ * entries: PICO_UNIT_DIR (admin overrides) then PICO_PACKAGED_UNIT_DIR (where
+ * packages install units on a usrmerged system).
  *
- * The path lives on the Manager rather than in a file-static array here
- * because it has to be redirectable: a test that cannot point unit loading at
- * a temporary directory can only be run as root against the host's real /etc,
- * which is no test at all. Adding a third directory (e.g. /run) stays a
- * one-line change to the default, not a rewrite.
+ * The path lives on the Manager rather than in a file-static array so tests
+ * can point unit loading at a temporary directory.
  *
  * Backported fix:
  *  - baa162cec "core: fix a use-after-free" -- the original freed its
@@ -26,7 +22,7 @@
  *    old value. unit_load() below logs using fragment_path's value before
  *    freeing it on the error path, not after.
  *
- * G2 fallback: an instance with no fragment of its own (e.g.
+ * Template fallback: an instance with no fragment of its own (e.g.
  * "serial-getty@ttyUSB0.service", never shipped by any package) loads
  * through its template's file instead, quarried from v30's own template
  * fallback at load-fragment.c:2289-2300. u->fragment_path then records the
@@ -127,8 +123,8 @@ static int unit_find_fragment(Unit *u, const char *name, char **ret, bool *ret_m
  * same type makes `name` an alias of that unit -- v30 collected the same names
  * while following the fragment's symlinks (load-fragment.c open_follow()).
  * Not an alias: a regular file, a symlink to a file of the same name, a mask
- * (-> /dev/null), anything instance- or template-shaped (plan 32's own
- * fallback owns those). 1 with *ret owned, 0, -ENOMEM.
+ * (-> /dev/null), anything instance- or template-shaped (the template
+ * fallback in unit_load() owns those). 1 with *ret owned, 0, -ENOMEM.
  */
 static int alias_one_hop(Manager *m, const char *name, char **ret) {
         char * const *dir;
@@ -248,9 +244,8 @@ int unit_load(Unit *u) {
          * anywhere -- not "try literal, then template, in each directory".
          * That ordering is load-bearing, not an implementation detail: it
          * is what lets serial-getty@ttyGS0.service in a higher-priority
-         * directory win over serial-getty@.service in a lower-priority one
-         * (G3(b)'s override), and it is exactly what a per-directory
-         * "optimization" would silently invert. See
+         * directory win over serial-getty@.service in a lower-priority one,
+         * and a per-directory "optimization" would invert it. See
          * test_literal_beats_template_across_dirs() in test-unit-load.c.
          */
         if (r == 0 && !masked && u->instance) {

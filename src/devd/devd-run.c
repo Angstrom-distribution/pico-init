@@ -2,8 +2,8 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The RUN+= child. devd-run.h has why nothing here ever waits, and the two
- * things a fork/exec out of a signalfd daemon must undo before exec'ing.
+ * The RUN+= child. devd-run.h has why nothing here ever waits, and the
+ * two things a fork/exec out of a signalfd daemon must undo before exec'ing.
  */
 
 #include "devd-run.h"
@@ -94,13 +94,10 @@ static void child_record(DevdRun *r, pid_t pid, const char *path) {
         DevdRunChild *c = &r->children[r->n_children++];
         size_t len = strlen(base);
 
-        /* Clamped, not checked: this name is only ever printed on the exit
-         * line, so a truncated one costs a vaguer log record and nothing else
-         * -- unlike the paths d55275e had to make fail closed, which named a
-         * different file when they truncated. Written as a memcpy rather than
-         * an ignored snprintf() so -Wformat-truncation, which needs
-         * optimisation to run and so never fires on an -O0 host gate, has
-         * nothing to say about it. */
+        /* Clamped, not checked: this name is only printed on the exit line,
+         * so truncation costs a vaguer log record and nothing else. A memcpy
+         * rather than an ignored snprintf() to keep -Wformat-truncation, which
+         * only runs with optimisation, quiet. */
         if (len >= sizeof(c->name))
                 len = sizeof(c->name) - 1;
 

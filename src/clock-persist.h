@@ -3,7 +3,7 @@
 
 /*
  * Keeping the wall clock roughly right across reboots on a board whose RTC is
- * dead or reset by every reboot (the iPAQ h2200's PXA RTC reads 1970 at boot).
+ * dead or reset by every reboot (e.g. a PXA RTC that reads 1970 at boot).
  *
  * The time is kept in /etc/timestamp, the OpenEmbedded file (initscripts'
  * save-rtc.sh and bootmisc.sh): fourteen digits, YYYYMMDDHHMMSS, UTC. PID 1

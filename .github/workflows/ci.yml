@@ -9,10 +9,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Three small, fast ubuntu-latest jobs -- no matrix, no macOS/Windows
-# runners, everything finishes in well under a minute. Keeps this
-# comfortably inside GitHub Free's private-repo Actions minutes even on
-# every push and every PR update.
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -24,10 +20,9 @@ jobs:
         run: meson setup build
       - name: Build
         run: ninja -C build
-      # Root, deliberately: the PID1 core tests write real cgroups and the
-      # netd ones create veth pairs and bind :123. Unprivileged they do not
-      # skip, they fail -- and skipping them to get a green tick would leave
-      # CI exercising almost none of the core. -E keeps the build dir's env.
+      # Root: the PID1 core tests write real cgroups and the netd ones create
+      # veth pairs and bind :123. Unprivileged they fail rather than skip.
+      # -E keeps the caller's environment.
       - name: Test
         run: sudo -E meson test -C build --print-errorlogs
 

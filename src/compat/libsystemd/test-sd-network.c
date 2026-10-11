@@ -2,13 +2,10 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * sd-network's resolv.conf family against a real fixture file, the
- * provenance gate, the always-empty route_domains, the permanently
- * deferred ntp getter, a sample of the state-stub family (defer and
- * honest_failure alike return -EOPNOTSUPP today; only their comments
- * differ, so one representative of each plus the ifindex validation they
- * all share is what is worth asserting), and link_get_stat against a
- * real lease file.
+ * sd-network's resolv.conf family against a fixture file, the provenance
+ * gate, the always-empty route_domains, the ntp getter, a sample of the
+ * -EOPNOTSUPP state getters plus the ifindex validation they share, and
+ * link_get_stat against a lease file.
  */
 
 #include "sd-network.h"
@@ -132,7 +129,7 @@ static void test_state_stub_family(void) {
         ASSERT_EQ_INT(sd_network_link_get_operational_state(-1, &v), -EINVAL);
         ASSERT_EQ_INT(sd_network_link_get_operational_state(1, &v), -EOPNOTSUPP);
 
-        /* One honest_failure representative, same shape. */
+        /* A getter for a directive netd lacks, same shape. */
         ASSERT_EQ_INT(sd_network_link_get_activation_policy(0, &v), -EINVAL);
         ASSERT_EQ_INT(sd_network_link_get_activation_policy(1, &v), -EOPNOTSUPP);
 

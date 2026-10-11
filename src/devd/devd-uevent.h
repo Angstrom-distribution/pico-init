@@ -2,10 +2,9 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The kernel uevent listener (plans/31, Part 2, milestone H1).
+ * The kernel uevent listener.
  *
- * Structurally this is netd-rtnl.c's nl_socket_open() with three deltas, and
- * the third one is the only interesting one:
+ * Structurally this is netd-rtnl-core.c's netlink socket setup with three differences:
  *
  *  1. NETLINK_KOBJECT_UEVENT rather than NETLINK_ROUTE.
  *  2. Multicast group 1 rather than RTNLGRP_LINK. Group 1 is the kernel's own
@@ -48,12 +47,10 @@
 /*
  * How much of the message's KEY=VALUE tail is kept verbatim.
  *
- * H1 needed six named fields and nothing else. The rule engine needs the rest:
- * ENV{} matches against whatever the kernel sent, and a RUN+= child is given
- * the same properties in its environment -- which is how `usb_modeswitch`
- * learns what it was called about. Keeping the tail as the wire's own
- * NUL-separated blob rather than re-parsing it into a table here leaves the
- * table's shape to devd-match.c, which is the file that has to bound it.
+ * Besides the named fields, ENV{} matches against whatever the kernel sent,
+ * and a RUN+= child is given the same properties in its environment (which is
+ * how `usb_modeswitch` learns what it was called about). The tail is kept as
+ * the wire's NUL-separated blob; devd-match.c builds and bounds the table.
  */
 #define DEVD_UEVENT_PROPS_MAX 2048
 

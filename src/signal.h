@@ -4,10 +4,9 @@
 /*
  * signalfd-based signal handling: SIGCHLD/SIGTERM/SIGHUP blocked via
  * sigprocmask before the signalfd is created, then read and handled
- * synchronously in manager-loop context. This header deliberately does not
- * include <signal.h>; only this project's own files include it as
- * "signal.h" (quote form), so the libc header is never shadowed for
- * angle-bracket includes.
+ * synchronously in manager-loop context. This header does not include
+ * <signal.h>; it is included in quote form, so the libc header is not
+ * shadowed for angle-bracket includes.
  */
 
 #pragma once

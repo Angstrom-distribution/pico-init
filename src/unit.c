@@ -103,18 +103,10 @@ Unit *unit_free(Unit *u) {
          *
          * A job holds a borrowed j->unit and the unit points back at it as
          * u->job; freeing the unit without breaking that pair leaves the job
-         * installed, still on the run queue, pointing at freed memory -- and
-         * the next manager_dispatch_run_queue() runs it. job_free() already
-         * refuses to leave the mirror image of this dangling (it uninstalls
-         * first, clearing unit->job), and this is the other half of the same
-         * invariant.
-         *
-         * Not reachable from today's two callers: manager_free() frees every
-         * job before it frees any unit, and manager_load_unit()'s error path
-         * runs on a unit that never had one. It becomes reachable the moment
-         * a SIGHUP reload or unit garbage collection drops a live unit -- the
-         * reload TODO in manager-loop.c -- so it is closed as a prerequisite
-         * of that work rather than after it.
+         * installed, still on the run queue, pointing at freed memory. job_free()
+         * uninstalls first, clearing unit->job, which covers the other half of
+         * the invariant. manager_free() finishes every job before freeing any
+         * unit, so this only matters when a live unit is freed on its own.
          *
          * JOB_CANCELED, non-recursive: this is job_install()'s own supersede
          * call, for the same reason. The unit is going away structurally, so
@@ -128,30 +120,24 @@ Unit *unit_free(Unit *u) {
          * Before vtable->done(), not after: job_finish_full() republishes the
          * unit's state file, which dispatches through vtable->active_state()
          * -- reading a Service whose done() hook had already freed its members
-         * would be the use-after-free this fix exists to prevent, one layer
-         * further in.
+         * would be a use-after-free.
          *
-         * One constraint this hands to whoever writes the reload, worth
-         * stating because this call is where it will first be noticed rather
-         * than where it originates: job_finish_full() ends by walking this
+         * Constraint on callers: job_finish_full() ends by walking this
          * unit's Before=/After= neighbours to re-queue whatever its completion
          * unblocked, and those are borrowed pointers into the manager's unit
          * table. So a unit must be freed while the units it has edges to are
          * still alive -- drop stale units one at a time from a table that is
          * otherwise intact, never bulk-free a set with edges among it. That is
          * already true of the dependency arrays themselves (any surviving unit
-         * holding an edge to a freed one is dangling regardless of jobs);
-         * manager_free() sidesteps it entirely by finishing every job before
-         * it frees any unit.
+         * holding an edge to a freed one is dangling regardless of jobs).
          */
         if (u->job)
                 job_finish_full(u->job, JOB_CANCELED, false);
 
         /*
-         * Per-type teardown next. Only the concrete type knows what it owns
-         * -- a Service holds two argv vectors, a cgroup and possibly a queued
-         * timer event -- so without this hook every started service leaked all
-         * of them. The base type cannot guess at any of it.
+         * Per-type teardown next: only the concrete type knows what it owns
+         * (a Service holds argv vectors, a cgroup and possibly a queued timer
+         * event).
          */
         if (u->vtable && u->vtable->done)
                 u->vtable->done(u);

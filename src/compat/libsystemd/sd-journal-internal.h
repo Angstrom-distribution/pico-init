@@ -2,25 +2,19 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * Private state and helpers shared across the sd_journal_*() read-side
- * implementation files (sd-journal-open.c/-navigate.c/-data.c/-info.c).
- * Nothing here is part of the public API; the write-side files
- * (sd-journal-send.c/-sendv.c/-stream.c) don't need any of it, since they
- * never open a journal object at all.
+ * Private state and helpers shared by the sd_journal_*() read-side files
+ * (sd-journal-open.c/-navigate.c/-data.c/-info.c/-util.c). The write-side
+ * files (sd-journal-send.c/-sendv.c/-stream.c) never open a journal object.
  *
- * `struct sd_journal` is a snapshot reader over logd's own ring
+ * `struct sd_journal` is a snapshot reader over logd's ring
  * (src/logd/logd-read.h): one logd_ring_read() at open, replaced wholesale
- * by sd_journal_process() when the ring files change underneath it. No
- * binary .journal format is involved anywhere.
+ * by sd_journal_process() when the ring files change.
  *
- * Position is tracked as a location plus, only while ON_ENTRY, an index
- * into the current ring. A pending boundary seek (realtime/monotonic/
- * cursor) is tracked separately from ON_ENTRY rather than reusing pos +/- 1,
- * because "the boundary just before ring[i]" and "sitting on ring[i-1]"
- * need different answers from a following sd_journal_previous(): the first
- * wants ring[i-1], the second wants ring[i-2]. Collapsing them into one
- * index would silently skip an entry the first time previous() is called
- * right after a seek.
+ * Position is a location plus, only while ON_ENTRY, an index into the
+ * current ring. A pending boundary seek (realtime/monotonic/cursor) is
+ * tracked separately from ON_ENTRY rather than as pos +/- 1: "the boundary
+ * just before ring[i]" and "sitting on ring[i-1]" need different answers
+ * from a following sd_journal_previous() (ring[i-1] vs ring[i-2]).
  */
 
 #pragma once
@@ -47,9 +41,8 @@ typedef struct SdJournalMatch {
         size_t name_len; /* bytes before '=', cached so filtering doesn't re-scan it every entry */
 } SdJournalMatch;
 
-/* A dedup set of previously-returned byte strings, shared shape for
- * sd_journal_enumerate_unique()'s values and sd_journal_enumerate_fields()'s
- * names. */
+/* Dedup set of previously-returned byte strings, for
+ * sd_journal_enumerate_unique() values and sd_journal_enumerate_fields() names. */
 typedef struct SdJournalSeenSet {
         void **items;
         size_t *lens;
@@ -99,19 +92,13 @@ struct sd_journal {
         bool have_rotated_st; /* rotated.export may not exist at all */
 };
 
-/* --- shared across the read-side files (sd-journal-internal.c) --- */
+/* --- shared across the read-side files (sd-journal-util.c) --- */
 
-/* journal_field_valid()'s own rule, independently re-derived from
- * logd-write.c's field_name_valid() (not shared code -- that function is
- * static to its own TU, and this project's own logd is a reference here,
- * not a dependency this shim links): 1-64 bytes, first byte not a digit,
- * every byte in [A-Z0-9_]. */
+/* Same rule as logd-write.c's field_name_valid() (static there, so
+ * duplicated): 1-64 bytes, first byte not a digit, every byte in [A-Z0-9_]. */
 bool journal_field_name_valid(const char *name, size_t len);
 
-/* Reads /proc/sys/kernel/random/boot_id once per process and caches it:
- * every read-side function that needs "this boot's ID" (get_monotonic_usec,
- * seek_monotonic_usec, get_cutoff_monotonic_usec) asks here rather than
- * re-opening /proc on every call. 0 or -errno. */
+/* Reads /proc/sys/kernel/random/boot_id once per process and caches it. 0 or -errno. */
 int journal_current_boot_id(sd_id128_t *ret);
 
 /* 32 lowercase hex chars -> 16 bytes, the canonical _BOOT_ID= form

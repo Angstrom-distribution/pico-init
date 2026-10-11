@@ -2,11 +2,11 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The picoctl control socket (plan §1.7, milestone C2): one root-only
+ * The picoctl control socket: one root-only
  * AF_UNIX SOCK_SEQPACKET socket at <runtime_dir>/control, owned and bound by
  * PID 1 directly.
  *
- * Deliberately NOT a .socket unit -- PID 1 cannot socket-activate itself --
+ * Not a .socket unit -- PID 1 cannot socket-activate itself --
  * but the listener and every accepted connection each get their own io
  * source on the manager's own m->event, at EVENT_PRIORITY_CTRL (manager.h).
  *
@@ -37,7 +37,7 @@ struct pico_manager_ctrl;
 
 /* Bind <runtime_dir>/control mode 0600, listen, join the epoll set.
  * 0 or -errno. Failure is not fatal to boot -- picoctl's mutating verbs are
- * simply unavailable, exactly as they are on an image without the socket. */
+ * unavailable, exactly as they are on an image without the socket. */
 int manager_ctrl_setup(Manager *m);
 
 /* Close the socket, unlink its path, drop every pending reply. */
@@ -51,7 +51,7 @@ void manager_ctrl_done(Manager *m);
  * the connection's own io source, if it holds no other reference right now,
  * is unlinked from the event's live source list on the spot, so a later
  * dispatch in the same batch that might still name it (its own EPOLLHUP)
- * simply never finds it (see manager-ctrl.c's ctrl_conn_free()). */
+ * never finds it (see manager-ctrl.c's ctrl_conn_free()). */
 void manager_ctrl_notify_job_finished(Job *j, JobResult result);
 
 /*
@@ -59,7 +59,7 @@ void manager_ctrl_notify_job_finished(Job *j, JobResult result);
  * deferred-reply records. 0 (never an error) when ctrl is not set up at
  * all. Production code never calls these -- they exist so a test can prove
  * an early-disconnecting client leaks nothing, rather than merely asserting
- * the happy path (plan §1.7, C2's own "done when").
+ * the happy path.
  */
 size_t manager_ctrl_debug_n_conns(Manager *m);
 size_t manager_ctrl_debug_n_pending(Manager *m);

@@ -4,7 +4,7 @@
 /*
  * Orderly shutdown.
  *
- * The objective is deliberately NOT set here. Setting it directly would end
+ * The objective is not set here. Setting it directly would end
  * the event loop on its very next iteration -- before a single one of the stop
  * jobs this function just queued had a chance to run -- so "orderly shutdown"
  * would stop nothing at all. Instead a pending objective is recorded and the

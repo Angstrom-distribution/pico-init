@@ -2,13 +2,10 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * ID_PATH for `networkctl status <iface>` -- a hand-written, scope-limited
- * port of udev's builtin_path_id() (pci/usb/platform only). Split out of
- * netctl.c into its own file/header purely for testability: it is pure
- * string/directory-walk logic with no sysfs *write* dependency and no
- * netlink dependency either, so test-netctl-path.c can drive it against a
- * hand-built fixture directory tree instead of the real /sys. See
- * netctl-path.c's own header for the algorithm itself.
+ * ID_PATH for `networkctl status <iface>` -- a scope-limited port of udev's
+ * builtin_path_id() (pci/usb/platform only). Pure string/directory-walk
+ * logic, so test-netctl-path.c can drive it against a fixture directory tree
+ * instead of the real /sys. See netctl-path.c for the algorithm.
  */
 
 #pragma once
@@ -27,9 +24,7 @@ bool iface_path_id(const char *ifname, char *out, size_t bufsize);
 /*
  * The testable half: `devpath_real` is an already-resolved absolute
  * directory -- normally realpath()'d from /sys/class/net/<if>/device, but
- * test-netctl-path.c instead points this at a fixture tree it built itself,
- * since the algorithm from here on is pure path-string/readlink() work that
- * does not care whether the tree lives under /sys. False when no
+ * test-netctl-path.c points this at a fixture tree instead. False when no
  * pci/usb/platform ancestor was found anywhere in the walk (an unsupported
  * topology, e.g. a bare virtio-net device) -- never a guess.
  */

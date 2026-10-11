@@ -4,11 +4,8 @@
 /*
  * RFC 2104 HMAC, instantiated with sha256.h: a too-long key is hashed down
  * first, ipad/opad are XORed in per the RFC, and the result is
- * SHA256(okey || SHA256(ikey || input)). Verified against the RFC 4231
- * HMAC-SHA-256 test vectors in test-sd-id128.c, plus one live cross-check
- * against a real systemd machine's own `systemd-id128 --app-specific=...
- * machine-id` output -- HMAC-SHA-256 is a standardized construction, so a
- * correct implementation matches upstream's bit-for-bit with no shared code.
+ * SHA256(okey || SHA256(ikey || input)). Tested against the RFC 4231
+ * HMAC-SHA-256 vectors in test-sd-id128.c.
  */
 
 #include "hmac-sha256.h"

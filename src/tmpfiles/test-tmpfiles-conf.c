@@ -6,11 +6,9 @@
  * the real filesystem: every path goes through a --root under a temporary
  * directory, and nothing here calls pico_tmpfiles_create().
  *
- * The precedence cases are the ones the design singles out as easy to get
- * wrong: a same-named file in /etc must replace the /usr/lib one outright,
- * a /dev/null symlink must mask, and the survivors must sort by basename
- * across directories. Each is asserted on the list itself, so a regression
- * shows up as "wrong file" rather than as a missing directory later.
+ * Precedence cases: a same-named file in /etc must replace the /usr/lib one
+ * outright, a /dev/null symlink must mask, and the survivors must sort by
+ * basename across directories. Each is asserted on the list itself.
  */
 
 #include <errno.h>

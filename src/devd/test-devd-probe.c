@@ -9,8 +9,7 @@
  * nothing predictable and on a build host is nothing at all. That is what
  * devd_probe_bus_id()'s sys_root parameter is for.
  *
- * The ext superblock half of this probe lives outside devd now -- PID 1 reads
- * the same fields for its own root check -- and so do its tests: see
+ * The ext superblock reader is shared with PID 1 and tested in
  * ../test-ext-super.c.
  */
 

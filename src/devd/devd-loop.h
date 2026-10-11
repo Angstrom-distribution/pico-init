@@ -5,20 +5,14 @@
  * devd's event loop: one epoll fd multiplexing the shared signalfd, the shared
  * timerfd (which is what closes a settle window) and the group-1 uevent socket.
  *
- * This is netd-loop.c's registration pattern copied deliberately rather than
- * reinvented, and the copy is the point: the daemon decision in plans/31 (Part
- * 2, "What is already decided") makes devd a second instance of a shape this
- * project has already proven, not a first instance of a new one. Registrations
- * carry their own callback in the tag, dispatch always reads data.ptr back, and
- * `registered` -- never `fd >= 0` -- is what says a tag is live, for the reason
- * netd-loop.h spells out at length: every tag lives inside a calloc()'d owner,
- * so fd == 0 is a perfectly valid descriptor and only the bool is reliably
- * zero.
+ * The registration pattern is the same as netd-loop.c's. Registrations carry
+ * their own callback in the tag, dispatch reads data.ptr back, and
+ * `registered` -- never `fd >= 0` -- says a tag is live: every tag lives inside
+ * a calloc()'d owner, so fd == 0 is a valid descriptor and only the bool is
+ * reliably zero.
  *
- * devd has three fixed sources where netd has dynamic ones, so a switch would
- * have done. The callback stays anyway: H2's rule engine adds an async RUN+=
- * child-reaping source to this loop, and it should be able to do that without
- * editing a dispatch switch in this file.
+ * The callback is kept although the sources are fixed, so the RUN+= child
+ * reaping source can be added without editing a dispatch switch.
  */
 
 #pragma once

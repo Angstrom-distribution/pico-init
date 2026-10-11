@@ -4,44 +4,29 @@
 /*
  * networkctl -- a client for netd, not netd itself.
  *
- * Unlike picoctl (which genuinely talks to PID 1's own control surface),
- * netd has no IPC of its own to query: LinkState's comment in netd-link.h
- * says so explicitly -- "netd has no status CLI for anyone to read a finer
- * distinction from". So this does not invent one. `status` reads kernel
- * ground truth (sysfs + getifaddrs(3) + /proc/net/route + /etc/resolv.conf)
- * plus the two small documented text files netd itself publishes for this
- * purpose -- /run/netd/links/<ifindex> (setup state, matched .network) and
- * /run/netd/leases/<ifindex> (DNS/NTP/router, when DHCP actually leased
- * them) -- without a round trip through netd at all; it works even if netd
- * is not running. `reload` is the one verb that genuinely needs netd: it
- * SIGHUPs the live process, which netd-loop.c's signal handler already
- * turns into a config reload.
+ * netd has no IPC of its own to query, so `status` reads kernel ground truth
+ * (sysfs, getifaddrs(3), /proc/net/route, /etc/resolv.conf) plus the two small
+ * text files netd publishes -- /run/netd/links/<ifindex> (setup state,
+ * matched .network) and /run/netd/leases/<ifindex> (DNS/NTP/router) -- and
+ * works even if netd is not running. `reload` is the one verb that needs
+ * netd: it SIGHUPs the live process, which netd-loop.c turns into a config
+ * reload.
  *
- * Exists because bt-pan-client.sh (meta-handhelds) hard-requires a
- * `networkctl` binary on $PATH and calls `reload` and `status <iface>`.
- * Output is modelled on real systemd's own `networkctl`/`networkctl
- * status`/`networkctl status IFACE`, close enough to be useful to someone
- * who already knows that tool, but it does not claim fields netd has no way
- * to back honestly. Driver, Vendor and Model are sysfs reads with no
- * rtnetlink equivalent (real networkctl's own ID_NET_DRIVER/vendor/model
- * resolve through udev/hwdb this tree does not have); `status <iface>`'s
- * kernel-sourced rows (Type, Alternative Names, MTU min/max, QDisc, IPv6
- * Address Generation Mode, Number of Queues) come from one
- * netctl_rtnl_get_link() round trip (netctl-rtnl.c) -- this file's own tiny
- * rtnetlink client, built from netd-rtnl-core.c only, with no link to
- * netd_core or pico_init_core: `networkctl` stays a standalone binary that
- * works whether or not netd is running, it just now also talks to the
- * kernel directly for the handful of fields sysfs cannot answer. Path is a
- * third source again (netctl-path.c, a scope-limited udev builtin_path_id()
- * port over plain sysfs directory walking -- no netlink involved). Still
- * missing, because nothing in this tree computes them: NetDev/Link File (no
- * udev .link matching), Activation Policy and Required For Online (.network
- * directives netd-network.c does not implement), and Route Domains
- * (networkd's per-link Domains=~ routing-only domains) -- netd tracks none
- * of them. Offered DHCP leases is omitted too: it is a DHCP-server-only row,
- * and DhcpServerLease state is kept in memory only
- * (dhcp-server-lease-internal.h), with nothing published for this file to
- * read even when a link is running one.
+ * Output is modelled on systemd's `networkctl` and `networkctl status IFACE`
+ * but does not claim fields netd cannot back. Driver, Vendor and Model are
+ * sysfs reads (real networkctl resolves them through udev/hwdb); the
+ * kernel-sourced rows of `status <iface>` (Type, Alternative Names, MTU
+ * min/max, QDisc, IPv6 Address Generation Mode, Number of Queues) come from
+ * one netctl_rtnl_get_link() round trip (netctl-rtnl.c), a small rtnetlink
+ * client built from netd-rtnl-core.c only, so networkctl stays standalone.
+ * Path comes from netctl-path.c, a scope-limited port of udev's
+ * builtin_path_id() over sysfs.
+ *
+ * Not shown, because netd computes none of it: NetDev/Link File (no udev
+ * .link matching), Activation Policy and Required For Online (.network
+ * directives netd-network.c does not implement), Route Domains, and Offered
+ * DHCP leases (DhcpServerLease state is in memory only, see
+ * dhcp-server-lease-internal.h).
  */
 
 #include <arpa/inet.h>
@@ -169,11 +154,6 @@ static bool read_keyvalue(const char *path, const char *key, char *out, size_t b
 static void netd_link_file_path(unsigned ifindex, char *out, size_t bufsize) {
         snprintf(out, bufsize, "%s/%u", NETD_LINKS_DIR, ifindex);
 }
-
-/* NETD_LEASES_DIR's own per-ifindex path is still built directly, inline,
- * by status_all()'s NTP aggregation loop (the only remaining reader of a
- * lease file's path by ifindex) -- the Gateway row no longer reads one, see
- * collect_default_gateways(). */
 
 /* "configured", "configuring", "unmanaged", "pending", "failed", or
  * "unmanaged" as the honest default when netd has never seen this link
@@ -382,13 +362,6 @@ static bool usb_string_attr(const char *ifname, const char *attr, char *out, siz
         return out[0] != '\0';
 }
 
-/* IPv6 Address Generation Mode, QDisc, MTU min/max, Alternative Names and
- * Number of Queues used to each be their own sysfs/procfs read here. All
- * five now come from one netctl_rtnl_get_link() round trip (netctl-rtnl.c)
- * instead -- see this file's own header comment -- so there is nothing
- * left to define in this section; status_one() calls netctl_rtnl_get_link()
- * directly. */
-
 /* --- status: kernel ground truth + netd's published files -------------- */
 
 /*
@@ -405,14 +378,14 @@ static bool usb_string_attr(const char *ifname, const char *attr, char *out, siz
 #define FIELD_VAL_LEN 160
 
 /*
- * --- colour: mirrors real networkctl's own rules exactly -----------------
+ * --- colour: mirrors real networkctl's rules ----------------------------
  *
  * operational_state_to_color()/setup_state_to_color()/online_state_to_color()
  * (src/network/networkctl-util.c, systemd main as of commit
  * 4c63532c28094aeba6dccc5afb9690e02fd98d66, 2026-10-04) -- same checks,
- * reproduced byte-for-byte; pico-color.h's accessors already carry the
- * exact upstream ANSI_* literals and the colours_enabled() on/off
- * decision, so these only pick which accessor applies.
+ * reproduced byte-for-byte; pico-color.h's accessors carry the upstream
+ * ANSI_* literals and the colours_enabled() decision, so these only pick
+ * which accessor applies.
  */
 
 static void operational_color(const char *ifname, const char *state, const char **on, const char **off) {
@@ -468,7 +441,7 @@ static void online_color(const char *state, const char **on, const char **off) {
  * explicit ansi_*() call sites in networkctl-util.c/-status-{link,system}.c,
  * and this is format-table.c's own implicit default, never an explicit
  * call in either of those -- so it is reproduced locally here rather than
- * adding an accessor there, per this change's own file scope.
+ * adding an accessor there.
  */
 static const char *field_label_color(void) {
         return pico_colors_enabled() ? "\x1B[0;94m" : "";
@@ -476,9 +449,8 @@ static const char *field_label_color(void) {
 
 /* "%*s: %s\n" with the label (and its trailing colon) coloured the way
  * every field label in real networkctl's vertical status table is --
- * pico_ansi_normal()/field_label_color() both already collapse to "" when
- * colours are off, so this stays byte-identical to the old plain printf
- * in that case. */
+ * pico_ansi_normal()/field_label_color() both collapse to "" when colours
+ * are off, giving plain output. */
 static void print_field_plain(const char *label, const char *value) {
         printf("%s%*s:%s %s\n", field_label_color(), LABEL_WIDTH, label, pico_ansi_normal(), value);
 }
@@ -535,10 +507,9 @@ static bool ifaddr_to_string(const struct sockaddr *sa, char *buf, size_t len) {
  * networkctl's own dump_gateways() queries the same kernel route table via
  * RTM_GETROUTE instead, but needs no privileged socket either way).
  * `only_ifname` NULL collects every default route system-wide
- * (status_all()); non-NULL filters to that one interface (status_one()) --
- * replacing a read of netd's own lease file there, which goes stale the
- * moment the kernel's default route changes by any other means (manual
- * `ip route`, a different lease, route removal) without netd rewriting it.
+ * (status_all()); non-NULL filters to that one interface (status_one()). The
+ * lease file is not used because it goes stale when the default route changes
+ * by other means.
  * Destination 00000000 (hex, little-endian) is the default route; Gateway
  * is the same encoding.
  */
@@ -614,11 +585,9 @@ static void status_one(const char *ifname) {
          * answer (Type's ARPHRD, Alternative Names, MTU min/max, QDisc,
          * IPv6 Address Generation Mode, Number of Queues). A failure here
          * (r < 0) just means those rows are omitted below --
-         * netctl_rtnl_get_link() zeroes `info` even on failure, so every
-         * has_* / non-NULL check that follows is honest either way; not
-         * logged, to keep this file free of any dependency on netd's own
-         * logging (pico_log() lives in pico_init_core, which this binary
-         * deliberately does not link -- see this file's own header).
+         * netctl_rtnl_get_link() zeroes `info` even on failure. Not logged:
+         * pico_log() lives in pico_init_core, which this binary does not
+         * link.
          */
         (void) netctl_rtnl_get_link(ifname, &info);
 
@@ -626,8 +595,7 @@ static void status_one(const char *ifname) {
                 /* Real networkctl's bullet (the very first line) is coloured
                  * the same as the State row's operational half
                  * (operational_state_to_color()) further down, so both are
-                 * computed once here, up front, and reused for the State
-                 * row below rather than re-derived. */
+                 * computed once here and reused for the State row. */
                 char op[32], setup[32];
                 const char *on_op, *off_op, *on_setup, *off_setup, *on_online, *off_online;
 
@@ -670,11 +638,9 @@ static void status_one(const char *ifname) {
         }
 
         {
-                /* Bridge detection has no rtnetlink equivalent (kept as the
-                 * existing sysfs check); the ARPHRD classification below it
-                 * now comes from the same RTM_GETLINK reply as every other
-                 * new row, rather than a second, separate sysfs /type
-                 * read. */
+                /* Bridge detection has no rtnetlink equivalent, so it uses
+                 * sysfs; the ARPHRD classification below comes from the
+                 * RTM_GETLINK reply. */
                 char bridge_path[128];
                 const char *type;
 
@@ -822,7 +788,7 @@ static void status_all(void) {
          * The aggregate state has to be known before the bullet is printed
          * (real system_status() colours its own bullet the same as the
          * State row, operational_state_to_color() with no particular
-         * ifname -- networkctl-status-system.c), so this loop now runs
+         * ifname -- networkctl-status-system.c), so this loop runs
          * ahead of the interface-list printing loop below it.
          */
         for (i = list; i->if_name; i++) {

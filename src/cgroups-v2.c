@@ -2,11 +2,10 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * cgroups v2 supervision. Written fresh rather than quarried: the ~2011
- * systemd this project quarries elsewhere is cgroup-v1 only, and v1's
- * release-agent notification is unreliable enough that a whole PID-set
- * tracker exists upstream to work around it. v2's cgroup.events makes all of
- * that unnecessary, so the v1 code was studied and then not used.
+ * cgroups v2 supervision. Written fresh rather than lifted from the ~2011
+ * systemd the rest of this tree derives from, which is cgroup-v1 only: v1's
+ * release-agent notification is unreliable enough that upstream needed a
+ * PID-set tracker, and v2's cgroup.events makes that unnecessary.
  *
  * Three things here are load-bearing and easy to get wrong:
  *  - cgroup.kill takes "1", not "all". "all" is rejected with EIO.
@@ -468,7 +467,7 @@ int cgroup_v2_new(const char *path, struct pico_cgroup **ret) {
         }
 
         /*
-         * Deliberately NOT fatal. cgroup.kill arrived in Linux 5.14, and the
+         * Not fatal. cgroup.kill arrived in Linux 5.14, and the
          * kernels least likely to have it are exactly the old ARM vendor
          * kernels this project targets. Failing cgroup creation here would
          * mean every service fails to start on precisely those boards --
@@ -735,9 +734,7 @@ int cgroup_v2_kill(struct pico_cgroup *cg) {
 
         /*
          * Fast path. The value is "1" -- cgroup.kill takes a boolean, and
-         * "all" is rejected with EIO. (An earlier draft of this project's own
-         * design document said "all"; it was wrong, and writing it fails
-         * against a real kernel every time.)
+         * "all" is rejected with EIO.
          */
         if (cg->kill_fd >= 0)
                 return write_all(cg->kill_fd, "1");

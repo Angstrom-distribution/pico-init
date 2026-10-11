@@ -5,17 +5,12 @@
  * Fixture-driven test for unit-parse.c: real unit files on disk in, parsed
  * fields and tolerated errors out.
  *
- * This closes the last item on the §7 unit-test list. Two things had covered
- * parts of it and neither covered this. The line-level scanner moved into
- * conf-scan.c and is genuinely shared with netd's `.network` parser, so
- * test-netd-network.c's 30MB single-token line does exercise the unbounded
- * getline() path -- but it reaches it through netd's own
- * config_parse_match_name(), never through unit-parse.c. The VLA that actually
- * crashed was in config_parse_unit_deps() here, on the unit-file side of that
- * seam, and nothing committed had ever run a long line through it. And every
- * other PID1 test writes unit files only as a means to an end: they assert
- * about jobs, ordering, supervision and boot, so a directive silently parsed
- * into the wrong field would pass all of them as long as the unit loaded.
+ * The line-level scanner lives in conf-scan.c and is shared with netd's
+ * `.network` parser, but test-netd-network.c reaches it through netd's own
+ * handlers, never through unit-parse.c. And every other PID1 test writes unit
+ * files only as a means to an end: they assert about jobs, ordering,
+ * supervision and boot, so a directive silently parsed into the wrong field
+ * would pass all of them as long as the unit loaded.
  *
  * So the rule here is that every assertion is about the parser's own output --
  * the fields on the Unit and the Service -- and about what it does with input
@@ -278,7 +273,7 @@ static void test_degradation_record(void) {
         /* PIDFile= likewise: stored for Type=forking, never a drop. */
         ASSERT_STREQ(((Service *) u)->pid_file, "/run/richd.pid");
 
-        /* EnvironmentFile=/Environment= are parsed and stored now (E1), not
+        /* EnvironmentFile=/Environment= are parsed and stored, not
          * degraded -- see test_environment_directives() for their own
          * dedicated coverage. */
         ASSERT_STREQ(((Service *) u)->environment_files[0], "-/etc/default/rich");
@@ -382,11 +377,10 @@ static void test_degradation_record_covers_deps_and_timeouts(void) {
 }
 
 /*
- * E0: a second, independently-valid ExecStart= line still replaces the
- * first (no command list exists to run both), but that replacement is now
- * visible in the degradation record -- config_parse_exec_start() mirrors
- * config_parse_exec_start_pre()'s existing "multiple ... not supported"
- * pattern instead of silently dropping the first value with no trace.
+ * A second, independently-valid ExecStart= line replaces the first, and
+ * the replacement is visible in the degradation record --
+ * config_parse_exec_start() mirrors config_parse_exec_start_pre()'s
+ * "multiple ... not supported" pattern.
  */
 static void test_repeated_exec_start_is_recorded(void) {
         Manager *m;
@@ -420,7 +414,7 @@ static void test_repeated_exec_start_is_recorded(void) {
 }
 
 /*
- * E1: Environment=/EnvironmentFile= are parsed and stored, not degraded.
+ * Environment=/EnvironmentFile= are parsed and stored, not degraded.
  * Quoting matches ExecStart= (pico_extract_first_word()), each word is
  * %-expanded individually, an empty rvalue resets the accumulated list, and
  * EnvironmentFile='s optional leading '-' is kept verbatim.
@@ -655,11 +649,9 @@ static void test_comment_inside_continuation_is_skipped(void) {
 }
 
 /*
- * Quoting, and the trailing-garbage case the M1 review caught.
+ * Quoting, and trailing garbage after a quoted word.
  *
- * `"bar"baz` was silently accepted and glued into `barbaz`, despite a comment
- * in the code claiming it was rejected -- a dead check. Asserting the
- * rejection is what keeps that from regressing back into a value nobody wrote.
+ * `"bar"baz` must be rejected, not glued into `barbaz`, a value nobody wrote.
  */
 /*
  * StandardOutput=/StandardError=: journal (and its syslog/+console spellings)
@@ -932,28 +924,19 @@ static void test_invalid_dependency_names_are_rejected(void) {
 }
 
 /*
- * The reproduction this file exists for: a 30MB Requires= line.
+ * A 30MB Requires= line.
  *
- * config_parse_unit_deps() originally sized a VLA by strlen(rvalue), and
- * rvalue comes straight out of conf-scan.c's deliberately unbounded getline()
- * -- so a single long line in a unit file overflowed PID 1's stack. The M1
- * review found it before it shipped and reproduced it by hand with exactly
- * this input; the fix was a heap buffer. It stayed a hand-run check until now,
- * which meant the one hazard in this parser with a known crashing input had no
- * committed regression at all.
+ * rvalue comes straight out of conf-scan.c's unbounded getline(), so
+ * config_parse_unit_deps() must not size a stack buffer (VLA) by
+ * strlen(rvalue): one long line would overflow PID 1's stack.
  *
- * Two tokens, not one, and that is deliberate: a single 30MB token exercises
- * the allocation but never the tokenizer, and it is the strtok_r walk over a
- * heap copy that the VLA fix actually changed. The trailing short token also
- * proves the loop still terminates correctly after the enormous one.
+ * Two tokens, not one: a single 30MB token exercises the allocation but never
+ * the tokenizer's strtok_r walk over the heap copy. The trailing short token
+ * proves the loop still terminates after the enormous one.
  *
- * One thing this test looked like it had found and had not, recorded so the
- * next reader does not chase it either: the rejected 30MB token is echoed into
- * a "not a valid unit name" warning, which reads like PID 1 writing 30MB to
- * /dev/kmsg over one bad line. It does not. pico_log_internal() formats
- * through a fixed 1024-byte buffer, so the whole run emits under 3 KiB and the
- * longest line is 1022 bytes -- measured, not assumed. There is no unbounded
- * logging defect here to fix.
+ * The rejected 30MB token is echoed into a "not a valid unit name" warning,
+ * but pico_log_internal() formats through a fixed 1024-byte buffer, so the
+ * log output stays bounded.
  */
 static void test_huge_requires_line_does_not_crash(void) {
         const size_t huge_len = 30 * 1024 * 1024;
@@ -1058,7 +1041,7 @@ static void test_conditions_are_parsed(void) {
 }
 
 /*
- * The two spellings this MVP does not implement -- triggering, relative --
+ * The two spellings this parser does not implement -- triggering, relative --
  * are dropped with a warning rather than failing the unit, and an empty
  * value resets whatever the same directive had already accumulated,
  * including its negation flags.
@@ -1106,12 +1089,8 @@ static void test_unsupported_condition_values_are_dropped(void) {
 }
 
 /*
- * G2: specifier expansion through the real handler chain, not the engine's
- * own synthetic table (test-specifier.c already covers that). Everything
- * below this point is new; everything above is untouched by G2 -- see the
- * two test_conditions_are_parsed()/test_unsupported_condition_values_are_
- * dropped() cases above for the regression that matters most: neither
- * function nor test needed a single edit for this milestone to land.
+ * Specifier expansion through the real handler chain, not the engine's
+ * own synthetic table (test-specifier.c already covers that).
  */
 
 /*
@@ -1338,10 +1317,8 @@ static void test_unknown_specifier_tolerated(void) {
 }
 
 /*
- * Pins the v30-fidelity scope boundary named in this file's own header:
- * verified against the quarry that v30 does not run specifier_printf() over
- * a Condition* value either, so this stays unexpanded on purpose, not by
- * omission. Makes the choice visible in the suite instead of implicit.
+ * Upstream v30 does not run specifier_printf() over a Condition* value
+ * either, so it stays unexpanded on purpose; this pins that choice.
  */
 static void test_condition_values_are_not_expanded(void) {
         Manager *m;
@@ -1369,12 +1346,9 @@ static void test_condition_values_are_not_expanded(void) {
 }
 
 /*
- * G1/G3(b) unaffected, half two of two: a byte-for-byte copy of the real
- * shipped serial-getty@ttyGS0.service fixture (meta-angstrom's
- * recipes-core/init-systems/pico-init-units/), asserted field by field.
- * The file carries no '%' character at all (verified by grep over the whole
- * pico-init-units/ directory before this milestone started), so
- * introducing specifier expansion cannot have changed what it means.
+ * A byte-for-byte copy of a shipped serial-getty@ttyGS0.service unit,
+ * asserted field by field. It carries no '%' character at all, so
+ * specifier expansion cannot change what it means.
  */
 static void test_shipped_ttygs0_unit_is_unchanged(void) {
         Manager *m;
@@ -1429,10 +1403,8 @@ static void test_shipped_ttygs0_unit_is_unchanged(void) {
 }
 
 /*
- * G1/G3(b) unaffected, and G2's own precedence rule in the same breath: the
- * exact post-G3(a) on-disk layout (a real template alongside the literal
- * override), tested before G3(a) itself is even written. Every assertion
- * from test_shipped_ttygs0_unit_is_unchanged() must hold identically.
+ * Precedence: a real template alongside the literal override. Every
+ * assertion from test_shipped_ttygs0_unit_is_unchanged() must hold identically.
  */
 static void test_shipped_ttygs0_unit_wins_over_template(void) {
         Manager *m;
@@ -1460,7 +1432,7 @@ static void test_shipped_ttygs0_unit_wins_over_template(void) {
                                       "[Install]\n"
                                       "WantedBy=default.target\n"),
                       0);
-        /* the generic template: deliberately different ExecStart=, no
+        /* the generic template: different ExecStart=, no
          * After=/ConditionPathExists= -- if this ever won, every assertion
          * below would fail loudly rather than silently degrade. */
         ASSERT_EQ_INT(test_write_file(dir, "serial-getty@.service", "[Service]\nExecStart=/bin/false %I\n"),
@@ -2088,10 +2060,8 @@ static void test_supplementary_groups_parsed(void) {
 }
 
 /*
- * The two real-world gaps both start from (plans/30 R6 extension): the
- * stock oe-core seatd.service and picowl.service, as actually shipped
- * (directive lines only, verbatim -- no license header, no comments this
- * file's own scanner doesn't already have dedicated coverage for). Both
+ * The stock oe-core seatd.service and a picowl.service as shipped
+ * (directive lines only, verbatim). Both
  * carry a long run of directives pico-init has no field for at all
  * (ProtectHome=, CapabilityBoundingSet=, DeviceAllow=, ...): the point of
  * this test is that none of that stops either unit from loading with a

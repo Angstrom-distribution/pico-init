@@ -3,13 +3,11 @@
 /* SPDX-License-Identifier: CC0-1.0 */
 
 /*
- * SipHash-2-4, carried from systemd v261.2 (commit 4925d9f07f),
- * src/basic/siphash24.h. Public domain (CC0-1.0), as is siphash24.c
- * beside it -- both files, not just the .c.
+ * SipHash-2-4, carried from systemd v261.2 src/basic/siphash24.h. Public
+ * domain (CC0-1.0), as is siphash24.c.
  *
- * Trimmed to what the DHCP lift set actually calls: the usec_t and
- * struct iovec compression helpers are dropped, since they exist only to
- * pull in systemd's time and iovec utilities.
+ * The usec_t and struct iovec compression helpers are dropped: they only
+ * exist to pull in systemd's time and iovec utilities.
  */
 
 #pragma once

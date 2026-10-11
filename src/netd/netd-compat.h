@@ -3,32 +3,28 @@
 
 /*
  * The shim layer that lets the lifted LGPL-2.1-or-later files under
- * src/netd/dhcp/ compile nearly verbatim (plan §2.2, "Support" row).
+ * src/netd/dhcp/ compile nearly verbatim.
  *
- * Everything here exists because a real v261.2 file under
- * src/libsystemd-network/ reaches for it. The set was not guessed: it is the
- * measured macro/helper census over the eleven files in the lift set
- * (dhcp-message.c, sd-dhcp-client.c, dhcp-client-send.c, sd-dhcp-lease.c,
- * sd-dhcp-client-id.c, dhcp-protocol.c, dhcp-route.c, sd-dhcp-server.c,
- * dhcp-server-request.c, dhcp-server-send.c, sd-dhcp-server-lease.c) -- so
- * nothing is defined "just in case", and anything a lift turns out to still
- * need gets added here rather than edited into the lifted file.
+ * Everything here exists because a lifted v261.2 file from
+ * src/libsystemd-network/ reaches for it; nothing is defined "just in case".
+ * Anything a lifted file still needs gets added here rather than edited into
+ * the lifted file.
  *
  * Header-only on purpose. The test programs link netd-core, not netd.c, so a
  * shim implemented in a .c file would either have to live in netd-core (where
  * it does not belong) or be missing from every test binary. `static inline`
- * costs nothing and keeps the shim one file, as plan §2.4 lists it.
+ * costs nothing and keeps the shim one file.
  *
- * DELIBERATELY NOT statement expressions. Upstream implements TAKE_PTR,
+ * No statement expressions. Upstream implements TAKE_PTR,
  * ASSERT_PTR, IN_SET and friends with GNU `({ ... })`, which -Wpedantic (on
- * for every build here, see the verify harness) rejects outright. Each one
+ * for every build here) rejects outright. Each one
  * below is re-expressed in standard C, at the cost of the evaluation-count
  * caveats called out per macro. Read those before using one on an expression
  * with side effects.
  *
  * Licensing note: this header is GPL-2.0-or-later like the rest of netd's own
  * code, and is included by LGPL-2.1-or-later files. That is the permitted
- * direction (plan §2.3/§2.11) -- each lifted file keeps its own LGPL
+ * direction -- each lifted file keeps its own LGPL
  * identifier, and the combined netd binary is GPL-2.0-or-later as a whole.
  */
 
@@ -167,7 +163,7 @@ __attribute__((__noreturn__)) static inline void
  * operator, with the value carried between them in a file-static.
  *
  * That static is safe here and nowhere near as fragile as it looks: netd is
- * single-threaded by construction (one process, one epoll loop, §2.3), and
+ * single-threaded by construction (one process, one epoll loop), and
  * the two halves are separated only by the pico_log() call in the same
  * expression -- nothing can run in between. The point of the dance is that
  * `error` is evaluated exactly once, which the obvious three-way comma
@@ -459,8 +455,7 @@ static inline bool netd_in_set(long long x, size_t n, const long long *set) {
 /*
  * dhcp-message.c and sd-dhcp-client.c both build the DHCP parameter request
  * list with set_ensure_put() over UINT8_TO_PTR() keys -- so hashmap.h reaches
- * into what §2.1 called the "pure codec", not just into the server's lease
- * table where it was expected.
+ * into the DHCP codec, not just into the server's lease table.
  *
  * It does not follow that netd needs a hashmap. The key is a uint8_t: the
  * entire key space is 256 values, so the set is a 32-byte bitmap with no
@@ -471,7 +466,7 @@ static inline bool netd_in_set(long long x, size_t n, const long long *set) {
  * The one behavioural difference to know: iteration is in ascending option
  * order rather than upstream's hash order. That is an improvement -- it makes
  * the emitted parameter request list deterministic, which the golden-byte
- * codec tests of §2.8 depend on.
+ * codec tests depend on.
  */
 typedef struct NetdU8Set {
         uint8_t bits[32];
@@ -606,7 +601,7 @@ static inline usec_t usec_sub_signed(usec_t a, int64_t b) {
         return usec_sub_unsigned(a, (usec_t) b);
 }
 
-/* --- IPv4 address helpers (the "mini in-addr" set of plan §2.2) --- */
+/* --- IPv4 address helpers --- */
 
 static inline bool in4_addr_is_null(const struct in_addr *a) {
         assert(a);
@@ -727,7 +722,7 @@ static inline const char *netd_in4_addr_to_string(const struct in_addr *a, char 
 /* --- machine id --- */
 
 /*
- * sd_id128_get_machine() replacement (plan §2.2, "Client identity" row). The
+ * sd_id128_get_machine() replacement. The
  * DHCP client derives its default DUID from the machine ID, so this needs to
  * be stable across boots and identical in shape to upstream's: 16 bytes read
  * from /etc/machine-id's 32 lowercase hex characters.

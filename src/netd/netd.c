@@ -2,13 +2,8 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * netd's main(). Nothing else lives here on purpose: meson.build's netd_exe
- * links this file directly, on top of netd_core, and netd_core is also what
- * every netd test executable links -- so anything a test needs to call
- * (netd_new(), netd_startup(), the setters, netd_free()) has to be defined
- * somewhere netd_core actually reaches, never in this file. That logic
- * lives in netd-loop.c now; see that file's header for the full reasoning.
- * This mirrors PID 1's own main.c/manager.c split for the same reason.
+ * netd's main(). Everything a test needs to call lives in netd-loop.c, which
+ * netd_core links; this file is linked only into the netd executable.
  */
 
 #include "netd.h"

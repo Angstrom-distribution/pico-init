@@ -3,19 +3,9 @@
 
 /*
  * pico-init's own implementation of the sd-login.h ABI surface. Function
- * names, signatures and the documented error conventions below match
- * real systemd's src/systemd/sd-login.h (HEAD ded83144, 2026-08-23)
- * byte-for-byte -- that is the compatibility contract -- but nothing
- * here is copied text from that LGPL-2.1-or-later source; it was read
- * for the contract only. What is behind each signature is this
- * project's own, described in sd-login-resolve.c/sd-login-cgroup.c/
- * sd-login.c.
- *
- * The doc comments below are pico's own restatement of each function's
- * contract (not upstream's wording), except where a function's real
- * behavior here is byte-identical to what upstream already documents for
- * a logind-less system, in which case restating it differently would
- * only make the two harder to compare.
+ * names, signatures and documented error conventions match systemd's
+ * src/systemd/sd-login.h (HEAD ded83144). The implementations are in
+ * sd-login-resolve.c, sd-login-cgroup.c and sd-login.c.
  */
 
 #pragma once

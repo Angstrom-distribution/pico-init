@@ -70,8 +70,8 @@ static int log_level_syslog_priority(PicoLogLevel level) {
         return 6;
 }
 
-/* Where pico_log() writes. stderr until a daemon opts into /dev/kmsg; see
- * pico_log_to_kmsg() and util.h for why that is opt-in rather than automatic. */
+/* Where pico_log() writes: stderr until a daemon opts into /dev/kmsg; see
+ * pico_log_to_kmsg() in util.h. */
 static int log_fd = STDERR_FILENO;
 static bool log_fd_is_kmsg = false;
 
@@ -90,13 +90,8 @@ void pico_log_to_kmsg(void) {
 }
 
 /*
- * One buffer, one write() -- not fprintf()+vfprintf()+fputc() as three
- * separate calls. Harmless against a plain console/pipe, but this is the
- * discipline a line-oriented destination needs in general (three writes
- * for what is meant to be one line can become three separate records
- * rather than one, exactly the property logd-recv.c's own stdout capture
- * cares about for the same reason), so it is applied here uniformly
- * rather than only where it happens to matter today.
+ * One buffer, one write(), not several. A line-oriented destination (kmsg,
+ * logd's stdout capture) would otherwise see one line as several records.
  */
 void pico_log_internal(PicoLogLevel level, const char *format, ...) {
         char buf[1024];
@@ -129,10 +124,9 @@ void pico_log_internal(PicoLogLevel level, const char *format, ...) {
         buf[total] = '\n';
         total += 1;
 
-        /* Not `(void) write(...)`: a void cast does NOT suppress
+        /* Not `(void) write(...)`: a void cast does not suppress
          * warn_unused_result in GCC, and glibc marks write() __wur under
-         * _FORTIFY_SOURCE -- which the target build enables and a -O0 host
-         * build does not, so this is invisible until cross-compilation. */
+         * _FORTIFY_SOURCE, which -O0 host builds do not enable. */
         if (write(log_fd, buf, (size_t) total) < 0) {
                 /* Nothing useful to do here: this is the logger. */
         }
@@ -330,16 +324,10 @@ int pico_extract_first_word(const char **state, char **ret) {
                                 /*
                                  * Closing a quote: the next character must be
                                  * unquoted whitespace or end-of-string, or
-                                 * that's trailing garbage right after the
-                                 * quote (foo="bar"baz). This is the actual
-                                 * a2a5291b3/b2fadec60 check -- a prior version
-                                 * of this function had the equivalent check
-                                 * placed after the loop, where it could never
-                                 * fire (the loop's own exit conditions mean
-                                 * *p is always '\0'/' '/'\t' by the time it's
-                                 * reached), so foo="bar"baz was silently
-                                 * accepted as "barbaz". Found by review
-                                 * before this ever shipped.
+                                 * it is trailing garbage right after the
+                                 * quote (foo="bar"baz). This is the
+                                 * a2a5291b3/b2fadec60 check; after the loop
+                                 * it could never fire.
                                  */
                                 if (p[1] != '\0' && p[1] != ' ' && p[1] != '\t') {
                                         free(buf);
@@ -361,13 +349,8 @@ int pico_extract_first_word(const char **state, char **ret) {
         }
         *w = '\0';
 
-        /*
-         * No trailing-garbage check needed here: the loop above only ever
-         * exits with *p == '\0' or (unquoted) *p being a space/tab -- the
-         * real trailing-garbage rejection happens at the point a quote
-         * closes, above, where the actual violating character is still
-         * known.
-         */
+        /* No trailing-garbage check here: the loop only exits with *p == '\0'
+         * or an unquoted space/tab; the rejection happens when a quote closes. */
 
         *state = p;
         *ret = buf;
@@ -515,8 +498,8 @@ static char *env_unquote(char *v) {
 
 /*
  * v30's load_env_file() + normalize_env_assignment(), with three changes:
- * getline() instead of a LINE_MAX fgets() buffer (e6dde451a's reasoning, see
- * unit-parse.c: a long line is never silently split into two), NAME is
+ * getline() instead of a LINE_MAX fgets() buffer (so a long line is never
+ * silently split into two; see e6dde451a), NAME is
  * stripped as well as the value, and a line with no '=' or an empty NAME is
  * warned about and skipped rather than stored -- the same policy
  * Environment= itself applies at parse time.

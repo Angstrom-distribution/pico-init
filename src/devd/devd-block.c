@@ -200,10 +200,8 @@ int devd_block_event(
 
         /*
          * Only add and remove. A `change` on a block device means the medium
-         * behind it changed, which for the GPT-prepared-media scope here would
-         * mean re-reading a table under a mount devd already made -- real
-         * scope, and not this milestone's. Silently doing half of it would be
-         * worse than not doing it.
+         * behind it changed, which would mean re-reading a table under a mount
+         * devd already made; that is not handled.
          */
         if (u->action != DEVD_ACTION_ADD && u->action != DEVD_ACTION_REMOVE)
                 return 0;

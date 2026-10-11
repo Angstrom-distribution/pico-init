@@ -3,24 +3,18 @@
 
 /*
  * Everything in sd-login.h except the cgroup/unit/slice family
- * (sd-login-cgroup.c): the logind-shaped world (sessions, seats, users,
- * machines, the login monitor) pico-init never populates, because
- * pico-init is not logind and registers none of it. The errno contract
- * throughout is upstream's own (sd-login.c, HEAD ded83144): -ENXIO for a
- * named object that does not exist, -ENODATA for metadata missing on an
- * object confirmed to exist (or for a NULL session/seat, which upstream
- * resolves via the caller's own session -- impossible here, so the
- * -ENODATA that lookup would fail with propagates directly instead).
+ * (sd-login-cgroup.c): sessions, seats, users, machines and the login
+ * monitor, none of which pico-init registers because it is not logind. The
+ * errno contract is upstream's (sd-login.c, HEAD ded83144): -ENXIO for a
+ * named object that does not exist, -ENODATA for missing metadata on an
+ * existing object, or for a NULL session/seat (upstream resolves that via
+ * the caller's own session, which cannot exist here).
  *
- * A few answers ARE real rather than stubbed, because they are true
- * regardless of logind: sd_uid_get_state()'s "offline" is upstream's own
- * documented answer for "no /run/systemd/users/<uid>" (permanently the
- * case here); sd_uid_get_sessions()/get_seats()/sd_get_seats() and
- * friends report zero, the true count; sd_uid_is_on_seat() answers "not
- * on that seat" (0) truthfully for the same reason; sd_machine_get_class()
- * answers ".host" without touching any state, exactly as upstream does;
- * sd_seat_can_multi_session() is upstream's own unconditional "true"
- * stub, byte-identical here.
+ * Some answers are true without logind: sd_uid_get_state() is "offline"
+ * (upstream's answer when /run/systemd/users/<uid> is absent);
+ * sd_uid_get_sessions()/get_seats()/sd_get_seats() and friends report zero;
+ * sd_uid_is_on_seat() is 0; sd_machine_get_class() is ".host", as upstream;
+ * sd_seat_can_multi_session() is upstream's unconditional "true" stub.
  */
 
 #include "sd-login.h"
@@ -33,10 +27,8 @@
 #include <string.h>
 
 /* Shared by every sd_pid_get_*(), sd_pidfd_get_*() and sd_peer_get_*()
- * function below that has no real answer: confirm the process/pidfd/peer resolves to a
- * live pid (the same check sd-login-cgroup.c's real getters make), then
- * report -ENODATA -- the metadata genuinely does not exist on this
- * system, which is the truthful answer once existence itself is settled. */
+ * function below that has no data: confirm the process/pidfd/peer resolves
+ * to a live pid (as sd-login-cgroup.c's getters do), then report -ENODATA. */
 static int pid_confirmed_but_no_data(pid_t pid) {
         pid_t rpid;
         char *content;
@@ -149,9 +141,7 @@ int sd_uid_get_state(uid_t uid, char **ret_state) {
         if (!s)
                 return -ENOMEM;
 
-        /* ret_state is optional, like every other output pointer here --
-         * upstream's own existence-only idiom (sd-login.c's
-         * `if (ret_state) *ret_state = TAKE_PTR(s);`). */
+        /* ret_state is optional, as in upstream. */
         if (ret_state)
                 *ret_state = s;
         else
@@ -212,12 +202,11 @@ int sd_uid_get_login_time(uid_t uid, uint64_t *ret_usec) {
 
 /* Shared by every sd_session_get_*()/is_*() and sd_seat_get_*()/can_*()
  * function: NULL means "my own session/seat", which upstream resolves via
- * sd_pid_get_session(0) -- impossible here, so its -ENODATA propagates
- * directly (sd-login.c:45's -ENXIO/-ENOMEDIUM -> -ENODATA mapping). A
- * name containing '/' (or "." / "..") could never be a real
- * /run/systemd/{sessions,seats}/<name> filename -- -EINVAL, a caller
- * bug, not a lookup failure. Any other name is syntactically fine and
- * permanently unregistered -- -ENXIO, "does not exist". */
+ * sd_pid_get_session(0); that cannot succeed here, so its -ENODATA
+ * propagates (sd-login.c:45's -ENXIO/-ENOMEDIUM -> -ENODATA mapping). A
+ * name containing '/' (or "." / "..") cannot be a
+ * /run/systemd/{sessions,seats}/<name> filename: -EINVAL. Any other name is
+ * valid but never registered: -ENXIO. */
 static int session_or_seat_errno(const char *name) {
         if (!name)
                 return -ENODATA;
@@ -318,12 +307,10 @@ int sd_seat_can_multi_session(const char *seat) {
 
 /* -------------------------------------------------------------------- */
 
-/* A real hostname label never starts or ends with '.' or '-', and never
- * has two dots in a row -- unlike ".host", which is a machined-internal
- * sentinel, not a hostname at all. sd_machine_get_class() below checks
- * for that sentinel before ever calling this, matching upstream's own
- * order; sd_machine_get_ifindices() has no such special case, so ".host"
- * correctly fails this and gets -EINVAL there. */
+/* A hostname never starts or ends with '.' or '-' and has no two dots in a
+ * row. ".host" is a machined sentinel, not a hostname: sd_machine_get_class()
+ * checks for it before calling this, as upstream does, while
+ * sd_machine_get_ifindices() does not, so ".host" gets -EINVAL there. */
 static int is_valid_hostname_ish(const char *name) {
         size_t len, i;
 
@@ -356,8 +343,7 @@ int sd_machine_get_class(const char *machine, char **ret_clazz) {
                 s = strdup("host");
                 if (!s)
                         return -ENOMEM;
-                /* ret_clazz is optional, matching upstream's own
-                 * `if (ret_clazz) *ret_clazz = TAKE_PTR(c);` idiom. */
+                /* ret_clazz is optional, as in upstream. */
                 if (ret_clazz)
                         *ret_clazz = s;
                 else
@@ -374,10 +360,8 @@ int sd_machine_get_class(const char *machine, char **ret_clazz) {
 int sd_machine_get_ifindices(const char *machine, int **ret_ifindices) {
         (void) ret_ifindices;
 
-        /* ".host" fails hostname validation the same way upstream's
-         * assert_return(hostname_is_valid(machine, 0)) does -- unlike
-         * sd_machine_get_class(), this call has no special-cased answer
-         * for it. */
+        /* ".host" fails hostname validation as in upstream's
+         * assert_return(hostname_is_valid(machine, 0)). */
         if (!machine || !is_valid_hostname_ish(machine))
                 return -EINVAL;
 
@@ -414,11 +398,10 @@ int sd_login_monitor_new(const char *category, sd_login_monitor **ret) {
             strcmp(category, "uid") != 0 && strcmp(category, "machine") != 0)
                 return -EINVAL;
 
-        /* The real errno on any logind-less system: inotify_add_watch() on
-         * the nonexistent /run/systemd/<category> directory fails ENOENT
-         * (sd-login.c:1183-1218). A monitor that could never fire would
-         * strand a caller waiting forever instead of routing it to its
-         * existing no-logind fallback. */
+        /* Upstream's errno without logind: inotify_add_watch() on the missing
+         * /run/systemd/<category> directory fails ENOENT (sd-login.c:1183-1218).
+         * A monitor that never fires would hang callers instead of letting
+         * them use their no-logind fallback. */
         return -ENOENT;
 }
 

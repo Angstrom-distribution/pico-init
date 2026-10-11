@@ -14,8 +14,8 @@
  */
 
 /* O_PATH is a glibc/kernel extension gated behind _GNU_SOURCE; -std=gnu17
- * alone does not imply it (see socket.c's own note), so this has to be
- * explicit and first, before any header pulls in features.h. */
+ * alone does not imply it, so it must be defined first, before any header
+ * pulls in features.h. */
 #define _GNU_SOURCE
 
 #include "sd-device.h"

@@ -2,21 +2,16 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * M5's acceptance test: a real boot, end to end, against a minimal unit set.
+ * A real boot, end to end, against a minimal unit set.
  *
- * Everything the earlier milestones tested in isolation has to work together
- * here -- fragment parsing, the load queue, .wants/ symlinks, preset
- * application, transaction ordering, fork/exec, SIGCHLD reaping through the
- * signalfd, and cgroup supervision -- so this is deliberately driven through
- * the real manager_loop() rather than a hand-rolled pump. A test that called
- * the dispatch functions itself would prove the pieces work but not that the
- * loop wires them together in the right order, which is the entire content of
- * M5.
+ * Fragment parsing, the load queue, .wants/ symlinks, preset application,
+ * transaction ordering, fork/exec, SIGCHLD reaping through the signalfd and
+ * cgroup supervision all have to work together, so the test drives the real
+ * manager_loop() rather than calling the dispatch functions itself: that is
+ * what proves the loop wires them together in the right order.
  *
- * The loop is stopped the same way anything else stops it: a timer event that
- * sets the objective. That is also a small integration test of its own, since
- * it means the timer queue, the epoll registration and the objective handling
- * all have to be working for this test to terminate at all.
+ * The loop is stopped by a timer event that sets the objective, which also
+ * exercises the timer queue, the epoll registration and objective handling.
  */
 
 #include <errno.h>
@@ -139,7 +134,7 @@ int main(void) {
          * like cgroupfs. A scratch directory cannot stand in: cgroup_v2_new()
          * opens cgroup.procs, which only a real cgroupfs provides, and the
          * service would silently degrade to running unsupervised -- proving
-         * the fallback works, but not the thing M5 is about.
+         * the fallback works, but not supervision.
          *
          * Services live at <root>/system.slice/<unit> and cgroup_v2_new()
          * creates only the leaf, so the slice has to exist first.

@@ -38,18 +38,13 @@
  * anything: a newly known or newly enabled unit is not queued, matching
  * upstream daemon-reload exactly -- it only becomes startable, not started.
  *
- * Deliberately NOT re-run: manager_apply_presets(). Real `systemctl daemon-
- * reload` never touches presets either -- that is what `systemctl preset`
- * is for -- and this project's own manager_startup() only ever calls
- * manager_apply_presets() once, on m->first_boot (see unit-enable.h's own
- * comment on why that is a once-ever decision, not a per-boot one).
- * Re-running it from every reload would re-open a decision this project has
- * deliberately chosen to make exactly once; a unit discovered here with no
- * symlink pointing at it becomes known and loadable, same as at boot, but
- * stays undecided until something explicit (`picoctl enable`/`preset`)
- * decides it -- exactly the real systemd behavior for a reload.
+ * Not re-run: manager_apply_presets(). `systemctl daemon-reload` never
+ * touches presets either (that is `systemctl preset`), and manager_startup()
+ * calls it once, on m->first_boot (see unit-enable.h). A unit discovered here
+ * with no symlink pointing at it becomes known and loadable, as at boot, but
+ * stays undecided until `picoctl enable`/`preset` decides it.
  *
- * Not re-read, deliberately:
+ * Not re-read:
  *  - Requires=/Wants=/Before=/After= *declared in a changed unit's own
  *    fragment*. The graph stores an edge a unit declared and the inverse a
  *    neighbour's Before=/After= put there in the same slot, so dropping
@@ -267,10 +262,7 @@ int manager_reload(Manager *m) {
                         pico_log(PICO_LOG_WARNING, "%s: scanning .wants/.requires: %s", u->id, strerror(-r));
         }
 
-        /* Presets are deliberately NOT re-applied here -- see this file's
-         * own header. A unit discovered above with no symlink naming it is
-         * now known and loadable, same as at boot, but stays undecided
-         * until something explicit (`picoctl enable`/`preset`) decides it. */
+        /* Presets are not re-applied here; see this file's header. */
 
         pico_log(PICO_LOG_INFO,
                  "Reloaded %d unit%s; dependencies and socket units unchanged until reboot",

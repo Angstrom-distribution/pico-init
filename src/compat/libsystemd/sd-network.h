@@ -4,20 +4,15 @@
 /*
  * pico-init's own implementation of the sd-network public API surface.
  *
- * Written from scratch against the real, current sd-network.h for its
- * function signatures and documented error conventions only -- no text from
- * that LGPL-2.1-or-later header is reproduced here, and sd-network (like
- * sd-device) postdates this project's v30 GPL-era quarry point entirely, so
- * there is no GPL shape to carry forward either.
+ * Function signatures and documented error conventions match systemd's
+ * sd-network.h.
  *
- * The real library's data source is systemd-networkd's /run/systemd/netif
- * state files, which do not exist on this image; this shim's source is
- * netd's own /run/netd state instead (netd.h, netd-resolv.h). Several
- * real getters read state netd computes but never publishes anywhere a
- * library could read it back from -- each such gap is a -EOPNOTSUPP with a
- * comment naming the missing netd publisher at its call site, never a
- * fabricated answer. See network-state.c's top comment for the full
- * -ENODATA vs -EOPNOTSUPP discriminator this shim uses throughout.
+ * The real library reads systemd-networkd's /run/systemd/netif state files,
+ * which do not exist here; this shim reads netd's /run/netd state instead
+ * (netd.h, netd-resolv.h). Getters for state netd computes but does not
+ * publish return -EOPNOTSUPP, with a comment at the call site naming the
+ * missing publisher. See network-state.c's top comment for the -ENODATA vs
+ * -EOPNOTSUPP rule.
  */
 
 #pragma once

@@ -2,22 +2,15 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * sd_bus_error: plain caller-owned struct manipulation, no bus involved.
- * Genuinely real, unlike almost everything else under sd-bus-*.c, because
- * callers invoke sd_bus_error_free() unconditionally in cleanup paths --
- * faking this would corrupt every such caller's assumptions about what it
- * owns.
+ * sd_bus_error: caller-owned struct manipulation, no bus involved. This is
+ * fully functional, unlike most of sd-bus-*.c, because callers invoke
+ * sd_bus_error_free() unconditionally in cleanup paths.
  *
- * The name<->errno table below is this project's own -- reimplemented from
- * the real bus_standard_errors[] table's *contract* (src/libsystemd/sd-bus/
- * bus-error.c, HEAD ded83144), not copied from it. One deliberate
- * simplification versus upstream: real libsystemd keeps a second table
- * (errno_to_bus_error_const()) for the reverse errno->name direction, hand-
- * picking a "nicest" name per errno (e.g. EACCES prefers ACCESS_DENIED
- * over the table's own first EACCES entry, FAILED). This shim uses one
- * table for both directions -- the first matching entry wins on the
- * reverse lookup too -- so there is exactly one place that can disagree
- * with itself about what an errno's bus name is.
+ * The name<->errno table is written from the contract of upstream's
+ * bus_standard_errors[] (src/libsystemd/sd-bus/bus-error.c, HEAD ded83144),
+ * not copied. Upstream keeps a second table for errno->name that picks a
+ * preferred name per errno (EACCES -> ACCESS_DENIED rather than FAILED);
+ * here one table serves both directions and the first matching entry wins.
  */
 
 #include "sd-bus.h"

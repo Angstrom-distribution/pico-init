@@ -5,23 +5,16 @@
  * The GPT reader and PID 1's Discoverable-Partitions swap activation.
  * gpt-scan.h has the why, the seam between the two halves, and the API.
  *
- * On the shape of the code: every field is pulled out of a read buffer with an
- * explicit little-endian accessor rather than by overlaying a packed struct.
- * That is not fussiness. A packed struct would have to be right about the
- * host's own byte order (this project targets ARMv5TE today and says nothing
- * about tomorrow) and about unaligned access on a machine that traps it, and
- * it would hide the one property that actually matters here: that no read ever
- * reaches past the bytes that were really read from the device. Offsets against
- * a size-checked buffer make that property visible on every line.
+ * Every field is pulled out of a read buffer with an explicit little-endian
+ * accessor rather than by overlaying a packed struct: that does not depend on
+ * the host's byte order or on unaligned access, and offsets against a
+ * size-checked buffer make it visible that no read reaches past the bytes that
+ * were really read.
  *
- * The input deserves that care. A partition table is data from a disk someone
- * may have handed the machine, parsed by PID 1 as root before anything else
- * runs, and every length in it -- entry size, entry count, where the array
- * lives -- is a number the table itself supplies. Each one is range-checked
- * before it is used, and the two CRC-32s the format carries are verified rather
- * than skipped, which is what makes "this table is corrupt" a conclusion rather
- * than a crash. This is the same discipline conf-scan.c applies to unbounded
- * text input, in the shape a binary format needs.
+ * A partition table is untrusted data parsed by PID 1 as root, and every
+ * length in it (entry size, entry count, where the array lives) is supplied by
+ * the table itself. Each is range-checked before use, and the format's two
+ * CRC-32s are verified.
  */
 
 #include "gpt-scan.h"
@@ -90,7 +83,7 @@ enum {
  * rather than none: it keeps the byte offset inside off_t on a 32-bit build
  * without large-file support, and the primary array sits immediately after the
  * header on every table anyone has ever written -- the copy far out at the end
- * of the disk is the backup, which this deliberately does not read.
+ * of the disk is the backup, which this does not read.
  */
 #define GPT_ARRAY_OFFSET_MAX UINT64_C(0x40000000) /* 1 GiB */
 
@@ -694,7 +687,7 @@ int gpt_boot_root(
                 return r;
 
         /*
-         * Published before the guards below, and deliberately: "root is
+         * Published before the guards below: "root is
          * read-only" is an answer the mountinfo line alone settles, and a
          * caller that only wants that must still get it when the guards go on
          * to say there is no block device to name.
@@ -775,8 +768,7 @@ int gpt_boot_disk(const char *mountinfo, char *ret_node, size_t node_size, char 
  * sysfs directory which of its children carries that number.
  *
  * The alternative -- pasting the number onto the disk name -- gets /dev/vda2
- * right and /dev/mmcblk0p2 wrong, and this project's next hardware target has
- * an SD slot.
+ * right and /dev/mmcblk0p2 wrong.
  */
 static int gpt_partition_node(const char *sysfs_disk, unsigned nr, char *ret, size_t size) {
         struct dirent *e;

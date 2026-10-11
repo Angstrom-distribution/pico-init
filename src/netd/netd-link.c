@@ -3,13 +3,6 @@
 
 /*
  * The interface table and the per-link state machine. See netd-link.h.
- *
- * N1+N2+N3: table operations, .network matching, the per-link state
- * machine, static Address=/Gateway= application, and now the real DHCPv4
- * client and server (dhcp-client-internal.h / dhcp-server-internal.h, both
- * landed) are wired in. link_apply_lease()/link_write_lease_file() were
- * already implemented against the real DhcpLease accessor API at N1, so N2's
- * client had somewhere real to hand a lease the moment it existed.
  */
 
 #include "netd-link.h"
@@ -41,20 +34,17 @@
  * whichever source configured it, removing it later needs the same metric to
  * find the same kernel route again.
  *
- * The metric is per link, not one fixed value for all of them. The kernel
- * identifies a route by table+prefix+priority, and netd adds with
- * NLM_F_CREATE|NLM_F_REPLACE: two managed uplinks (eth0 and usb0, say) at one
- * shared metric are the *same* route to the kernel, so the second link's add
- * silently replaces the first link's default route while both links'
- * gateway_configured still say they have one -- and the first link's later
- * delete then no-ops on -ESRCH. Deriving the metric from the ifindex is what
- * actually makes netd-rtnl.h's "a second interface's default route can
- * coexist" true: distinct metric, distinct route, both individually
- * removable, and the kernel picks the lowest metric as primary.
+ * The metric is per link. The kernel identifies a route by
+ * table+prefix+priority and netd adds with NLM_F_CREATE|NLM_F_REPLACE, so two
+ * managed uplinks (eth0 and usb0, say) at one shared metric are the *same*
+ * route: the second add silently replaces the first link's default route
+ * while both links' gateway_configured still say they have one, and the
+ * first link's later delete no-ops on -ESRCH. A per-link metric keeps the
+ * routes distinct and individually removable, and the kernel picks the
+ * lowest metric as primary (see netd-rtnl.h).
  *
- * ifindex rather than registration order because it is the link identity that
- * survives everything that matters here: it is assigned once in link_new()
- * and never rewritten (link_update_snapshot() leaves it alone), so a teardown
+ * Derived from the ifindex because it is assigned once in link_new() and
+ * never rewritten (link_update_snapshot() leaves it alone), so a teardown
  * always computes the same metric the add did, and a restarted netd that
  * re-enumerates the same interfaces derives the same metrics again.
  */
@@ -124,15 +114,13 @@ static bool same_subnet(struct in_addr a, unsigned char a_pfx, struct in_addr b,
  *      the new address first would make it "secondary" to the old one
  *      (net.ipv4.conf.*.promote_secondaries defaults to 0), and the
  *      following delete of the old (primary) address would then cascade
- *      into deleting the new (secondary) one too -- reproduced directly
- *      against this kernel while building N1's own end-to-end test.
+ *      into deleting the new (secondary) one too.
  *   3. a genuine change to a DIFFERENT subnet -- add first, safely, for the
  *      shortest possible address-less window; the two addresses never share
  *      a connected route, so there is no secondary/cascade risk.
  *
  * `lifetime_sec` is UINT32_MAX for a static Address=, the lease time for a
- * DHCP one. Used by both apply_static_address() and link_apply_lease() so
- * the same kernel hazard is fixed in exactly one place.
+ * DHCP one. Shared by apply_static_address() and link_apply_lease().
  */
 static int converge_address(Link *l, const struct in_addr *want, unsigned char want_pfx, uint32_t lifetime_sec) {
         Netd *n = l->netd;
@@ -219,14 +207,10 @@ Link *link_free(Link *l) {
         n = l->netd;
 
         /*
-         * link_deconfigure() itself refuses (logged -EBUSY) if
-         * l->applying_lease is somehow set, but that can only happen if a
-         * REMOVED rtnl event for this exact ifindex were processed from
-         * inside link_apply_lease()'s own call graph -- and it never is:
-         * link_apply_lease() only performs synchronous rtnl writes, never
-         * netd_rtnl_process(), so no live event can be dispatched while it is
-         * on the stack. The (void) here is the same best-effort discipline
-         * every other caller of link_free() already uses.
+         * link_deconfigure() refuses (logged -EBUSY) if l->applying_lease is
+         * set, which would need a REMOVED event for this ifindex processed
+         * from inside link_apply_lease(); that only performs synchronous rtnl
+         * writes, never netd_rtnl_process(), so it cannot happen. Best-effort.
          */
         (void) link_deconfigure(l);
 
@@ -431,9 +415,7 @@ static int apply_static_gateway(Link *l, const Network *nw) {
         return 0;
 }
 
-/* Defined near link_deconfigure() below; forward-declared here so
- * link_configure() can call them without reordering the file around the
- * teardown helpers they share with link_deconfigure() itself. */
+/* Defined near link_deconfigure() below. */
 static void link_stop_dhcp_client(Link *l);
 static void link_stop_dhcp_server(Link *l);
 static void link_sync_lldp(Link *l, const Network *nw);
@@ -443,9 +425,8 @@ static void link_sync_lldp(Link *l, const Network *nw);
 /*
  * Read ADDRESS= back out of this link's own lease file (netd-link.h's
  * KEY=VALUE format), for dhcp_client_set_request_address() below --
- * RFC 2131 4.4.2's INIT-REBOOT, and the whole reason a netd crash is cheap
- * (plan §2.7): a restarted netd reconfirms the lease it already had instead
- * of renumbering the interface. 0 with *ret filled, or -errno (ENOENT on a
+ * RFC 2131 4.4.2's INIT-REBOOT: a restarted netd reconfirms the lease it
+ * already had instead of renumbering the interface. 0 with *ret filled, or -errno (ENOENT on a
  * first boot, or after a clean teardown already removed the file).
  */
 static int link_read_lease_address(Link *l, struct in_addr *ret) {
@@ -495,9 +476,8 @@ static int link_read_lease_address(Link *l, struct in_addr *ret) {
  * no OFFER policy, so it always accepts.
  *
  * IP_ACQUIRE/IP_CHANGE/RENEW hand the lease to link_apply_lease() by direct
- * call, exactly the design the plan (§2.6) and this milestone's own header
- * comments describe. EXPIRED (NAK, expiry, or after a DECLINE) hands off to
- * link_lose_lease(), which deliberately does *not* touch the client -- see
+ * call. EXPIRED (NAK, expiry, or after a DECLINE) hands off to
+ * link_lose_lease(), which does *not* touch the client -- see
  * that function's doc for why it restarts itself.
  */
 static int dhcp_client_event_callback(DhcpClient *client, int event, void *userdata) {
@@ -569,10 +549,9 @@ static int dhcp_client_event_callback(DhcpClient *client, int event, void *userd
 }
 
 /*
- * Create, configure and start a DHCPv4 client for `l`. Idempotent by
- * construction from the caller's side only (link_configure() never calls
- * this when l->dhcp_client is already set); this function itself always
- * builds a fresh client. 0 or -errno.
+ * Create, configure and start a DHCPv4 client for `l`. Always builds a fresh
+ * client; link_configure() does not call this when l->dhcp_client is set.
+ * 0 or -errno.
  */
 static int link_start_dhcp_client(Link *l) {
         Netd *n = l->netd;
@@ -613,9 +592,8 @@ fail:
 
 /*
  * Create, configure and start a DHCPv4 server for `l`, pool derived from the
- * .network's own Address= (plan §2.7's usb0-gadget scenario: the host's own
- * static address on usb0 doubles as the server's address and default
- * router). 0 or -errno.
+ * .network's own Address= (a usb0 gadget's static address doubles as the
+ * server's address and default router). 0 or -errno.
  */
 static int link_start_dhcp_server(Link *l, const Network *nw) {
         Netd *n = l->netd;
@@ -642,9 +620,7 @@ static int link_start_dhcp_server(Link *l, const Network *nw) {
          * offset 0 / size 0 both mean "default" to dhcp_server_configure_
          * pool() (dhcp-server.c): skip the subnet address, fill the rest of
          * the subnet up to (not including) the broadcast address. The
-         * server's own address is excluded automatically wherever it falls
-         * in that range (dhcp_server_address_available()/_is_in_pool()), so
-         * no separate carve-out is needed here.
+         * server's own address is excluded automatically.
          */
         r = dhcp_server_configure_pool(server, &address, prefixlen, 0, 0);
         if (r < 0)
@@ -684,9 +660,8 @@ fail:
  * include/linux/netdevice.h's enum netdev_addr_type, read back out of
  * /sys/class/net/<if>/addr_assign_type as a plain integer -- not a UAPI
  * header, so these four values are transcribed rather than #include'd.
- * Stable since the sysfs attribute was added and documented at
- * Documentation/ABI/testing/sysfs-class-net; confirmed against the build
- * container's own kernel headers before this lands, not re-derived here.
+ * Stable since the sysfs attribute was added; see
+ * Documentation/ABI/testing/sysfs-class-net.
  */
 #define NETD_NET_ADDR_PERM 0
 #define NETD_NET_ADDR_RANDOM 1
@@ -718,11 +693,9 @@ static bool link_read_addr_assign_type(const char *ifname, unsigned *out) {
 }
 
 /*
- * Upstream's own HASH_KEY for net_get_unique_predictable_data_from_name()
- * (systemd netif-util.c) -- cited by name so this constant can be checked
- * directly against that source. Not dhcp-client-id.c's own HASH_KEY, which
- * is a different constant for a different purpose (the DHCP DUID-derived
- * client id) -- the two must never be conflated.
+ * Upstream's HASH_KEY for net_get_unique_predictable_data_from_name()
+ * (systemd netif-util.c). Not dhcp-client-id.c's HASH_KEY, which is a
+ * different constant for the DHCP client id.
  */
 static const uint8_t PERSISTENT_MAC_HASH_KEY[16] = {
         0xd3, 0x1e, 0x48, 0xfa, 0x90, 0xfe, 0x4b, 0x4c, 0x9d, 0xaf, 0xd5, 0xd7, 0xa1, 0xb1, 0x2e, 0x8a,
@@ -730,10 +703,8 @@ static const uint8_t PERSISTENT_MAC_HASH_KEY[16] = {
 
 /* True when every byte of a 16-byte id is 0 -- an uninitialized placeholder
  * /etc/machine-id, not a real identity yet. netd_machine_id() (netd-compat.h)
- * does not reject this on its own (it only rejects a short/malformed file),
- * so link_apply_persistent_mac() checks it at this one call site rather than
- * changing that function's contract for dhcp-client-id.c's own, unrelated
- * caller. */
+ * only rejects a short/malformed file, so link_apply_persistent_mac() checks
+ * this itself. */
 static bool id128_is_null(const NetdId128 *id) {
         for (size_t i = 0; i < sizeof(id->bytes); i++)
                 if (id->bytes[i] != 0)
@@ -763,26 +734,24 @@ void netd_persistent_mac_derive(
  * real systemd-networkd uses for MACAddressPolicy=persistent
  * (link-config.c's link_generate_new_hw_addr() plus
  * net_get_unique_predictable_data()/net_get_unique_predictable_data_from_name(),
- * netif-util.c), gated down to exactly the "not a real burned-in address"
- * case:
+ * netif-util.c), applied only to a link without a real burned-in address:
  *
  *   mac = low 6 bytes of htole64(siphash24(machine_id || ifname,
  *                                          PERSISTENT_MAC_HASH_KEY))
  *   mac[0] &= ~0x01 (clear multicast); mac[0] |= 0x02 (set local-admin)
  *
  * -- both unconditional for a generated address (net_verify_hardware_
- * address(), netif-util.c). Called once per link_configure_impl()
- * invocation, right before netd_rtnl_link_up(), so every exemption below
- * has to be re-checked on every call, not just the first:
+ * address(), netif-util.c). Called on every link_configure_impl()
+ * invocation, right before netd_rtnl_link_up(), so the exemptions below are
+ * re-checked each time:
  *
  *   - already up: the kernel refuses an address change on most drivers once
  *     a link is administratively up, and real policy never touches an
  *     already-up link's address either.
  *   - loopback: never gets a generated address (link-config.c's own
  *     loopback short-circuit).
- *   - non-Ethernet: pico-init's own scope narrowing versus upstream (which
- *     also covers ARPHRD_INFINIBAND) -- no InfiniBand pico target, and
- *     NETD_HW_ADDR_MAX (netd-rtnl.h) is 6 bytes, too short regardless.
+ *   - non-Ethernet: upstream also covers ARPHRD_INFINIBAND, which netd does
+ *     not; NETD_HW_ADDR_MAX (netd-rtnl.h) is 6 bytes, too short for it.
  *   - addr_assign_type PERM/SET/STOLEN, or unreadable/unrecognized: a real
  *     burned-in address, one something else already set deliberately, or
  *     nothing to go on -- never overwritten, never guessed.
@@ -790,11 +759,9 @@ void netd_persistent_mac_derive(
  *     address derived from a placeholder identity a later real write would
  *     invalidate.
  *
- * Non-fatal end to end: a MAC that could not be derived or applied is
- * cosmetic, not a configuration failure (matches upstream's own
- * warn-and-continue at the equivalent call site, link-config.c's
- * link_apply_rtnl_settings()) -- the caller's return value and l->state are
- * never affected by this function.
+ * Non-fatal: a MAC that could not be derived or applied is cosmetic, as in
+ * upstream's link_apply_rtnl_settings() (link-config.c); l->state is never
+ * affected.
  */
 static void link_apply_persistent_mac(Link *l) {
         Netd *n = l->netd;
@@ -861,9 +828,7 @@ static int link_configure_impl(Link *l) {
 
         /*
          * Always re-match from scratch, never trust a previous l->network:
-         * this is what makes link_configure() safe to call from a live event,
-         * from re-enumeration, and (via link_reconfigure()) from SIGHUP,
-         * where the old Network the pointer named has already been freed by
+         * after SIGHUP the old Network has already been freed by
          * network_load_all().
          */
         nw = network_find(n, l->ifname);
@@ -885,11 +850,8 @@ static int link_configure_impl(Link *l) {
         l->state = LINK_CONFIGURING;
 
         /*
-         * Before bringing the link up: a MAC change needs the link down,
-         * and this is the one point link_configure_impl() always reaches
-         * before netd_rtnl_link_up() below, on every call (first-seen and
-         * every reconfigure/SIGHUP alike). Self-gating -- see
-         * link_apply_persistent_mac()'s own exemption list.
+         * Before bringing the link up: a MAC change needs the link down.
+         * Self-gating, see link_apply_persistent_mac().
          */
         link_apply_persistent_mac(l);
 
@@ -915,13 +877,10 @@ static int link_configure_impl(Link *l) {
         }
 
         /*
-         * DHCPv4 client. Starting it is not itself convergence: nothing the
-         * .network asked for is in the kernel until a lease actually lands,
-         * which link_apply_lease() applies and only then marks CONFIGURED.
-         * Idempotent by construction -- an already-running client (the
-         * common SIGHUP case: DHCP= was already armed and has a lease) is
-         * left alone rather than restarted, so a reload never throws away a
-         * working lease to ask for a fresh DISCOVER.
+         * DHCPv4 client. Starting it is not itself convergence: nothing is
+         * in the kernel until a lease lands, which link_apply_lease() applies
+         * and only then marks CONFIGURED. An already-running client is left
+         * alone, so a reload never throws away a working lease.
          */
         if (network_dhcp4_enabled(nw)) {
                 if (!l->dhcp_client) {
@@ -942,9 +901,8 @@ static int link_configure_impl(Link *l) {
                 link_stop_dhcp_client(l);
 
         /*
-         * DHCPv4 server. Unlike the client, starting it successfully *is*
-         * full convergence for this directive -- there is no lease to wait
-         * for on the server's own side of the link.
+         * DHCPv4 server. Unlike the client, starting it *is* full convergence
+         * for this directive.
          */
         if (nw->dhcp_server) {
                 if (!l->dhcp_server) {
@@ -976,12 +934,9 @@ static int link_configure_impl(Link *l) {
 }
 
 /*
- * Public entry point: run the real logic above, then publish whatever state
- * it settled on -- UNMANAGED/CONFIGURING/CONFIGURED/FAILED, every one of
- * link_configure_impl()'s return paths -- in a single place rather than at
- * each of its returns. Best-effort: a state file write failing is logged by
- * link_write_state_file()'s own caller contract (none here -- see its
- * header) and never turns a real configure success into a reported failure.
+ * Public entry point: run link_configure_impl(), then publish whatever state
+ * it settled on in one place rather than at each of its returns. A failed
+ * state file write never turns a configure success into a failure.
  */
 int link_configure(Link *l) {
         int r = link_configure_impl(l);
@@ -1001,13 +956,10 @@ int link_reconfigure(Link *l) {
                 return -EINVAL;
 
         /*
-         * The SIGHUP path for one link (netd-link.h). link_configure()
-         * already re-matches from scratch and converges idempotently against
-         * whatever it finds -- a link whose match and configuration are
-         * unchanged takes the "already exactly right" branch in
-         * apply_static_address()/apply_static_gateway() and is left alone,
-         * which is what makes this safe to call unconditionally for every
-         * link on every reload rather than only for ones that look dirty.
+         * link_configure() re-matches from scratch and converges
+         * idempotently: an unchanged link takes the "already exactly right"
+         * branch in apply_static_address()/apply_static_gateway() and is left
+         * alone, so this is safe to call for every link on every reload.
          */
         return link_configure(l);
 }
@@ -1073,10 +1025,9 @@ static void dhcp_server_unref_void(void *p) {
  * batch; freeing it here is exactly what netd_loop_defer_free() exists to
  * stop (see its comment in netd-loop.h).
  *
- * -ENOMEM is the one case where the reference is dropped on the floor: the
- * object is stopped, so it holds no fd, no timer and no epoll registration,
- * and leaking that inert memory is strictly better than handing the rest of
- * the batch a freed tag.
+ * On -ENOMEM the reference is dropped on the floor: the object is stopped,
+ * so it holds no fd, timer or epoll registration, and leaking that inert
+ * memory beats handing the rest of the batch a freed tag.
  */
 static void link_release_dhcp_object(Link *l, void *object, netd_free_func_t free_func, const char *what) {
         int r = netd_loop_defer_free(l->netd, object, free_func);
@@ -1114,9 +1065,8 @@ static void link_stop_dhcp_client(Link *l) {
         link_release_dhcp_object(l, client, dhcp_client_unref_void, "DHCP client");
 }
 
-/* Same shape for the server side; DHCP_SERVER_DONT_DESTROY (dhcp-server-
- * internal.h) is this milestone's own addition to a defect upstream never
- * fixed -- see that header's comment. */
+/* Same shape for the server side; see DHCP_SERVER_DONT_DESTROY in
+ * dhcp-server-internal.h. */
 static void link_stop_dhcp_server(Link *l) {
         DhcpServer *server = l->dhcp_server;
 
@@ -1256,13 +1206,11 @@ int link_apply_lease(Link *l, DhcpLease *lease) {
 
         /*
          * The three cases converge_address() distinguishes map directly onto
-         * client_enter_bound()'s own event choice (dhcp-client.c): RENEW is
-         * exactly case 1 (same address/mask -- a REPLACE-only refresh),
-         * IP_CHANGE is case 2 or 3 depending on whether the new address
-         * shares a subnet with the one being replaced. converge_address()
-         * decides from the addresses themselves rather than the event
-         * netd-link.c is not even passed here, which gives the same answer
-         * for both a live client event and a static reload.
+         * client_enter_bound()'s event choice (dhcp-client.c): RENEW is
+         * case 1 (same address/mask), IP_CHANGE is case 2 or 3 depending on
+         * whether the new address shares a subnet with the old one.
+         * converge_address() decides from the addresses themselves, so the
+         * event is not needed here.
          */
         r = converge_address(l, &addr, prefixlen, lifetime_sec);
         if (r < 0)
@@ -1360,8 +1308,8 @@ int link_lose_lease(Link *l) {
         /* Reached from the DHCP client's own EXPIRED notification (see
          * dhcp_client_event_callback()); guarded exactly like
          * link_apply_lease() against being reached reentrantly for the same
-         * link. link_teardown_kernel_state() below deliberately does not
-         * touch l->dhcp_client -- see this function's doc in netd-link.h. */
+         * link. link_teardown_kernel_state() below does not touch
+         * l->dhcp_client -- see this function's doc in netd-link.h. */
         if (l->applying_lease)
                 return -EBUSY;
 

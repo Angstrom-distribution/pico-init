@@ -2,21 +2,18 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * sd_journal_stream_fd(): real, via logd's OTHER socket -- the same
- * /run/logd/stdout path pico services' own stdout/stderr are wired to
- * (src/logd/logd.h, src/service-exec.c). The bound abstract source address
- * this connects from is the actual stream identity logd's fragment table
- * keys on (logd-recv.c find_or_create_stream()); it comes for free by
- * binding before connect(), and is what gives every returned fd its own
+ * sd_journal_stream_fd(): connects to logd's stdout socket, the
+ * /run/logd/stdout path that services' stdout/stderr are wired to
+ * (src/logd/logd.h, src/service-exec.c). The abstract source address bound
+ * before connect() is the stream identity logd keys its fragment table on
+ * (logd-recv.c find_or_create_stream()); it gives every returned fd its own
  * line-reassembly stream with correct ucred attribution.
  *
- * Documented degradation: logd's stdout receive path records PRIORITY=6
- * unconditionally (there is no per-stream handshake to say otherwise), so
- * `priority` beyond validation and `identifier` are not transported --
- * _COMM (from the kernel-verified SCM_CREDENTIALS) serves as the real
- * identifier instead. A level_prefix=1 caller's "<N>" line prefixes are
- * recorded literally in MESSAGE: the data survives, only the interpretation
- * upstream's own journald-stream.c would apply to it does not happen here.
+ * Limitations: logd's stdout path records PRIORITY=6 unconditionally (no
+ * per-stream handshake), so `priority` (beyond validation) and `identifier`
+ * are not transported; _COMM from SCM_CREDENTIALS identifies the sender. With
+ * level_prefix=1, "<N>" line prefixes are recorded literally in MESSAGE
+ * instead of being interpreted as upstream's journald-stream.c does.
  */
 
 #include "sd-journal.h"
@@ -53,9 +50,8 @@ int sd_journal_stream_fd(const char *identifier, int priority, int level_prefix)
 
         n = (unsigned) __atomic_fetch_add(&counter, 1, __ATOMIC_RELAXED);
 
-        /* sun_path[0] left '\0' by the initializer above: an abstract-
-         * namespace address, unforgeable by anything that isn't this
-         * process (see sun_path's leading NUL, unix(7)). */
+        /* sun_path[0] is left '\0' by the initializer: an abstract-namespace
+         * address (unix(7)). */
         name_len = snprintf(
                         local.sun_path + 1,
                         sizeof(local.sun_path) - 1,

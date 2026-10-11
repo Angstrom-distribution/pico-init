@@ -5,13 +5,10 @@
  * pico-tmpfiles: systemd-tmpfiles(8)'s --create, --clean and --remove, over
  * tmpfiles.d(5) files exactly as OE packages already install them.
  *
- * Seventeen oe-core recipes ship tmpfiles.d snippets (dbus, sudo, pam,
- * rpcbind, bind, util-linux's lastlog2, sysklogd, ...) and with systemd in
- * DISTRO_FEATURES several recipes *drop* their sysvinit-era volatiles
- * fallback on the assumption that systemd-tmpfiles will do the work. Under
- * pico-init this binary is what does it. The grammar and the precedence rules
- * are systemd v259's own, read from src/tmpfiles/tmpfiles.c and
- * src/basic/conf-files.c rather than from the man page alone, since the two
+ * Many packages ship tmpfiles.d snippets and assume systemd-tmpfiles
+ * applies them; under pico-init this binary does. The grammar and
+ * precedence rules follow systemd v259's src/tmpfiles/tmpfiles.c and
+ * src/basic/conf-files.c rather than the man page alone, since the two
  * disagree in places (an `f` argument is written verbatim, no newline).
  *
  * What each implemented line type does under each operation:
@@ -61,10 +58,9 @@
  * non-glob lines before glob lines; --clean and --remove run before
  * --create, children before parents.
  *
- * Deliberately not carried over from upstream: the CHASE_SAFE "unsafe
- * symlink transition" refusal on every parent walk, SELinux/SMACK labelling,
- * ACLs, xattrs, file attributes, and --purge. Each is a feature with no
- * consumer in this project's images, not an oversight.
+ * Not carried over from upstream: the CHASE_SAFE "unsafe symlink
+ * transition" refusal on every parent walk, SELinux/SMACK labelling, ACLs,
+ * xattrs, file attributes, and --purge.
  */
 
 #pragma once

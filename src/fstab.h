@@ -42,7 +42,7 @@ typedef enum FstabOutcome {
         FSTAB_MOUNTED,   /* mounted by pico-init */
         FSTAB_REMOUNTED, /* already mounted, fstab's options reapplied */
         FSTAB_PRESENT,   /* already mounted, nothing to apply */
-        FSTAB_NOAUTO,    /* noauto: deliberately left alone */
+        FSTAB_NOAUTO,    /* noauto: left alone */
         FSTAB_SKIPPED,   /* not something pico-init can mount */
         FSTAB_FAILED,    /* attempted, and the kernel said no */
         FSTAB_ABSENT,    /* nofail, and its device never appeared */

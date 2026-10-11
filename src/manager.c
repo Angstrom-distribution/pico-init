@@ -195,7 +195,7 @@ int manager_new(Manager **ret) {
                 goto fail;
 
         /*
-         * sd_event_new(), deliberately NOT sd_event_default(): the manager's
+         * sd_event_new(), not sd_event_default(): the manager's
          * loop stays out of the thread-default slot so no future in-process
          * libsystemd-compat consumer calling sd_event_default() can silently
          * attach sources to PID 1's own loop.
@@ -374,8 +374,8 @@ int manager_dispatch_load_queue(Manager *m) {
 
                 /* A fragment that is missing or malformed leaves the unit in
                  * UNIT_ERROR, which is recorded on the unit itself; it is not
-                 * an error for the queue as a whole, so the return is ignored
-                 * deliberately rather than by omission. */
+                 * an error for the queue as a whole, so the return is
+                 * intentionally ignored. */
                 (void) unit_load(u);
 
                 /*
@@ -383,14 +383,11 @@ int manager_dispatch_load_queue(Manager *m) {
                  * transition. Every other manager_state_notify_unit() call
                  * site (unit.c's unit_notify(), job.c, unit-reload.c,
                  * manager-notify.c) fires only on a transition -- a unit
-                 * that loads cleanly but is simply never started (no
+                 * that loads cleanly but is never started (no
                  * WantedBy=/Requires= pulled it in, nobody ran `picoctl
-                 * start` yet) never transitions, so it never got a state
-                 * file at all. picoctl status then reported "not-found" for
-                 * a unit that was genuinely loaded and valid -- confirmed
-                 * live on h2200 for bt-pan-client.service, not WantedBy=
-                 * anything and never auto-started. Real systemctl status on
-                 * the same case shows Loaded: loaded / Active: inactive.
+                 * start`) never transitions and would get no state file, so
+                 * picoctl status would report "not-found" for a loaded, valid
+                 * unit. Real systemctl shows Loaded: loaded / Active: inactive.
                  */
                 manager_state_notify_unit(u);
                 n++;

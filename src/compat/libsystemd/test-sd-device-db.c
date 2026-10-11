@@ -12,11 +12,10 @@
  * with an empty value that removes one, S:/G: lines it skips, malformed
  * lines it ignores, and an unterminated last line it drops.
  *
- * Every lookup that starts a test goes through the public API on a device
- * that has never built its property table. That is the recursion check:
- * device_read_db() runs inside device_ensure_properties() and has to find
- * the file without calling back into it, and a regression there is a stack
- * overflow on the first property lookup, not a failed assertion.
+ * Every test starts with a public API lookup on a device that has never built
+ * its property table. That is the recursion check: device_read_db() runs
+ * inside device_ensure_properties() and must not call back into it; a
+ * regression is a stack overflow, not a failed assertion.
  */
 
 #include "sd-device.h"

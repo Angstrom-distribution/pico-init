@@ -7,7 +7,7 @@
  * <linux/watchdog.h>, never redefined here.
  *
  * STARVATION ARGUMENT (the property EVENT_PRIORITY_WATCHDOG exists to
- * guarantee, argued from the shim's real dispatch code, not assumed):
+ * guarantee):
  * sd-event.c's time sources become pending only via epoll, and
  * sd_event_dispatch() re-polls with a ZERO timeout between single-source
  * dispatches while anything stays pending -- so a due watchdog timerfd is
@@ -43,8 +43,8 @@
  * Requested timeout: long enough that no legitimate single PID1 operation
  * (a unit-dir scan on slow media, a sync()) plausibly exceeds three feed
  * intervals, short enough that an unattended embedded device recovers from
- * a wedge in under a minute. This project's own decision, not a copy of
- * upstream's server-oriented default (RuntimeWatchdogSec=0/off).
+ * a wedge in under a minute. Upstream defaults to off
+ * (RuntimeWatchdogSec=0).
  */
 #define PICO_WATCHDOG_TIMEOUT_SEC 30
 

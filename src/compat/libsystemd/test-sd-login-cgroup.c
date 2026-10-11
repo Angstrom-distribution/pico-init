@@ -2,15 +2,12 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * Real /sys/fs/cgroup/system.slice/<x>.service directories and a real
- * forked-and-joined child process, the same "give it a real directory to
- * read, not a mock" approach test-timer-cgroup.c already uses for
- * cgroups-v2.c. sd_pid_get_cgroup()/get_unit()/get_slice() and their
- * pidfd/peer siblings are exercised against that one real child: pidfd
- * via a real pidfd_open() syscall, peer via a real AF_UNIX connect() the
- * child makes only after it has already joined the cgroup -- accept()
- * blocking on that connection is the test's whole synchronization point,
- * no separate readiness pipe needed.
+ * Uses a real /sys/fs/cgroup/system.slice/<x>.service directory and a forked
+ * child, as test-timer-cgroup.c does for cgroups-v2.c.
+ * sd_pid_get_cgroup()/get_unit()/get_slice() and their pidfd/peer siblings
+ * run against that child: pidfd via pidfd_open(), peer via an AF_UNIX
+ * connect() the child makes after joining the cgroup; accept() blocking on
+ * it is the synchronization point.
  */
 
 #include "sd-login.h"
@@ -193,8 +190,8 @@ int main(void) {
                 ASSERT_EQ_INT(sd_pid_get_unit(dead, &ret), -ESRCH);
         }
 
-        /* --- sd-login.c's "process confirmed alive, no such metadata"
-         * honest_failure family, sharing the same resolver --- */
+        /* --- sd-login.c's "process alive, no such metadata" getters, which
+         * share the same resolver --- */
         ASSERT_EQ_INT(sd_pid_get_session(child, &ret), -ENODATA);
         ASSERT_EQ_INT(sd_pid_get_owner_uid(child, &ruid), -ENODATA);
 

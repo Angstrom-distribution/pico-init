@@ -18,40 +18,25 @@
  *     swap, the empty-or-UTC unlink case, the tzset()-then-kernel-push
  *     order, and the kernel push being logged-and-ignored on failure).
  *   - src/shared/clock-util.c's clock_set_timezone() -> netd_time_build_tz().
- * None of the four carries a per-file copyright line upstream (verified
- * against the checkout at the quarry point, not assumed), so this file
- * follows the project-default attribution the rest of the lift set uses.
+ * None of the four carries a per-file copyright line upstream, so this file
+ * follows the project-default attribution.
  *
- * Quarry-discipline history review (plan §2.2's prose block records the
- * window's methodology): `4925d9f07f..main` touches src/timedate in exactly
- * one commit, 844c44a0d4 "timedated: roll back state on config write
- * failure" -- not applicable. It saves and restores a bus-facing Context
- * object's cached c->zone/c->local_rtc across a failed write so a repeated
- * SetTimezone() D-Bus call retries instead of reporting stale success; netd
- * has no such cache and no bus -- netd_time_get_timezone() always re-reads
- * the real symlink rather than trusting an in-memory value, so the class of
- * bug that commit fixes cannot occur here by construction. The window's two
- * src/timesync commits (98e7cc36f0, 8027ff6ecd) are cited in netd-sntp.c,
- * the file whose scope they actually touch; src/shared/clock-util.c and
- * src/timedate/timedated.c beyond the one commit above are untouched in the
- * window.
+ * Upstream's later timedated commit 844c44a0d4 "timedated: roll back state on
+ * config write failure" does not apply: it restores a bus-facing Context
+ * cache, and netd has none -- netd_time_get_timezone() always re-reads the
+ * real symlink. The two src/timesync commits (98e7cc36f0, 8027ff6ecd) are
+ * cited in netd-sntp.c.
  *
- * Three pure decision functions exist purely for testability, the same
- * reason netd_time_build_timex() does (its own header comment predates this
- * file's real implementation and already explains it): clock_adjtime(),
- * settimeofday() and clock_settime() all mutate real, process-global or
- * kernel-global state that a test cannot safely apply, and settimeofday()/
- * clock_settime() specifically need CAP_SYS_TIME, which this project's own
- * verify.sh container denies even to root (confirmed directly: EPERM) --
- * so netd_time_build_tz() and netd_time_clock_floor_decide() split "what
- * would happen" from "make it happen" exactly as netd_time_build_timex()
- * already does for the clock_adjtime() case.
+ * netd_time_build_timex(), netd_time_build_tz() and
+ * netd_time_clock_floor_decide() split "what would happen" from "make it
+ * happen" so tests can cover them: clock_adjtime(), settimeofday() and
+ * clock_settime() mutate global state and the latter two need CAP_SYS_TIME.
  */
 
 /* clock_adjtime(), clock_settime()'s ADJ_ and STA_ constants, and futimens()
  * are declared under glibc's __USE_GNU guard -- -std=gnu17 alone does not
  * imply _GNU_SOURCE, so this has to be explicit and first, before any header
- * pulls in <features.h> (same fix test-netd-rtnl.c already needed for
+ * pulls in <features.h> (test-netd-rtnl.c needs the same for
  * unshare()). */
 #define _GNU_SOURCE
 
@@ -86,8 +71,7 @@ int netd_time_build_timex(int64_t offset_usec, struct timex *ret_tmx, NetdClockA
         if (abs_offset < (int64_t) NETD_TIME_STEP_THRESHOLD_USEC) {
                 /*
                  * Slew: ADJ_NANO makes .offset nanoseconds. The time constant
-                 * is fixed rather than derived from a poll interval (§2.6
-                 * drops adaptive polling): 7, upstream's own
+                 * is fixed rather than derived from a poll interval: 7, upstream's
                  * log2i(poll_interval_usec / USEC_PER_SEC) - 4 with netd's
                  * fixed NETD_SNTP_POLL_INTERVAL_USEC of 2048s substituted in
                  * -- log2(2048) - 4 == 7 -- so the formula collapses to a
@@ -119,7 +103,7 @@ int netd_time_build_timex(int64_t offset_usec, struct timex *ret_tmx, NetdClockA
                 *ret_mode = NETD_CLOCK_STEP;
         }
 
-        /* STA_UNSYNC deliberately left clear (netd-time.h, plan §2.6 step 5). */
+        /* STA_UNSYNC left clear, see netd-time.h. */
 
         *ret_tmx = tmx;
         return 0;
@@ -339,7 +323,7 @@ int netd_time_set_timezone(Netd *n, const char *tz) {
         else {
                 /* Not "%m": pico_log_internal() is declared with the ISO
                  * "printf" format archetype, and -Wpedantic rejects glibc's
-                 * %m extension against it (verified: -Werror=format=). */
+                 * %m extension against it (-Werror=format=). */
                 int sr = settimeofday(NULL, &kt);
 
                 if (sr < 0)
@@ -351,7 +335,7 @@ int netd_time_set_timezone(Netd *n, const char *tz) {
         return 0;
 }
 
-/* --- the clock floor (§2.6 step 6) --- */
+/* --- the clock floor --- */
 
 bool netd_time_clock_floor_decide(usec_t clock_file_mtime_usec, usec_t now_usec, usec_t *ret_target_usec) {
         usec_t epoch_usec, floor_usec;
@@ -371,8 +355,8 @@ bool netd_time_clock_floor_decide(usec_t clock_file_mtime_usec, usec_t now_usec,
 /* "<state_dir>/<name>", malloc'd. Not netd_runtime_path(): that helper is
  * rooted at Netd.runtime_dir (/run/netd, tmpfs, cleared every boot), and the
  * clock floor needs to survive a reboot to mean anything -- it belongs under
- * Netd.state_dir (/var/lib/netd) instead, exactly as NETD_CLOCK_FILE's own
- * doc comment in netd-time.h says. */
+ * Netd.state_dir (/var/lib/netd) instead, see NETD_CLOCK_FILE in
+ * netd-time.h. */
 static int state_path(Netd *n, const char *name, char **ret) {
         char path[PATH_MAX];
         char *copy;
@@ -466,9 +450,8 @@ int netd_time_clock_floor_touch(Netd *n) {
         /*
          * timesyncd.c's advance_tstamp(): try bumping the mtime by 1us, then
          * 10us, 100us, ... up to 10s, stopping at the first bump the
-         * filesystem's timestamp granularity can actually record. Directly
-         * relevant on the JFFS2/UBIFS-class rootfs this project's h2200
-         * target would use, where sub-second granularity is not a given.
+         * filesystem's timestamp granularity can actually record. Relevant on
+         * flash filesystems, where sub-second granularity is not a given.
          */
         r = 0;
         for (usec_t a = 1; a <= 10 * USEC_PER_SEC; a *= 10) {

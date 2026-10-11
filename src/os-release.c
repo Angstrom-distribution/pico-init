@@ -5,13 +5,9 @@
  * os-release(5) lookup. See os-release.h for the subset of the format this
  * accepts and why it is a subset.
  *
- * It is a handler over pico_conf_scan() rather than a reader of its own, for
- * the reason conf-scan.h states outright: that scanner already carries seven
- * backported upstream fixes -- the unbounded getline(), skipping a malformed
- * line instead of failing the file, the UTF-8 BOM -- and os-release syntax
- * (KEY=value, '#' comments, blank lines) is a subset of the INI syntax it
- * already scans. A second reader would inherit those fixes once and then
- * quietly stop inheriting them.
+ * It is a handler over pico_conf_scan() rather than a reader of its own:
+ * os-release syntax (KEY=value, '#' comments, blank lines) is a subset of the
+ * INI syntax that scanner handles, with its backported fixes (see conf-scan.h).
  *
  * os-release has no [Section] headers, so every assignment arrives with
  * section == NULL and this ignores the field entirely. The one thing the

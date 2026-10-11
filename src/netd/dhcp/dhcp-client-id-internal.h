@@ -3,47 +3,28 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 /*
- * Ported from src/libsystemd-network/dhcp-client-id-internal.h (48 lines)
- * and dhcp-duid-internal.h (39 lines), merged into one file: pico-init's
- * own file layout (set at N0 scaffold time, before this milestone) has no
- * separate dhcp-duid.c/.h, and a DUID only ever exists wrapped inside a
- * DHCPv4 client-id (type 255, RFC 4361) here, so the two upstream files'
- * types travel together.
- *
- * Quarry point: systemd v261.2, commit 4925d9f07f. History review
- * (4925d9f07f..main, plan §2.2): no fix in the 26-commit lift-set window
- * touches sd-dhcp-client-id.c/sd-dhcp-duid.c or their internal headers.
+ * Ported from systemd v261.2 src/libsystemd-network/dhcp-client-id-internal.h
+ * and dhcp-duid-internal.h, merged into one file: a DUID only ever exists
+ * wrapped inside a DHCPv4 client-id (type 255, RFC 4361) here.
  *
  * Cut on the way in:
  *  - DUID_TYPE_UUID / dhcp_duid_set_uuid(): needs
- *    sd_id128_get_machine_app_specific(), an HMAC-SHA256-based per-
- *    application derivation from the machine ID that is a different (and
- *    larger) primitive than the SipHash-based netd_machine_id() shim
- *    netd-compat.h provides. DUID-LLT, DUID-LL and DUID-EN -- the three a
- *    real DHCPv4 client actually chooses between -- are kept in full;
- *    DUID-EN is the one with the in-source golden vector (plan §2.8,
- *    sd-dhcp-duid.c:191), carried verbatim in test-netd-codec.c.
- *  - client_id_hash_func()/client_id_compare_func(): upstream's Hashmap/Set
- *    key-ops pair for a client-id-keyed lease table. netd's DHCP server
- *    lease table is a flat array (plan §2.2, DHCP server row), not a
- *    hashmap, so nothing calls these; the server agent needs its own
- *    equality check if it wants one, and dhcp_client_id_equal() below is a
- *    plain-comparison substitute cheap enough to add if asked for.
+ *    sd_id128_get_machine_app_specific(), an HMAC-SHA256-based derivation
+ *    that is a different primitive than the SipHash-based netd_machine_id()
+ *    shim in netd-compat.h. DUID-LLT, DUID-LL and DUID-EN are kept; DUID-EN
+ *    has an in-source golden vector (sd-dhcp-duid.c:191), carried in
+ *    test-netd-codec.c.
+ *  - client_id_hash_func()/client_id_compare_func(): Hashmap/Set key-ops for
+ *    a client-id-keyed lease table. The DHCP server lease table is a flat
+ *    array, so nothing calls them.
  *  - sd_device support in dhcp_identifier_set_iaid(): netd has no udev
- *    dependency of any kind, so the "stable interface name" IAID source is
- *    unavailable; only the MAC-address fallback path is carried. This is
- *    the path the plan's own test vector (dhcp_identifier_set_iaid() over
- *    MAC "ABC123") exercises, so nothing about the pinned behaviour is lost.
+ *    dependency, so only the MAC-address IAID source is carried.
  */
 
 #pragma once
 
-/* Self-sufficient regardless of what a consumer includes first (a real
- * cross-agent bug: netd-resolv.c included dhcp-lease-internal.h without
- * netd-compat.h first, and this header needs its bool/usec_t/macros) --
- * safe to include redundantly, netd-compat.h has its own #pragma once. */
+/* Self-sufficient: needs bool/usec_t/macros from netd-compat.h. */
 #include "netd-compat.h"
-
 
 #include "dhcp-protocol.h"
 
@@ -80,8 +61,8 @@ typedef struct Duid {
                 struct {
                         be32_t pen;
                         /* RFC 8415 11.3 does not fix a maximum vendor-ID length;
-                         * upstream uses 8 bytes and so does the golden vector
-                         * (plan §2.8) this must reproduce exactly. */
+                         * upstream uses 8 bytes and so does the golden
+                         * vector, which this must reproduce exactly. */
                         uint8_t id[8];
                 } _packed_ en;
                 struct {
@@ -157,13 +138,11 @@ int dhcp_duid_set_raw(DhcpDuid *duid, const void *data, size_t data_size);
 int dhcp_duid_set_llt(DhcpDuid *duid, const void *hw_addr, size_t hw_addr_size, uint16_t arp_type, usec_t usec);
 int dhcp_duid_set_ll(DhcpDuid *duid, const void *hw_addr, size_t hw_addr_size, uint16_t arp_type);
 /* Machine-ID-derived DUID-EN (SipHash over /etc/machine-id, SYSTEMD_PEN).
- * In NETD_TEST_MODE (netd-compat.h-adjacent convention, see the .c file),
- * uses a fixed test machine ID and self-checks against the pinned golden
- * vector from plan §2.8 / sd-dhcp-duid.c:191. */
+ * With NETD_TEST_MODE set, uses a fixed machine ID and asserts the result
+ * against the golden vector from sd-dhcp-duid.c:191. */
 int dhcp_duid_set_en(DhcpDuid *duid);
 int dhcp_duid_to_string(const DhcpDuid *duid, char **ret);
 
-/* dhcp_identifier_set_iaid() (plan §2.2, Client identity row): MAC-address
- * path only -- see this file's header for why sd_device is not carried.
- * `ret` must point at 4 writable bytes. */
+/* MAC-address path only (see the header). `ret` must point at 4 writable
+ * bytes. */
 int dhcp_identifier_set_iaid(const struct hw_addr_data *hw_addr, bool legacy_unstable_byteorder, void *ret);

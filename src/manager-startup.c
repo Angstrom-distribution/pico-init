@@ -2,9 +2,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The boot sequence. Kept in its own file because it is the one place that
- * says, in order, what booting actually means here -- and because M5's
- * integration work is exactly "make every step of this real".
+ * The boot sequence, in order.
  */
 
 #include <errno.h>
@@ -23,13 +21,13 @@
 /*
  * Give every target an After= on each unit it Wants= or Requires=.
  *
- * Without this a target is not a milestone at all: Wants= is a dependency, not
+ * Without this a target marks no point in the boot: Wants= is a dependency, not
  * an ordering, so default.target would go active the instant it was started --
- * before a single thing it pulls in had run -- and "reached default.target"
- * would mean nothing. That is exactly what happened before this existed.
+ * before a single thing it pulls in had run, and "reached default.target"
+ * would mean nothing.
  *
  * This is pico-init's equivalent of upstream's DefaultDependencies=, narrowed
- * to the one rule that makes boot milestones work. An explicit Before= in a
+ * to the one rule that makes targets order the boot. An explicit Before= in a
  * unit file still wins, because unit_add_dependency() deduplicates and the
  * ordering graph is checked for cycles afterwards -- a unit that genuinely
  * must start after its own target simply says so and the cycle check reports
@@ -82,7 +80,7 @@ static void manager_add_target_default_ordering(Manager *m) {
  * one hop. Without it nothing orders a boot-time service after the sockets it
  * may be activated by, so a service can race its own socket's bind and lose.
  *
- * Scoped deliberately: services only, never a Socket (which must start before
+ * Services only, never a Socket (which must start before
  * the target it is pulled into, not after) and never a Target (which would
  * order sockets.target after itself and close a cycle). An explicit ordering
  * in the unit file still wins, exactly as above.
@@ -141,19 +139,17 @@ int manager_startup(Manager *m, const char *default_target) {
          * 0. Arm the hardware watchdog first, before the runtime state
          * directory, the control socket and the sd_notify() listener: it
          * has no dependency on /run or on any unit state, and every line of
-         * boot from here on is then covered by it -- a hang during unit
-         * loading, preset application, or cycle detection on slow media is
-         * exactly the class of hang worth catching, so arming any later
-         * would throw away that coverage for free. Then bring up state/
+         * boot from here on is then covered by it, including a hang during
+         * unit loading, preset application or cycle detection on slow media.
+         * Then bring up state/
          * ctrl/notify, so the very first unit_notify() of the boot is
          * already published rather than silently dropped.
          *
          * None of the four is fatal: no /dev/watchdog (qemu/CI images have
          * none) costs only watchdog protection, and a read-only or absent
-         * /run costs picoctl its verbs and sd_notify() its listener. A boot
-         * that fails because its own failure-recovery or status-reporting
-         * hardware was absent would be strictly worse than one that boots
-         * quietly without it.
+         * /run costs picoctl its verbs and sd_notify() its listener. Failing
+         * the boot over absent recovery or status reporting would be worse
+         * than booting without it.
          */
         r = manager_watchdog_setup(m);
         if (r < 0)
@@ -212,15 +208,12 @@ int manager_startup(Manager *m, const char *default_target) {
          * result before manager_startup() ran). Real systemd never applies
          * presets from PID 1 at all: `systemctl preset-all` runs once, at
          * image build or first-boot-gated provisioning time, and writes
-         * real symlinks that every later boot just reads. Calling
-         * manager_apply_presets() unconditionally here used to redo that
-         * decision from scratch every single boot, in memory only, which
-         * silently re-enabled any unit a preset says "enable" the moment
-         * something (e.g. `picoctl disable`) removed its symlink -- exactly
-         * the bug this gate exists to close. Persisting the first-boot
-         * result as real symlinks (unit-enable.c's own job) is what lets
-         * every later boot skip this step and still see the same units
-         * enabled, from .wants/.requires alone.
+         * real symlinks that every later boot just reads. Applying
+         * presets in memory on every boot would re-enable any unit a preset
+         * says "enable" after something (e.g. `picoctl disable`) removed its
+         * symlink. The first-boot result is persisted as real symlinks
+         * (unit-enable.c), so later boots see the same units enabled from
+         * .wants/.requires alone.
          */
         if (m->first_boot) {
                 r = manager_apply_presets(m);

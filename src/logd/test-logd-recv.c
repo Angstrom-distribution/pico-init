@@ -2,37 +2,24 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The receive path (plan §3, J1): a fake service writing multi-line/partial/oversized output, a real syslog(3)
+ * The receive path: a fake service writing multi-line/partial/oversized output, a real syslog(3)
  * client against a bound test socket, and correct ucred+cgroup attribution and framing for every entry.
  *
- * The load-bearing case is test_real_sockets_two_streams_same_pid(): the
- * corrected design keys the fragment tail by stream identity (the sender's
- * bound source address) rather than by PID, specifically because a PID can
- * be reused across streams and a real kernel-reported PID is used to prove
- * it -- two real AF_UNIX client sockets, each bound to its own abstract-
- * namespace address before connect() (exactly what service-exec.c will do
- * per plan §3.6), both sent from THIS one test process so the kernel
- * reports the identical real PID for both via SCM_CREDENTIALS. That is the
- * precise scenario that corrupted the original per-PID design; this test
- * demonstrates the corrected one cannot, with real recvmsg()/SO_PASSCRED
- * involved throughout, not synthetic parameters. A second, narrower test
- * (test_pid_change_on_stream) exercises the complementary case -- a real
- * PID *change* reported on one already-known stream -- directly with
- * injected ucred values, since that half needs no OS cooperation to be
- * exact. The one sub-case this file does not attempt to reproduce live is
- * a numeric PID silently recycled to a *different* process while still
- * reported as unchanged on the same stream: that needs actual kernel PID
- * wraparound (root, a lowered pid_max, real fork()/exec() timing) the way
- * the design review itself reproduced it, which is out of reach for a
- * hermetic unit test; the /proc/<pid>/stat start-time re-validation this
- * file's logd-recv.c carries for it is verified by code reading and by the
- * negative case (an unchanged real process across many datagrams never
- * spuriously flushes) rather than a live positive repro -- recorded here
- * rather than overclaimed.
+ * The key case is test_real_sockets_two_streams_same_pid(): the fragment tail is keyed by stream
+ * identity (the sender's bound source address) rather than by PID. Two real AF_UNIX client sockets,
+ * each bound to its own abstract-namespace address before connect() (as service-exec.c does), are
+ * both sent from this one test process, so the kernel reports the identical PID for both via
+ * SCM_CREDENTIALS. test_pid_change_on_stream covers a PID change reported on one known stream, with
+ * injected ucred values.
+ *
+ * Not reproduced live: a numeric PID recycled to a different process while still reported as
+ * unchanged on the same stream. That needs kernel PID wraparound (root, a lowered pid_max, real
+ * fork()/exec() timing). The /proc/<pid>/stat start-time re-validation in logd-recv.c is only
+ * covered by the negative case (an unchanged process across many datagrams never spuriously
+ * flushes).
  */
 
-/* logd-recv.h declares struct ucred in its own signatures -- see
- * logd-recv.c's identical comment for why this has to be first. */
+/* logd-recv.h declares struct ucred; see logd-recv.c for why this is first. */
 #define _GNU_SOURCE
 
 #include "logd-kmsg.h"
@@ -69,9 +56,8 @@ static LogdWriter *new_test_writer(const char *dir) {
         return w;
 }
 
-/* An abstract-namespace (sun_path[0] == '\0') address, unique per call --
- * a synthetic peer for tests that drive logd_recv_process_stdout()
- * directly rather than through real sockets. */
+/* A unique abstract-namespace (sun_path[0] == '\0') address, as a synthetic
+ * peer for tests that call logd_recv_process_stdout() directly. */
 static socklen_t make_synthetic_peer(struct sockaddr_un *addr, const char *tag) {
         int n;
 
@@ -293,9 +279,8 @@ static void test_stdout_anonymous_peer(void) {
         ASSERT_EQ_INT(logd_recv_process_stdout(rc, "anon-line\n", strlen("anon-line\n"), NULL, 0, NULL), 0);
 
         /* An unterminated one: an anonymous sender gets no tail carried
-         * across calls at all (logd-recv.h), so this must be force-flushed
-         * immediately (tagged eof) rather than buffered and possibly never
-         * seen again. */
+         * across calls (logd-recv.h), so it is flushed immediately (tagged
+         * eof). */
         ASSERT_EQ_INT(logd_recv_process_stdout(rc, "anon-partial", strlen("anon-partial"), NULL, 0, NULL), 0);
 
         logd_recv_free(rc);
@@ -359,10 +344,9 @@ static void test_pid_change_on_stream(void) {
 }
 
 /*
- * Mimics exactly what service-exec.c (plan §3.6) does for each service
- * invocation: bind an outbound socket to a unique Linux abstract-namespace
- * address before connect(), so the receiver's recvfrom() reports a stable,
- * unforgeable per-invocation source address on every datagram it sends.
+ * Mimics service-exec.c: bind an outbound socket to a unique abstract-
+ * namespace address before connect(), so the receiver's recvfrom() reports a
+ * stable per-invocation source address on every datagram.
  */
 static int bind_abstract_client(void) {
         static int counter = 0;
@@ -392,13 +376,10 @@ static int bind_abstract_client(void) {
 }
 
 /*
- * The load-bearing reproduction (see this file's header): two real client
- * sockets, each bound to its own abstract-namespace address, both from
- * this one test process -- so the kernel reports the SAME real PID for
- * both via SCM_CREDENTIALS, exactly the scenario that corrupted the
- * original per-PID design. If the tail were still keyed by PID, stream
- * B's datagram would splice onto stream A's pending partial line, or
- * clobber it outright.
+ * Two real client sockets, each bound to its own abstract-namespace address,
+ * both from this one test process, so the kernel reports the same PID for
+ * both via SCM_CREDENTIALS. Keyed by PID, stream B's datagram would splice
+ * onto stream A's pending partial line or clobber it.
  */
 static void test_real_sockets_two_streams_same_pid(void) {
         char *dir = test_tmpdir_new();
@@ -451,10 +432,8 @@ static void test_real_sockets_two_streams_same_pid(void) {
         ASSERT_TRUE(logd_field_equals(
                         logd_entry_field(logd_ring_entry(ring, 1), "MESSAGE"), "stream-a-partial-finished"));
         {
-                /* Both really are this same process -- confirm the kernel
-                 * actually did report the identical PID for both, which is
-                 * the whole point: the isolation held despite that, not
-                 * because of some accidental difference. */
+                /* Confirm the kernel reported the identical PID for both, so
+                 * the isolation is due to the stream key. */
                 const LogdReadField *pid0 = logd_entry_field(logd_ring_entry(ring, 0), "_PID");
                 const LogdReadField *pid1 = logd_entry_field(logd_ring_entry(ring, 1), "_PID");
 
@@ -484,9 +463,8 @@ static bool setup_fake_cgroup(char *orig_cgroup_out, size_t orig_sz) {
 
                         if (nl)
                                 *nl = '\0';
-                        /* Checked: this path is restored later, and restoring
-                         * a truncated one would move the process into some
-                         * other cgroup entirely. Better to record nothing. */
+                        /* Checked: restoring a truncated path would move the
+                         * process into some other cgroup. */
                         if (snprintf(orig_cgroup_out, orig_sz, "/sys/fs/cgroup%s", line + 3) >= (int) orig_sz)
                                 orig_cgroup_out[0] = '\0';
                 }
@@ -531,19 +509,16 @@ static void restore_and_cleanup_cgroup(const char *orig_cgroup) {
 
         (void) rmdir("/sys/fs/cgroup/system.slice/test-logd-recv-fake.service/init.scope");
         (void) rmdir("/sys/fs/cgroup/system.slice/test-logd-recv-fake.service");
-        /* system.slice itself is never removed -- it likely predates this
-         * test and other things may use it. */
+        /* system.slice is not removed: other things may use it. */
 }
 
 /*
- * Real cgroup-v2 attribution (plan §3.3, corrected 2026-08-24): a process
- * under /system.slice/test-logd-recv-fake.service/init.scope must
- * attribute to the FIRST non-slice component (the service), not the
- * trailing .scope. This moves the whole test process into a real,
- * freshly-created cgroup for the duration of one check and restores it
- * before returning -- skipped cleanly (not failed) if this environment's
- * cgroupfs is not writable, since that is a real, legitimate possibility
- * under some container/sandbox configurations rather than a bug.
+ * Real cgroup-v2 attribution: a process under
+ * /system.slice/test-logd-recv-fake.service/init.scope must attribute to the
+ * first non-slice component (the service), not the trailing .scope. This
+ * moves the test process into a freshly created cgroup for one check and
+ * restores it afterwards; skipped if the cgroupfs is not writable (some
+ * container/sandbox configurations).
  */
 static void test_cgroup_unit_extraction_real_kernel(void) {
         char orig_cgroup[512];
@@ -625,12 +600,11 @@ static void test_syslog_basic(void) {
                "kernel-verified ucred, never the spoofable bracket text\n");
 }
 
-/* A real syslog(3)/openlog()/closelog() call against a bound test socket
- * (the J1 done-when's own wording). Binds the receiving socket at the
- * real /dev/log path for the duration of this one check, since glibc's
- * syslog(3) has no override for that path -- skipped cleanly if /dev/log
- * already exists (a real syslog daemon's socket must never be disturbed)
- * or cannot be bound here. */
+/* A real syslog(3)/openlog()/closelog() call against a bound test socket.
+ * Binds the receiving socket at the real /dev/log path for this check, since
+ * glibc's syslog(3) has no override for that path; skipped if /dev/log
+ * already exists (a real syslog daemon's socket must not be disturbed) or
+ * cannot be bound. */
 static void test_syslog_real_client(void) {
         struct stat st;
         int recv_fd, r;
@@ -711,7 +685,7 @@ static void test_shutdown_flushes_pending_tail(void) {
                                       rc, "never-terminated", strlen("never-terminated"), &peer, peer_len, &cred),
                       0);
 
-        logd_recv_free(rc); /* must flush the pending tail, not silently drop it */
+        logd_recv_free(rc); /* must flush the pending tail */
         logd_writer_free(w);
 
         ASSERT_EQ_INT(logd_ring_read(dir, &ring), 0);
@@ -746,14 +720,10 @@ static void test_bind_socket_sets_passcred(void) {
 }
 
 /*
- * The real /dev/kmsg backfill mechanism (plan §3.2, milestone J2): a
- * fresh open() starts at the ring's beginning, not "now", so draining it
- * immediately captures the whole kernel ring already accumulated before
- * logd's kmsg reader ever existed -- exercised here against the real,
- * running kernel's actual ring, not a fixture (no dedicated test-logd-
- * kmsg is registered in meson.build, so this lives alongside J1's other
- * real-kernel-backed checks). Skipped cleanly, not failed, if this
- * environment has no /dev/kmsg or no permission to read it.
+ * /dev/kmsg backfill: a fresh open() starts at the ring's beginning, so
+ * draining it immediately captures the kernel ring accumulated before the
+ * reader existed. Run against the running kernel's real ring; skipped if
+ * there is no /dev/kmsg or no permission to read it.
  */
 static void test_kmsg_backfill_and_transport(void) {
         LogdKmsg *k;
@@ -778,7 +748,7 @@ static void test_kmsg_backfill_and_transport(void) {
         logd_kmsg_free(k);
         logd_writer_free(w);
 
-        ASSERT_TRUE(n > 0); /* a real kernel always has something in its ring by the time this runs */
+        ASSERT_TRUE(n > 0); /* a running kernel's ring is never empty */
 
         ASSERT_EQ_INT(logd_ring_read(dir, &ring), 0);
         ASSERT_EQ_INT((int) logd_ring_n_entries(ring), n);

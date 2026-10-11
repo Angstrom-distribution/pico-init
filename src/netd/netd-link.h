@@ -2,7 +2,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The interface table and the per-link state machine (plan §2.4, §2.5).
+ * The interface table and the per-link state machine.
  *
  * A Link is created when rtnetlink first reports an ifindex and destroyed
  * when it reports it gone -- never from configuration, and never in response
@@ -17,8 +17,7 @@
  * implementation under src/netd/dhcp/ meets the rest of the daemon: address,
  * default route, /etc/resolv.conf, the lease state file, and the direct
  * function call into netd-sntp.c/netd-time.c that replaces upstream's entire
- * networkd -> state file -> inotify -> timesyncd -> D-Bus -> timedated relay
- * (§2.6).
+ * networkd -> state file -> inotify -> timesyncd -> D-Bus -> timedated relay.
  */
 
 #pragma once
@@ -42,7 +41,7 @@ typedef struct DhcpLease DhcpLease;
 typedef struct LldpLink LldpLink;
 
 /*
- * Per-link states. Deliberately coarser than networkd's two-axis
+ * Per-link states. Coarser than networkd's two-axis
  * operational/administrative pair: netd has no status CLI for anyone to read
  * a finer distinction from, so the states that exist are the ones that change
  * behaviour.
@@ -110,17 +109,13 @@ struct Link {
          * upstream's own history warns is reachable from inside a DHCP
          * client/server callback still on the call stack (sd-dhcp-server.c
          * has no DONT_DESTROY guard around its callbacks the way
-         * sd-dhcp-client.c does -- plan §2.2's history-review finding).
-         * link_apply_lease() never itself calls link_configure()/
-         * link_reconfigure()/link_deconfigure() -- only address/route/
-         * resolv.conf/lease-file/time state -- so today's call graph cannot
-         * actually re-enter through this flag. It exists so a future mistake
-         * (a DHCP callback calling into the reconfigure path directly, or
-         * link_apply_lease growing such a call) becomes a logged -EBUSY
-         * instead of a use-after-free: link_configure() and
-         * link_deconfigure() both refuse to run while this is set, rather
-         * than mutate or free kernel/lease state a still-running callback may
-         * depend on. See the report on this milestone for the full reasoning.
+         * sd-dhcp-client.c does). link_apply_lease() never itself calls
+         * link_configure()/link_reconfigure()/link_deconfigure(), so the
+         * current call graph cannot re-enter through this flag. It turns a
+         * future mistake into a logged -EBUSY instead of a use-after-free:
+         * link_configure() and link_deconfigure() both refuse to run while it
+         * is set, rather than mutate or free state a still-running callback
+         * may depend on.
          */
         bool applying_lease;
 };
@@ -153,7 +148,7 @@ int netd_link_rtnl_handler(void *userdata, NetdRtnlLinkEvent event, const NetdRt
  * add any static Address=/Gateway=, arm the DHCPv4 client when DHCP= says so,
  * start the DHCPv4 server when DHCPServer=yes.
  *
- * Idempotent, and that is load-bearing rather than tidy: it is called on the
+ * Idempotent: it is called on the
  * initial event, on every subsequent link change, and once per link on
  * SIGHUP, and each of those may find the link already exactly right.
  *
@@ -166,8 +161,7 @@ int link_configure(Link *l);
  * The SIGHUP path for one link: drop what netd configured, re-match against
  * the reloaded .network set, and configure again. A link whose match did not
  * change and whose configuration is unchanged is left strictly alone --
- * reloading must not bounce a working interface, which is the failure mode
- * `networkctl reconfigure` is famous for.
+ * reloading must not bounce a working interface.
  *
  * 0 or -errno.
  */
@@ -210,13 +204,11 @@ int link_deconfigure(Link *l);
  *      "secondary" to the old one (both cover the same connected route), and
  *      the kernel cascades a primary-address delete into deleting every
  *      secondary in that subnet too (net.ipv4.conf.*.promote_secondaries
- *      defaults to 0) -- reproduced directly while building N1's own
- *      end-to-end test. Add-then-remove here would silently lose both
- *      addresses at once instead of leaving a brief gap.
+ *      defaults to 0). Add-then-remove would lose both addresses at once
+ *      instead of leaving a brief gap.
  *   3. IP_CHANGE to a *different* subnet -- add the new address before
  *      removing the old one, safely: the two addresses never share a
- *      connected route, so there is no secondary/cascade risk, and this is
- *      the case an "atomic renewal" description was actually written for.
+ *      connected route, so there is no secondary/cascade risk.
  *
  * 0 or -errno.
  */
@@ -238,8 +230,7 @@ int link_lose_lease(Link *l);
 
 /*
  * /run/netd/leases/<ifindex>, netd's own trivial documented text format --
- * not networkd's, which upstream marks "do not parse" and which
- * usb-multi-gadget-dhcp-fallback.sh currently probes anyway (§2.5, §2.7).
+ * not networkd's, which upstream marks "do not parse".
  *
  * Written atomically (tmp + rename), one KEY=VALUE per line, keys stable:
  * ADDRESS, PREFIXLEN, ROUTER, DNS, NTP, TIMEZONE, LIFETIME, T1, T2. Absent
@@ -259,29 +250,25 @@ int link_remove_lease_file(Link *l);
  * link_state_to_string()'s own strings), and NETWORK (the matched .network
  * file's path, omitted when l->network is NULL).
  *
- * Exists for networkctl (netctl.c, netd's own client) to report real setup
- * state and the matched config file without any IPC to netd -- see that
- * file's own header for why it reads kernel/netd state directly rather than
- * inventing an IPC protocol.
+ * Lets networkctl (netctl.c) report setup state and the matched config file
+ * without any IPC to netd.
  */
 int link_write_state_file(Link *l);
 int link_remove_state_file(Link *l);
 
 const char *link_state_to_string(LinkState s);
 
-/* --- persistent MAC derivation (GOAL B) ---
+/* --- persistent MAC derivation ---
  *
  * The pure half of link_apply_persistent_mac() (netd-link.c): no I/O, no
  * gating, just real systemd-networkd's MACAddressPolicy=persistent algorithm
  * (netif-util.c's net_get_unique_predictable_data_from_name() plus
  * link-config.c's own bit fixup) for `machine_id`/`ifname`. `machine_id` is
  * the raw 16 bytes (NetdId128.bytes, netd-compat.h) -- taken as a plain
- * array rather than that type so this header does not have to pull in
- * netd-compat.h's DHCP-lift-set shim (its assert()/log_*() redefinitions)
- * into every translation unit that includes netd-link.h. Exposed from an
- * otherwise-static section only so test-netd-mac.c can check it against
- * fixed vectors without a live Link/NetdRtnl fixture; every real caller
- * reaches it through link_configure_impl(), not directly. Writes exactly
+ * array rather than that type so this header does not pull netd-compat.h's
+ * assert()/log_*() redefinitions into every translation unit that includes
+ * it. Exposed only so test-netd-mac.c can check it against fixed vectors;
+ * real callers reach it through link_configure_impl(). Writes exactly
  * NETD_HW_ADDR_MAX bytes to `mac_out`.
  */
 void netd_persistent_mac_derive(

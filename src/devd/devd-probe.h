@@ -5,29 +5,23 @@
  * The bus-level identity behind /dev/disk/by-id/, and the sanitizer in front of
  * it.
  *
- * Upstream gets this from two udev builtins, `blkid` and `usb_id`, and neither
- * exists on a pico image. Reading what each actually does is what makes
- * replacing them cheap rather than a port:
+ * Upstream gets this from two udev builtins, `blkid` and `usb_id`, neither of
+ * which exists on a pico image:
  *
- *  - blkid is libblkid's whole per-filesystem superblock zoo, and devd needs
- *    exactly one entry from it -- the ext one. That half lives in
- *    ../ext-super.h, outside devd, because PID 1's root check reads the same
- *    superblock for its own reasons; devd is one of its two consumers rather
- *    than its owner.
- *  - usb_id looks like a builtin that would have to be ported, and reading it
- *    shows it is sysfs reads with a sanitizer on the front: idVendor/idProduct
+ *  - blkid: devd needs only the ext superblock, which is read by
+ *    ../ext-super.h (shared with PID 1's root check).
+ *  - usb_id is sysfs reads with a sanitizer on the front: idVendor/idProduct
  *    and the manufacturer/product/serial descriptor strings, run through
- *    replace_whitespace()/replace_chars(). MMC never needed a builtin at all --
- *    upstream's own rule reads ATTRS{name}/ATTRS{serial} straight out of sysfs.
- *    So both buses are a parent-directory walk and two file reads.
+ *    replace_whitespace()/replace_chars(). MMC needs no builtin; upstream's
+ *    rule reads ATTRS{name}/ATTRS{serial} straight from sysfs. Both buses are
+ *    therefore a parent-directory walk and two file reads.
  *
- * The named v1 divergence, recorded rather than silent: usb_id has a fallback
- * ladder for devices with no descriptor strings (hex vendor:product, interface
- * class walks). devd has none -- such a device simply gets no by-id link.
+ * Divergence: usb_id has a fallback ladder for devices with no descriptor
+ * strings (hex vendor:product, interface class walks). devd has none; such a
+ * device gets no by-id link.
  *
- * Every entry point here takes its roots as parameters. That is not test
- * scaffolding bolted on: it is what lets test-devd-probe.c build a sysfs tree
- * for a USB card reader that is not plugged into the machine running the test.
+ * Every entry point takes its roots as parameters so test-devd-probe.c can
+ * build a fixture sysfs tree.
  */
 
 #pragma once
@@ -37,11 +31,9 @@
 /*
  * "usb-Generic_USB_Reader_000000264001-part1" and friends.
  *
- * Two sizes, not one. The stem is what a bus device identifies itself as; the
- * full id is that plus a "-partN" suffix. Keeping the stem's buffer strictly
- * smaller is what makes the concatenation provably fit -- otherwise the widest
- * stem plus the widest suffix is longer than the buffer it goes into, and the
- * compiler is right to say so.
+ * The stem is what a bus device identifies itself as; the full id adds a
+ * "-partN" suffix. The stem buffer is strictly smaller so the concatenation
+ * provably fits.
  */
 #define DEVD_ID_STEM_MAX 128
 #define DEVD_ID_MAX 160

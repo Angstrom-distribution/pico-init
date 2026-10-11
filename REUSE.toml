@@ -15,12 +15,10 @@ path = [
 SPDX-FileCopyrightText = "Koen Kooi"
 SPDX-License-Identifier = "GPL-2.0-or-later"
 
-# Verbatim copies from systemd at the pinned tag: src/libsystemd/
-# libsystemd.sym and src/libudev/libudev.sym, which the generator
-# (tools/gen-libsystemd-sym.py) reads to produce libsystemd.sym /
-# libudev.sym as a subset plus at most one pico-only node, and the
-# pkg-config templates the test-*-pc tests diff the installed .pc files
-# against.
+# Verbatim copies from systemd v259: the libsystemd.sym and libudev.sym that
+# tools/gen-libsystemd-sym.py reads to produce the compat libraries' version
+# scripts, and the pkg-config templates the test-*-pc tests diff the
+# generated .pc files against.
 [[annotations]]
 path = [
   "src/compat/libsystemd/libsystemd-v259.sym",

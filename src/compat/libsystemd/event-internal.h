@@ -7,39 +7,23 @@
  * a real program including sd-event.h only ever sees opaque sd_event /
  * sd_event_source pointers.
  *
- * DESIGN, not upstream's. sd-event didn't exist yet in the pre-2012 systemd
- * source this project quarries algorithm shape from (checked: `git log
- * --all -- src/libsystemd/sd-event` at the v30 tag finds nothing), so there
- * is no GPL-era shape to carry forward here. What follows is pico's own
- * structure built to satisfy the real, current sd-event.h contract (read
- * from the LGPL-2.1-or-later checkout for signatures/semantics only, per
- * the family's design brief) -- not a reimplementation of any particular
- * upstream internal layout.
+ * This layout is pico's own, written against the sd-event.h contract rather
+ * than upstream's internals.
  *
- * ONE TIMERFD PER TIME SOURCE, DELIBERATELY. Upstream shares one timerfd per
- * clockid across every timer, kept as a priority queue, and periodically
- * coalesces nearby deadlines into a single wakeup -- worthwhile when a
- * process owns dozens of timers (systemd's own daemons). This shim's callers
- * are small standalone helper tools with a handful of timers at most, so the
- * complexity of a shared clock/prioqueue buys nothing; a plain timerfd per
- * source is simpler and behaviourally a strict subset of the contract
- * (sd_event_source_set_time_accuracy() only ever permits *later* delivery,
- * so firing exactly on time always satisfies it -- see sd-event.c).
+ * One timerfd per time source. Upstream shares one timerfd per clockid in a
+ * priority queue and coalesces nearby deadlines, which pays off with dozens
+ * of timers. Callers here have a handful at most, so a plain timerfd per
+ * source is enough; firing exactly on time always satisfies
+ * sd_event_source_set_time_accuracy(), which only permits later delivery.
  *
- * ONE SOURCE TYPE PER CLOCK EVENT KIND, NOT FIVE. Upstream has a distinct
- * internal enum value per clock (realtime, monotonic, boottime, and the two
- * alarm variants), which is what makes its shared-timerfd-per-clock scheme
- * possible.
- * Without that sharing there is nothing to gain from splitting the enum;
- * one SOURCE_TIME carries its own `clockid_t` field instead.
+ * One SOURCE_TIME type carrying its own clockid_t, instead of upstream's
+ * enum value per clock, which only exists to support the shared timerfds.
  *
  * run_prepare_callbacks() (sd-event.c) refs every entry of its scratch array
- * before running any prepare callback and unrefs them all afterward, the
- * same idiom sd_event_dispatch() uses around its one in-flight source: a
- * prepare callback that destroys a different, still-unvisited source would
- * otherwise leave that array holding a freed pointer for the rest of the
- * scan -- the same batch-array hazard PID 1's own manager-loop.c used to
- * guard against by hand before this migration.
+ * before running any prepare callback and unrefs them all afterward, as
+ * sd_event_dispatch() does around its one in-flight source: a prepare
+ * callback that destroys a different, still-unvisited source would otherwise
+ * leave the array holding a freed pointer.
  */
 
 #pragma once
@@ -51,10 +35,8 @@
 
 #include "sd-event.h"
 
-/* sd_event's own %usec_t is uint64_t already (matching the public API);
- * these two are just the family's private constants, independent of
- * pico-init-core's own util.h -- this library links against nothing of
- * pico-init's, on purpose (see meson.build). */
+/* usec_t is uint64_t, as in the public API. Defined here because this
+ * library links against nothing else of pico-init's (see meson.build). */
 #define EVENT_USEC_PER_SEC ((uint64_t) 1000000ULL)
 #define EVENT_USEC_PER_MSEC ((uint64_t) 1000ULL)
 

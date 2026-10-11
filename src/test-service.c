@@ -2,17 +2,16 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * M3's acceptance test: a lifecycle test walks every state, a timeout
- * produces FAILED, and a crash triggers auto-restart -- plus the two
- * regressions this milestone's own quarrying review flagged by name (B2's
- * signal-amnesty asymmetry, B7's start-rate limiting) and one bug this
- * review found on its own (see test_bug_running_timer_not_cancelled()).
+ * Service lifecycle: a test walks every state, a timeout produces FAILED, and
+ * a crash triggers auto-restart -- plus regressions for the signal-amnesty
+ * asymmetry, start-rate limiting and a start timer left running
+ * (see test_bug_running_timer_not_cancelled()).
  *
  * Real fork()/execve() is used throughout -- these are not mocked processes.
  * Reaping goes through the manager's own signalfd (pico_signal_fd()) rather
  * than a raw waitpid() poll loop, so this exercises the real SIGCHLD path
- * service_sigchld_event() expects, just without depending on
- * manager-loop.c's (separately owned, in-flight) epoll dispatch of it.
+ * service_sigchld_event() expects, just without manager-loop.c's epoll
+ * dispatch of it.
  *
  * cgroup v2 operations are opportunistic: service_ensure_cgroup() in
  * service.c is designed to degrade gracefully (s->cgroup stays NULL) when
@@ -157,12 +156,10 @@ static Service *load_service(Manager *m, const char *dir, const char *name, cons
  * Waits for SIGCHLD via the manager's real signalfd, fully draining every
  * ready child on each wakeup and routing each one to its actual owner via
  * manager_get_unit_by_pid() -- the way manager-loop.c's own SIGCHLD dispatch
- * will, once its (in flight, separately owned) epoll wiring lands. This is
- * not a simplification for one Service: with two services' processes both
+ * does. With two services' processes both
  * mid-death (see test_b2_signal_amnesty_differs_by_type()), routing
  * unconditionally to whichever Service* the caller passed in would
- * misattribute the wrong pid's exit to the wrong service -- caught in
- * review before this test would have been flaky rather than wrong.
+ * misattribute the wrong pid's exit to the wrong service.
  *
  * Returns true once `s`'s own pid has been reaped and routed, false on
  * timeout -- never blocks past timeout_ms, so a state-machine regression
@@ -240,7 +237,7 @@ static bool wait_for_timer(Manager *m, int timeout_ms) {
 }
 
 /*
- * M3's "done when": DEAD -> EXEC_START -> RUNNING -> STOP -> DEAD for
+ * DEAD -> EXEC_START -> RUNNING -> STOP -> DEAD for
  * Type=simple. EXEC_START is entered and left again synchronously inside
  * service_start() itself for Type=simple ("started the moment it is
  * forked") so it is never separately observable here -- that is exactly the
@@ -306,7 +303,7 @@ static void test_lifecycle_simple(void) {
 
         ASSERT_TRUE(reap_for(s, 3000));
 
-        /* B2, half of it: our own SIGTERM killing a Type=simple daemon is a
+        /* Our own SIGTERM killing a Type=simple daemon is a
          * clean, successful stop -- DEAD, not FAILED. */
         ASSERT_EQ_INT(s->state, SERVICE_DEAD);
         ASSERT_EQ_INT(s->result, SERVICE_SUCCESS);
@@ -320,7 +317,7 @@ static void test_lifecycle_simple(void) {
 }
 
 /*
- * The property the milestone brief calls out by name: a oneshot's start job
+ * A oneshot's start job
  * completes only once the process has exited, never merely because it was
  * forked. Asserted directly by checking state immediately after
  * service_start() returns (still EXEC_START/ACTIVATING) and again only
@@ -425,7 +422,7 @@ static const char *slurp(const char *path) {
 /*
  * Every ExecStartPre= line runs, in file order, before ExecStart=; a "-"
  * line that fails is skipped over and the chain carries on. systemd does the
- * same; a unit shipping `mkdir` then a second step used to lose the first.
+ * same; a `mkdir` then a second step must not lose the first.
  */
 static void test_exec_start_pre_runs_every_line_in_order(void) {
         Manager *m;
@@ -581,7 +578,7 @@ static void test_remain_after_exit(void) {
 }
 
 /*
- * B2, made explicit: same signal (SIGTERM), opposite verdicts, depending on
+ * Signal amnesty: same signal (SIGTERM), opposite verdicts, depending on
  * whether the process it killed was a long-running daemon's main process
  * (clean) or a oneshot/control command (never clean). v30 amnestied both
  * alike; a Type=oneshot boot-plumbing unit killed at its start timeout
@@ -623,7 +620,7 @@ static void test_b2_signal_amnesty_differs_by_type(void) {
 
 /*
  * A start timeout must produce FAILED with SERVICE_FAILURE_TIMEOUT, and
- * B3's write-once rule must protect that cause from being overwritten by
+ * The write-once failure-cause rule must protect that cause from being overwritten by
  * the SIGTERM-death classification the timeout's own kill triggers a
  * moment later (the "watchdog reports the cause, not the effect" case).
  */
@@ -719,7 +716,7 @@ static void test_crash_restart(void) {
 }
 
 /*
- * B7's regression, made concrete: without start-rate limiting, a
+ * Regression for start-rate limiting: without start-rate limiting, a
  * nonexistent ExecStart= with Restart=on-failure and a tiny RestartSec=
  * spins fork/execve/ENOENT forever. Bounded to at most start_limit_burst+1
  * real attempts so a regression here fails the assertion below rather than
@@ -1058,8 +1055,7 @@ static void test_restart_of_daemon_failing_on_sigterm(void) {
 }
 
 /*
- * Bug found during this milestone's own review, not upstream: every branch
- * of service_enter_running() leaves the start attempt behind for good, so
+ * Every branch of service_enter_running() leaves the start attempt behind for good, so
  * the start timeout that got the service there must be cancelled on every
  * one of those branches -- not just the failure path, which is the one
  * service_enter_stop() already covers. A Type=simple daemon that forked
@@ -1102,7 +1098,7 @@ static void test_bug_running_timer_not_cancelled(void) {
         free(dir);
 }
 
-/* B9/CVE-2021-4034-class: a unit with no ExecStart= at all must refuse to
+/* CVE-2021-4034-class: a unit with no ExecStart= at all must refuse to
  * load rather than becoming a service with an empty argv. */
 static void test_b9_service_verify_refuses_no_execstart(void) {
         Manager *m;
@@ -1125,7 +1121,7 @@ static void test_b9_service_verify_refuses_no_execstart(void) {
         free(dir);
 }
 
-/* B1: TimeoutStartSec=0 means "never", not "immediately" -- opposite of
+/* TimeoutStartSec=0 means "never", not "immediately" -- opposite of
  * RestartSec=0. A service with a real, slow-to-exit ExecStart= and
  * TimeoutStartSec=0 must not be killed by a phantom zero-length timeout. */
 static void test_b1_zero_timeout_means_infinity(void) {
@@ -1423,7 +1419,7 @@ static void test_bare_exec_name_not_found_fails_like_missing_absolute(void) {
 }
 
 /*
- * §9.2's acceptance test: a unit with User=/Group= naming real unprivileged
+ * A unit with User=/Group= naming real unprivileged
  * accounts actually runs as those ids, proven by the kernel's own
  * /proc/<pid>/status for the exec'd /bin/sleep, and root's supplementary
  * group is gone from the exec'd process. Group= alone keeps uid 0 and
@@ -1586,11 +1582,11 @@ static void test_user_unknown_fails_start_cleanly(void) {
 }
 
 /*
- * SupplementaryGroups= (plans/30 R6 extension, upstream's
+ * SupplementaryGroups= (upstream's
  * get_supplementary_groups()/enforce_groups()): a name or a numeric gid is
  * appended to the exec'd process's group list, independent of User=/Group=
- * -- picowl.service's own real shape (SupplementaryGroups=video, no
- * User=/Group= at all). Proven the same way test_user_group_drops_privilege()
+ * -- e.g. SupplementaryGroups=video with no
+ * User=/Group= at all. Proven the same way test_user_group_drops_privilege()
  * above proves User=/Group=: a real /proc/<pid>/status Groups: line.
  */
 static void test_supplementary_groups_applied(void) {
@@ -2256,9 +2252,9 @@ static void test_forking_pidfile_of_parent_refused(void) {
         free(dir);
 }
 
-/* --- Environment=/EnvironmentFile= (plans/41 E2) --- */
+/* --- Environment=/EnvironmentFile= --- */
 
-/* util.c's quarried helpers directly: merge order and in-place override,
+/* util.c's helpers directly: merge order and in-place override,
  * lookup, and the env-file line grammar. */
 static void test_env_helpers(void) {
         char *base[] = { "A=1", "B=2", NULL };
@@ -2442,9 +2438,9 @@ static void test_environment_file_missing_fails_start(void) {
         free(dir);
 }
 
-/* --- $VAR/${VAR} in exec lines (plans/41 E3) --- */
+/* --- $VAR/${VAR} in exec lines --- */
 
-/* util.c's quarried replace_env()/replace_env_argv() directly. */
+/* util.c's replace_env()/replace_env_argv() directly. */
 static void test_replace_env_helpers(void) {
         char *env[] = { "FOO=a b", "Q=x \"y z\"", "EMPTY=", "BAD=\"open", NULL };
         char *argv[] = { "$FOO",    "$UNSET", "pre${FOO}post", "${UNSET}", "$$",     "cost:$$5",
@@ -2494,7 +2490,7 @@ static void read_file(const char *path, char *out, size_t out_size) {
  * End to end, ExecStartPre= and ExecStart= alike: a bare $FOO splits into
  * several arguments, an unset one adds none, ${FOO} is substituted inside a
  * longer word after %-specifiers, $$ is a literal $, and argv[0] (the exec
- * path) is never expanded. The values come from the E2 merge, a file
+ * path) is never expanded. The values come from the merge of a file
  * overriding Environment=.
  */
 static void test_exec_line_expansion(void) {
@@ -2546,7 +2542,7 @@ static void test_exec_line_expansion(void) {
 }
 
 /*
- * The hazard E3 names: service_spawn() recognizes the main command by
+ * service_spawn() recognizes the main command by
  * pointer identity, and the expanded argv is a different pointer. A Type=exec
  * unit whose ExecStart= uses $VAR must still get its readiness pipe, and the
  * process must really run the expanded command line.
@@ -2648,7 +2644,7 @@ static void test_close_all_except_keeps_every_fd(void) {
  * signalled. The daemon's own TERM trap appends after both lines, so the
  * file's order is the proof. The oneshot + RemainAfterExit=yes half is the
  * case with nothing to signal at all, where ExecStop= is the only teardown
- * there is (plans/29's usb-multi-gadget).
+ * there is.
  */
 static void test_exec_stop_runs_before_signal(void) {
         Manager *m;

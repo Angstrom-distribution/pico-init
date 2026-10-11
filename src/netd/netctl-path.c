@@ -2,15 +2,10 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * ID_PATH, scope-limited to the three subsystems a pico target actually
- * sees: pci, usb, platform -- a hand-written port of udev's
- * builtin_path_id() (udev-builtin-path_id.c) restricted to those branches,
- * same reasoning udev-builtin-path_id.c's own comment gives for
- * "supported_parent" refusal: a topology this function does not recognize
- * (a bare virtio-net NIC under qemu, say) gets no Path row at all, never a
- * guess -- matching real networkctl against the same hardware, which has
- * the identical refusal for virtio (it only ever sets a transport, never a
- * parent).
+ * ID_PATH, limited to pci, usb and platform -- a port of udev's
+ * builtin_path_id() (udev-builtin-path_id.c) restricted to those branches.
+ * A topology this function does not recognize (a bare virtio-net NIC under
+ * qemu, say) gets no Path row at all, never a guess, as with real networkctl.
  *
  * Walks from the network device's own physical node (realpath() of its
  * "device" symlink, the same starting point netctl.c's own usb_device_dir()
@@ -23,12 +18,8 @@
  * produces udev's own outermost-first ordering
  * ("pci-0000:0c:00.0-usb-0:2:1.0") without a second, root-to-leaf pass.
  *
- * Scope trim versus the full upstream algorithm: get_usb_revision()'s
- * "usbv<rev>-" prefix (fires only when the immediate parent is itself a hub,
- * per its own bDeviceProtocol check) is not implemented -- a pico target's
- * worked examples are all the no-revision case, and adding it needs a sysfs
- * read this function does not otherwise need. Noted here rather than
- * silently dropped.
+ * Not implemented: get_usb_revision()'s "usbv<rev>-" prefix (fires only when
+ * the immediate parent is itself a hub), which needs an extra sysfs read.
  */
 
 #include "netctl-path.h"
@@ -75,10 +66,8 @@ static const char *path_id_classify(const char *devdir, char *buf, size_t bufsiz
  * point into caller-controlled buffers (cur is PATH_MAX, result accumulates
  * across loop iterations) that GCC cannot prove stay short, so
  * -Wformat-truncation flags every %s join below at -O2. Clamped, not
- * checked: a path_id segment this function cannot fit just gets silently
- * truncated, which costs a vaguer Path row and nothing else -- same
- * reasoning as devd-match.c's iface_subsystem() and devd-run.c's
- * child_record().
+ * checked: a segment that does not fit is silently truncated, costing only a
+ * vaguer Path row.
  */
 static void path_id_append(char *buf, size_t bufsize, size_t *len, const char *s) {
         size_t n = strlen(s);

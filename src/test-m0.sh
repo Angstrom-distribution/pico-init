@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2026 Koen Kooi
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
-# M0 acceptance test: the binary links, runs, exits 0 when not PID1, and
+# Smoke test: the binary links, runs, exits 0 when not PID1, and
 # every public entry point from the src/*.h API surface is actually present
 # in the linked binary (stub bodies returning -ENOSYS are fine -- absence
 # is not).

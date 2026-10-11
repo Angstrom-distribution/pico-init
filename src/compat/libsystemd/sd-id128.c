@@ -2,17 +2,12 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * Implementation behind sd-id128.h -- see that header for the compatibility
- * contract and provenance note. Written from scratch against real, current
- * sd-id128.c/id128-util.c (systemd.git, HEAD ded83144, 2026-08-23) for
- * behaviour and error semantics only.
+ * Implementation behind sd-id128.h; behaviour and error semantics follow
+ * upstream sd-id128.c/id128-util.c (systemd HEAD ded83144).
  *
  * sd_id128_get_machine()/get_boot()/get_invocation() each cache their
- * result in a per-thread static, exactly like real libsystemd: once a
- * process has a valid machine/boot/invocation id, that id cannot change out
- * from under it for the rest of the process's life, so re-reading the
- * backing file or environment on every call would only add I/O for no
- * behavioural benefit.
+ * result in a per-thread static, like real libsystemd: a valid id cannot
+ * change for the rest of the process's life.
  */
 
 #include "sd-id128.h"
@@ -53,11 +48,9 @@ char *sd_id128_to_string(sd_id128_t id, char s[_SD_ARRAY_STATIC SD_ID128_STRING_
 }
 
 /*
- * Always big-endian byte order, even for an id whose own variant bits claim
- * otherwise -- matching every other Linux userspace UUID renderer rather
- * than reinterpreting the bytes per RFC 4122's (rarely honoured) variant
- * field. Real upstream's own comment calls this out explicitly; carried
- * here as behaviour, not as text.
+ * Always big-endian byte order, even for an id whose variant bits claim
+ * otherwise, matching other Linux UUID renderers rather than
+ * reinterpreting the bytes per RFC 4122's variant field.
  */
 char *sd_id128_to_uuid_string(sd_id128_t id, char s[_SD_ARRAY_STATIC SD_ID128_UUID_STRING_MAX]) {
         size_t k = 0;
@@ -102,12 +95,9 @@ static bool has_urn_uuid_prefix(const char *s) {
 }
 
 /*
- * Accepts exactly: 32 hex digits, or a 36-char dashed UUID (dashes at
- * positions 8/13/18/23), either optionally preceded by a case-insensitive
- * "urn:uuid:" -- which then requires the dashed form, matching real
- * upstream's own is_guid latch (the prefix sets is_guid before the loop
- * even sees a dash, so a plain 32-char body after the prefix comes up
- * short against the UUID length check below and is rejected).
+ * Accepts 32 hex digits, or a 36-char dashed UUID (dashes at positions
+ * 8/13/18/23), optionally preceded by a case-insensitive "urn:uuid:". The
+ * prefix requires the dashed form, as upstream does.
  */
 int sd_id128_from_string(const char *s, sd_id128_t *ret) {
         sd_id128_t parsed;
@@ -176,8 +166,7 @@ int sd_id128_string_equal(const char *s, sd_id128_t id) {
 }
 
 /* Shared by sd_id128_randomize() and every get_*_app_specific(): forces the
- * version nibble to 4 and the variant bits to DCE, "to be nice" per real
- * upstream's own comment -- not a promise about entropy quality. */
+ * version nibble to 4 and the variant bits to DCE, as upstream does. */
 sd_id128_t id128_make_v4_uuid(sd_id128_t id) {
         id.bytes[6] = (uint8_t) ((id.bytes[6] & 0x0f) | 0x40);
         id.bytes[8] = (uint8_t) ((id.bytes[8] & 0x3f) | 0x80);
@@ -305,9 +294,8 @@ int sd_id128_get_boot(sd_id128_t *ret) {
 
                 fd = open("/proc/sys/kernel/random/boot_id", O_RDONLY | O_CLOEXEC | O_NOCTTY);
                 if (fd < 0) {
-                        /* Real upstream's own proc_mounted() check: ENOENT on this exact path can
-                         * mean either "old kernel, no boot_id" or "/proc isn't mounted at all" --
-                         * the latter gets its own distinct -ENOSYS rather than a misleading -ENOENT. */
+                        /* ENOENT here means either an old kernel without boot_id or no /proc
+                         * mounted; the latter gets -ENOSYS, as upstream does. */
                         if (errno == ENOENT && !proc_is_mounted())
                                 return -ENOSYS;
                         return -errno;
@@ -325,15 +313,10 @@ int sd_id128_get_boot(sd_id128_t *ret) {
 }
 
 /*
- * glibc/musl's secure_getenv() reimplemented by hand rather than called:
- * both gate it behind their own feature-test-macro conventions, and there
- * is no portable, reliable compile-time test for "is this libc one of the
- * two" -- doing the actual safety check ourselves (kernel AT_SECURE flag,
- * then the classic real-vs-effective id mismatch) is fewer moving parts
- * than branching on __GLIBC__ and hoping every other libc's secure_getenv()
- * needs no _GNU_SOURCE-equivalent toggle. Same documented behaviour either
- * way: the environment is trusted only when this process crossed no
- * privilege boundary to get here.
+ * secure_getenv() reimplemented because libcs gate it behind differing
+ * feature-test macros and there is no portable compile-time test for them.
+ * The environment is trusted only when this process crossed no privilege
+ * boundary (kernel AT_SECURE flag, then real-vs-effective id mismatch).
  */
 static const char *pico_secure_getenv(const char *name) {
 #ifdef AT_SECURE
@@ -349,14 +332,10 @@ static const char *pico_secure_getenv(const char *name) {
 static _Thread_local sd_id128_t cached_invocation_id;
 
 /*
- * Real upstream also falls back to a kernel user-keyring "invocation_id"
- * key when the environment variable is unset, for system services that
- * don't get it as an environment variable. Deliberately not carried here:
- * pico-init's service-exec never stores an invocation id in the keyring,
- * and upstream's own behaviour when that key is genuinely absent is the
- * same -ENXIO this returns for "unset" -- so the omission is observably
- * identical on a pico system, not a shortcut. If service-exec ever starts
- * exporting INVOCATION_ID (see sd-id128.h), this starts working unchanged.
+ * Upstream also falls back to a kernel user-keyring "invocation_id" key.
+ * Omitted: service-exec never stores one, and an absent key gives the same
+ * -ENXIO as an unset variable. If service-exec starts exporting
+ * INVOCATION_ID, this works unchanged.
  */
 int sd_id128_get_invocation(sd_id128_t *ret) {
         if (sd_id128_is_null(cached_invocation_id)) {
@@ -388,11 +367,8 @@ int sd_id128_get_invocation(sd_id128_t *ret) {
 _Static_assert(SHA256_DIGEST_SIZE >= sizeof(((sd_id128_t *) 0)->bytes), "digest too small to truncate");
 
 /*
- * Bit-identical to real libsystemd for the same inputs: HMAC-SHA256 is a
- * standardized construction (FIPS 198 / RFC 2104, over FIPS 180-4), and the
- * key/message order below -- key material is `base`, the HMAC'd message is
- * `app_id` -- is the one compat-critical detail this shim has to get right;
- * everything else follows from the standard.
+ * Bit-identical to real libsystemd for the same inputs: HMAC-SHA256 (RFC
+ * 2104, FIPS 198) keyed with `base`, over the message `app_id`.
  */
 int sd_id128_get_app_specific(sd_id128_t base, sd_id128_t app_id, sd_id128_t *ret) {
         uint8_t digest[SHA256_DIGEST_SIZE];

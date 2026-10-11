@@ -2,10 +2,10 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * M1's acceptance test: a three-unit "A wants B, A after C" graph loaded from
- * real fragments on disk, with the edges asserted to be exactly what the files
- * said -- plus the regressions for the two bugs this milestone's review found
- * (a unit name that escapes the search directory, and an edge inserted twice).
+ * A three-unit "A wants B, A after C" graph loaded from real fragments on
+ * disk, with the edges asserted to be exactly what the files said -- plus
+ * regressions for a unit name that escapes the search directory and for an
+ * edge inserted twice.
  *
  * The units are written to a temporary directory and the manager is pointed at
  * it, so this exercises the real loader end to end: directory scan, fragment
@@ -55,7 +55,7 @@ static Manager *manager_for(const char *dir) {
         return m;
 }
 
-/* M1's "Done when": A wants B and runs after C, exactly as written. */
+/* A wants B and runs after C, exactly as written. */
 static void test_three_unit_ordering(void) {
         Unit *a, *b, *c;
         Manager *m;
@@ -186,8 +186,8 @@ static void test_cycle_detection(void) {
 }
 
 /*
- * Regression for the review finding that no unit-name validation existed
- * before a dependency token became a path. The fragment below asks for a unit
+ * Regression: a dependency token was used as a path without unit-name
+ * validation. The fragment below asks for a unit
  * outside the search directory; it must be dropped, not loaded, and must not
  * appear in the unit table under any name.
  */
@@ -238,8 +238,7 @@ static void test_unit_name_validation(void) {
         ASSERT_TRUE(unit_name_is_valid("multi-user.target"));
         ASSERT_TRUE(unit_name_is_valid("serial-getty@ttyGS0.service"));
         ASSERT_TRUE(unit_name_is_valid("a_b:c.service"));
-        /* .socket became a real unit type with plan §1.6's scaffolding; a name
-         * is valid exactly when its suffix names a type this init knows. */
+        /* A name is valid exactly when its suffix names a type this init knows. */
         ASSERT_TRUE(unit_name_is_valid("foo.socket"));
 
         /* rejected */

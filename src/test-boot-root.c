@@ -2,7 +2,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * M2's boot-rooting acceptance test: .wants/.requires directories, [Install]
+ * Boot rooting: .wants/.requires directories, [Install]
  * WantedBy=/RequiredBy=, and preset application (systemd.preset(5) rules,
  * including its counter-intuitive "no rule matched" == enable default), all
  * exercised against real fragments and real symlinks on disk.
@@ -76,8 +76,8 @@ static void apply_enablement(Manager *m) {
 }
 
 /* Whether <dir>/<target><suffix>/<unit_id> exists as a symlink -- the
- * on-disk fact manager_apply_presets() must now also produce whenever it
- * enables a unit, not just the in-memory edge and u->enabled. */
+ * on-disk fact manager_apply_presets() produces whenever it enables a unit,
+ * not just the in-memory edge and u->enabled. */
 static bool enable_symlink_on_disk(const char *dir, const char *target, const char *suffix, const char *unit_id) {
         char path[PATH_MAX];
         struct stat st;
@@ -221,8 +221,8 @@ static void test_install_wantedby_with_preset_enable(void) {
 
         ASSERT_TRUE(unit_has_dependency(target, UNIT_WANTS, foo));
         ASSERT_TRUE(foo->enabled);
-        /* the new contract: a preset-driven enable is now persisted as a
-         * real symlink too, not just an in-memory edge */
+        /* a preset-driven enable is persisted as a real symlink too, not just
+         * an in-memory edge */
         ASSERT_TRUE(enable_symlink_on_disk(udir, "default.target", ".wants", "foo.service"));
 
         manager_free(m);
@@ -479,7 +479,7 @@ static void test_real_angstrom_pico_preset_parses(void) {
 }
 
 /*
- * M2's acceptance criterion, made literal: a default.target pulling in units
+ * A default.target pulling in units
  * via real WantedBy=/preset resolution ends up wanting exactly the set a
  * hand-built explicit list would -- alpha via a .wants/ symlink, beta via a
  * preset "enable", delta via the no-rule-matched default, and NOT gamma,
@@ -602,12 +602,9 @@ static void test_first_boot_persists_preset_symlinks(void) {
 }
 
 /*
- * The exact regression this milestone fixes: `systemctl disable foo` (here,
- * removing the symlink by hand, exactly what that verb does) must stay
- * disabled across a later boot, even though the preset still says "enable"
- * -- because a non-first boot never consults presets at all. Before the
- * fix, manager_apply_presets() ran on every boot and re-enabled foo the
- * moment its symlink was gone, in memory, every single time.
+ * `systemctl disable foo` (here, removing the symlink by hand, as that verb
+ * does) must stay disabled across a later boot, even though the preset still
+ * says "enable", because a non-first boot never consults presets.
  */
 static void test_second_boot_does_not_resurrect_a_disabled_unit(void) {
         Unit *foo;
@@ -655,7 +652,7 @@ static void test_second_boot_does_not_resurrect_a_disabled_unit(void) {
 
         foo = manager_get_unit(m, "foo.service");
         ASSERT_TRUE(foo != NULL);
-        ASSERT_TRUE(!foo->enabled); /* the regression: this used to be true again */
+        ASSERT_TRUE(!foo->enabled);
         ASSERT_TRUE(!enable_symlink_on_disk(udir, "default.target", ".wants", "foo.service"));
 
         manager_free(m);

@@ -22,13 +22,8 @@
 
 /*
  * The checker, by absolute path rather than through $PATH: this runs as PID 1
- * with whatever environment the kernel handed it, and a filesystem repair tool
- * is not a thing to go looking for.
- *
- * e2fsprogs-e2fsck is not installed on any image this project builds today, so
- * the access() below is the branch every current boot takes. That is a
- * deliberate ordering -- this code lands first and warns, the package lands
- * separately -- and not an oversight.
+ * with whatever environment the kernel handed it. When e2fsprogs is not
+ * installed the access() check below logs a warning and the boot continues.
  */
 #define PICO_FSCK_EXT4 "/usr/sbin/fsck.ext4"
 
@@ -221,9 +216,7 @@ int pico_root_check(FstabEntry *root_line) {
         r = gpt_boot_root("/proc/self/mountinfo", NULL, 0, NULL, 0, part, sizeof(part), &read_only);
 
         /*
-         * The branch every image built today takes, because nothing has flipped
-         * `rw` to `ro` on any of these kernel command lines yet. It has to be
-         * correct and cheap on an ordinary boot, and it is: one file read, no
+         * The ordinary-boot branch, so it must be cheap: one file read, no
          * device opened, and no remount unless fstab's "/" line asks for one.
          *
          * `read_only` is answered by the mountinfo line alone, so it is
@@ -257,10 +250,8 @@ int pico_root_check(FstabEntry *root_line) {
         /*
          * From here root IS read-only, so this function owes the rest of the
          * boot either the root fstab asks for -- read-write, unless its "/"
-         * line says "ro" -- or a logged reason why not. An
-         * unidentifiable device is not such a reason -- a machine sitting at a
-         * console with a writable root is worth more than one that is right
-         * about which node it is on.
+         * line says "ro" -- or a logged reason why not. An unidentifiable
+         * device is not such a reason.
          */
         if (r < 0) {
                 pico_log(PICO_LOG_WARNING,
@@ -306,10 +297,9 @@ int pico_root_check(FstabEntry *root_line) {
                  (unsigned) fs.last_orphan);
 
         /*
-         * The other branch every image takes today: e2fsprogs-e2fsck is not
-         * installed anywhere yet. Warn and go on -- refusing to boot over a
-         * missing tool would be a worse outcome than mounting a filesystem the
-         * kernel was going to mount anyway.
+         * Warn and go on when the checker is missing: refusing to boot over it
+         * would be worse than mounting a filesystem the kernel would mount
+         * anyway.
          */
         if (access(PICO_FSCK_EXT4, X_OK) < 0) {
                 pico_log(PICO_LOG_WARNING, "%s is not installed, remounting %s unchecked", PICO_FSCK_EXT4, part);
@@ -338,14 +328,10 @@ int pico_root_check(FstabEntry *root_line) {
                  * machine restarts. Left to main(), which owns the one
                  * sync()/reboot() path this init has.
                  *
-                 * Not guarded against repeating: /run is a tmpfs and survives
-                 * nothing, so there is no marker to leave. A filesystem that
-                 * comes back with the same verdict every boot would loop, and
-                 * the honest state of this is that the guard is an open design
-                 * question (plans/29 §10, open item 6c) rather than something
-                 * to invent here. What is here instead is a log line naming the
-                 * reason on every pass, so a loop is legible in the kernel ring
-                 * rather than silent.
+                 * Not guarded against repeating: /run is a tmpfs, so there is
+                 * no marker to leave, and a filesystem that comes back with
+                 * the same verdict every boot would loop. The log line below
+                 * makes such a loop visible in the kernel ring.
                  */
                 pico_log(PICO_LOG_ERR,
                          "%s was repaired and %s asks for a reboot (exit %d) -- rebooting",
@@ -356,10 +342,8 @@ int pico_root_check(FstabEntry *root_line) {
 
         case PICO_FSCK_UNCORRECTED:
                 /*
-                 * The deliberate divergence from upstream's emergency.target.
-                 * The rest of the boot goes ahead with root read-only, which on
-                 * a machine with no session to act from is strictly more useful
-                 * than an emergency shell nobody is sitting in front of.
+                 * Diverges from upstream's emergency.target: boot on with root
+                 * read-only (see root-check.h).
                  */
                 pico_log(PICO_LOG_ERR,
                          "%s has errors %s could not correct (exit %d) -- leaving the root filesystem "

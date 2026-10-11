@@ -5,35 +5,32 @@
 /*
  * INI-style unit-file parser, quarried from systemd's ~2011-era
  * src/conf-parser.c + src/load-fragment.c (tag v30, commit 501c92c,
- * copyright 2010 Lennart Poettering, GPL-2.0-or-later). Only
- * [Unit]/[Service]/[Install] and the directives service.h/unit.h actually
- * have fields for are implemented -- everything else (dbus, socket
- * activation, cgroup v1, SELinux, specifiers) is recognized as valid INI
- * syntax and dropped at debug level rather than erroring, matching real
+ * copyright 2010 Lennart Poettering, GPL-2.0-or-later). Only the directives
+ * that service.h, socket.h and unit.h have fields for are implemented;
+ * everything else is recognized as valid INI syntax and dropped at debug
+ * level (and recorded as a degradation) rather than erroring, matching real
  * unit-file tolerance.
  *
  * The line-level scanner (getline loop, sections, comments, continuations,
- * BOM, key/value split) now lives in conf-scan.c, shared with netd's
- * `.network` parser -- see conf-scan.h for why. This file reduces to the
- * handler table and unit-file semantics: unit_parse_file() below just drives
- * pico_conf_scan() with unit_conf_handler().
+ * BOM, key/value split) lives in conf-scan.c, shared with netd's `.network`
+ * parser; see conf-scan.h. This file is the handler table and unit-file
+ * semantics: unit_parse_file() drives pico_conf_scan() with
+ * unit_conf_handler().
  *
- * Backported fixes from the 2011 baseline's real upstream history (see
- * plans/29-pico-init.md quarrying-discipline note); commit hashes below are
- * from github.com/systemd/systemd. Seven of the original eleven are scanner
- * properties and their citations moved to conf-scan.c with the code that
- * carries them (e6dde451a unbounded getline, 2d4fffb00 malformed-line-skip,
- * 9adbfeb38+0ef695858 the comment-backslash/blank-line-terminates pair,
- * 4f29e0db1 unterminated-continuation flush, 9dd7ea9a7 BOM skip, 8ea913b2e
- * invalid-free, 91ffff962 free-old-section-before-replacing). The three
- * remaining are unit-file value semantics and stay here:
+ * Backported fixes (commit hashes from github.com/systemd/systemd). Seven
+ * fixes are scanner properties and are cited in conf-scan.c with the code
+ * that carries them (e6dde451a unbounded getline, 2d4fffb00
+ * malformed-line-skip, 9adbfeb38+0ef695858 the comment-backslash/
+ * blank-line-terminates pair, 4f29e0db1 unterminated-continuation flush,
+ * 9dd7ea9a7 BOM skip, 8ea913b2e invalid-free, 91ffff962
+ * free-old-section-before-replacing). The rest are unit-file value
+ * semantics and stay here:
  *
  *  - 35b1078e1 "load-fragment: Don't assert() on invalid exec flags" --
- *    the original code hit assert(skip < l) on "ExecStart=- /bin/true"
- *    (a modifier separated from the path by whitespace) and aborted the
- *    whole manager process. A malformed unit file must never be able to
- *    kill PID1, so parse_exec_line() below rejects that shape with a
- *    warning instead.
+ *    v30 hit assert(skip < l) on "ExecStart=- /bin/true" (a modifier
+ *    separated from the path by whitespace) and aborted the manager. A
+ *    malformed unit file must never be able to kill PID 1, so
+ *    parse_exec_line() rejects that shape with a warning.
  *  - c853953658 "load-fragment: Rework config_parse_exec()" -- replaces
  *    the historical assert(path_is_absolute(path)) with an explicit
  *    validate-and-reject chain; parse_exec_line() follows that template.
@@ -41,40 +38,27 @@
  *    accesses" -- an unterminated quote or trailing garbage after a
  *    closing quote was silently accepted; pico_extract_first_word() (util.c,
  *    shared with $VAR splitting at spawn time) rejects both.
- *  - 92c1622e14 / 36c16a7cdd (M3, service.c quarry) -- TimeoutStartSec=/
- *    TimeoutStopSec= and RestartSec= have opposite zero-semantics upstream
- *    (0 means "never time out" for the former, "restart immediately" for
- *    the latter). parse_usec() below also accepts the literal "infinity",
- *    and only the two Timeout*Sec= handlers translate a parsed 0 to
- *    USEC_INFINITY; config_parse_restart_sec() deliberately does not.
+ *  - 92c1622e14 / 36c16a7cdd -- TimeoutStartSec=/TimeoutStopSec= and
+ *    RestartSec= have opposite zero-semantics upstream (0 means "never time
+ *    out" for the former, "restart immediately" for the latter).
+ *    parse_usec() also accepts the literal "infinity", and only the two
+ *    Timeout*Sec= handlers translate a parsed 0 to USEC_INFINITY;
+ *    config_parse_restart_sec() does not.
  *
- * Not backported (see plans/29-pico-init.md for scope): the UTF-8
- * validity/escaping fixes (b5d742138, 78d17fa09, 9e6027783) -- no
- * quoted-strv directive in this MVP needs them; the mtime-tracking fixes
- * (9fd8d678b, da46a1bc3) -- unit_parse_file() has no mtime out-param in
- * the M0 header contract; the ';'-multi-command ExecStart fixes
- * (3851c51ad, 598c47c86) -- multi-command ExecStart= is out of MVP scope,
- * Type=simple takes exactly one command.
+ * Not backported: the UTF-8 validity/escaping fixes (b5d742138, 78d17fa09,
+ * 9e6027783) -- no quoted-strv directive here needs them; the mtime-tracking
+ * fixes (9fd8d678b, da46a1bc3) -- unit_parse_file() has no mtime out-param;
+ * the ';'-multi-command ExecStart fixes (3851c51ad, 598c47c86) -- each
+ * ExecStart= line is exactly one command.
  *
- * Specifier expansion (%i/%I/%n/%N/%p, G2): config_parse_unit_deps() and
- * config_parse_install_names() expand per-token through unit_name_printf()
- * (name-safe: no expansion here can introduce whitespace or a '/'), and
+ * Specifier expansion (%i/%I/%n/%N/%p): config_parse_unit_deps() and
+ * config_parse_install_names() expand per token through unit_name_printf()
+ * (name-safe: no expansion can introduce whitespace or a '/'), and
  * parse_exec_line()/config_parse_description() expand through
- * unit_full_printf() (adds %I, which unescapes and so can). Deliberately
- * NOT expanded: config_parse_condition_path() -- verified against the
- * quarry that v30 at this tag (load-fragment.c:1584-1620) does not run
- * specifier_printf() on a condition value either, so staying unexpanded
- * keeps this milestone at v30 fidelity rather than one that only looks
- * complete. See that function's own comment for the practical consequence.
- *
- * The stack-overflow-class bug the M1 review found (a VLA sized by an
- * unbounded, attacker-controlled line length, reproduced with a 30MB
- * Requires= line) was in config_parse_unit_deps() below, not the scanner --
- * conf-scan.c's own getline/realloc-based line handling never used a VLA
- * either. Its committed regression test lives in netd/test-netd-network.c,
- * exercising the same heap-not-VLA discipline through netd's own parser
- * (see that file for why: this project's test programs are not this file's
- * to add to at N0).
+ * unit_full_printf() (adds %I, which unescapes and so can). Not expanded:
+ * config_parse_condition_path(), because v30 at this tag
+ * (load-fragment.c:1584-1620) does not run specifier_printf() on a
+ * condition value either; see that function's comment for the consequence.
  */
 
 #include "unit.h"
@@ -113,18 +97,6 @@ typedef struct ConfigItem {
 } ConfigItem;
 
 /*
- * Parses one Exec*= value (ExecStart=, ExecStop=, ...) into a NULL-terminated argv.
- * Supports the "-" modifier (ignore exit status), stored via *ret_ignore for
- * the caller to keep on the command (v30 load-fragment.c:531-533 sets
- * ExecCommand.ignore the same way), only when it's not separated from the
- * path by whitespace; that's the exact shape ("ExecStart=- /bin/true") that
- * hit assert(skip < l) upstream (35b1078e1) -- reject it with a warning
- * instead of indexing past it. Other modifiers (@ + ! :) aren't supported in
- * this MVP and cause the whole directive to be rejected, same as
- * c853953658's validate-and-reject rework rather than the original
- * assert-on-bad-input.
- */
-/*
  * Expand *word through the full table (%I included) and replace it in
  * place, freeing the raw word either way -- the caller has nothing left to
  * clean up on either return path.
@@ -138,6 +110,16 @@ static int expand_word(Unit *u, char **word) {
         return r;
 }
 
+/*
+ * Parses one Exec*= value (ExecStart=, ExecStop=, ...) into a NULL-terminated argv.
+ * Supports the "-" modifier (ignore exit status), stored via *ret_ignore for
+ * the caller to keep on the command (v30 load-fragment.c:531-533 sets
+ * ExecCommand.ignore the same way), only when it's not separated from the
+ * path by whitespace; "ExecStart=- /bin/true" hit assert(skip < l) upstream
+ * (35b1078e1) and is rejected with a warning. Other modifiers (@ + ! :) are
+ * not supported and cause the whole directive to be rejected (c853953658's
+ * validate-and-reject rework).
+ */
 static int
                 parse_exec_line(Unit *u,
                                 const char *path,
@@ -191,33 +173,28 @@ static int
         }
 
         /*
-         * Expanded here, after pico_extract_first_word() and before the
-         * absolute-path check below -- so the check judges the expanded
-         * path, and so a %I that unescapes to something containing a space
-         * (e.g. an instance "a\x20b") stays one argv element instead of
-         * being split by a whole-rvalue expansion done before word-splitting
-         * ever ran. v30 itself expands ExecStart= at spawn time instead
-         * (unit_full_printf_strv() from service.c, already-tokenized argv
-         * in hand by then) rather than here at parse time -- pico expands
-         * earlier for the same per-word-not-per-line reason, just applied
-         * sooner. $VAR expansion is the one spawn-time pass (service-exec.c),
-         * and runs on these already-%-expanded words, v30's own order.
+         * Expanded after pico_extract_first_word() and before the
+         * absolute-path check, so the check judges the expanded path and a
+         * %I that unescapes to something containing a space (e.g. an
+         * instance "a\x20b") stays one argv element. v30 expands at spawn
+         * time (unit_full_printf_strv() on the tokenized argv); this is the
+         * same per-word expansion, done at parse time. $VAR expansion is the
+         * spawn-time pass (service-exec.c) and runs on these already
+         * %-expanded words, as in v30.
          */
         r = expand_word(u, &word);
         if (r < 0)
                 return r;
 
         /*
-         * c853953658's template, updated to match modern systemd (since
-         * v239, 7c891d53b "load-fragment: when parsing paths for Exec*=, be
-         * more liberal"): a bare filename (no '/' at all) is also accepted
-         * here and resolved against the search path at exec time
-         * (service-exec.c's find_in_default_path()) -- only a RELATIVE path
-         * that still contains a '/' ("foo/bar") is rejected, since neither
-         * this parser nor the exec-time lookup has anything to resolve it
-         * against. pico_exec_path_is_valid() is the shared (parse-time and
-         * service_verify()'s re-check) test for the whole absolute-or-bare
-         * rule, including the trailing-'/' (directory) and "."/".." cases.
+         * c853953658's template, as modern systemd (since v239, 7c891d53b
+         * "load-fragment: when parsing paths for Exec*=, be more liberal"):
+         * a bare filename (no '/') is also accepted and resolved at exec time
+         * (service-exec.c's find_in_default_path()). A relative path that
+         * contains a '/' ("foo/bar") is rejected, as nothing can resolve it.
+         * pico_exec_path_is_valid() is the shared test (also used by
+         * service_verify()), including the trailing-'/' (directory) and
+         * "."/".." cases.
          */
         if (!pico_exec_path_is_valid(word)) {
                 pico_log(PICO_LOG_WARNING,
@@ -278,9 +255,8 @@ static int config_parse_description(
         (void) line;
         (void) lvalue;
 
-        /* Full table (%I included): a Description= is free text, never a
-         * path or a name, so there is nothing here for an unescaped '/' to
-         * corrupt. */
+        /* Full table (%I included): a Description= is free text, so an
+         * unescaped '/' corrupts nothing. */
         r = unit_full_printf(u, rvalue, &d);
         if (r < 0)
                 return r;
@@ -296,13 +272,10 @@ static int config_parse_unit_deps(Unit *u, const char *path, unsigned line, Unit
         char *tok;
 
         /*
-         * Heap, not a VLA: rvalue comes straight from conf-scan.c's unbounded
-         * getline() (e6dde451a -- no LINE_MAX truncation is the whole point),
-         * so a VLA sized by strlen(rvalue) turns one long Requires= line into
-         * a stack overflow -- exactly the "malformed unit file kills PID1"
-         * class this file exists to prevent (see the 35b1078e1 note at the
-         * top of this file). Found by review before this ever shipped, not a
-         * hypothetical.
+         * Heap, not a VLA: rvalue comes from conf-scan.c's unbounded getline()
+         * (e6dde451a), so a VLA sized by strlen(rvalue) would turn one long
+         * Requires= line into a stack overflow (see the 35b1078e1 note at the
+         * top of this file).
          */
         names = pico_strdup(rvalue);
         if (!names)
@@ -314,12 +287,9 @@ static int config_parse_unit_deps(Unit *u, const char *path, unsigned line, Unit
                 int r;
 
                 /*
-                 * Per token, before validation, not on the whole rvalue:
-                 * unit_name_printf()'s table (%n %N %p %i) cannot itself
-                 * introduce whitespace, but expanding per-word here anyway is
-                 * what keeps that true by construction rather than by an
-                 * accident of which specifiers happen to exist today -- the
-                 * same discipline parse_exec_line() needs for real, below.
+                 * Per token, before validation: unit_name_printf()'s table
+                 * (%n %N %p %i) cannot introduce whitespace, and expanding
+                 * per word keeps that true if specifiers are added.
                  */
                 r = unit_name_printf(u, tok, &expanded);
                 if (r < 0) {
@@ -328,22 +298,16 @@ static int config_parse_unit_deps(Unit *u, const char *path, unsigned line, Unit
                 }
 
                 /*
-                 * unit_name_is_valid() subsumes the old suffix check and adds
-                 * the one that actually matters: this token is concatenated
-                 * into a search-path entry by unit_load(), so
-                 * "Requires=../../tmp/evil.service" must be rejected before it
-                 * ever becomes a path.
+                 * This token is concatenated into a search-path entry by
+                 * unit_load(), so "Requires=../../tmp/evil.service" must be
+                 * rejected before it becomes a path.
                  */
                 if (!unit_name_is_valid(expanded)) {
                         /*
-                         * A syntactically real unit name of a type pico has
-                         * no vtable for (.mount, .device, ...) is a
-                         * compatibility gap, not a malformed directive --
-                         * the degradation record is the stated visibility
-                         * mechanism for exactly this (picoctl show,
-                         * pico-unit-lint), so it must not go missing here
-                         * the way "../evil.service" silently and correctly
-                         * does.
+                         * A valid unit name of a type pico has no vtable for
+                         * (.mount, .device, ...) is a compatibility gap, not a
+                         * malformed directive: record it as a degradation
+                         * (visible in picoctl show and pico-unit-lint).
                          */
                         if (unit_name_has_unsupported_type(expanded)) {
                                 char what[UNIT_NAME_MAX + 32];
@@ -388,13 +352,8 @@ static int config_parse_unit_deps(Unit *u, const char *path, unsigned line, Unit
                         continue;
                 }
 
-                /*
-                 * A single bad dependency is non-fatal to the rest of the
-                 * unit, the same way systemd itself logs-and-continues rather
-                 * than aborting the whole load. The usual cause is a
-                 * self-dependency or an out-of-memory grow, neither of which
-                 * makes the other directives in the file wrong.
-                 */
+                /* A single bad dependency (usually a self-dependency or OOM) is
+                 * non-fatal to the rest of the unit, as in systemd. */
                 r = unit_add_dependency(u, d, other);
                 if (r < 0)
                         pico_log(PICO_LOG_DEBUG,
@@ -452,26 +411,15 @@ static int config_parse_after(Unit *u, const char *path, unsigned line, const ch
  * the negation is recorded in the parallel *_negated array at the same
  * index, which unit_condition_test() consults.
  *
- * Triggering ('|') is still dropped with a warning rather than returned as an
- * error: a handler returning < 0 aborts the rest of the scan (conf-scan.c)
- * and leaves the unit UNIT_ERROR, so a real unit file carrying a directive
- * this MVP does not implement would drop out of the boot entirely over a
- * directive it does not need. Dropping is also exactly what this spelling
- * already did before this handler existed, so it is no regression -- but it
- * does mean a triggering condition is ignored rather than honoured, which is
- * the named limitation of this minimal support.
+ * Triggering ('|') is dropped with a warning and a degradation rather than
+ * returned as an error: a handler returning < 0 aborts the rest of the scan
+ * (conf-scan.c) and leaves the unit UNIT_ERROR. The triggering condition is
+ * therefore ignored, not honoured.
  *
- * Deliberately not specifier-expanded (G2): verified at v30's own tag that
- * this directive (load-fragment.c:1584-1620) is not run through
- * specifier_printf() there either -- that only came later upstream. Staying
- * at v30 fidelity here is a real, named limitation: a generic
- * "serial-getty@.service" template cannot carry
- * "ConditionPathExists=/dev/%I". Not needed for the units this project
- * currently ships (SERIAL_CONSOLES-derived consoles always exist; the
- * ttyGS0 override keeps its literal condition), and test-unit-parse.c pins
- * this exact non-expanding behaviour so the choice stays visible rather than
- * silently regressed if a future commit's search-and-replace ever reaches
- * this function.
+ * Not specifier-expanded: v30 at this tag (load-fragment.c:1584-1620) does not
+ * run specifier_printf() on this directive either (that came later
+ * upstream), so a generic "serial-getty@.service" template cannot carry
+ * "ConditionPathExists=/dev/%I". test-unit-parse.c pins this behaviour.
  */
 static int config_parse_condition_path(
                 Unit *u,
@@ -556,8 +504,8 @@ static int config_parse_condition_path_is_directory(
 
 /* --- [Service] handlers --- */
 
-/* Targets are a real unit type now, so a [Service] directive on one is a
- * misplaced-directive warning rather than an impossible case. */
+/* A [Service] directive on a non-service unit is a misplaced-directive
+ * warning. */
 static Service *unit_to_service(Unit *u, const char *path, unsigned line) {
         if (u->type != UNIT_SERVICE) {
                 pico_log(PICO_LOG_WARNING,
@@ -588,10 +536,9 @@ static int config_parse_type(Unit *u, const char *path, unsigned line, const cha
         else if (strcmp(rvalue, "forking") == 0)
                 s->type = SERVICE_TYPE_FORKING;
         else if (strcmp(rvalue, "notify-reload") == 0) {
-                /* Everything notify-reload adds over notify is a reload
-                 * protocol, and neither ExecReload= nor a reload verb exists
-                 * for it to differ on -- so the start semantics are exact,
-                 * and the record is what keeps that visible. */
+                /* notify-reload only adds a reload protocol over notify, and
+                 * there is no reload verb for it to differ on; the degradation
+                 * record keeps that visible. */
                 s->type = SERVICE_TYPE_NOTIFY;
                 pico_log(PICO_LOG_WARNING,
                          "%s:%u: Type=notify-reload: no reload machinery, running as Type=notify",
@@ -600,14 +547,11 @@ static int config_parse_type(Unit *u, const char *path, unsigned line, const cha
                 return unit_add_degradation(u, "Type=notify-reload");
         } else if (strcmp(rvalue, "dbus") == 0) {
                 /*
-                 * Readiness ("the name appeared on the system bus") is
-                 * unobtainable in principle here, pico-init runs no bus at
-                 * all -- so this is a permanent degrade, not a stopgap.
-                 * Running as simple is how avahi-daemon/bluetooth behaved
-                 * for years before Type=dbus existed; refusing the unit
-                 * guarantees they never start. BusName= itself still falls
-                 * through to the generic unknown-directive degradation
-                 * below.
+                 * Readiness ("the name appeared on the system bus") cannot be
+                 * observed: pico-init runs no bus. Running as simple is how
+                 * avahi-daemon/bluetooth behaved before Type=dbus existed;
+                 * refusing the unit would keep them from starting. BusName=
+                 * falls through to the generic unknown-directive degradation.
                  */
                 s->type = SERVICE_TYPE_SIMPLE;
                 pico_log(PICO_LOG_WARNING,
@@ -618,9 +562,7 @@ static int config_parse_type(Unit *u, const char *path, unsigned line, const cha
                 return unit_add_degradation(u, "Type=dbus");
         } else if (strcmp(rvalue, "idle") == 0) {
                 /* Real idle is simple with the start delayed until the job
-                 * queue drains -- degrade to simple now, the delay itself is
-                 * a later refinement (every in-image Type=idle consumer is a
-                 * getty pico-init's own units already replace). */
+                 * queue drains; the delay is not implemented. */
                 s->type = SERVICE_TYPE_SIMPLE;
                 pico_log(PICO_LOG_WARNING,
                          "%s:%u: Type=idle: start-delay not implemented, running as Type=simple",
@@ -629,11 +571,10 @@ static int config_parse_type(Unit *u, const char *path, unsigned line, const cha
                 return unit_add_degradation(u, "Type=idle");
         } else {
                 /*
-                 * Still a hard failure rather than a dropped directive: any
-                 * OTHER type changes *when* a service counts as started, so
-                 * silently running one as simple would report the unit up
-                 * before it actually is, and everything ordered After= it
-                 * would then start too early. Refusing is safer.
+                 * A hard failure rather than a dropped directive: any other type
+                 * changes *when* a service counts as started, so running it as
+                 * simple would report the unit up too early and start
+                 * everything ordered After= it too early.
                  */
                 pico_log(PICO_LOG_ERR,
                          "%s:%u: Type=%s is not supported (simple, oneshot, exec, notify, notify-reload, forking, "
@@ -648,13 +589,13 @@ static int config_parse_type(Unit *u, const char *path, unsigned line, const cha
 }
 
 /*
- * StandardInput=socket (oe-core's dropbear@.service) and tty/tty-force/
- * tty-fail (getty units, oe-core's weston.service) are the values real
- * consumers need; see service.h's ServiceStandardInput comment. Recognising
- * one keeps "StandardInput" out of the degraded-directives list, which is
- * what socket.c's socket_instance_refused() checks -- a tty-stdin Accept=yes
- * instance is accepted and gets its connection via LISTEN_FDS, as upstream.
- * Any other value (null, file:, data, ...) still degrades.
+ * StandardInput=socket (e.g. dropbear@.service) and tty/tty-force/tty-fail
+ * (getty units, weston.service) are supported; see service.h's
+ * ServiceStandardInput comment. A recognised value keeps "StandardInput" out
+ * of the degraded-directives list that socket.c's socket_instance_refused()
+ * checks; a tty-stdin Accept=yes instance is accepted and gets its connection
+ * via LISTEN_FDS, as upstream. Any other value (null, file:, data, ...)
+ * degrades.
  */
 static int config_parse_standard_input(
                 Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
@@ -759,9 +700,8 @@ static int config_parse_tty_path(
 
 /*
  * systemd's own boolean spellings (parse_boolean() in src/basic/parse-util.c):
- * 1/yes/y/true/t/on and 0/no/n/false/f/off, case-insensitively. Matching that
- * set exactly is part of the drop-in goal -- "RemainAfterExit=on" and "=true"
- * both appear in real unit files.
+ * 1/yes/y/true/t/on and 0/no/n/false/f/off, case-insensitively; real unit
+ * files use "RemainAfterExit=on" and "=true" alike.
  */
 static int parse_boolean_value(const char *v, bool *ret) {
         if (strcmp(v, "1") == 0 || strcasecmp(v, "yes") == 0 || strcasecmp(v, "y") == 0 ||
@@ -964,13 +904,10 @@ static int config_parse_guess_main_pid(
 
 /*
  * Shape-only check shared by User=/Group= and SupplementaryGroups=: no
- * control character, no ':' (/etc/passwd's own field separator, never legal
- * inside a name) and no '/' (a name is never a path). Whether the account or
- * group actually EXISTS is a start-time question (NSS, or the user database
- * simply not being loaded yet) -- answering it here would make the unit
- * tree's load order depend on it, which upstream also does not do at parse
- * time (config_parse_user_group_strv_compat()'s own valid_user_group_name()
- * is a syntax check, not an existence one).
+ * control character, no ':' (/etc/passwd's field separator) and no '/'.
+ * Whether the account or group exists is a start-time question (NSS, or the
+ * user database not being available yet); upstream's valid_user_group_name()
+ * in config_parse_user_group_strv_compat() is also a syntax check only.
  */
 static bool user_group_token_is_valid(const char *p) {
         for (; *p; p++)
@@ -1018,14 +955,11 @@ static int config_parse_user_group(
 /*
  * SupplementaryGroups=: a whitespace-separated list of names/numeric gids,
  * %-expanded per word like Environment= above, each checked with the same
- * shape rule as User=/Group= (a bad token is skipped with a warning, not a
- * reason to reject the whole line -- matching this file's own Environment=
- * precedent rather than upstream's reject-the-whole-directive one, since
- * nothing here needs config_parse_user_group_strv_compat()'s ENOEXEC
- * strictness). Accumulates across repeated lines, matching upstream;
- * resolution (name-or-numeric -> gid_t, combined with User=/Group=) happens
- * at spawn time in exec_creds_resolve() (service-exec.c). An empty rvalue
- * resets the whole list, the same precedent as Environment=.
+ * shape rule as User=/Group=. A bad token is skipped with a warning rather
+ * than rejecting the whole line (as Environment= does; upstream rejects the
+ * directive). Accumulates across repeated lines, as upstream; resolution to
+ * a gid_t, combined with User=/Group=, happens at spawn time in
+ * exec_creds_resolve() (service-exec.c). An empty rvalue resets the list.
  */
 static int config_parse_supplementary_groups(
                 Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
@@ -1089,13 +1023,9 @@ static int config_parse_exec_start(
         if (!s)
                 return 0;
 
-        /* Same non-fatal-per-directive policy as every other handler in this
-         * file (Restart=, RestartSec=, ...): parse_exec_line() already logged
-         * why, so just leave exec_start as it was rather than failing the
-         * whole unit over one bad directive. A unit that ends up with no
-         * ExecStart= at all is a validation problem, not a parse error --
-         * not yet enforced (no post-load validation pass exists), tracked in
-         * plans/29-pico-init.md. */
+        /* Non-fatal per directive, like every other handler here:
+         * parse_exec_line() already logged why, so leave exec_start as it was.
+         * A unit with no ExecStart= at all is caught by service_verify(). */
         r = parse_exec_line(u, path, line, lvalue, rvalue, &argv, &ignore);
         if (r < 0)
                 return 0;
@@ -1240,12 +1170,9 @@ static int config_parse_exec_reload(
 /*
  * Environment=. Tokenized with the same pico_extract_first_word() ExecStart=
  * uses, so quoting is identical: Environment="FOO=a b" is one word. Each word
- * is then %-expanded individually through expand_word(), matching
- * parse_exec_line()'s per-word-not-per-line order for the reason recorded at
- * that function's own comment. A word with no '=' or an empty name is warned
- * and skipped, not stored -- v30 stored it unchecked; that is not worth
- * copying. An empty rvalue resets the list, the same precedent as
- * config_parse_condition_path().
+ * is then %-expanded individually through expand_word(), as in
+ * parse_exec_line(). A word with no '=' or an empty name is warned about and
+ * skipped (v30 stored it unchecked). An empty rvalue resets the list.
  */
 static int config_parse_environment(
                 Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
@@ -1347,14 +1274,12 @@ static int config_parse_environment_file(
 }
 
 /*
- * All seven upstream Restart= values map exactly; none is approximated, so
- * none records a degradation. What each one restarts on is decided by
- * service_shall_restart() (service.c), which follows upstream's
- * service_shall_restart() value by value. on-watchdog parses but can never
- * fire, because pico has no per-service watchdog -- WatchdogSec='s own
- * degradation is the visible marker for that, exactly as upstream treats
- * on-watchdog on a unit without WatchdogSec=. Type=oneshot with always or
- * on-success is refused later by service_verify(), not here.
+ * All seven upstream Restart= values map exactly, so none records a
+ * degradation. service_shall_restart() (service.c) decides what each one
+ * restarts on. on-watchdog parses but can never fire, as there is no
+ * per-service watchdog; WatchdogSec='s degradation is the visible marker, as
+ * upstream treats on-watchdog on a unit without WatchdogSec=. Type=oneshot
+ * with always or on-success is refused later by service_verify(), not here.
  */
 static int config_parse_restart(Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
         Service *s = unit_to_service(u, path, line);
@@ -1379,12 +1304,9 @@ static int config_parse_restart(Unit *u, const char *path, unsigned line, const 
  * Minimal time-span parser: a plain integer is seconds; a single
  * "<n><suffix>" with suffix one of us/ms/s/min/m/h is also accepted, and so
  * is the literal spelling "infinity" (case-insensitive), which maps straight
- * to USEC_INFINITY. Compound spans ("1min 30s") aren't supported in this
- * MVP. The overflow check is an explicit bound comparison rather than the
- * round-trip cast idiom ((uint64_t)(size_t)v != v) that 31ef154f1
- * (2026-08-18, most recent fix in the whole quarry history) replaced for
- * being legally elidable by an optimizer -- built correctly from day one
- * instead of porting the fragile idiom.
+ * to USEC_INFINITY. Compound spans ("1min 30s") are not supported. The
+ * overflow check is an explicit bound comparison, not the round-trip cast
+ * idiom ((uint64_t)(size_t)v != v), which an optimizer may legally elide.
  */
 static int parse_usec(const char *rvalue, usec_t *ret) {
         char *end;
@@ -1502,9 +1424,8 @@ static int config_parse_timeout_stop_sec(
 
 /* --- [Socket] handlers --- */
 
-/* Targets/services are real unit types too, so a [Socket] directive on one
- * is a misplaced-directive warning rather than an impossible case, matching
- * unit_to_service()'s own shape above. */
+/* A [Socket] directive on a non-socket unit is a misplaced-directive
+ * warning, as in unit_to_service(). */
 static Socket *unit_to_socket(Unit *u, const char *path, unsigned line) {
         if (u->type != UNIT_SOCKET) {
                 pico_log(PICO_LOG_WARNING,
@@ -1523,14 +1444,13 @@ static void socket_port_append(Socket *s, SocketPort *p) {
         while (*tail)
                 tail = &(*tail)->next;
 
-        *tail = p; /* tail-appended: fd order == declared Listen* order (H12) */
+        *tail = p; /* tail-appended: fd order == declared Listen* order */
 }
 
 /*
  * "/path" -> AF_UNIX; a bare 1-65535 decimal -> a port, family resolved
  * later at bind time (629abfc23f -- see socket.c). Anything else is logged
- * and dropped, same non-fatal-per-directive policy as every other handler
- * in this file.
+ * and dropped (non-fatal per directive, like every other handler here).
  */
 static int config_parse_listen(Unit *u, const char *path, unsigned line, const char *rvalue, int type) {
         Socket *s = unit_to_socket(u, path, line);
@@ -1712,12 +1632,11 @@ static int config_parse_socket_max_connections(
 /* --- [Install] handlers --- */
 
 /*
- * WantedBy=/RequiredBy= are stored as raw names, not resolved into edges here.
- * At parse time the named target may not be loaded yet, and -- more
- * importantly -- whether these are honoured at all depends on enablement (a
- * .wants/ symlink or a preset rule), which cannot be decided until every
- * fragment has been read. unit-enable.c turns them into real edges later, or
- * deliberately does not.
+ * WantedBy=/RequiredBy= are stored as raw names, not resolved into edges here:
+ * the named target may not be loaded yet, and whether they are honoured
+ * depends on enablement (a .wants/ symlink or a preset rule), which cannot be
+ * decided until every fragment has been read. unit-enable.c turns them into
+ * edges later, or does not.
  */
 static int config_parse_install_names(
                 Unit *u, const char *path, unsigned line, const char *rvalue, char ***target) {
@@ -1825,11 +1744,10 @@ static const ConfigItem config_items[] = {
 /*
  * The conf-scan.h handler: dispatches one already-scanned assignment through
  * config_items[] and logs-and-drops anything not in it. `section` is NULL
- * for an assignment outside any [Section] header (conf-scan.c's contract);
- * everything else, known section or not, is decided here rather than by the
- * scanner -- an unrecognized [Section] simply never matches a config_items
- * row, so its directives fall through to the same debug-and-drop path a
- * recognized section's unknown directive would.
+ * for an assignment outside any [Section] header (conf-scan.c's contract).
+ * An unrecognized [Section] never matches a config_items row, so its
+ * directives take the same debug-and-drop path as an unknown directive in a
+ * known section.
  */
 static int unit_conf_handler(
                 const char *path,
@@ -1856,20 +1774,18 @@ static int unit_conf_handler(
         else if (strcmp(section, "Install") == 0)
                 sec = SECTION_INSTALL;
 
-        /* [Install] is no longer dropped wholesale: WantedBy=/RequiredBy= have
-         * real backing fields and are in the table below. Everything else in
-         * that section (Alias=, Also=, DefaultInstance=) still falls through
-         * to the unknown-directive debug log below, which is the graceful
-         * degradation the drop-in goal asks for. */
+        /* In [Install] only WantedBy=/RequiredBy= are implemented; Alias=,
+         * Also= and DefaultInstance= fall through to the unknown-directive
+         * debug log below. */
 
         for (i = 0; i < sizeof(config_items) / sizeof(config_items[0]); i++)
                 if (config_items[i].section == sec && strcmp(config_items[i].lvalue, lvalue) == 0)
                         return config_items[i].parse(u, path, line, lvalue, rvalue);
 
-        /* Still DEBUG per line -- the per-unit WARNING in unit_parse_file()
-         * is what makes the drop visible; this line only keeps the file:line.
-         * An empty name ("=value") is a malformed line, not a dropped
-         * directive, so it is skipped rather than recorded. */
+        /* DEBUG per line; the per-unit WARNING in unit_parse_file() makes the
+         * drop visible and this line keeps the file:line. An empty name
+         * ("=value") is a malformed line, not a dropped directive, so it is
+         * not recorded. */
         pico_log(PICO_LOG_DEBUG, "%s:%u: unknown directive %s= in [%s], ignoring", path, line, lvalue, section);
         return *lvalue ? unit_add_degradation(u, lvalue) : 0;
 }
@@ -1897,20 +1813,17 @@ int unit_parse_file(Unit *u, const char *path) {
         }
 
         /*
-         * B9/69339ae9f7/29500cf8c4/8688a389ca: load-time validation. Placed
-         * here rather than in unit_load() (unit-load.c) because this is the
-         * one function that already knows parsing succeeded and the fragment
-         * is otherwise done with -- a unit that parses cleanly but never sets
-         * ExecStart= is a validation problem, not a parse error, and must
-         * still fail to load rather than silently becoming a service with
-         * nothing to run.
+         * 69339ae9f7/29500cf8c4/8688a389ca: load-time validation, here because
+         * this is where parsing is known to have succeeded. A unit that parses
+         * cleanly but never sets ExecStart= must still fail to load rather
+         * than become a service with nothing to run.
          */
         if (r == 0 && u->type == UNIT_SERVICE)
                 r = service_verify(SERVICE(u));
         else if (r == 0 && u->type == UNIT_SOCKET)
-                /* Gated on r == 0 for the same reason as service_verify()
-                 * above (75193d4128, see socket.c's header): this must never
-                 * run against a stub or errored unit. */
+                /* Gated on r == 0 like service_verify() above (75193d4128, see
+                 * socket.c's header): never run against a stub or errored
+                 * unit. */
                 r = socket_verify_and_pair(SOCKET(u));
 
         return r;

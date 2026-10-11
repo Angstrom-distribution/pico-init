@@ -2,19 +2,15 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The control socket (plan §1.7, C2): deferred replies driven through the real manager loop, reset-failed,
+ * The control socket: deferred replies driven through the real manager loop, reset-failed,
  * early-disconnect leak checks, and oversized/malformed/unknown-verb rejection without allocation.
  *
- * Every case here talks the real wire protocol over a real AF_UNIX
- * SOCK_SEQPACKET socket to a real Manager running its real manager_loop() --
- * never a mock of manager-ctrl.c's own internals. A request is sent (a raw
- * client, not picoctl itself: test-picoctl.c already covers the CLI half end
- * to end, and driving the protocol directly here keeps this file's failure
- * output about the protocol, not about an extra subprocess layer), then the
- * real loop is pumped via a repeating timer tick (test-socket.c's own S1/S2
- * pattern, duplicated rather than shared -- see drive_until() below) until
- * either a reply arrives or a generous tick budget runs out as a safety net
- * against a genuine regression hanging the suite.
+ * Every case talks the real wire protocol over an AF_UNIX SOCK_SEQPACKET
+ * socket to a real Manager running its real manager_loop(). Requests come from
+ * a raw client rather than picoctl (test-picoctl.c covers the CLI). The loop
+ * is pumped via a repeating timer tick (the same pattern as test-socket.c,
+ * duplicated; see drive_until() below) until a reply arrives or the tick
+ * budget runs out, so a regression cannot hang the suite.
  */
 
 /* struct sockaddr_un/SOCK_SEQPACKET are POSIX, but SOCK_CLOEXEC folded into
@@ -281,13 +277,9 @@ static void ctrl_fixture_teardown(struct ctrl_fixture *f) {
 /* --- tests --- */
 
 /*
- * The core acceptance case, and the one the plan explicitly warns not to
- * shortcut: every verb driven against BOTH an active and an inactive unit,
- * because a recent real bug in the job engine survived exactly because a
- * test covered only the combination that obviously worked. None of the six
- * combinations is special-cased in manager-ctrl.c -- job.c's own fixes are
- * what make all six terminate correctly, and this is what proves it end to
- * end through the socket rather than at job.c's own internal API.
+ * Every verb driven against BOTH an active and an inactive unit. None of the
+ * six combinations is special-cased in manager-ctrl.c; job.c is what makes all
+ * six terminate, and this proves it end to end through the socket.
  */
 static void test_start_stop_restart_active_and_inactive(void) {
         struct ctrl_fixture f;
@@ -311,7 +303,7 @@ static void test_start_stop_restart_active_and_inactive(void) {
         ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 start demo.service", "ok done\n", 400);
         ASSERT_EQ_INT(unit_active_state(u), UNIT_ACTIVE);
 
-        /* start: already active -- the redundant-anchor fix, not a hang */
+        /* start: already active -- the redundant anchor job still finishes */
         ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 start demo.service", "ok done\n", 400);
         ASSERT_EQ_INT(unit_active_state(u), UNIT_ACTIVE);
 
@@ -325,12 +317,12 @@ static void test_start_stop_restart_active_and_inactive(void) {
         ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 stop demo.service", "ok done\n", 800);
         ASSERT_EQ_INT(unit_active_state(u), UNIT_INACTIVE);
 
-        /* stop: already inactive -- the other redundant-anchor fix */
+        /* stop: already inactive -- the redundant anchor job still finishes */
         ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 stop demo.service", "ok done\n", 400);
         ASSERT_EQ_INT(unit_active_state(u), UNIT_INACTIVE);
 
         /* restart: inactive -- the stop half is a no-op, the conversion to
-         * a start must still happen (JOB_RESTART's own fixed bug) */
+         * a start must still happen */
         ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 restart demo.service", "ok done\n", 800);
         ASSERT_EQ_INT(unit_active_state(u), UNIT_ACTIVE);
 
@@ -345,13 +337,11 @@ static void test_start_stop_restart_active_and_inactive(void) {
  * result, not "ok" -- and the unit must actually be FAILED, not merely
  * "not active".
  *
- * Type=oneshot, deliberately, not simple: Type=simple counts as started the
+ * Type=oneshot, not simple: Type=simple counts as started the
  * moment fork() returns (service.h's own header says so), which happens
  * before the child's execve() can fail -- so a Type=simple start against a
  * nonexistent ExecStart= genuinely replies "ok done" and only fails
- * asynchronously afterward, with no job left in flight to notify. That was
- * this test's own first draft and it failed for exactly that reason, caught
- * by running it rather than by reasoning about it. Type=oneshot only
+ * asynchronously afterward, with no job left in flight to notify. Type=oneshot only
  * completes its start job once the process exits, so the exec failure is
  * still synchronous with the job here.
  */
@@ -819,11 +809,9 @@ static void test_malformed_requests_rejected_without_allocating(void) {
 }
 
 /*
- * G2: the ctrl-side instancing fallback. Every case here needs a template
- * (foo@.service) in the fixture tree so req.unit can name an instance
- * nothing ever shipped a fragment for -- exactly the "picoctl start
- * serial-getty@ttyUSB0.service" shape manager-ctrl.c's own header comment
- * on the fallback describes.
+ * The ctrl-side instancing fallback. Every case needs a template (foo@.service)
+ * in the fixture tree so req.unit can name an instance nothing ever shipped a
+ * fragment for, as in "picoctl start serial-getty@ttyUSB0.service".
  */
 
 static void ctrl_fixture_write_template(struct ctrl_fixture *f) {

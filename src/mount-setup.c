@@ -68,16 +68,11 @@ static const MountPoint mount_table[] = {
         {  "cgroup2",     "/sys/fs/cgroup",  "cgroup2",     "nsdelegate",      MS_NOSUID | MS_NOEXEC | MS_NODEV, false },
 
         /*
-         * USB gadget (and any other configfs-based subsystem's) control
-         * tree. Without this mount, a kernel built with CONFIG_USB_CONFIGFS=y
-         * registers its "usb_gadget" group internally but nothing ever makes
-         * it visible: /sys/kernel/config exists as a bare sysfs directory
-         * either way, so `mkdir /sys/kernel/config/usb_gadget` fails with
-         * ENOENT the same way whether the kernel support is present or not --
-         * confirmed live on h2200 (CONFIG_USB_CONFIGFS=y in the running
-         * kernel's own .config, usb-multi-gadget.service still failing on
-         * this exact mkdir). systemd mounts this as one of its standard
-         * early API filesystems; it was simply missing here.
+         * USB gadget (and any other configfs-based subsystem's) control tree.
+         * Without this mount /sys/kernel/config is a bare sysfs directory, and
+         * `mkdir /sys/kernel/config/usb_gadget` fails with ENOENT whether or
+         * not the kernel has CONFIG_USB_CONFIGFS. systemd mounts it as one of
+         * its standard early API filesystems.
          */
         { "configfs", "/sys/kernel/config", "configfs",             NULL,      MS_NOSUID | MS_NOEXEC | MS_NODEV, false },
 };
@@ -201,79 +196,47 @@ int mount_setup(void) {
 }
 
 /*
- * dev_setup(): the five /dev symlinks, from scratch.
+ * dev_setup(): the five /dev symlinks.
  *
- * PROVENANCE. This is a from-scratch reimplementation, not a quarry -- written
- * after reading the real upstream function and its whole history, but copying
- * none of it. Two reasons, both concrete. Upstream's dev_setup()
- * (src/shared/dev-setup.c, LGPL-2.1-or-later today) is a NULSTR_FOREACH_PAIR
- * over a packed string literal calling symlink_label(), which is a
- * mac_selinux_create_file_prepare()/mac_smack_fix() sandwich -- carrying it
- * would mean carrying the label layer or gutting it until nothing of the
- * original remained. And what is actually being reused is a five-entry table
- * of well-known paths, which is interface, not implementation. The file stays
- * GPL-2.0-or-later with only this project's own copyright, on the same footing
- * as netd-rtnl.c, which reads sd-netlink's message constructors as a design
- * reference and lifts nothing.
+ * Written from scratch, not lifted. Upstream's dev_setup()
+ * (src/shared/dev-setup.c, LGPL-2.1-or-later) goes through symlink_label(), a
+ * SELinux/SMACK labelling layer that would have to be carried or gutted, and
+ * what is reused is only a five-entry table of well-known paths. The file stays
+ * GPL-2.0-or-later with only this project's copyright. The table originates in
+ * systemd 5c0532d1cc "mounts: automatically create /dev/stderr and friends
+ * early on boot"; the code was later split out of src/core/mount-setup.c by
+ * 5ba2dc259f, so `git log --follow` on dev-setup.c misses everything before 2012.
  *
- * The history was reviewed the way the quarrying discipline requires, and the
- * enumeration itself has a trap worth recording: the code was split out of
- * src/core/mount-setup.c into src/shared/dev-setup.c by 5ba2dc259f rather than
- * renamed, so `git log --follow -- src/shared/dev-setup.c` gives 46 commits and
- * silently drops everything before 2012. The real window is the union with
- * src/mount-setup.c + src/core/mount-setup.c back to the table's origin in
- * 5c0532d1cc (2010-10-27): 85 commits, of which most touched licence headers,
- * includes, or the other functions that later joined that file.
+ * Taken from upstream's history:
  *
- * Adopted from that history, each for its own reason:
- *
- *  - 5c0532d1cc "mounts: automatically create /dev/stderr and friends early on
- *    boot" -- the table itself and the fact that PID 1 owns it, because
- *    scripts running before any device manager need these.
  *  - 8f0e73f250 "dev-setup: allow a path prefix for use in chroots" -- the
- *    prefix parameter. mount-setup.c's own functions take no test root (they
- *    mount real filesystems, so there is nothing to point elsewhere), so the
- *    pattern followed here is the one the Manager's settable unit/preset/
- *    runtime paths use: the caller supplies the root, and production passes
- *    the real one.
- *  - 01ed0e2307 "dev-setup: make NULL as parameter for dev_setup() equivalent
- *    to ''" -- NULL prefix means no prefix, rather than composing a path with
- *    a literal "(null)" in it.
+ *    prefix parameter, here for tests, following the Manager's settable
+ *    unit/preset/runtime paths.
+ *  - 01ed0e2307 -- a NULL prefix means no prefix, rather than a literal
+ *    "(null)" in the path.
  *  - 696fee7d95 "dev-setup: do not create a dangling /proc/kcore symlink" --
  *    /dev/core is skipped when the kernel has no CONFIG_PROC_KCORE. It is the
- *    only conditional entry; the other four sources are always present.
+ *    only conditional entry.
  *  - 2b85f4e19c "core: Beef up PrivateDevices=" -- the explicit `access() < 0`
- *    spelling. Worth naming even though the bare-truth-test version happened
- *    to behave the same, because `if (access(...))` reads as "if it exists"
- *    and means the opposite.
- *  - 7f112f50fe "exec: introduce PrivateDevices=" and 03cfe0d514 "nspawn:
- *    finish user namespace support" -- between them these turned dev_setup()
- *    from void into int and gave it any error handling at all. Before that
- *    every failure was silent.
+ *    spelling, since `if (access(...))` reads as "if it exists" and means the
+ *    opposite.
+ *  - 7f112f50fe, 03cfe0d514 -- dev_setup() returns int and reports errors.
  *
- * Deliberately NOT adopted, each a real behavioural difference:
+ * Differences from upstream:
  *
- *  - symlink_label() and the MAC layer under it. No SELinux, no SMACK.
- *  - The uid/gid parameters and their lchown(). Those exist only for nspawn's
- *    user namespaces (03cfe0d514); PID 1 here is real root and upstream itself
- *    passes UID_INVALID/GID_INVALID on that path, skipping the chown.
- *  - Upstream's "return 0 whatever happened" contract. Its own two callers
- *    discard the result -- one bare, one explicitly (void)-cast -- so the
- *    return value carries no information. This one counts.
- *  - Upstream's non-idempotence. This is the sharpest difference, and it is a
- *    divergence rather than a gap: upstream calls symlink() and logs EEXIST at
- *    debug, so a /dev/stdout that already points somewhere wrong stays wrong
- *    forever -- first boot wins. symlink_idempotent() exists in the tree and
- *    dev_setup() has never used it. Repair is cheap here and is what makes
- *    "idempotent" mean more than "the second call fails quietly", so a link
+ *  - No symlink_label() and no MAC layer: no SELinux, no SMACK.
+ *  - No uid/gid parameters or lchown(); those exist only for nspawn's user
+ *    namespaces (03cfe0d514).
+ *  - The return value counts the links in place; upstream returns 0 whatever
+ *    happened and both its callers discard it.
+ *  - Idempotent: upstream calls symlink() and logs EEXIST at debug, so a
+ *    /dev/stdout that already points somewhere wrong stays wrong. Here a link
  *    whose target is wrong is replaced atomically.
  *
- * The one thing that is deliberately kept exactly as upstream has it, because
- * changing it would be a silent behaviour change: an existing NON-symlink at
- * one of these paths is left alone and warned about, never unlinked. /dev/core
- * being a real file is somebody's decision, not this function's to reverse --
- * the same reasoning socket.c's S_ISSOCK guard already applies to unlinking a
- * stale bind path.
+ * As in upstream, an existing NON-symlink at one of these paths is left alone
+ * and warned about, never unlinked: /dev/core being a real file is not this
+ * function's decision to reverse (socket.c's S_ISSOCK guard applies the same
+ * reasoning to a stale bind path).
  */
 typedef struct DevSymlink {
         const char *target; /* what the link points at; never prefixed */
@@ -380,8 +343,8 @@ int dev_setup(const char *prefix) {
                 int r;
 
                 /*
-                 * The target is checked unprefixed on purpose, and this is the
-                 * one place the prefix is deliberately asymmetric. The link
+                 * The target is checked unprefixed on purpose: this is the
+                 * one place the prefix is asymmetric. The link
                  * this creates says "/proc/kcore" literally whatever the
                  * prefix is, so what decides whether that link would dangle is
                  * the running kernel's own /proc, not anything under the test

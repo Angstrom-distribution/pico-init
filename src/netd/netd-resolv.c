@@ -2,10 +2,9 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * /etc/resolv.conf. See netd-resolv.h for the rules, all of which exist
- * because someone hit the bug they prevent.
+ * /etc/resolv.conf. See netd-resolv.h for the rules.
  *
- * N1: a full rebuild from every link's static DNS= plus, where UseDNS=
+ * A full rebuild from every link's static DNS= plus, where UseDNS=
  * allows it, the link's lease's option 6 -- and the lease's domainname
  * (option 15) as a single `search` line. There is no static equivalent of
  * the domain (netd-network.h's Network has no Domain= field), so `search`

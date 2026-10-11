@@ -4,15 +4,14 @@
 /*
  * The tmpfiles.d(5) reader: which files apply, and what each line means.
  *
- * Two rules here are the ones that are easy to get subtly wrong, and both
- * are taken from systemd's code rather than its prose:
+ * Two rules that are easy to get subtly wrong, taken from systemd's code
+ * rather than its prose:
  *
  *  - A basename found in an earlier directory hides the same basename in
  *    every later one *entirely* (conf-files.c files_add(): "Skipping
  *    overridden file"). /etc/tmpfiles.d/foo.conf does not merge with
  *    /usr/lib/tmpfiles.d/foo.conf, it replaces it. A symlink to /dev/null
- *    is a mask, which is how volatile-binds.bb switches off etc.conf and
- *    home.conf today.
+ *    is a mask.
  *  - The surviving files are applied in lexicographic order of basename,
  *    across directories, and within one path the first line parsed wins
  *    (tmpfiles.c parse_line(): "Duplicate line for path, ignoring").

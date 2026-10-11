@@ -3,8 +3,7 @@
 
 /*
  * The sysfs by-id walk and the sanitizer it needs. devd-probe.h has the
- * reasoning; the ext superblock half this file used to carry lives in
- * ../ext-super.c, which PID 1 reads too.
+ * reasoning.
  */
 
 #include "devd-probe.h"

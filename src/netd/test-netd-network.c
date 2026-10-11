@@ -2,24 +2,17 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * N0's acceptance test: the .network parser (plan §2.5, §2.8, §2.10).
+ * The .network parser.
  *
  * Covers: the [DHCPv4] defaults (in particular UseTimezone=yes, netd's
- * founding divergence from networkd); verbatim copies of this project's two
- * real files, usb0.network and usb0-server.network; a third real fixture set
- * the plan does not name but production hits regardless --
- * console-base-image.bb's do_systemd_network() heredocs, which use
- * directives outside netd's subset ([IPv6AcceptRA], [Route],
- * RouteMetric=) and are what will actually match the qemu NIC at
- * integration time; the three-directory search path with basename shadowing
- * and lexicographic union ordering; [Match] Name= glob matching, including
- * the "no [Match] Name= matches nothing" rule; and unknown-section/directive
- * tolerance. It also closes the M1 review's still-open item: a committed
- * regression for the stack-overflow-class bug a VLA sized by an unbounded,
- * attacker-controlled line length used to cause (see conf-scan.c and
- * unit-parse.c's headers) -- exercised here, through netd's own parser,
- * because this project's PID1 test programs are not this milestone's to add
- * to.
+ * divergence from networkd); usb0.network and usb0-server.network fixtures
+ * for a USB gadget link; fixtures using directives outside netd's subset
+ * ([IPv6AcceptRA], [Route], RouteMetric=); the three-directory search path
+ * with basename shadowing and lexicographic union ordering; [Match] Name=
+ * glob matching, including the "no [Match] Name= matches nothing" rule; and
+ * unknown-section/directive tolerance. It also holds a regression for the
+ * stack-overflow-class bug a VLA sized by an unbounded, attacker-controlled
+ * line length used to cause (see conf-scan.c and unit-parse.c).
  */
 
 #include <arpa/inet.h>
@@ -43,8 +36,8 @@ static char *join_path(const char *dir, const char *name) {
 }
 
 /* A .network that sets nothing must still come back with netd's defaults --
- * in particular UseTimezone=yes, which is where netd deliberately parts
- * company with networkd. */
+ * in particular UseTimezone=yes, which is where netd parts company with
+ * networkd. */
 static void test_defaults(void) {
         Network *nw = NULL;
 
@@ -78,7 +71,7 @@ static void test_dhcp_spellings(void) {
 }
 
 /* Only YES and IPV4 arm the v4 client. An IPv6-only file parses and does
- * nothing, rather than being rejected (§2.9: all of IPv6 is out of scope). */
+ * nothing, rather than being rejected (IPv6 is not implemented). */
 static void test_dhcp4_enabled(void) {
         Network *nw = NULL;
 
@@ -122,7 +115,7 @@ static void test_match_glob_and_no_match_matches_nothing(void) {
         network_free(bare);
 }
 
-/* Verbatim copy of recipes-connectivity/usb-multi-gadget/usb-multi-gadget/usb0.network. */
+/* A USB gadget link configured as a DHCP client. */
 static const char *usb0_network_fixture =
                 "[Match]\n"
                 "Name=usb0\n"
@@ -158,7 +151,7 @@ static void test_real_usb0_network_parses(void) {
         free(dir);
 }
 
-/* Verbatim copy of recipes-connectivity/usb-multi-gadget/usb-multi-gadget/usb0-server.network. */
+/* A USB gadget link serving DHCP. */
 static const char *usb0_server_network_fixture =
                 "[Match]\n"
                 "Name=usb0\n"
@@ -195,13 +188,10 @@ static void test_real_usb0_server_network_parses(void) {
 }
 
 /*
- * console-base-image.bb's do_systemd_network() writes these three files into
- * every rootfs unconditionally, including this distro's -- not named by plan
- * §2.5, but what will actually match the qemu NIC at integration time, so a
- * parse failure here would otherwise only be found at boot. Verbatim copies
- * of the three heredocs, exercising directives well outside netd's subset:
- * RouteMetric=, and whole sections ([IPv6AcceptRA], [Route])
- * netd has no fields for at all.
+ * Typical console-image .network files, exercising directives well outside
+ * netd's subset: RouteMetric=, and whole sections ([IPv6AcceptRA], [Route])
+ * netd has no fields for at all. A parse failure would otherwise only be
+ * found at boot.
  */
 static const char *console_10_en_network =
                 "[Match]\n"
@@ -298,11 +288,11 @@ static void test_console_base_image_fixtures_parse(void) {
 
 /* An unrecognized section and unrecognized directives inside a recognized
  * one are valid syntax, dropped at debug level -- the same drop-in tolerance
- * rule unit-parse.c already applies to unit files (§2.5). */
+ * rule unit-parse.c applies to unit files. */
 static const char *tolerant_fixture =
                 "[Match]\n"
                 "Name=usb0\n"
-                "MACAddress=00:11:22:33:44:55\n" /* [Match] beyond Name= is out of scope (§2.9) */
+                "MACAddress=00:11:22:33:44:55\n" /* [Match] beyond Name= is not supported */
                 "\n"
                 "[Network]\n"
                 "DHCP=yes\n"
@@ -485,15 +475,13 @@ static void test_missing_search_dir_is_not_an_error(void) {
 }
 
 /*
- * The M1 review found a stack-overflow-class bug: a VLA sized by an
- * unbounded, attacker-controlled line length, originally reproduced with a
- * 30MB Requires= line in a unit file and fixed by switching to a heap
- * buffer (unit-parse.c's config_parse_unit_deps()). The project's own
- * open-items list flagged that reproduction as still only a hand-run check.
- * conf-scan.c's own getline()/realloc()-based line handling never used a VLA
- * either, and neither does this file's config_parse_match_name() -- both
- * are exercised here by a 30MB single-token Name= line, closing the gap
- * without touching a PID1 test program.
+ * Regression for a stack-overflow-class bug: a VLA sized by an unbounded,
+ * attacker-controlled line length, originally reproduced with a 30MB
+ * Requires= line in a unit file and fixed by switching to a heap buffer
+ * (unit-parse.c's config_parse_unit_deps()). conf-scan.c's getline()/
+ * realloc()-based line handling never used a VLA either, and neither does
+ * this file's config_parse_match_name(); both are exercised here by a 30MB
+ * single-token Name= line.
  */
 static void test_huge_line_does_not_crash(void) {
         char *dir;

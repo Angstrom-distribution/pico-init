@@ -3,35 +3,27 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 /*
- * Ported (redesigned around a flat 256-bucket array instead of upstream's
- * Hashmap; see tlv-util.h's header for why) from
- * src/libsystemd-network/tlv-util.c (574 lines).
- *
- * Quarry point: systemd v261.2, commit 4925d9f07f. History review
- * (4925d9f07f..main, plan §2.2): no fix in the 26-commit lift-set window
- * touches this file.
+ * Ported from systemd v261.2 src/libsystemd-network/tlv-util.c, redesigned
+ * around a flat 256-bucket array instead of upstream's Hashmap (see
+ * tlv-util.h).
  *
  * Assertion policy (netd-compat.h): every length read off the wire in
- * tlv_parse() below is externally-supplied packet data, so each of those
- * checks is netd_validate()/-EBADMSG, never assert() -- this is one of the
- * two files (with dhcp-message.c) the plan singles out for the 199-assert
- * hazard. tlv_flags_verify() and the tag/length-width switches, by
- * contrast, assert on flag combinations netd's own code passes as
- * constants (TLV_DHCP4, TLV_DHCP4_SUBOPTION): those are internal
- * invariants, not packet input, and stay asserts.
+ * tlv_parse() is externally supplied, so those checks are
+ * netd_validate()/-EBADMSG, never assert(). tlv_flags_verify() and the
+ * tag/length-width switches assert on flag combinations netd's own code
+ * passes as constants (TLV_DHCP4, TLV_DHCP4_SUBOPTION): internal invariants,
+ * not packet input.
  */
 
 #include "netd-compat.h"
 
 #include "tlv-util.h"
 
-/* Not in netd-compat.h; a one-line macro three files in this lift need. */
 #define FLAGS_SET(flags, flag) (((flags) & (flag)) == (flag))
 
 
-/* Overflow-saturating arithmetic (upstream's size_add()/size_multiply(),
- * src/basic/utf8.h et al -- not in the lift set, small enough to inline
- * here). Both saturate at SIZE_MAX rather than wrapping. */
+/* Overflow-saturating arithmetic (upstream's size_add()/size_multiply()):
+ * both saturate at SIZE_MAX rather than wrapping. */
 static size_t size_add(size_t a, size_t b) {
         size_t r = a + b;
         return r < a ? SIZE_MAX : r;
@@ -102,10 +94,8 @@ int tlv_get_full(const DhcpTlv *tlv, uint8_t tag, size_t length, struct iovec *r
         if (b->count == 0)
                 return -ENODATA;
 
-        /* Local non-const alias: member access through a pointer-to-const
-         * struct top-level-consts the pointer member itself (b->iov would be
-         * `struct iovec *const`), which FOREACH_ARRAY's loop variable cannot
-         * be incremented as. */
+        /* Local non-const alias: through a pointer-to-const, b->iov would be
+         * `struct iovec *const`, which FOREACH_ARRAY cannot increment. */
         struct iovec *entries = b->iov;
 
         /* When multiple entries exist, use the first one matching the length. */
@@ -134,10 +124,9 @@ int tlv_get_alloc(const DhcpTlv *tlv, uint8_t tag, struct iovec *ret) {
         struct iovec *entries = b->iov; /* see tlv_get_full()'s comment */
 
         if (FLAGS_SET(tlv->flags, TLV_MERGE)) {
-                /* Concatenate every same-tag entry, plus one extra byte so the
-                 * result can double as a NUL-terminated string (dhcp_message_get_
-                 * option_string() relies on this, exactly as upstream's
-                 * tlv_get_alloc() -> iovw_concat() does). */
+                /* Concatenate every same-tag entry, plus one byte so the result
+                 * can double as a NUL-terminated string
+                 * (dhcp_message_get_option_string() relies on this). */
                 size_t total = 0;
                 FOREACH_ARRAY(iov, entries, b->count)
                 total = size_add(total, iov->iov_len);
@@ -178,12 +167,9 @@ void tlv_remove(DhcpTlv *tlv, uint8_t tag) {
 }
 
 static int tlv_bucket_add(TlvBucket *b, size_t length, const void *data) {
-        /* Not GREEDY_REALLOC(): that macro token-pastes "_allocated" onto its
-         * array argument's own name to find the sibling counter variable
-         * (x, x_allocated), which only works for a bare local variable, not
-         * a struct member -- TlvBucket's counter is called "allocated", not
-         * "iov_allocated". Calling the underlying function directly sidesteps
-         * that naming assumption. */
+        /* Not GREEDY_REALLOC(): it token-pastes "_allocated" onto the array
+         * name to find its counter, which only works for a bare local, not
+         * TlvBucket's "allocated" member. */
         if (!netd_greedy_realloc((void **) &b->iov, b->count + 1, sizeof(b->iov[0]), &b->allocated))
                 return -ENOMEM;
 

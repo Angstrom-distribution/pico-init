@@ -2,9 +2,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * memfd_create() needs _GNU_SOURCE on glibc; this is a test binary, not
- * part of the shim itself, so there is no reason to avoid it here the way
- * sd-id128.c does in its own production code.
+ * memfd_create() needs _GNU_SOURCE on glibc.
  */
 #define _GNU_SOURCE
 
@@ -87,14 +85,10 @@ static void test_to_string(void) {
         sd_id128_t id = ID_EXPECT;
         char buf[SD_ID128_STRING_MAX];
         char ubuf[SD_ID128_UUID_STRING_MAX];
-        char * volatile null_buf = NULL; /* volatile, not just a variable: the real
-                                          * armv5te cross-compiler's constant propagation still
-                                          * proves a plain local is NULL at -Os and raises the
-                                          * same -Wnonnull anyway. volatile blocks that proof
-                                          * regardless of optimization level, even though the
-                                          * whole point here is exercising this
-                                          * shim's own defensive runtime check for the case a
-                                          * real, non-constant caller bug would produce. */
+        char * volatile null_buf = NULL; /* volatile: the armv5te cross-compiler's
+                                          * constant propagation proves a plain local is NULL
+                                          * at -Os and raises -Wnonnull; this exercises the
+                                          * runtime NULL check. */
 
         ASSERT_TRUE(sd_id128_to_string(id, buf) == buf);
         ASSERT_STREQ(buf, ID_EXPECT_PLAIN_STR);
@@ -381,15 +375,11 @@ static void test_get_machine_real(void) {
 
         r = slurp("/etc/machine-id", raw, sizeof(raw));
         if (r < 0 || raw[0] == '\0') {
-                /* No usable real machine-id on this build host: either the file is
-                 * missing entirely (fopen failed, r < 0/-ENOENT), or it exists but
-                 * is empty (slurp() returns 0 on any successful open regardless of
-                 * byte count, so an empty read is detected via the terminated
-                 * buffer instead) -- a real, common state for a container/image
-                 * whose machine-id hasn't been generated yet, not a hypothetical.
-                 * The getter's own documented contract covers both: -ENOENT for a
-                 * missing file, -ENOMEDIUM for a present-but-empty one (verified
-                 * against id128_read_fd()'s real logic). */
+                /* No usable machine-id on this host: the file is missing
+                 * (r < 0) or empty (slurp() returns 0 on any successful open, so
+                 * emptiness is detected from the buffer), as in a fresh container
+                 * image. The getter returns -ENOENT for a missing file and
+                 * -ENOMEDIUM for an empty one. */
                 r = sd_id128_get_machine(&id);
                 ASSERT_TRUE(r == -ENOENT || r == -ENOMEDIUM);
                 return;
@@ -441,9 +431,8 @@ static void test_get_invocation(void) {
         r = sd_id128_get_invocation(&id);
         ASSERT_EQ_INT(r, -ENXIO);
 
-        /* setenv() + a fresh call warms this shim's own per-process cache; there is no
-         * way to un-cache afterwards, matching real libsystemd's own documented
-         * behaviour (see sd-id128.c) -- so this is the only successful call made here. */
+        /* A successful call fills the per-process cache, which cannot be
+         * cleared (as in libsystemd), so this is the only successful call here. */
         setenv("INVOCATION_ID", ID_EXPECT_PLAIN_STR, 1);
         r = sd_id128_get_invocation(&id);
         ASSERT_EQ_INT(r, 0);
@@ -470,19 +459,16 @@ static void test_app_specific_errors(void) {
 }
 
 /*
- * Bit-identical cross-check against a real systemd machine, captured on the
- * pico-init-build:latest build container (Ubuntu 24.04 arm64, systemd
- * 255.4-1ubuntu8.17) on 2026-09-06:
+ * Bit-identical cross-check against real systemd (Ubuntu 24.04 arm64,
+ * systemd 255.4-1ubuntu8.17):
  *
  *   # cat /etc/machine-id
  *   96460b7e615a40aaabc72b9c7be70b6e
  *   # systemd-id128 --app-specific=489b4c98cd9046f680d5f4b302cbcfe4 machine-id
  *   c32adb0230da41a9978346b9359f4acf
  *
- * Independently reproduced with Python's hmac/hashlib against the same
- * three values before being written here, so this checks this shim's HMAC
- * key/message order against a real, external systemd -- not against its
- * own hmac_sha256() a second time.
+ * Also reproduced with Python's hmac/hashlib, so this checks the HMAC
+ * key/message order against an external implementation.
  */
 static void test_app_specific_real_cross_check(void) {
         sd_id128_t base = SD_ID128_MAKE(96, 46, 0b, 7e, 61, 5a, 40, aa, ab, c7, 2b, 9c, 7b, e7, 0b, 6e);

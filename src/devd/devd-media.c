@@ -2,8 +2,8 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * Removable-media mounting. devd-media.h has the policy and the two things it
- * deliberately is not (DPS, and a rule).
+ * Removable-media mounting. devd-media.h has the policy and how it differs
+ * from DPS.
  */
 
 #include "devd-media.h"

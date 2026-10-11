@@ -6,10 +6,9 @@
  * The INI line scanner, quarried from systemd's ~2011-era src/conf-parser.c
  * (tag v30, commit 501c92c, copyright 2010 Lennart Poettering,
  * GPL-2.0-or-later), factored out of unit-parse.c so its backported fixes
- * apply to every INI-syntax config this project parses, not just unit files
- * -- see conf-scan.h. Seven of unit-parse.c's eleven backported upstream
- * fixes are properties of this layer specifically and now live here instead
- * of there (commit hashes from github.com/systemd/systemd):
+ * apply to every INI-syntax config this project parses (see conf-scan.h).
+ * These upstream fixes (github.com/systemd/systemd commit hashes) are
+ * properties of this layer:
  *
  *  - e6dde451a "conf-parser: use fgets_with_tabs... unbounded read" --
  *    getline() below is inherently unbounded, so a long line is never
@@ -18,13 +17,11 @@
  *    line is logged and skipped, not a whole-file -EINVAL.
  *  - 9adbfeb38 + 0ef695858 -- a comment line is skipped entirely: it must not
  *    start a continuation, and it must not end one already in progress
- *    either (9adbfeb38a's own fix broke that second half, which
- *    0ef69585d8 then restored for a genuinely blank line specifically --
- *    a comment mid-continuation stays transparent, only blank still ends it).
+ *    (a comment mid-continuation is transparent, only a blank line ends it).
  *  - 4f29e0db1 "conf-parser: parse last line of file even if it's an
  *    unterminated continuation" -- flushed explicitly after the read loop.
  *  - 9dd7ea9a7 "conf-parser: skip UTF-8 byte order mark" -- a BOM on the
- *    first line no longer breaks "[Section]" matching.
+ *    first line must not break "[Section]" matching.
  *  - 8ea913b2e "conf-parser: fix invalid free" -- the continuation buffer's
  *    allocation check below tests its own lvalue, not a stale nearby one.
  *  - 91ffff962 "conf-parser: free old section on error" -- the current
@@ -36,12 +33,9 @@
  * scanner behaviour, and stay in the file that owns that semantics.
  *
  * What lives here knows about sections, comments, continuations, the BOM
- * and the key/value split. It knows nothing about what any key means, or
- * even which section names are meaningful -- an unrecognized [Section] is
- * just a string handed to the caller's handler on every assignment under
- * it. Whether a section or key is one the caller understands is entirely
- * the handler's judgement now; that seam is the whole point of this file
- * (conf-scan.h).
+ * and the key/value split, and nothing about which sections or keys are
+ * meaningful: every assignment is handed to the caller's handler together
+ * with its section name.
  */
 
 #include "conf-scan.h"
@@ -129,8 +123,7 @@ static int
                 return 0;
         }
 
-        /* 2d4fffb00: a line with no '=' used to fail the whole file; skip
-         * just this line. */
+        /* 2d4fffb00: skip just this line rather than failing the whole file. */
         eq = strchr(l, '=');
         if (!eq) {
                 pico_log(PICO_LOG_WARNING, "%s:%u: no '=' found, ignoring line", filename, line);
@@ -189,17 +182,11 @@ int pico_conf_scan(const char *filename, pico_conf_handler_t handler, void *user
 
                 if (continuation) {
                         /*
-                         * 9adbfeb38a's own refinement, 0ef69585d8 (real
-                         * origin/main upstream: verified via `git log` on the
-                         * mirror, no post-2012 LGPL code copied, only the
-                         * behaviour) -- a comment is skipped entirely,
-                         * continuation untouched, not treated as ending one.
-                         * Only a genuinely blank line still ends an
-                         * in-progress continuation instead of being folded
-                         * into it; the earlier cs_line_is_blank_or_comment()
-                         * check here flushed on either, which silently
-                         * dropped the rest of the command line on a real
-                         * unit file's mid-ExecStart= comment.
+                         * Behaviour of upstream 0ef69585d8: a comment is
+                         * skipped with the continuation untouched; only a
+                         * blank line ends an in-progress continuation.
+                         * Flushing on a comment would drop the rest of an
+                         * ExecStart= line that has a comment in the middle.
                          */
                         if (cs_line_is_comment(l))
                                 continue;

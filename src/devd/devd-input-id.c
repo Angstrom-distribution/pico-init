@@ -421,7 +421,7 @@ static bool classify_keys(const DevdInputCaps *c, unsigned *flags) {
         }
 
         /* Bits 1-31, KEY_ESC through KEY_S, all set: a full keyboard.
-         * KEY_RESERVED (bit 0) is deliberately not required. */
+         * KEY_RESERVED (bit 0) is not required. */
         if ((c->key[0] & 0xFFFFFFFEUL) == 0xFFFFFFFEUL) {
                 *flags |= DEVD_INPUT_ID_KEYBOARD;
                 is_key = true;

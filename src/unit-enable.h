@@ -57,12 +57,9 @@ int manager_preset_query(Manager *m, const char *unit_name);
  * written at all.
  *
  * This is what makes calling this function indistinguishable, on disk, from
- * a real `systemctl preset-all` -- which matters because manager-startup.c
- * calls it at most ONCE per machine's life (first boot only; see
- * manager-startup.c's own comment on manager_startup()). A later boot never
- * calls this again, so a unit a symlink from here no longer names (because
- * something removed it, e.g. `picoctl disable`) stays disabled -- the
- * preset's "enable" opinion only ever gets to act once.
+ * a real `systemctl preset-all`. manager_startup() calls it at most once per
+ * machine's life (first boot only), so a unit whose symlink was later removed
+ * (e.g. `picoctl disable`) stays disabled.
  *
  * Number enabled, or -errno. A failure persisting one unit's symlink is
  * logged and does not undo that unit's in-memory enablement or stop the loop

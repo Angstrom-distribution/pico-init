@@ -2,8 +2,7 @@
 /* SPDX-License-Identifier: MIT */
 
 /*
- * Carried verbatim from systemd v261.2 (commit 4925d9f07f),
- * src/basic/sparse-endian.h. Third-party MIT code inside an otherwise
+ * Carried verbatim from systemd v261.2 src/basic/sparse-endian.h. Third-party MIT code inside an otherwise
  * GPL/LGPL tree, so its own licence header stays exactly as written and
  * LICENSES/MIT.txt carries the full text. The only change is the include
  * block: systemd's "basic-forward.h" becomes <stdint.h>.

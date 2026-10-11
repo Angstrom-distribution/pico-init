@@ -5,28 +5,24 @@
  * PID 1's own first-boot detection and /etc/machine-id fill-in -- the
  * pico-init equivalent of upstream's src/core/machine-id-setup.c (the
  * first-boot/credential plumbing in src/core/main.c) and
- * src/shared/machine-id-setup.c's machine_id_setup() (systemd.git, HEAD
- * ded83144, 2026-08-23), narrowed to the one case this project actually
- * needs: a fresh image boots with /etc/machine-id missing, empty, or
- * literally "uninitialized", and nothing has run before PID 1 to fill it
- * in -- there is no systemd-firstboot, no package-manager-time
- * `systemd-machine-id-setup`, nothing.
+ * src/shared/machine-id-setup.c's machine_id_setup(), narrowed to the one
+ * case that matters here: a fresh image boots with /etc/machine-id missing,
+ * empty, or literally "uninitialized", and nothing has run before PID 1 to
+ * fill it in (no systemd-firstboot, no systemd-machine-id-setup).
  *
- * Deliberately NOT carried from upstream (all in acquire_machine_id()):
- * the D-Bus-machine-id, system-credential, container_uuid and SMBIOS/DMI
- * acquisition chain -- an angstrom-pico image has none of those sources,
- * so every one of them would be dead code reading inputs that can never be
- * present. Also not carried: machine_id_commit() (the transient-file ->
+ * Not carried from upstream (all in acquire_machine_id()): the
+ * D-Bus-machine-id, system-credential, container_uuid and SMBIOS/DMI
+ * acquisition chain, since these images have none of those sources. Also
+ * not carried: machine_id_commit() (the transient-file ->
  * real-file promotion a switch-root/soft-reboot does) and the
  * /run/machine-id-survives-soft-reboot reuse path -- pico-init has no
  * switch-root handoff, so a boot either gets a real writable /etc from the
  * start or stays on the transient fallback for its entire life.
  *
- * The one behaviour this project's own policy overrides rather than
- * copies: upstream refuses to boot at all when /etc/machine-id is BOTH
- * missing and /etc/ is read-only ("System cannot boot", src/shared/
- * machine-id-setup.c). pico-init logs a warning and continues with the id
- * only cached in this process, matching every other optional-subsystem
+ * One difference from upstream: upstream refuses to boot at all when
+ * /etc/machine-id is BOTH missing and /etc/ is read-only ("System cannot
+ * boot", src/shared/machine-id-setup.c). pico-init logs a warning and continues with the
+ * id only cached in this process, matching every other optional-subsystem
  * failure in main.c -- a board that cannot persist a machine id anywhere
  * is still more useful booted than frozen over it.
  */

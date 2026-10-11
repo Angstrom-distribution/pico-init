@@ -165,9 +165,8 @@ int unit_install_enablement(Unit *u) {
 
 /* Every directory component of `path` except its own basename, created if
  * missing -- install.c's mkdir_parents_label(). Shared by both
- * unit_enable_create_symlink() callers (boot time here, picoctl's own
- * enable verb), moved here when the second caller needed the exact same
- * behaviour rather than kept as a picoctl-only static. */
+ * unit_enable_create_symlink() callers (boot time here, picoctl's enable
+ * verb). */
 static int mkdir_parents(const char *path) {
         char buf[PATH_MAX];
         size_t len = strlen(path);
@@ -516,14 +515,10 @@ int manager_apply_presets(Manager *m) {
                 return -EINVAL;
 
         /*
-         * Collected exactly once for the whole boot, not per unit: the
-         * preset rule set is identical for every unit, so the directory
-         * scan and per-file parse collect_preset_entries() does must not be
-         * repeated U times for U units. A collection failure here (anything
-         * but a missing directory, which collect_preset_entries() already
-         * treats as empty) is logged once below and every eligible unit is
-         * skipped, the same outcome the old per-unit collect would have hit
-         * on every single call.
+         * Collected once, not per unit: the rule set is the same for every
+         * unit. A collection failure (anything but a missing directory, which
+         * collect_preset_entries() treats as empty) is logged once below and
+         * every eligible unit is skipped.
          */
         collect_rc = collect_preset_entries(m, &entries, &n);
         if (collect_rc < 0)
@@ -534,9 +529,8 @@ int manager_apply_presets(Manager *m) {
          * unit_install_enablement() below resolves WantedBy=/RequiredBy=
          * targets through manager_load_unit(), which can append to m->units
          * and realloc it -- the same hazard manager_startup() documents for
-         * its own .wants/.requires scan. A newly-loaded target unit ending up
-         * at the tail of the table also gets its own turn through this same
-         * loop, which is exactly right: it deserves a preset decision too.
+         * its own .wants/.requires scan. A newly loaded target unit at the
+         * tail of the table also gets its own turn through this loop.
          */
         for (i = 0; i < m->n_units; i++) {
                 Unit *u = m->units[i];
@@ -561,14 +555,11 @@ int manager_apply_presets(Manager *m) {
                 }
 
                 /*
-                 * No match (r == 0) means ENABLE, not disable. This is
-                 * upstream systemd's own default -- `systemctl preset`
-                 * enables any unit no rule speaks for -- and it is what OE
-                 * images already get from systemd-preset at rootfs build
-                 * time, so matching it is what the drop-in-compatibility goal
-                 * requires. An image that wants the opposite default ships a
-                 * catch-all "disable *" rule, exactly as it would under real
-                 * systemd.
+                 * No match (r == 0) means ENABLE, not disable: upstream's
+                 * default (`systemctl preset` enables any unit no rule speaks
+                 * for), which OE images already get at rootfs build time. An
+                 * image that wants the opposite ships a catch-all "disable *"
+                 * rule, as under real systemd.
                  */
                 if (r == 0 || (r == 1 && decision == 1)) {
                         int ir = unit_install_enablement(u);

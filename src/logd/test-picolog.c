@@ -2,20 +2,16 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * picolog (plan §3.4, J3): filter/follow/export modes against fixture rings, binary-safe fields under both
+ * picolog: filter/follow/export modes against fixture rings, binary-safe fields under both
  * the default blob-data path and -a, and a rotation boundary crossed mid-follow.
  *
  * Two layers: the logd-read.c reader primitives are tested directly (field
- * lookup, unit/priority/kernel predicates, the picoctl-facing
- * logd_ring_read_filtered() convenience, reading across a rotation, and
- * following across one crossed mid-poll -- the case most likely to hide a
- * real bug, so it is driven by interleaving real writer appends with real
- * poll calls rather than reading a pre-built fixture). The CLI itself is
- * then exercised end to end by spawning the real installed `picolog`
- * binary against a fixture ring, pointed at it via the LOGD_RUNTIME_DIR
- * env var picolog.c documents for exactly this purpose -- catching a bug
- * in argv parsing or display formatting that a reader-only test would
- * never see.
+ * lookup, unit/priority/kernel predicates, logd_ring_read_filtered(),
+ * reading across a rotation, and following across one crossed mid-poll,
+ * driven by interleaving real writer appends with real poll calls). The CLI
+ * is then exercised end to end by spawning the built `picolog` binary
+ * against a fixture ring via the LOGD_RUNTIME_DIR environment variable,
+ * which covers argv parsing and display formatting.
  */
 
 #include "logd-read.h"
@@ -70,8 +66,8 @@ static void build_fixture_ring(const char *dir) {
                 ASSERT_EQ_INT(logd_writer_append(w, f, sizeof(f) / sizeof(f[0])), 0);
         }
         {
-                /* Binary-safe MESSAGE -- the same JOURNAL_EXPORT_FORMATS.md
-                 * worked example J0's own golden test reproduces. */
+                /* Binary-safe MESSAGE: the JOURNAL_EXPORT_FORMATS.md worked
+                 * example, as in test-logd-write.c. */
                 LogdField f[] = {
                         {           "MESSAGE",     "foo\nbar",                      7 },
                         {          "PRIORITY",            "6",                      1 },
@@ -154,9 +150,8 @@ static void test_reader_predicates(void) {
         ASSERT_TRUE(logd_entry_matches_unit(e0, NULL));            /* no filter matches anything */
         ASSERT_TRUE(!logd_entry_matches_unit(e2, "netd.service")); /* kernel entry has no _SYSTEMD_UNIT at all */
 
-        /* bare name mangling: `-u netd` must match _SYSTEMD_UNIT=netd.service,
-         * the same way systemctl/journalctl mangle an unsuffixed argument --
-         * this was the live-device bug (`journalctl -u picowl` found nothing). */
+        /* Bare name mangling: `-u netd` must match _SYSTEMD_UNIT=netd.service,
+         * as systemctl/journalctl mangle an unsuffixed argument. */
         ASSERT_TRUE(logd_entry_matches_unit(e0, "netd"));
         ASSERT_TRUE(!logd_entry_matches_unit(e0, "eudev"));
         ASSERT_TRUE(!logd_entry_matches_unit(e0, "netd.socket")); /* known suffix, not mangled, no match */
@@ -200,8 +195,8 @@ static void test_ring_read_filtered_tail(void) {
         }
         logd_writer_free(w);
 
-        /* The plain function call picoctl's status verb needs (plan §1.7's
-         * C1): the last 3 entries for netd.service, in one call. */
+        /* The call picoctl's status verb uses: the last 3 entries for
+         * netd.service. */
         ASSERT_EQ_INT(logd_ring_read_filtered(dir, "netd.service", 3, &ring), 0);
         ASSERT_EQ_INT((int) logd_ring_n_entries(ring), 3);
         ASSERT_TRUE(logd_field_equals(logd_entry_field(logd_ring_entry(ring, 0), "MESSAGE"), "netd-07"));
@@ -214,8 +209,8 @@ static void test_ring_read_filtered_tail(void) {
         printf("test-picolog: logd_ring_read_filtered() gives picoctl the last N entries for one unit in one call\n");
 }
 
-/* Copies `f`'s value into a small NUL-terminated buffer rather than reading
- * past value_len on the underlying (not NUL-terminated) ring buffer. */
+/* Copies `f`'s value into a NUL-terminated buffer; ring values are not
+ * NUL-terminated. */
 static void field_value_copy(const LogdReadField *f, char *out, size_t outsz) {
         size_t n = f->value_len < outsz - 1 ? f->value_len : outsz - 1;
 
@@ -279,11 +274,10 @@ static void test_ring_read_across_rotation(void) {
 }
 
 /*
- * The rotation-crossed-mid-follow case plan §3.7 asks for explicitly:
- * interleave real writer appends with real logd_follow_poll() calls across
- * many rotations (4KiB cap, same sizing as J0's own rotation test), and
- * confirm every post-follow entry is delivered exactly once, in order, and
- * that nothing written before logd_follow_new() ever appears.
+ * Rotation crossed mid-follow: interleave real writer appends with
+ * logd_follow_poll() calls across many rotations (4KiB cap, as in
+ * test-logd-write.c's rotation test), and confirm every post-follow entry is delivered exactly once, in
+ * order, and that nothing written before logd_follow_new() ever appears.
  */
 static void test_follow_across_rotation(void) {
         LogdWriter *w;
@@ -380,8 +374,8 @@ static bool find_picolog(char *out, size_t outsz) {
                 return false;
         *slash = '\0';
 
-        /* Checked: a truncated path would name some other file, and access()
-         * succeeding on it would run the wrong binary under test. */
+        /* Checked: a truncated path could name another file that access()
+         * finds executable. */
         if (snprintf(out, outsz, "%s/picolog", self) >= (int) outsz)
                 return false;
 
@@ -389,8 +383,8 @@ static bool find_picolog(char *out, size_t outsz) {
 }
 
 /* Runs `picolog_path args` via the shell and captures stdout. *out_len, if
- * non-NULL, receives the exact byte count read (never inferred via
- * strlen(), since -o export output may not be text). Returns the process
+ * non-NULL, receives the byte count read (-o export output may not be
+ * text). Returns the process
  * exit status, or -1 on a harness-level failure. */
 static int run_picolog_capture(
                 const char *picolog_path, const char *args, char *out, size_t outsz, size_t *out_len) {
@@ -429,7 +423,7 @@ static void test_cli_short_format_and_filters(void) {
 
         r = run_picolog_capture(picolog_path, "", out, sizeof(out), NULL);
         ASSERT_EQ_INT(r, 0);
-        ASSERT_TRUE(strchr(out, '\x1B') == NULL); /* no tty, no colour: byte-identical to before */
+        ASSERT_TRUE(strchr(out, '\x1B') == NULL); /* no tty, no colour */
         ASSERT_TRUE(strstr(out, "netd[42]: hello from netd") != NULL);
         ASSERT_TRUE(strstr(out, "eudev: urgent warning") !=
                     NULL); /* no _PID on this fixture entry -> no [pid] */
@@ -443,9 +437,7 @@ static void test_cli_short_format_and_filters(void) {
         ASSERT_TRUE(strstr(out, "urgent warning") == NULL);
         ASSERT_TRUE(strstr(out, "kernel booted") == NULL);
 
-        /* bare "-u netd" (no .service) must behave identically -- the
-         * live-device regression this fixes was exactly this invocation
-         * returning nothing against a real _SYSTEMD_UNIT=picowl.service entry. */
+        /* bare "-u netd" (no .service) must behave identically */
         r = run_picolog_capture(picolog_path, "-u netd", out, sizeof(out), NULL);
         ASSERT_EQ_INT(r, 0);
         ASSERT_TRUE(strstr(out, "hello from netd") != NULL);
@@ -514,9 +506,7 @@ static void test_cli_export_passthrough(void) {
         unsetenv("LOGD_RUNTIME_DIR");
         ASSERT_EQ_INT(r, 0);
 
-        /* Byte-for-byte identical to the file on disk -- true passthrough,
-         * not a re-serialization that merely happens to produce the same
-         * bytes. */
+        /* Byte-for-byte identical to the file on disk. */
         ASSERT_EQ_INT((int) out_len, (int) raw_len);
         ASSERT_TRUE(memcmp(out, raw, raw_len) == 0);
 
@@ -559,10 +549,10 @@ static void build_color_fixture_ring(const char *dir) {
         logd_writer_free(w);
 }
 
-/* SYSTEMD_COLORS=true forces colour on even though popen()'s pipe isn't a
- * tty (pico-color.h's documented priority order) -- real get_log_colors()'s
- * mapping (terminal-util.c): err red, warning yellow, notice highlighted,
- * wrapped exactly around the message text and nothing else on the line. */
+/* SYSTEMD_COLORS=true forces colour on though popen()'s pipe isn't a tty
+ * (see pico-color.h). Mapping as get_log_colors() (terminal-util.c): err
+ * red, warning yellow, notice highlighted, wrapped around the message text
+ * only. */
 static void test_cli_color_priority_escapes(void) {
         char picolog_path[4096];
         char *dir = test_tmpdir_new();

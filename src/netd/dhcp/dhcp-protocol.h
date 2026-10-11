@@ -4,42 +4,17 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 /*
- * Ported from src/libsystemd-network/dhcp-protocol.h (104 lines) plus the
- * option-code enum from src/systemd/sd-dhcp-protocol.h (public header,
- * folded in here since netd ships no separate library API surface), and a
- * minimal hardware-address type standing in for src/basic/ether-addr-util.h
- * (out of the lift set; netd has no other user of it).
+ * Ported from systemd v261.2 src/libsystemd-network/dhcp-protocol.h plus the
+ * option-code enum from src/systemd/sd-dhcp-protocol.h, and a minimal
+ * hardware-address type standing in for src/basic/ether-addr-util.h.
  *
- * Quarry point: systemd v261.2, commit 4925d9f07f. History review
- * (4925d9f07f..main, plan §2.2) covered dhcp-protocol.h in the 26-commit
- * lift-set window and found no fix touching this file; the window's one
- * backport-worthy commit, 7bd9f0f805 ("dhcp-server: reject pool offsets
- * beyond the subnet"), touches sd-dhcp-server.c only -- not carried here,
- * see dhcp-lease-internal.h and the final report for the forward note to
- * the server agent.
- *
- * Cut on the way in: DHCP_MAX_FQDN_LENGTH and the DHCP_FQDN_FLAG_* enum
- * (option 81 is cut, plan §2.1); DHCP_RELAY_AGENT_FLAG_* and the relay
- * sub-option enum (relay is not part of this lift). MIN_V6ONLY_WAIT_USEC is
- * kept even though netd does not request option 108 today -- it is a
- * one-line RFC constant, not a dependency magnet, so there is no reason to
- * drop it ahead of need.
- *
- * Every header in this lift set includes netd-compat.h itself (below) rather
- * than assuming the consuming .c file already did -- upstream could rely on
- * sd-forward.h/basic-forward.h being pulled in first, but a real cross-agent
- * bug here (netd-resolv.c including dhcp-lease-internal.h with no
- * netd-compat.h in sight) showed that assumption does not hold across an
- * API boundary other milestones build against. MIN_V6ONLY_WAIT_USEC's
- * USEC_PER_SEC comes from netd-compat.h's util.h, pulled in that way.
+ * Cut: DHCP_MAX_FQDN_LENGTH and the DHCP_FQDN_FLAG_* enum (option 81 is cut);
+ * DHCP_RELAY_AGENT_FLAG_* and the relay sub-option enum.
  */
 
 #pragma once
 
-/* Self-sufficient regardless of what a consumer includes first (a real
- * cross-agent bug: netd-resolv.c included dhcp-lease-internal.h without
- * netd-compat.h first, and this header needs its bool/usec_t/macros) --
- * safe to include redundantly, netd-compat.h has its own #pragma once. */
+/* Self-sufficient: needs bool/usec_t/macros from netd-compat.h. */
 #include "netd-compat.h"
 
 #include <errno.h>
@@ -52,8 +27,7 @@
 
 /* 20 bytes covers every ARP hardware type netd cares about (Ethernet is 6);
  * upstream's HW_ADDR_MAX_SIZE is 32 to cover Infiniband, which netd does not
- * support (dhcp_message_init_header() below forces hw_addr to NULL for
- * ARPHRD_INFINIBAND, matching upstream), so this stays deliberately smaller. */
+ * support, so this is smaller. */
 #define HW_ADDR_MAX_SIZE 20
 
 struct hw_addr_data {
@@ -85,9 +59,8 @@ typedef struct DHCPMessageHeader DHCPMessageHeader;
 
 #define DHCP_MAGIC_COOKIE ((uint32_t) 0x63825363)
 
-/* offsetof(DHCPMessageHeader, magic) + 64 -- the vendor-specific area size
- * BOOTP (RFC 951) defines, kept as the minimum build/pad size (plan's
- * dhcp-message.c note on dhcp_message_build()'s BOOTP_MESSAGE_SIZE floor). */
+/* offsetof(DHCPMessageHeader, magic) + 64: the vendor-specific area size
+ * BOOTP (RFC 951) defines, used as the minimum build/pad size. */
 #define BOOTP_MESSAGE_SIZE (offsetof(DHCPMessageHeader, magic) + 64)
 
 enum {
@@ -123,12 +96,10 @@ typedef enum {
         _DHCP_OVERLOAD_ALL = DHCP_OVERLOAD_FILE | DHCP_OVERLOAD_SNAME,
 } DHCPOptionOverload;
 
-/* https://www.iana.org/assignments/bootp-dhcp-parameters/ -- only the
- * options netd's own lift set (dhcp-message.c/dhcp-lease.c) touches, plus
- * the handful kept for the option-code name table's completeness. Option 81
- * (FQDN), 119 (Domain Search) and 162 (encrypted DNS/DNR) are deliberately
- * absent: their get/append paths are cut (plan §2.1), so keeping the
- * numeric constants around would invite a call site that can't work. */
+/* https://www.iana.org/assignments/bootp-dhcp-parameters/ -- the options
+ * dhcp-message.c and dhcp-lease.c touch, plus a few more for the option-code
+ * name table. Options 81 (FQDN), 119 (Domain Search) and 162 (DNR) are
+ * absent because their get/append paths are cut. */
 enum {
         SD_DHCP_OPTION_PAD = 0,
         SD_DHCP_OPTION_SUBNET_MASK = 1,
@@ -172,10 +143,7 @@ enum {
         SD_DHCP_OPTION_END = 255,
 };
 
-/* RFC 8925 3.4: the lower boundary for V6ONLY_WAIT. Kept for API
- * completeness even though netd does not request option 108 (plan's DHCP
- * option set is limited to what §2.5/§2.6 name); one RFC constant is not a
- * dependency magnet the way the option itself would be. */
+/* RFC 8925 3.4: the lower boundary for V6ONLY_WAIT. */
 #define MIN_V6ONLY_WAIT_USEC (300U * USEC_PER_SEC)
 
 typedef enum DHCPState {

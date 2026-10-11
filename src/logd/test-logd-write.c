@@ -2,23 +2,19 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * The export-format writer and the /run ring (plan §3, J0).
+ * The export-format writer and the /run ring.
  *
- * Everything up to test_rotation_boundary() tests logd's own writer in
- * isolation: field-name validation, the exact binary-safe framing
- * JOURNAL_EXPORT_FORMATS.md's own worked example uses (byte-for-byte, not a
- * self-consistency check), both clocks bounded against real clock reads
- * taken immediately before/after the call, restart-resume, the oversized-
- * entry cap, and rotation preserving record boundaries under repeated
- * append.
+ * Everything up to test_rotation_boundary() tests the writer in isolation:
+ * field-name validation, the binary-safe framing of
+ * JOURNAL_EXPORT_FORMATS.md's worked example (byte-for-byte), both clocks
+ * bounded against real clock reads, restart-resume, the oversized-entry cap,
+ * and rotation preserving record boundaries under repeated append.
  *
- * test_journal_remote_roundtrip() is the load-bearing one (plan §3.7's own
- * "done when"): it feeds a real ring through the real
+ * test_journal_remote_roundtrip() feeds a real ring through the real
  * systemd-journal-remote and reads it back with the real journalctl, so a
- * wire-format bug cannot hide behind a mirrored assumption the way a
- * writer-tests-itself round trip would let one. It is skipped (meson exit
- * code 77) rather than failed if the tool isn't installed, but every other
- * case here still runs and is hard-asserted either way.
+ * wire-format bug cannot hide behind a mirrored assumption. It is skipped
+ * (meson exit code 77) if the tools are not installed; every other case
+ * still runs.
  */
 
 #include "logd-write.h"
@@ -38,8 +34,7 @@
 #include "../util.h"
 #include "logd.h"
 
-/* 32 lowercase hex chars -- a fixed, reproducible _BOOT_ID for every test
- * below that needs exact bytes rather than "well-formed". */
+/* 32 lowercase hex chars: a fixed _BOOT_ID for tests that need exact bytes. */
 #define TEST_BOOT_ID "cafef00ddeadbeefcafef00ddeadbeef"
 
 static void test_field_name_validation(void) {
@@ -70,8 +65,7 @@ static void test_field_name_validation(void) {
                 ASSERT_EQ_INT(logd_writer_append(w, &f, 1), -EINVAL);
         }
 
-        /* Positive control: the validator isn't so strict it rejects a real
-         * field name too. */
+        /* Positive control: a valid name is accepted. */
         {
                 LogdField f = { "SYSLOG_IDENTIFIER", "ok", 2 };
 
@@ -95,11 +89,9 @@ static const char *skip_lines(const char *p, int n) {
 }
 
 /*
- * JOURNAL_EXPORT_FORMATS.md's own worked example, reproduced exactly:
+ * JOURNAL_EXPORT_FORMATS.md's worked example:
  * `journal.send("foo\nbar")` documents as MESSAGE\n + a little-endian 7 +
- * seven NUL padding bytes + the 7 literal bytes "foo\nbar" + \n. This is a
- * byte-for-byte check against the spec's own bytes, not against anything
- * this writer assumed about itself.
+ * seven NUL padding bytes + the 7 literal bytes "foo\nbar" + \n.
  */
 static void test_binary_safe_golden_bytes(void) {
         LogdWriter *w;
@@ -147,9 +139,8 @@ static void test_binary_safe_golden_bytes(void) {
         printf("test-logd-write: binary-safe encoding matches JOURNAL_EXPORT_FORMATS.md's own worked example\n");
 }
 
-/* Both clocks bounded against real clock reads taken immediately before and
- * after the call (not just "present"), _BOOT_ID exact, and a plain
- * caller-supplied field round-tripping byte-for-byte. */
+/* Both clocks bounded against clock reads taken before and after the call,
+ * _BOOT_ID exact, and a plain caller-supplied field round-tripping. */
 static void test_plain_field_and_clocks(void) {
         LogdWriter *w;
         char *dir = test_tmpdir_new();
@@ -246,10 +237,7 @@ static void test_append_before_open_fails(void) {
         printf("test-logd-write: append() before open() fails rather than silently no-opping\n");
 }
 
-/* A restarted logd must resume the active file, not truncate it -- the
- * whole point of §3.2's fd-ownership design is that a crash loses no
- * in-flight output, and that starts with the writer itself never opening
- * O_TRUNC. */
+/* A restarted logd must resume the active file, not truncate it. */
 static void test_resume_after_restart(void) {
         LogdWriter *w1, *w2;
         char *dir = test_tmpdir_new();
@@ -291,9 +279,8 @@ static void test_resume_after_restart(void) {
         printf("test-logd-write: a restarted writer resumes the active file instead of truncating it\n");
 }
 
-/* An entry that alone would exceed the cap is refused, not partially
- * written -- -EMSGSIZE before anything reaches the ring, and the active
- * file is left untouched. */
+/* An entry that alone would exceed the cap is refused with -EMSGSIZE before
+ * anything reaches the ring; the active file is left untouched. */
 static void test_oversized_entry_rejected(void) {
         LogdWriter *w;
         char *dir = test_tmpdir_new();
@@ -377,12 +364,10 @@ static void read_whole_file_concat(const char *path1, const char *path2, char **
 }
 
 /*
- * Rotation must preserve byte-exact record boundaries (plan §3.7's own
- * wording). Every appended MESSAGE carries its own sequence number, so
- * reconstructing rotated-then-active and walking the sequence catches a
- * split, duplicated, or reordered entry directly -- real wall-clock drift
- * in the two auto timestamp fields' digit widths makes exact total byte
- * counts not worth predicting, so this checks content, not size.
+ * Rotation must preserve record boundaries. Every appended MESSAGE carries
+ * a sequence number, so reading rotated-then-active and walking the sequence
+ * catches a split, duplicated or reordered entry. Timestamp digit widths
+ * vary, so this checks content, not size.
  */
 static void test_rotation_boundary(void) {
         LogdWriter *w;
@@ -447,9 +432,8 @@ static void test_rotation_boundary(void) {
                         p += strlen("MESSAGE=entry-");
                 }
 
-                /* Older entries than the ring can hold are legitimately
-                 * gone -- a 2-file ring only ever keeps the active file plus
-                 * one rotated predecessor -- but rotation genuinely happened
+                /* Older entries are gone (the ring keeps the active file plus
+                 * one rotated predecessor), but rotation happened
                  * (seen_count spans more than one rotation's worth) and the
                  * most recent entry survived. */
                 ASSERT_TRUE(seen_count >= 2);
@@ -544,11 +528,8 @@ static int run_capture(const char *cmd, char *out, size_t outsz) {
 }
 
 /*
- * The load-bearing test (plan §3.7's "done when"): a real ring, fed through
- * the real systemd-journal-remote, read back with the real journalctl.
- * Mandatory-field-set findings this test encodes, determined empirically
- * against journal-file.c/journal-remote-write.c (see logd-write.h's header
- * citation), not assumed from the docs alone: __REALTIME_TIMESTAMP and
+ * A real ring, fed through the real systemd-journal-remote, read back with
+ * the real journalctl. Mandatory fields (see logd-write.h): __REALTIME_TIMESTAMP and
  * _BOOT_ID are both required for systemd-journal-remote to accept an entry
  * at all (VALID_REALTIME(0) is false; a null boot ID is EBADMSG), while
  * __MONOTONIC_TIMESTAMP is silently accepted as 0 if absent -- so its
@@ -560,9 +541,8 @@ static void test_journal_remote_roundtrip(bool *skipped) {
         char *dir;
         LogdWriter *w;
         char *active_path;
-        char cmd[8192]; /* generous: silences -Wformat-truncation, which sizes
-                         * against out_journal's declared capacity rather
-                         * than the short path a real tmpdir actually is */
+        char cmd[8192]; /* large to silence -Wformat-truncation, which sizes
+                         * against out_journal's declared capacity */
         char out_journal[4096];
         char export_buf[65536];
         char capture[65536];

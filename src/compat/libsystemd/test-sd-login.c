@@ -4,10 +4,10 @@
 /*
  * Everything in sd-login.h except the cgroup/unit/slice family (which has
  * its own real-cgroup test, test-sd-login-cgroup.c): the uid/session/
- * seat/machine/get_all/login_monitor functions, mixing real answers
- * (sd_uid_get_state()'s "offline", sd_get_seats() and friends reporting
- * zero, sd_machine_get_class()'s ".host") with the honest_failure
- * answers a permanently logind-less system gives everywhere else.
+ * seat/machine/get_all/login_monitor functions: the answers that hold
+ * without logind (sd_uid_get_state()'s "offline", sd_get_seats() and friends
+ * reporting zero, sd_machine_get_class()'s ".host") and the errors given
+ * everywhere else.
  */
 
 #include "sd-login.h"
@@ -18,8 +18,8 @@
 
 #include "../../test-util.h"
 
-/* sd_seat_can_multi_session() is real libsystemd's own deprecated stub
- * too (still part of the real ABI, still needs a tested answer here). */
+/* sd_seat_can_multi_session() is a deprecated stub in libsystemd too, and
+ * still part of the ABI. */
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 
 static void test_uid_functions(void) {
@@ -42,7 +42,7 @@ static void test_uid_functions(void) {
 
         ASSERT_EQ_INT(sd_uid_is_on_seat((uid_t) -1, 0, "seat0"), -EINVAL);
         ASSERT_EQ_INT(sd_uid_is_on_seat(0, 0, NULL), -ENODATA);
-        ASSERT_EQ_INT(sd_uid_is_on_seat(0, 0, "seat0"), 0); /* not on that seat -- truthfully */
+        ASSERT_EQ_INT(sd_uid_is_on_seat(0, 0, "seat0"), 0); /* not on that seat */
 
         ASSERT_EQ_INT(sd_uid_get_display(0, &state), -ENODATA);
         ASSERT_EQ_INT(sd_uid_get_login_time(0, NULL), -ENXIO);
@@ -66,7 +66,7 @@ static void test_seat_functions(void) {
         ASSERT_EQ_INT(sd_seat_get_active("seat0", NULL, NULL), -ENXIO);
         ASSERT_EQ_INT(sd_seat_can_tty("seat0"), -ENXIO);
         ASSERT_EQ_INT(sd_seat_can_graphical("seat0"), -ENXIO);
-        ASSERT_EQ_INT(sd_seat_can_multi_session(NULL), 1); /* upstream's own unconditional stub */
+        ASSERT_EQ_INT(sd_seat_can_multi_session(NULL), 1); /* upstream's unconditional stub */
         ASSERT_EQ_INT(sd_seat_can_multi_session("seat0"), 1);
 }
 

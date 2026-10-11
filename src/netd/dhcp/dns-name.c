@@ -3,33 +3,22 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 /*
- * Ported subset of src/shared/dns-domain.c (~200 of 1,376 lines): see
- * dns-name.h for exactly what and why.
+ * Ported subset of systemd v261.2 src/shared/dns-domain.c; see dns-name.h.
  *
- * Quarry point: systemd v261.2, commit 4925d9f07f. History review
- * (4925d9f07f..main, plan §2.2): no fix in the 26-commit lift-set window
- * touches dns-domain.c.
+ * dns_label_unescape()/dns_label_escape()/dns_name_concat() are near-verbatim
+ * (the escape and length rules are RFC 1035). ascii_isalpha()/ascii_isdigit()/
+ * valid_ldh_char()/ascii_strcasecmp_n() are small helpers inlined from
+ * src/basic/{string-util,hostname-util}.c.
  *
- * dns_label_unescape()/dns_label_escape()/dns_name_concat() are carried
- * near-verbatim (the escape-sequence and length-limit rules are RFC 1035
- * text, not something to improvise); ascii_isalpha()/ascii_isdigit()/
- * valid_ldh_char()/ascii_strcasecmp_n() are small helpers pulled in from
- * src/basic/{string-util,hostname-util}.c inline rather than as separate
- * files, since each is a handful of lines and neither source file is
- * otherwise in this lift.
- *
- * Assertion policy: dns_label_unescape()/dns_name_concat() below parse
- * option-12/15 string data that ultimately comes off the wire (through
- * dhcp_message_get_option_dns_name() in dhcp-message.c), so every length
- * and syntax check in them is a real -EINVAL/-ENOBUFS return, never
- * assert() -- matching netd-compat.h's rule for externally-supplied data.
+ * Assertion policy: dns_label_unescape()/dns_name_concat() parse option 12/15
+ * strings that come off the wire (via dhcp_message_get_option_dns_name()), so
+ * their length and syntax checks return -EINVAL/-ENOBUFS and never assert.
  */
 
 #include "netd-compat.h"
 
 #include "dns-name.h"
 
-/* Not in netd-compat.h; a one-line macro three files in this lift need. */
 #define FLAGS_SET(flags, flag) (((flags) & (flag)) == (flag))
 
 
@@ -73,11 +62,9 @@ static int ascii_strcasecmp_n(const char *a, const char *b, size_t n) {
  * Unescape one DNS label from *name (a "." separated presentation-format
  * name) into dest, advancing *name past it (and past the separating dot,
  * if any). Returns the label length, 0 at the end of the name, or a
- * negative errno on a syntax violation -- ported near-verbatim from
- * dns_label_unescape(), trimmed to the flag netd actually passes (LDH is
- * unused by netd's own call sites but kept since dns_name_is_valid_ldh()
- * needs it; DNS_LABEL_NO_ESCAPES and DNS_LABEL_LEAVE_TRAILING_DOT, which
- * upstream's option 119 decoder and reverse-lookup helpers used, are cut).
+ * negative errno on a syntax violation. Ported near-verbatim from
+ * dns_label_unescape(); DNS_LABEL_NO_ESCAPES and
+ * DNS_LABEL_LEAVE_TRAILING_DOT are cut.
  */
 static int dns_label_unescape(const char **name, char *dest, size_t sz, DNSLabelFlags flags) {
         const char *n;
@@ -182,8 +169,8 @@ static int dns_label_unescape(const char **name, char *dest, size_t sz, DNSLabel
         return r;
 }
 
-/* Ported near-verbatim from dns_label_escape(). Static: netd's only caller
- * is dns_name_concat()'s normalize round-trip (see dns-name.h's header). */
+/* Ported near-verbatim from dns_label_escape(). Static: only
+ * dns_name_concat()'s normalize round-trip calls it. */
 static int dns_label_escape(const char *p, size_t l, char *dest, size_t sz) {
         char *q;
 

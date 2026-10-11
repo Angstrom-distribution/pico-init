@@ -2,18 +2,13 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * pico-init's own implementation of the sd-bus-vtable.h ABI surface: the
- * sd_bus_vtable layout and the SD_BUS_VTABLE_START/SD_BUS_METHOD/
- * SD_BUS_SIGNAL/SD_BUS_PROPERTY table-building macros, matching real
- * systemd's src/systemd/sd-bus-vtable.h (HEAD ded83144, 2026-08-23)
- * byte-for-byte in macro name, macro usage and struct layout -- read for
- * that contract only, nothing here copied from that LGPL-2.1-or-later
- * source. Kept in full, including the variadic-argument-name plumbing
- * (SD_BUS_METHOD_WITH_ARGS and friends), so a caller's existing
- * SD_BUS_VTABLE_START()/SD_BUS_METHOD()/... array definitions compile
- * unchanged against this shim -- sd_bus_add_object_vtable() itself always
- * fails (sd-bus-stubs.c), but the vtable array a caller builds to pass to
- * it must still be valid C.
+ * The sd_bus_vtable layout and the SD_BUS_VTABLE_START/SD_BUS_METHOD/
+ * SD_BUS_SIGNAL/SD_BUS_PROPERTY table-building macros, matching systemd's
+ * src/systemd/sd-bus-vtable.h (HEAD ded83144) in macro name, usage and
+ * struct layout; written from that contract, not copied. A caller's
+ * existing vtable[] definitions compile unchanged. sd_bus_add_object_vtable()
+ * itself always fails (sd-bus-stubs.c), but the table passed to it must
+ * still be valid C.
  *
  * sd_bus_object_vtable_format's storage (extern here) lives in
  * sd-bus-noop.c: SD_BUS_VTABLE_START() takes its address, so any vtable[]
@@ -186,18 +181,12 @@ struct sd_bus_vtable {
         }
 
 /*
- * Deliberately not carried: SD_BUS_METHOD_WITH_ARGS()/SD_BUS_SIGNAL_WITH_ARGS()/
- * SD_BUS_ARGS()/SD_BUS_RESULT() and the same-length-ladder-of-macros
- * preprocessor trick they need to pair up a flat "type1, name1, type2,
- * name2, ..." variadic list into separate signature and null-separated
- * name strings. That ladder is fiddly to get right (upstream's own
- * version special-cases the single-NULL SD_BUS_NO_ARGS/SD_BUS_NO_RESULT
- * case outside the normal even/odd pairing) and no function in this shim
- * needs it -- sd_bus_add_object_vtable() always fails regardless of how
- * the table passed to it was built. A consumer using the WITH_ARGS
- * convenience form needs converting to the manual
- * SD_BUS_METHOD_WITH_NAMES()/SD_BUS_SIGNAL_WITH_NAMES() form above, which
- * this shim fully supports.
+ * Not provided: SD_BUS_METHOD_WITH_ARGS()/SD_BUS_SIGNAL_WITH_ARGS()/
+ * SD_BUS_ARGS()/SD_BUS_RESULT(), which need a preprocessor ladder to split
+ * a flat "type1, name1, type2, name2, ..." list into signature and name
+ * strings. Nothing here needs it, since sd_bus_add_object_vtable() always
+ * fails. Use SD_BUS_METHOD_WITH_NAMES()/SD_BUS_SIGNAL_WITH_NAMES() above
+ * instead.
  */
 
 #ifdef __cplusplus
