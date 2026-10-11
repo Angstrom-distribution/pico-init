@@ -17,6 +17,7 @@
  *    children still hold processes.
  */
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -95,6 +96,313 @@ static int open_ctrl_file(const char *dir, const char *name, int flags) {
         return fd;
 }
 
+/* Contents of <dir>/<name> into buf, NUL-terminated. Length, or -errno. */
+static int read_ctrl_file(const char *dir, const char *name, char *buf, size_t size) {
+        ssize_t n;
+        int fd;
+
+        fd = open_ctrl_file(dir, name, O_RDONLY);
+        if (fd < 0)
+                return fd;
+
+        n = read(fd, buf, size - 1);
+        close(fd);
+        if (n < 0)
+                return -errno;
+
+        buf[n] = '\0';
+        return (int) n;
+}
+
+/* One write(2) of `text` to <dir>/<name>, no truncate and no append: the way cgroup files are written. */
+static int write_ctrl_file(const char *dir, const char *name, const char *text) {
+        size_t len = strlen(text);
+        ssize_t n;
+        int fd, r = 0;
+
+        fd = open_ctrl_file(dir, name, O_WRONLY);
+        if (fd < 0)
+                return fd;
+
+        n = write(fd, text, len);
+        if (n < 0)
+                r = -errno;
+        else if ((size_t) n != len)
+                r = -EIO;
+
+        close(fd);
+        return r;
+}
+
+/* True when `word` is one of the space or newline separated words of `list`. */
+static bool list_has_word(const char *list, const char *word) {
+        size_t len = strlen(word);
+        const char *p = list;
+
+        while (*p) {
+                size_t n = strcspn(p, " \t\n");
+
+                if (n == len && strncmp(p, word, len) == 0)
+                        return true;
+                p += n;
+                p += strspn(p, " \t\n");
+        }
+        return false;
+}
+
+int cgroup_v2_enable_controllers(const char *dir, const char *wanted, int *ret_errno) {
+        char offered[256], enabled[256];
+        const char *p;
+        int done = 0, first_errno = 0, r;
+
+        if (ret_errno)
+                *ret_errno = 0;
+        if (!dir || !wanted)
+                return -EINVAL;
+
+        r = read_ctrl_file(dir, "cgroup.controllers", offered, sizeof(offered));
+        if (r < 0)
+                return r;
+        r = read_ctrl_file(dir, "cgroup.subtree_control", enabled, sizeof(enabled));
+        if (r < 0)
+                return r;
+
+        for (p = wanted; *p;) {
+                char word[32], cmd[sizeof(word) + 1];
+                size_t n;
+
+                p += strspn(p, " ");
+                n = strcspn(p, " ");
+                if (n == 0)
+                        break;
+                if (n >= sizeof(word)) {
+                        p += n;
+                        continue;
+                }
+                memcpy(word, p, n);
+                word[n] = '\0';
+                p += n;
+
+                if (!list_has_word(offered, word) || list_has_word(enabled, word))
+                        continue;
+
+                snprintf(cmd, sizeof(cmd), "+%s", word);
+                r = write_ctrl_file(dir, "cgroup.subtree_control", cmd);
+                if (r < 0) {
+                        pico_log(PICO_LOG_DEBUG, "%s: enabling %s: %s", dir, word, strerror(-r));
+                        if (first_errno == 0)
+                                first_errno = -r;
+                        continue;
+                }
+                done++;
+        }
+
+        if (ret_errno)
+                *ret_errno = first_errno;
+        return done;
+}
+
+int cgroup_v2_disable_controllers(const char *dir, int *ret_errno) {
+        char enabled[256];
+        const char *p;
+        int done = 0, first_errno = 0, r;
+
+        if (ret_errno)
+                *ret_errno = 0;
+        if (!dir)
+                return -EINVAL;
+
+        r = read_ctrl_file(dir, "cgroup.subtree_control", enabled, sizeof(enabled));
+        if (r < 0)
+                return r;
+
+        for (p = enabled; *p;) {
+                char word[32], cmd[sizeof(word) + 1];
+                size_t n;
+
+                p += strspn(p, " \t\n");
+                n = strcspn(p, " \t\n");
+                if (n == 0)
+                        break;
+                if (n >= sizeof(word)) {
+                        p += n;
+                        continue;
+                }
+                memcpy(word, p, n);
+                word[n] = '\0';
+                p += n;
+
+                snprintf(cmd, sizeof(cmd), "-%s", word);
+                r = write_ctrl_file(dir, "cgroup.subtree_control", cmd);
+                if (r < 0) {
+                        pico_log(PICO_LOG_DEBUG, "%s: disabling %s: %s", dir, word, strerror(-r));
+                        if (first_errno == 0)
+                                first_errno = -r;
+                        continue;
+                }
+                done++;
+        }
+
+        if (ret_errno)
+                *ret_errno = first_errno;
+        return done;
+}
+
+int cgroup_v2_prepare_root(const char *root) {
+        char slice[PATH_MAX];
+        int n, enabled, err = 0;
+
+        if (!root)
+                return -EINVAL;
+
+        n = snprintf(slice, sizeof(slice), "%s/system.slice", root);
+        if (n < 0 || (size_t) n >= sizeof(slice))
+                return -ENAMETOOLONG;
+        if (mkdir(slice, 0755) < 0 && errno != EEXIST)
+                return -errno;
+
+        enabled = cgroup_v2_enable_controllers(root, "cpu memory", &err);
+        if (enabled > 0)
+                pico_log(PICO_LOG_INFO, "cgroup: enabled %d controller(s) for %s", enabled, root);
+        if (err)
+                pico_log(PICO_LOG_WARNING,
+                         "cgroup: cannot enable all controllers in %s: %s",
+                         root,
+                         strerror(err));
+
+        /* Only useful if the root passed them down: a slice below a root that
+         * enables nothing offers nothing, and the call then just returns 0. */
+        err = 0;
+        enabled = cgroup_v2_enable_controllers(slice, "cpu memory", &err);
+        if (enabled > 0)
+                pico_log(PICO_LOG_INFO, "cgroup: enabled %d controller(s) for %s", enabled, slice);
+        if (err)
+                pico_log(PICO_LOG_WARNING,
+                         "cgroup: cannot enable all controllers in %s: %s",
+                         slice,
+                         strerror(err));
+
+        return 0;
+}
+
+/* Deepest nesting walked below a cgroup; the kernel's default is unlimited, a real tree is a handful. */
+#define CGROUP_PRUNE_MAX_DEPTH 32
+
+static int cgroup_remove_below(const char *path, unsigned depth, bool remove_self) {
+        char **names = NULL;
+        size_t n_names = 0, i;
+        struct dirent *e;
+        DIR *d;
+        int r = 0;
+
+        if (depth > CGROUP_PRUNE_MAX_DEPTH)
+                return -ELOOP;
+
+        d = opendir(path);
+        if (!d)
+                return errno == ENOENT ? 0 : -errno;
+
+        /* Names first, removal second: unlinking while readdir() runs may skip entries. */
+        while ((e = readdir(d)) != NULL) {
+                struct stat st;
+                char **grown;
+
+                if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+                        continue;
+                if (fstatat(dirfd(d), e->d_name, &st, AT_SYMLINK_NOFOLLOW) < 0 || !S_ISDIR(st.st_mode))
+                        continue;
+
+                grown = realloc(names, (n_names + 1) * sizeof(*names));
+                if (!grown) {
+                        r = -ENOMEM;
+                        break;
+                }
+                names = grown;
+                names[n_names] = pico_strdup(e->d_name);
+                if (!names[n_names]) {
+                        r = -ENOMEM;
+                        break;
+                }
+                n_names++;
+        }
+        closedir(d);
+
+        for (i = 0; i < n_names; i++) {
+                char child[PATH_MAX];
+                int k, n;
+
+                n = snprintf(child, sizeof(child), "%s/%s", path, names[i]);
+                if (n < 0 || (size_t) n >= sizeof(child))
+                        k = -ENAMETOOLONG;
+                else
+                        k = cgroup_remove_below(child, depth + 1, true);
+                if (k < 0 && r == 0)
+                        r = k;
+                free(names[i]);
+        }
+        free(names);
+
+        if (remove_self && rmdir(path) < 0 && errno != ENOENT && r == 0)
+                r = -errno;
+
+        return r;
+}
+
+int cgroup_v2_prune_children(const char *path) {
+        if (!path)
+                return -EINVAL;
+        return cgroup_remove_below(path, 0, false);
+}
+
+int cgroup_v2_remove_tree(const char *path) {
+        if (!path)
+                return -EINVAL;
+        return cgroup_remove_below(path, 0, true);
+}
+
+/*
+ * A unit cgroup left over from an earlier run: empty, but possibly with child
+ * cgroups and controllers enabled for them. Writing a new main pid into it
+ * would fail with EBUSY (a cgroup that enables controllers for its children
+ * cannot hold processes), so the children go and the controllers are switched
+ * off. A cgroup that still has members is not touched.
+ */
+static void cgroup_reset_stale(const char *path) {
+        char events[128];
+        int r;
+
+        if (read_ctrl_file(path, "cgroup.events", events, sizeof(events)) < 0 ||
+            !strstr(events, "populated 0"))
+                return;
+
+        r = cgroup_v2_prune_children(path);
+        if (r < 0)
+                pico_log(PICO_LOG_DEBUG, "%s: pruning stale children: %s", path, strerror(-r));
+        (void) cgroup_v2_disable_controllers(path, NULL);
+}
+
+int cgroup_v2_delegate_to(const char *path, uid_t uid, gid_t gid) {
+        static const char * const files[] = { "cgroup.procs", "cgroup.subtree_control", "cgroup.threads" };
+        size_t i;
+
+        if (!path)
+                return -EINVAL;
+
+        if (chown(path, uid, gid) < 0)
+                return -errno;
+
+        for (i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+                char file[PATH_MAX];
+                int n = snprintf(file, sizeof(file), "%s/%s", path, files[i]);
+
+                if (n < 0 || (size_t) n >= sizeof(file))
+                        return -ENAMETOOLONG;
+                if (chown(file, uid, gid) < 0 && errno != ENOENT)
+                        return -errno;
+        }
+        return 0;
+}
+
 int cgroup_v2_new(const char *path, struct pico_cgroup **ret) {
         struct pico_cgroup *cg;
         int r;
@@ -103,8 +411,11 @@ int cgroup_v2_new(const char *path, struct pico_cgroup **ret) {
                 return -EINVAL;
 
         /* No real cgroupfs (test/CI): mkdir fails ENOENT/EACCES/EROFS, propagate cleanly. */
-        if (mkdir(path, 0755) < 0 && errno != EEXIST)
-                return -errno;
+        if (mkdir(path, 0755) < 0) {
+                if (errno != EEXIST)
+                        return -errno;
+                cgroup_reset_stale(path);
+        }
 
         cg = calloc(1, sizeof(*cg));
         if (!cg)
@@ -469,6 +780,8 @@ int cgroup_v2_is_empty(struct pico_cgroup *cg) {
 }
 
 struct pico_cgroup *cgroup_v2_free(struct pico_cgroup *cg) {
+        int r;
+
         if (!cg)
                 return NULL;
 
@@ -481,13 +794,16 @@ struct pico_cgroup *cgroup_v2_free(struct pico_cgroup *cg) {
 
         if (cg->path) {
                 /*
-                 * Best-effort. A still-populated cgroup fails EBUSY, and the
-                 * directory is then orphaned -- which is why the caller should
-                 * only free once the empty event has arrived. Logged rather
-                 * than silently swallowed so a leaked cgroup is findable.
+                 * Best-effort. Empty child cgroups a delegated service made
+                 * go first (rmdir of a cgroup with children fails EBUSY). A
+                 * still-populated cgroup fails EBUSY too, and the directory
+                 * is then orphaned -- which is why the caller should only
+                 * free once the empty event has arrived. Logged rather than
+                 * silently swallowed so a leaked cgroup is findable.
                  */
-                if (rmdir(cg->path) < 0 && errno != ENOENT)
-                        pico_log(PICO_LOG_DEBUG, "%s: rmdir: %s", cg->path, strerror(errno));
+                r = cgroup_v2_remove_tree(cg->path);
+                if (r < 0)
+                        pico_log(PICO_LOG_DEBUG, "%s: rmdir: %s", cg->path, strerror(-r));
 
                 free(cg->path);
         }

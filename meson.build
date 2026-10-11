@@ -231,6 +231,8 @@ pico_tests = [
   # test-service is registered further down, after the shared libsystemd
   # its Type=notify helper links.
   'test-timer-cgroup',
+  # Controller enabling, child-cgroup removal and stale-cgroup reset behind Delegate=.
+  'test-cgroup-delegate',
   'test-boot',
   # Socket activation (plan §1.6) and picoctl (plan §1.7), registered up
   # front and placeholder-bodied for exactly the reason above.

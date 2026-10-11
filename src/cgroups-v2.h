@@ -115,5 +115,53 @@ int cgroup_v2_get_pids(struct pico_cgroup *cg, pid_t *pids, size_t max, size_t *
  */
 int cgroup_v2_signal(struct pico_cgroup *cg, int sig);
 
-/* Close fds, remove the cgroup directory, free. Returns NULL. */
+/*
+ * Controller plumbing (cgroup.subtree_control). A child cgroup only has a
+ * controller's files (cpu.weight, memory.high, ...) when every ancestor
+ * enables it for its children, and a cgroup that enables controllers for its
+ * children cannot hold processes of its own (the no-internal-process rule).
+ *
+ * `wanted` is a space-separated list. A controller the kernel does not offer in
+ * the directory's cgroup.controllers, or one that is already enabled, is
+ * skipped quietly; each remaining one is a separate write, so one the kernel
+ * refuses does not stop the others. Returns how many were enabled (>= 0), or
+ * -errno when cgroup.controllers / cgroup.subtree_control cannot be read
+ * (not a cgroup directory, no such controller interface). *ret_errno, when
+ * not NULL, is the first write error, 0 if there was none.
+ */
+int cgroup_v2_enable_controllers(const char *dir, const char *wanted, int *ret_errno);
+
+/* The inverse: "-name" for every controller cgroup.subtree_control lists.
+ * Same return convention. */
+int cgroup_v2_disable_controllers(const char *dir, int *ret_errno);
+
+/*
+ * Create <root>/system.slice and enable +cpu +memory in the root and in the
+ * slice, so unit cgroups get cpu.weight, memory.high and friends. Best effort
+ * and never fatal: a controller the kernel refuses is logged and skipped.
+ * system.slice holds no processes of its own, so the no-internal-process rule
+ * does not apply to it. 0, or -errno when system.slice cannot be created.
+ */
+int cgroup_v2_prepare_root(const char *root);
+
+/*
+ * Remove every descendant cgroup of `path` depth-first, leaving `path`
+ * itself. A cgroup that still has processes cannot be removed (EBUSY) and
+ * stays, with everything above it. 0 when nothing is left below `path`, else
+ * the first error. Never kills anything.
+ */
+int cgroup_v2_prune_children(const char *path);
+
+/* prune_children, then remove `path` itself. 0 (also when it is already gone) or -errno. */
+int cgroup_v2_remove_tree(const char *path);
+
+/*
+ * Hand the cgroup to uid/gid, as Delegate=yes does for a User= service: the
+ * directory and the files the kernel's delegation rules say the delegatee
+ * must own (cgroup.procs, cgroup.subtree_control, cgroup.threads). A file
+ * that does not exist is skipped. 0 or -errno of the first real failure.
+ */
+int cgroup_v2_delegate_to(const char *path, uid_t uid, gid_t gid);
+
+/* Close fds, remove the cgroup directory and any empty cgroups below it, free. Returns NULL. */
 struct pico_cgroup *cgroup_v2_free(struct pico_cgroup *cg);
