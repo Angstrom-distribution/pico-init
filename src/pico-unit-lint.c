@@ -23,14 +23,22 @@
  *
  * Exit status: 0 with no findings, 1 with any (unless --warn-only), 2 when
  * the tree could not be scanned at all.
+ *
+ * The options of `systemd-analyze verify` that make sense for a directory
+ * lint are accepted: -q, --root=, --instance=, --system, --no-pager, and
+ * --recursive-errors=, --man, --generators as no-ops (only units in the tree
+ * are reported, no man page is checked, no generator runs). --user, --global,
+ * --image and --image-policy would change what is verified and are refused.
  */
 
 #include <dirent.h>
 #include <errno.h>
+#include <getopt.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
 #include "manager.h"
@@ -40,15 +48,44 @@
 
 #define LINT_INSTANCE "lint"
 
+static const char *instance_name = LINT_INSTANCE;
+
 static void usage(FILE *out) {
         fprintf(out,
-                "usage: pico-unit-lint [--warn-only] [--verbose] DIR...\n"
+                "usage: pico-unit-lint [OPTIONS...] DIR...\n"
                 "\n"
                 "Parse every unit file under each DIR with pico-init's own parser and\n"
                 "report the directives it would drop and the units it would fail to load.\n"
                 "\n"
-                "  --warn-only   exit 0 even when there are findings\n"
-                "  --verbose     also list units pico-init honours in full\n");
+                "  -h --help               show this help\n"
+                "     --version            show package version\n"
+                "     --warn-only          exit 0 even when there are findings\n"
+                "     --verbose            also list units pico-init honours in full\n"
+                "  -q --quiet              omit the summary line\n"
+                "     --root=PATH          resolve each DIR below PATH\n"
+                "     --instance=NAME      instance name templates are loaded as (default \"" LINT_INSTANCE
+                "\")\n"
+                "     --system             accepted, the only mode\n"
+                "     --no-pager           accepted, there is no pager\n"
+                "     --recursive-errors=MODE  accepted and ignored: yes, no, one\n"
+                "     --man[=BOOL]         accepted and ignored: man pages are not checked\n"
+                "     --generators[=BOOL]  accepted and ignored: generators are not run\n"
+                "\n"
+                "--user, --global, --image and --image-policy are not implemented.\n");
+}
+
+static int parse_bool(const char *s) {
+        static const char * const yes[] = { "1", "yes", "y", "true", "t", "on" };
+        static const char * const no[] = { "0", "no", "n", "false", "f", "off" };
+        size_t k;
+
+        for (k = 0; k < 6; k++) {
+                if (strcasecmp(s, yes[k]) == 0)
+                        return 1;
+                if (strcasecmp(s, no[k]) == 0)
+                        return 0;
+        }
+        return -EINVAL;
 }
 
 /* Load every template in `dir` under a fixed instance name so it gets parsed. */
@@ -72,9 +109,10 @@ static int load_templates(Manager *m, const char *dir) {
                 dot = strrchr(de->d_name, '.');
                 n = snprintf(instance,
                              sizeof(instance),
-                             "%.*s@" LINT_INSTANCE "%s",
+                             "%.*s@%s%s",
                              (int) (at - de->d_name),
                              de->d_name,
+                             instance_name,
                              dot);
                 if (n < 0 || (size_t) n >= sizeof(instance))
                         continue;
@@ -122,7 +160,7 @@ static bool in_tree(char **dirs, const char *id) {
 
 /* The name to report: the template's own for an instance this tool created. */
 static char *display_name(Unit *u) {
-        if (u->instance && strcmp(u->instance, LINT_INSTANCE) == 0)
+        if (u->instance && strcmp(u->instance, instance_name) == 0)
                 return unit_name_template(u->id);
 
         return pico_strdup(u->id);
@@ -133,7 +171,44 @@ static int unit_id_cmp(const void *a, const void *b) {
 }
 
 int main(int argc, char *argv[]) {
-        bool warn_only = false, verbose = false;
+        enum {
+                ARG_VERSION = 0x100,
+                ARG_WARN_ONLY,
+                ARG_VERBOSE,
+                ARG_ROOT,
+                ARG_INSTANCE,
+                ARG_SYSTEM,
+                ARG_NO_PAGER,
+                ARG_RECURSIVE_ERRORS,
+                ARG_MAN,
+                ARG_GENERATORS,
+                ARG_USER,
+                ARG_GLOBAL,
+                ARG_IMAGE,
+                ARG_IMAGE_POLICY,
+        };
+        static const struct option options[] = {
+                {             "help",       no_argument, NULL,                  'h' },
+                {          "version",       no_argument, NULL,          ARG_VERSION },
+                {        "warn-only",       no_argument, NULL,        ARG_WARN_ONLY },
+                {          "verbose",       no_argument, NULL,          ARG_VERBOSE },
+                {            "quiet",       no_argument, NULL,                  'q' },
+                {             "root", required_argument, NULL,             ARG_ROOT },
+                {         "instance", required_argument, NULL,         ARG_INSTANCE },
+                {           "system",       no_argument, NULL,           ARG_SYSTEM },
+                {         "no-pager",       no_argument, NULL,         ARG_NO_PAGER },
+                { "recursive-errors", required_argument, NULL, ARG_RECURSIVE_ERRORS },
+                {              "man", optional_argument, NULL,              ARG_MAN },
+                {       "generators", optional_argument, NULL,       ARG_GENERATORS },
+                {             "user",       no_argument, NULL,             ARG_USER },
+                {           "global",       no_argument, NULL,           ARG_GLOBAL },
+                {            "image", required_argument, NULL,            ARG_IMAGE },
+                {     "image-policy", required_argument, NULL,     ARG_IMAGE_POLICY },
+                {               NULL,                 0, NULL,                    0 },
+        };
+        bool warn_only = false, verbose = false, quiet = false;
+        const char *root = NULL;
+        int c;
         size_t n_tree = 0, n_degraded = 0, n_directives = 0, n_failed = 0;
         char **dirs = NULL;
         Manager *m = NULL;
@@ -141,19 +216,83 @@ int main(int argc, char *argv[]) {
         size_t i;
         int r;
 
-        for (i = 1; i < (size_t) argc; i++) {
-                if (strcmp(argv[i], "--warn-only") == 0)
-                        warn_only = true;
-                else if (strcmp(argv[i], "--verbose") == 0)
-                        verbose = true;
-                else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+        while ((c = getopt_long(argc, argv, "hq", options, NULL)) >= 0) {
+                switch (c) {
+                case 'h':
                         usage(stdout);
                         return 0;
-                } else if (argv[i][0] == '-') {
-                        fprintf(stderr, "pico-unit-lint: unknown option %s\n", argv[i]);
+                case ARG_VERSION:
+                        printf("pico-unit-lint %s\n", PICO_INIT_VERSION);
+                        return 0;
+                case ARG_WARN_ONLY:
+                        warn_only = true;
+                        break;
+                case ARG_VERBOSE:
+                        verbose = true;
+                        break;
+                case 'q':
+                        quiet = true;
+                        break;
+                case ARG_ROOT:
+                        root = optarg;
+                        break;
+                case ARG_INSTANCE: {
+                        char probe[UNIT_NAME_MAX + 1];
+
+                        if (snprintf(probe, sizeof(probe), "x@%s.service", optarg) >= (int) sizeof(probe) ||
+                            !unit_name_is_valid(probe)) {
+                                fprintf(stderr, "pico-unit-lint: invalid instance name '%s'\n", optarg);
+                                return 2;
+                        }
+                        instance_name = optarg;
+                        break;
+                }
+                case ARG_SYSTEM:
+                case ARG_NO_PAGER:
+                        break;
+                case ARG_RECURSIVE_ERRORS:
+                        if (strcmp(optarg, "help") == 0) {
+                                printf("yes\nno\none\n");
+                                return 0;
+                        }
+                        if (strcmp(optarg, "yes") != 0 && strcmp(optarg, "no") != 0 &&
+                            strcmp(optarg, "one") != 0) {
+                                fprintf(stderr,
+                                        "pico-unit-lint: unknown mode '%s' for --recursive-errors=\n",
+                                        optarg);
+                                return 2;
+                        }
+                        break;
+                case ARG_MAN:
+                case ARG_GENERATORS:
+                        if (optarg && parse_bool(optarg) < 0) {
+                                fprintf(stderr, "pico-unit-lint: failed to parse boolean '%s'\n", optarg);
+                                return 2;
+                        }
+                        break;
+                case ARG_USER:
+                case ARG_GLOBAL:
+                case ARG_IMAGE:
+                case ARG_IMAGE_POLICY:
+                        fprintf(stderr, "pico-unit-lint: %s is not implemented\n", argv[optind - 1]);
+                        return 2;
+                default:
                         usage(stderr);
                         return 2;
-                } else if (pico_strv_extend(&dirs, argv[i]) < 0)
+                }
+        }
+
+        for (i = (size_t) optind; i < (size_t) argc; i++) {
+                if (root) {
+                        char *joined = NULL;
+
+                        if (asprintf(&joined, "%s/%s", root, argv[i]) < 0)
+                                return 2;
+                        r = pico_strv_extend(&dirs, joined);
+                        free(joined);
+                } else
+                        r = pico_strv_extend(&dirs, argv[i]);
+                if (r < 0)
                         return 2;
         }
 
@@ -222,12 +361,13 @@ int main(int argc, char *argv[]) {
                 free(name);
         }
 
-        printf("pico-unit-lint: %zu units in tree, %zu degraded (%zu directive%s dropped), %zu failed to load\n",
-               n_tree,
-               n_degraded,
-               n_directives,
-               n_directives == 1 ? "" : "s",
-               n_failed);
+        if (!quiet)
+                printf("pico-unit-lint: %zu units in tree, %zu degraded (%zu directive%s dropped), %zu failed to load\n",
+                       n_tree,
+                       n_degraded,
+                       n_directives,
+                       n_directives == 1 ? "" : "s",
+                       n_failed);
 
         free(units);
         manager_free(m);

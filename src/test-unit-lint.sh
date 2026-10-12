@@ -165,4 +165,32 @@ cout=$("$lint" "$tree/clean" 2>/dev/null) || { echo "clean tree must exit 0" >&2
         exit 1
 }
 
+# systemd-analyze verify's options: -q drops the summary, --root= prefixes
+# each DIR, --instance= renames the template instance, the no-op ones are
+# accepted, and the ones that would change what is verified are refused.
+qout=$("$lint" -q --warn-only "$tree/system" 2>/dev/null)
+printf '%s\n' "$qout" | grep -q '^pico-unit-lint:' && { echo "-q printed the summary" >&2; exit 1; }
+printf '%s\n' "$qout" | grep -qxF "refused.service: FAILED TO LOAD" || { echo "-q dropped a finding" >&2; exit 1; }
+
+rout=$("$lint" --warn-only --root="$tree" system 2>/dev/null)
+printf '%s\n' "$rout" | grep -qxF "pico-unit-lint: 6 units in tree, 2 degraded (17 directives dropped), 1 failed to load" ||
+        { echo "--root= did not resolve DIR: $rout" >&2; exit 1; }
+
+"$lint" --warn-only --instance=other "$tree/system" 2>/dev/null | grep -qxF "volatile-binds@.service: 3 dropped: DefaultDependencies RequiresMountsFor ConditionPathIsReadWrite" ||
+        { echo "--instance= broke template reporting" >&2; exit 1; }
+"$lint" --instance='a/b' "$tree/clean" >/dev/null 2>&1 && { echo "bad instance must fail" >&2; exit 1; }
+
+"$lint" --system --no-pager --man --generators=no --recursive-errors=one "$tree/clean" >/dev/null 2>&1 ||
+        { echo "accepted no-op options failed" >&2; exit 1; }
+"$lint" --recursive-errors=bogus "$tree/clean" >/dev/null 2>&1 && { echo "bad --recursive-errors must fail" >&2; exit 1; }
+"$lint" --man=maybe "$tree/clean" >/dev/null 2>&1 && { echo "bad --man must fail" >&2; exit 1; }
+"$lint" --recursive-errors=help | grep -qxF one || { echo "--recursive-errors=help" >&2; exit 1; }
+"$lint" --version | grep -q '^pico-unit-lint ' || { echo "--version" >&2; exit 1; }
+
+for opt in --user --global --image=/x --image-policy=y; do
+        rc=0
+        "$lint" "$opt" "$tree/clean" >/dev/null 2>&1 || rc=$?
+        [ "$rc" -eq 2 ] || { echo "$opt exited $rc, wanted 2" >&2; exit 1; }
+done
+
 echo "test-unit-lint: all cases passed"
