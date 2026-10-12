@@ -103,6 +103,13 @@ struct Link {
 
         struct in_addr gateway;
         bool gateway_configured;
+        /* A /32 link-scope route to `gateway` was added because it lies
+         * outside the leased subnet; removed together with the default
+         * route. */
+        bool gateway_host_route;
+        /* The default route came from a lease, so a lease without a router
+         * takes it away again; a static Gateway= is never removed that way. */
+        bool gateway_from_lease;
 
         /*
          * Reentrancy guard. Set for the duration of link_apply_lease(), which

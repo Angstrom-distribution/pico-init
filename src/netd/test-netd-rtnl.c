@@ -54,6 +54,7 @@
 #include <unistd.h>
 
 #include "../test-util.h"
+#include "dhcp/dhcp-lease-internal.h"
 #include "netd-link.h"
 #include "netd-network.h"
 #include "netd-rtnl.h"
@@ -593,6 +594,90 @@ static void test_netns_dhcp_end_to_end(void) {
         printf("test-netd-rtnl: DHCP client-vs-server end-to-end subtest ok\n");
 }
 
+static DhcpLease *make_lease(const char *addr, const char *mask, const char *router) {
+        DhcpLease *lease = calloc(1, sizeof(*lease));
+
+        ASSERT_TRUE(lease != NULL);
+        lease->n_ref = 1;
+        ASSERT_EQ_INT(inet_pton(AF_INET, addr, &lease->address), 1);
+        ASSERT_EQ_INT(inet_pton(AF_INET, mask, &lease->subnet_mask), 1);
+
+        if (router) {
+                /* A zero entry first: the first usable router is the one that counts. */
+                lease->router = calloc(2, sizeof(*lease->router));
+                ASSERT_TRUE(lease->router != NULL);
+                lease->router_size = 2;
+                ASSERT_EQ_INT(inet_pton(AF_INET, router, &lease->router[1]), 1);
+        }
+        return lease;
+}
+
+/*
+ * A router outside the leased subnet needs a link-scope host route before the
+ * default route will install, and a renewed lease without a router must take
+ * the default route away again.
+ */
+static void test_netns_lease_gateway(void) {
+        char *tmp;
+        char netdir[PATH_MAX], rundir[PATH_MAX], statedir[PATH_MAX], resolv[PATH_MAX];
+        const char *netpath[2];
+        Netd *n = NULL;
+        Link *l;
+
+        enter_test_netns();
+
+        tmp = test_tmpdir_new();
+        ASSERT_TRUE(tmp != NULL);
+        ASSERT_TRUE(test_mkdir(tmp, "network") == 0);
+        ASSERT_TRUE(test_mkdir(tmp, "run") == 0);
+        ASSERT_TRUE(test_mkdir(tmp, "state") == 0);
+
+        snprintf(netdir, sizeof(netdir), "%s/network", tmp);
+        snprintf(rundir, sizeof(rundir), "%s/run", tmp);
+        snprintf(statedir, sizeof(statedir), "%s/state", tmp);
+        snprintf(resolv, sizeof(resolv), "%s/resolv.conf", tmp);
+
+        ASSERT_TRUE(test_write_file(netdir, "10-gw.network", "[Match]\nName=gwtest0\n\n[Network]\nDHCP=yes\n") == 0);
+        run_ip("link add name gwtest0 type veth peer name gwtest1");
+
+        ASSERT_TRUE(netd_new(&n) == 0);
+        netpath[0] = netdir;
+        netpath[1] = NULL;
+        ASSERT_TRUE(netd_set_network_path(n, netpath) == 0);
+        ASSERT_TRUE(netd_set_runtime_dir(n, rundir) == 0);
+        ASSERT_TRUE(netd_set_state_dir(n, statedir) == 0);
+        ASSERT_TRUE(netd_set_resolv_conf(n, resolv) == 0);
+        ASSERT_TRUE(netd_startup(n) == 0);
+
+        l = netd_find_link_by_name(n, "gwtest0");
+        ASSERT_TRUE(l != NULL);
+
+        /* /32 lease: the router is off-subnet. */
+        ASSERT_TRUE(link_apply_lease(l, make_lease("10.60.0.2", "255.255.255.255", "10.60.0.1")) == 0);
+        ASSERT_TRUE(l->gateway_configured);
+        run_shell("ip route show dev gwtest0 | grep -q '^10\\.60\\.0\\.1 .*scope link'");
+        run_shell("ip route show default dev gwtest0 | grep -q 'via 10\\.60\\.0\\.1'");
+
+        /* Renewal without a router. */
+        ASSERT_TRUE(link_apply_lease(l, make_lease("10.60.0.2", "255.255.255.255", NULL)) == 0);
+        ASSERT_TRUE(!l->gateway_configured);
+        run_shell("test -z \"$(ip route show default dev gwtest0)\"");
+        run_shell("! ip route show dev gwtest0 | grep -q '^10\\.60\\.0\\.1 '");
+
+        /* A router inside the subnet needs no host route. */
+        ASSERT_TRUE(link_apply_lease(l, make_lease("10.60.0.2", "255.255.255.0", "10.60.0.1")) == 0);
+        ASSERT_TRUE(l->gateway_configured);
+        run_shell("ip route show default dev gwtest0 | grep -q 'via 10\\.60\\.0\\.1'");
+        run_shell("! ip route show dev gwtest0 | grep -q '^10\\.60\\.0\\.1 '");
+
+        run_ip("link del gwtest0");
+        netd_free(n);
+        test_rm_rf(tmp);
+        free(tmp);
+
+        printf("test-netd-rtnl: lease gateway subtest ok\n");
+}
+
 static int reload_calls;
 
 static int count_reload(Netd *n) {
@@ -629,6 +714,7 @@ int main(void) {
         test_netns_rtnl();
         test_netns_static_network_and_sighup();
         test_netns_dhcp_end_to_end();
+        test_netns_lease_gateway();
         test_reload_dropped_after_exit_request();
 
         printf("test-netd-rtnl: ok\n");

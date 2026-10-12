@@ -87,6 +87,16 @@ static int route_del_default_idempotent(NetdRtnl *rtnl, int ifindex, const struc
         return (r == -ESRCH || r == -ENOENT) ? 0 : r;
 }
 
+static int route_add_host_idempotent(NetdRtnl *rtnl, int ifindex, const struct in_addr *dst, uint32_t metric) {
+        int r = netd_rtnl_route_add(rtnl, ifindex, dst, 32, NULL, metric);
+        return r == -EEXIST ? 0 : r;
+}
+
+static int route_del_host_idempotent(NetdRtnl *rtnl, int ifindex, const struct in_addr *dst, uint32_t metric) {
+        int r = netd_rtnl_route_del(rtnl, ifindex, dst, 32, NULL, metric);
+        return (r == -ESRCH || r == -ENOENT) ? 0 : r;
+}
+
 /* True when `a`/`a_pfx` and `b`/`b_pfx` name the same connected-route
  * prefix -- the condition that makes the kernel's secondary-address
  * cascade-delete reachable (see converge_address() below). Passed by value:
@@ -380,10 +390,73 @@ static int apply_static_address(Link *l, const Network *nw) {
         return converge_address(l, &want->address, want->prefixlen, UINT32_MAX);
 }
 
-static int apply_static_gateway(Link *l, const Network *nw) {
+/* Removes the default route and, if there is one, its host route. */
+static int link_gateway_remove(Link *l) {
         Netd *n = l->netd;
         int r;
 
+        r = route_del_default_idempotent(n->rtnl, l->ifindex, &l->gateway, link_route_metric(l));
+        if (r < 0)
+                return r;
+
+        if (l->gateway_host_route) {
+                r = route_del_host_idempotent(n->rtnl, l->ifindex, &l->gateway, link_route_metric(l));
+                if (r < 0)
+                        pico_log(PICO_LOG_WARNING,
+                                 "netd: %s: failed to remove gateway host route: %s",
+                                 l->ifname,
+                                 strerror(-r));
+        }
+
+        l->gateway_configured = false;
+        l->gateway_host_route = false;
+        l->gateway_from_lease = false;
+        return 0;
+}
+
+/*
+ * Installs `gw` as the default route and drops the previous one. A router
+ * outside the interface's subnet needs a link-scope host route first, or the
+ * kernel refuses the default route with ENETUNREACH (systemd c9ee0d2eeb,
+ * 863293dbd3: the netmask may mask out the gateway).
+ */
+static int link_gateway_replace(Link *l, const struct in_addr *gw, bool host_route, bool from_lease) {
+        Netd *n = l->netd;
+        uint32_t metric = link_route_metric(l);
+        struct in_addr old_gw = l->gateway;
+        bool had_gateway = l->gateway_configured, had_host_route = l->gateway_host_route;
+        int r;
+
+        if (host_route) {
+                r = route_add_host_idempotent(n->rtnl, l->ifindex, gw, metric);
+                if (r < 0)
+                        return r;
+        }
+
+        r = route_add_default_idempotent(n->rtnl, l->ifindex, gw, metric);
+        if (r < 0) {
+                if (host_route)
+                        (void) route_del_host_idempotent(n->rtnl, l->ifindex, gw, metric);
+                return r;
+        }
+
+        if (had_gateway) {
+                bool same = old_gw.s_addr == gw->s_addr;
+
+                if (!same)
+                        (void) route_del_default_idempotent(n->rtnl, l->ifindex, &old_gw, metric);
+                if (had_host_route && (!same || !host_route))
+                        (void) route_del_host_idempotent(n->rtnl, l->ifindex, &old_gw, metric);
+        }
+
+        l->gateway = *gw;
+        l->gateway_configured = true;
+        l->gateway_host_route = host_route;
+        l->gateway_from_lease = from_lease;
+        return 0;
+}
+
+static int apply_static_gateway(Link *l, const Network *nw) {
         if (!nw->gateway_set) {
                 if (!l->gateway_configured)
                         return 0;
@@ -392,27 +465,13 @@ static int apply_static_gateway(Link *l, const Network *nw) {
                 if (l->lease && network_dhcp4_enabled(nw))
                         return 0;
 
-                r = route_del_default_idempotent(n->rtnl, l->ifindex, &l->gateway, link_route_metric(l));
-                if (r < 0)
-                        return r;
-
-                l->gateway_configured = false;
-                return 0;
+                return link_gateway_remove(l);
         }
 
         if (l->gateway_configured && l->gateway.s_addr == nw->gateway.s_addr)
                 return 0;
 
-        r = route_add_default_idempotent(n->rtnl, l->ifindex, &nw->gateway, link_route_metric(l));
-        if (r < 0)
-                return r;
-
-        if (l->gateway_configured)
-                (void) route_del_default_idempotent(n->rtnl, l->ifindex, &l->gateway, link_route_metric(l));
-
-        l->gateway = nw->gateway;
-        l->gateway_configured = true;
-        return 0;
+        return link_gateway_replace(l, &nw->gateway, false, false);
 }
 
 /* Defined near link_deconfigure() below. */
@@ -975,7 +1034,7 @@ static int link_teardown_kernel_state(Link *l) {
         int r, ret = 0;
 
         if (l->gateway_configured) {
-                r = route_del_default_idempotent(n->rtnl, l->ifindex, &l->gateway, link_route_metric(l));
+                r = link_gateway_remove(l);
                 if (r < 0) {
                         pico_log(PICO_LOG_WARNING,
                                  "netd: %s: failed to remove route: %s",
@@ -983,8 +1042,7 @@ static int link_teardown_kernel_state(Link *l) {
                                  strerror(-r));
                         if (ret == 0)
                                 ret = r;
-                } else
-                        l->gateway_configured = false;
+                }
         }
 
         if (l->address_configured) {
@@ -1218,22 +1276,35 @@ int link_apply_lease(Link *l, DhcpLease *lease) {
 
         {
                 const struct in_addr *routers;
+                const struct in_addr *router = NULL;
                 int nrouters = dhcp_lease_get_router(lease, &routers);
 
-                if (nrouters > 0 && routers[0].s_addr != 0 &&
-                    (!l->gateway_configured || l->gateway.s_addr != routers[0].s_addr)) {
-                        int rr = route_add_default_idempotent(
-                                        n->rtnl, l->ifindex, &routers[0], link_route_metric(l));
+                for (int i = 0; i < nrouters; i++)
+                        if (routers[i].s_addr != 0) {
+                                router = &routers[i];
+                                break;
+                        }
 
-                        if (rr == 0) {
-                                if (l->gateway_configured)
-                                        (void) route_del_default_idempotent(
-                                                        n->rtnl, l->ifindex, &l->gateway, link_route_metric(l));
-                                l->gateway = routers[0];
-                                l->gateway_configured = true;
-                        } else
+                if (router) {
+                        bool host_route = !same_subnet(addr, prefixlen, *router, prefixlen);
+
+                        if (!l->gateway_configured || l->gateway.s_addr != router->s_addr ||
+                            l->gateway_host_route != host_route) {
+                                int rr = link_gateway_replace(l, router, host_route, true);
+
+                                if (rr < 0)
+                                        pico_log(PICO_LOG_WARNING,
+                                                 "netd: %s: failed to apply lease default route: %s",
+                                                 l->ifname,
+                                                 strerror(-rr));
+                        }
+                } else if (l->gateway_configured && l->gateway_from_lease) {
+                        /* The renewed lease dropped the router. */
+                        int rr = link_gateway_remove(l);
+
+                        if (rr < 0)
                                 pico_log(PICO_LOG_WARNING,
-                                         "netd: %s: failed to apply lease default route: %s",
+                                         "netd: %s: failed to remove lease default route: %s",
                                          l->ifname,
                                          strerror(-rr));
                 }
