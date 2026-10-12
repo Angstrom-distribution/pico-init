@@ -184,7 +184,8 @@ static void test_addr_list_is_bounded(void) {
 
         len = (size_t) snprintf(content, sizeof(content), "[Network]\nNTP=");
         for (int i = 0; i < 200; i++)
-                len += (size_t) snprintf(content + len, sizeof(content) - len, "10.1.%d.%d ", i / 250, i % 250 + 1);
+                len += (size_t) snprintf(
+                                content + len, sizeof(content) - len, "10.1.%d.%d ", i / 250, i % 250 + 1);
 
         dir = test_tmpdir_new();
         ASSERT_TRUE(dir != NULL);

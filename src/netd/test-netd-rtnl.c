@@ -637,7 +637,8 @@ static void test_netns_lease_gateway(void) {
         snprintf(statedir, sizeof(statedir), "%s/state", tmp);
         snprintf(resolv, sizeof(resolv), "%s/resolv.conf", tmp);
 
-        ASSERT_TRUE(test_write_file(netdir, "10-gw.network", "[Match]\nName=gwtest0\n\n[Network]\nDHCP=yes\n") == 0);
+        ASSERT_TRUE(test_write_file(netdir, "10-gw.network", "[Match]\nName=gwtest0\n\n[Network]\nDHCP=yes\n") ==
+                    0);
         run_ip("link add name gwtest0 type veth peer name gwtest1");
 
         ASSERT_TRUE(netd_new(&n) == 0);
