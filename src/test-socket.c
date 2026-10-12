@@ -876,14 +876,29 @@ static bool drive_until(Manager *m, Unit *service, const DriveWait *wait, int ma
         return drive_wait_done(wait);
 }
 
+/* Services no longer inherit the test's own environment, so the helper's
+ * result path travels as Environment=. */
+static const char *result_env_line(char *buf, size_t size) {
+        const char *result = getenv("TEST_RESULT_PATH");
+
+        snprintf(buf,
+                 size,
+                 "%s%s%s",
+                 result ? "Environment=TEST_RESULT_PATH=" : "",
+                 result ? result : "",
+                 result ? "\n" : "");
+        return buf;
+}
+
 static void write_helper_service(const char *dir, const char *name, const char *mode, const char *restart) {
-        char content[PATH_MAX + 256];
+        char content[3 * PATH_MAX + 256], env[PATH_MAX + 64];
 
         snprintf(content,
                  sizeof(content),
-                 "[Service]\nType=simple\nExecStart=%s %s\n%s",
+                 "[Service]\nType=simple\nExecStart=%s %s\n%s%s",
                  g_self_exe,
                  mode,
+                 result_env_line(env, sizeof(env)),
                  restart ? restart : "");
         ASSERT_EQ_INT(test_write_file(dir, name, content), 0);
 }
@@ -1567,6 +1582,7 @@ static void test_exec_type_with_socket_fds(void) {
         char *dir = test_tmpdir_new();
         char sockpath[N_PORTS][PATH_MAX], resultpath[PATH_MAX];
         char content[N_PORTS * (PATH_MAX + 32) + 64];
+        char envline[PATH_MAX + 64];
         size_t off = 0;
         struct sockaddr_un addr;
         FILE *f;
@@ -1588,9 +1604,10 @@ static void test_exec_type_with_socket_fds(void) {
 
         snprintf(content,
                  sizeof(content),
-                 "[Service]\nType=exec\nExecStart=%s --exec-fds %d\n",
+                 "[Service]\nType=exec\nExecStart=%s --exec-fds %d\n%s",
                  g_self_exe,
-                 N_PORTS);
+                 N_PORTS,
+                 result_env_line(envline, sizeof(envline)));
         ASSERT_EQ_INT(test_write_file(dir, "execfds.service", content), 0);
         ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
 
@@ -1701,7 +1718,7 @@ static void test_accept_yes_instance_per_connection(void) {
         Socket *s;
         Unit *anchor;
         char *dir = test_tmpdir_new();
-        char sockpath[PATH_MAX], resultpath[PATH_MAX], tmpl[PATH_MAX + 256];
+        char sockpath[PATH_MAX], resultpath[PATH_MAX], tmpl[3 * PATH_MAX], envline[PATH_MAX + 64];
         /* name[]/file[] sized well past what inst[]'s real content (a
          * short "%d-%lu-%lu") ever produces -- GCC's format-truncation
          * analysis can't trace inst[i]'s actual runtime bound through the
@@ -1716,8 +1733,9 @@ static void test_accept_yes_instance_per_connection(void) {
         setenv("TEST_RESULT_PATH", resultpath, 1);
         snprintf(tmpl,
                  sizeof(tmpl),
-                 "[Unit]\nAfter=anchor.service\n[Service]\nType=simple\nExecStart=%s --accept-conn %%i\n",
-                 g_self_exe);
+                 "[Unit]\nAfter=anchor.service\n[Service]\nType=simple\nExecStart=%s --accept-conn %%i\n%s",
+                 g_self_exe,
+                 result_env_line(envline, sizeof(envline)));
         m = accept_setup(dir, sockpath, "", tmpl, &s);
 
         anchor = manager_get_unit(m, "anchor.service");

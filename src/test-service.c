@@ -2338,10 +2338,10 @@ static void read_env_line(const char *path, const char *name, char *out, size_t 
 }
 
 /*
- * The child sees, in v30's merge order: inherited environ, overridden by
+ * The child sees the manager's default environment, overridden by
  * Environment=, overridden by EnvironmentFile= contents (a later file beating
- * an earlier one). The files are read per spawn, so a file ExecStartPre=
- * writes reaches ExecStart=; a missing '-' file is skipped.
+ * an earlier one); PID 1's own environ is not inherited. The files are read per spawn, so a file
+ * ExecStartPre= writes reaches ExecStart=; a missing '-' file is skipped.
  */
 static void test_environment_reaches_child(void) {
         Manager *m;
@@ -2399,11 +2399,90 @@ static void test_environment_reaches_child(void) {
         read_env_line(out, "PICO_TEST_OVERRIDDEN", v, sizeof(v));
         ASSERT_STREQ(v, "unit");
         read_env_line(out, "PICO_TEST_INHERITED", v, sizeof(v));
-        ASSERT_STREQ(v, "inherited");
+        ASSERT_STREQ(v, "");
+        read_env_line(out, "PATH", v, sizeof(v));
+        ASSERT_STREQ(v, "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin");
 
         unsetenv("PICO_TEST_INHERITED");
         unsetenv("PICO_TEST_OVERRIDDEN");
         manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * Starts a oneshot running `env` into <dir>/out and returns the finished
+ * service; the caller reads the result and frees the manager.
+ */
+static Service *run_env_unit(Manager *m, const char *dir, const char *directives) {
+        char unit[4 * PATH_MAX], out[PATH_MAX];
+        Service *s;
+
+        snprintf(out, sizeof(out), "%s/out", dir);
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Unit]\n[Service]\nType=oneshot\n%s"
+                 "ExecStart=/bin/sh -c \"env > %s.tmp && mv %s.tmp %s\"\n",
+                 directives,
+                 out,
+                 out,
+                 out);
+        s = load_service(m, dir, "envdef.service", unit);
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, s, 1000));
+        ASSERT_EQ_INT(s->state, SERVICE_DEAD);
+        ASSERT_EQ_INT(s->result, SERVICE_SUCCESS);
+        return s;
+}
+
+/*
+ * A stray boot-cmdline name=value or kernel HOME= in PID 1's environ does
+ * not reach a service, which gets PATH instead; a User= adds the account's
+ * USER/LOGNAME/HOME/SHELL (only root can switch to it) and Environment=
+ * still overrides them.
+ */
+static void test_environment_is_clean(void) {
+        Manager *m;
+        char *dir;
+        char out[PATH_MAX], v[256];
+        struct passwd *pw;
+
+        setenv("PICO_TEST_STRAY", "leak", 1);
+        setenv("HOME", "/", 1);
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+        snprintf(out, sizeof(out), "%s/out", dir);
+
+        (void) run_env_unit(m, dir, "");
+        read_env_line(out, "PICO_TEST_STRAY", v, sizeof(v));
+        ASSERT_STREQ(v, "");
+        read_env_line(out, "HOME", v, sizeof(v));
+        ASSERT_STREQ(v, "");
+        read_env_line(out, "PATH", v, sizeof(v));
+        ASSERT_STREQ(v, "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin");
+        manager_free(m);
+
+        if (getuid() == 0 && (pw = getpwnam("root")) != NULL) {
+                char want[256];
+
+                m = manager_for(dir);
+                (void) run_env_unit(m, dir, "User=root\nEnvironment=LOGNAME=override\n");
+                read_env_line(out, "USER", v, sizeof(v));
+                ASSERT_STREQ(v, "root");
+                read_env_line(out, "LOGNAME", v, sizeof(v));
+                ASSERT_STREQ(v, "override");
+                read_env_line(out, "HOME", v, sizeof(v));
+                ASSERT_STREQ(v, pw->pw_dir);
+                snprintf(want, sizeof(want), "%s", pw->pw_shell && *pw->pw_shell ? pw->pw_shell : "/bin/sh");
+                read_env_line(out, "SHELL", v, sizeof(v));
+                ASSERT_STREQ(v, want);
+                manager_free(m);
+        } else
+                printf("test-service: not root, skipping the User= environment check\n");
+
+        unsetenv("PICO_TEST_STRAY");
         test_rm_rf(dir);
         free(dir);
 }
@@ -3528,6 +3607,7 @@ int main(void) {
         test_forking_pidfile_of_parent_refused();
         test_env_helpers();
         test_environment_reaches_child();
+        test_environment_is_clean();
         test_environment_file_missing_fails_start();
         test_replace_env_helpers();
         test_exec_line_expansion();

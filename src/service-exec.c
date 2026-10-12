@@ -117,11 +117,6 @@
 #include "service.h"
 #include "socket.h"
 
-/* Declared explicitly rather than relying on <unistd.h> to have pulled it
- * in under whatever feature-test macros happen to be active -- environ is
- * read by build_exec_envp() and by child_exec()'s NULL-envp fallback. */
-extern char **environ;
-
 /* Hand-rolled ascending insertion sort -- see this file's header for why
  * qsort(3) is not used here. `n` is at most PICO_MAX_SOCKET_FDS + 2 (the
  * socket-activation set, the logd stdout socket, the Type=exec pipe). */
@@ -265,29 +260,8 @@ static int flags_fds(const int *fds, unsigned n_fds) {
         return 0;
 }
 
-static bool is_listen_var(const char *e) {
-        static const char * const names[] = {
-                "LISTEN_FDS=",
-                "LISTEN_PID=",
-                "LISTEN_FDNAMES=",
-        };
-        size_t i;
-
-        for (i = 0; i < sizeof(names) / sizeof(names[0]); i++)
-                if (strncmp(e, names[i], strlen(names[i])) == 0)
-                        return true;
-
-        return false;
-}
-
-/* Same reasoning as is_listen_var(): a stray NOTIFY_SOCKET= on the boot
- * cmdline lands in PID 1's own environment and must never leak through to a
- * child as a ghost listener address. Kept a sibling predicate rather than
- * folded into is_listen_var()'s table -- the two protocols are unrelated,
- * only the scrub mechanism is shared. */
-static bool is_notify_var(const char *e) {
-        return strncmp(e, "NOTIFY_SOCKET=", strlen("NOTIFY_SOCKET=")) == 0;
-}
+/* The manager's default PATH, and the search list for a bare Exec name. */
+#define PICO_DEFAULT_PATH "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
 
 /*
  * v30's exec_context_load_environment(): every EnvironmentFile= is read
@@ -347,17 +321,17 @@ static int load_environment_files(Service *s, char ***ret) {
  * is fine, this is exactly the "everything that can be computed in the
  * parent is computed there instead" this file's header promises.
  *
- * Merge order is v30's own (execute.c:1365), a later NAME= replacing an
- * earlier one: the inherited environ, then NOTIFY_SOCKET=/LISTEN_FDS=, then
- * Environment=, then EnvironmentFile= contents. The order matters: a
- * file beats Environment= (oe-core's read-only-rootfs hook overrides a
- * unit's default that way).
+ * Merge order, a later NAME= replacing an earlier one: the manager's default
+ * environment, then NOTIFY_SOCKET=/LISTEN_FDS=, then the User= account's
+ * USER=/LOGNAME=/HOME=/SHELL=, then Environment=, then EnvironmentFile=
+ * contents. The order matters: a file beats Environment= (oe-core's
+ * read-only-rootfs hook overrides a unit's default that way), and both beat
+ * the account defaults.
  *
- * Any inherited LISTEN_* or NOTIFY_SOCKET= is dropped first (upstream scrubs
- * the same names for the same reason). PID 1's own environment really can
- * contain one: the kernel hands init every unrecognised name=value
- * boot-cmdline parameter as an environment variable, and left in place it
- * would reach a child that was never meant to see it.
+ * Like systemd's system manager the default environment is clean: PATH
+ * only, plus TERM for a tty-attached unit. PID 1's own environ is what the
+ * kernel built (HOME=/, TERM=linux, and every unrecognised name=value
+ * boot-cmdline parameter), none of which a service should inherit.
  *
  * LAYOUT INVARIANT: [merged entries, every one malloc'd][reserved LISTEN_PID
  * slot, NULL in the parent, iff n_fds>0][NUL terminator]. Every entry is
@@ -370,28 +344,27 @@ static int load_environment_files(Service *s, char ***ret) {
  * child_exec() only reads it when n_fds>0). NULL on OOM.
  */
 static char **
-                build_exec_envp(char **unit_env,
+                build_exec_envp(char **creds_env,
+                                char **unit_env,
                                 char **file_env,
+                                bool tty,
                                 unsigned n_fds,
                                 const char *notify_socket,
                                 size_t *ret_pid_slot) {
         char *ours[3] = { NULL, NULL, NULL };
-        char fds_buf[32];
-        char **inherited, **envp = NULL;
-        size_t n = 0, i, idx = 0;
+        char *base[3] = { "PATH=" PICO_DEFAULT_PATH, NULL, NULL };
+        char fds_buf[32], term_buf[64];
+        char **envp = NULL;
+        size_t idx = 0;
 
-        while (environ[n])
-                n++;
+        if (tty) {
+                const char *term = getenv("TERM");
 
-        /* Borrowed pointers only: the merge below copies every string. */
-        inherited = calloc(n + 1, sizeof(char *));
-        if (!inherited)
-                return NULL;
-        for (i = 0; i < n; i++)
-                if (!is_listen_var(environ[i]) && !is_notify_var(environ[i]))
-                        inherited[idx++] = environ[i];
+                if (term && *term &&
+                    snprintf(term_buf, sizeof(term_buf), "TERM=%s", term) < (int) sizeof(term_buf))
+                        base[1] = term_buf;
+        }
 
-        idx = 0;
         if (notify_socket) {
                 size_t len = strlen("NOTIFY_SOCKET=") + strlen(notify_socket) + 1;
 
@@ -408,7 +381,7 @@ static char **
                 ours[idx++] = fds_buf;
         }
 
-        envp = pico_strv_env_merge(4, inherited, ours, unit_env, file_env);
+        envp = pico_strv_env_merge(5, base, ours, creds_env, unit_env, file_env);
         if (!envp || n_fds == 0)
                 goto finish;
 
@@ -440,7 +413,6 @@ static char **
 finish:
         if (notify_socket)
                 free(ours[0]);
-        free(inherited);
         return envp;
 }
 
@@ -557,6 +529,7 @@ typedef struct ExecCreds {
         gid_t gid;
         gid_t *groups;
         int n_groups;
+        char **env; /* USER=/LOGNAME=/HOME=/SHELL= for a User= with a passwd entry */
 } ExecCreds;
 
 /* An all-digits User=/Group= is an id, not a name to look up (systemd
@@ -631,6 +604,38 @@ static int supplementary_group_to_gid(Service *s, const char *tok, gid_t *ret) {
  * -ESRCH when a named account or group does not exist (logged here, with the
  * name), -E2BIG past NGROUPS_MAX, -ENOMEM.
  */
+static int creds_env_from_passwd(ExecCreds *c, const struct passwd *pw) {
+        const char *shell = pw->pw_shell && *pw->pw_shell ? pw->pw_shell : "/bin/sh";
+        const char *home = pw->pw_dir && *pw->pw_dir ? pw->pw_dir : "/";
+        char *e[4] = { NULL, NULL, NULL, NULL };
+        int i, r = 0;
+
+        if (asprintf(&e[0], "USER=%s", pw->pw_name) < 0)
+                e[0] = NULL;
+        if (asprintf(&e[1], "LOGNAME=%s", pw->pw_name) < 0)
+                e[1] = NULL;
+        if (asprintf(&e[2], "HOME=%s", home) < 0)
+                e[2] = NULL;
+        if (asprintf(&e[3], "SHELL=%s", shell) < 0)
+                e[3] = NULL;
+
+        for (i = 0; i < 4; i++)
+                if (!e[i])
+                        r = -ENOMEM;
+        if (r == 0) {
+                c->env = calloc(5, sizeof(char *));
+                if (!c->env)
+                        r = -ENOMEM;
+        }
+        for (i = 0; i < 4; i++) {
+                if (r == 0)
+                        c->env[i] = e[i];
+                else
+                        free(e[i]);
+        }
+        return r;
+}
+
 static int exec_creds_resolve(Service *s, ExecCreds *c) {
         const char *pw_name = NULL;
         struct passwd *pw = NULL;
@@ -686,8 +691,13 @@ static int exec_creds_resolve(Service *s, ExecCreds *c) {
                         c->uid = pw->pw_uid;
                         c->gid = pw->pw_gid;
                 }
-                if (pw)
+                if (pw) {
+                        int er = creds_env_from_passwd(c, pw);
+
+                        if (er < 0)
+                                return er;
                         pw_name = pw->pw_name;
+                }
         } else
                 c->uid = geteuid();
 
@@ -768,6 +778,7 @@ static void exec_creds_free(ExecCreds *c) {
         free(c->groups);
         c->groups = NULL;
         c->n_groups = 0;
+        c->env = pico_strv_free(c->env);
 }
 
 /*
@@ -867,10 +878,7 @@ static int find_in_default_path(const char *name, char *buf, size_t bufsize) {
  * service_spawn(), before fork()) are the fds this start is passing via
  * LISTEN_FDS -- excluded from the close-everything sweep at step 5, then
  * renumbered and unflagged at step 5b. `envp`/`pid_slot` are likewise
- * parent-built (build_exec_envp()); envp is NULL only when this start passes
- * neither socket-activation fds nor a NOTIFY_SOCKET= and the unit has no
- * Environment=/EnvironmentFile=, in which case the inherited environ is used
- * unchanged; pid_slot is meaningful only when n_sock_fds > 0 (see
+ * parent-built (build_exec_envp()); pid_slot is meaningful only when n_sock_fds > 0 (see
  * build_exec_envp()'s own layout-invariant comment).
  * `stdout_fd` (create_stdout_socket(), also parent-built) is likewise
  * excluded from the sweep, then dup2()'d over stdout/stderr at step 8;
@@ -1244,9 +1252,7 @@ static _Noreturn void
         }
 
         /* 11. Does not return on success. Its failure is reported purely by
-         * exit code -- there is no other channel back to the parent. envp is
-         * NULL exactly when service_spawn() had nothing to add to or remove
-         * from the inherited `environ`, which is then used unchanged.
+         * exit code -- there is no other channel back to the parent.
          *
          * Bare (slash-free) argv[0]: resolved against find_in_default_path()
          * above into `exec_path`, a stack buffer -- argv[0] ITSELF stays the
@@ -1278,7 +1284,7 @@ static _Noreturn void
                         (void) !write(exec_fd, &hot, sizeof(hot));
                 }
 
-                execve(exec_path, argv, envp ? envp : environ);
+                execve(exec_path, argv, envp);
         }
 
         if (exec_fd >= 0) {
@@ -1296,7 +1302,7 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
         size_t pid_slot = 0;
         const char *notify_socket;
         char **file_env = NULL, **expanded_argv = NULL;
-        bool has_unit_env, is_main, tty_stdin;
+        bool is_main, tty_stdin;
         ExecCreds creds;
         char subgroup_path[PATH_MAX];
         const char *cgroup_dir = NULL;
@@ -1379,7 +1385,6 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
                 exec_creds_free(&creds);
                 return r;
         }
-        has_unit_env = s->environment || s->environment_files;
 
         /*
          * Only the main command inherits socket-activation fds, matching
@@ -1415,33 +1420,24 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
          * scrub below still runs so an inherited value cannot leak through. */
         notify_socket = manager_notify_socket_path(UNIT(s)->manager);
 
-        /* With none of these, envp stays NULL and the child inherits
-         * environ as-is: a unit with nothing to add pays nothing. */
-        if (n_sock_fds > 0 || notify_socket || has_unit_env) {
-                envp = build_exec_envp(
-                                s->environment, file_env, (unsigned) n_sock_fds, notify_socket, &pid_slot);
-                if (!envp) {
-                        /* Starting without the unit's own environment would
-                         * run it misconfigured; starting without only
-                         * LISTEN_FDS/NOTIFY_SOCKET is the long-standing
-                         * degraded fallback. */
-                        if (has_unit_env) {
-                                pico_log(PICO_LOG_ERR, "%s: could not build the child environment", UNIT(s)->id);
-                                pico_strv_free(file_env);
-                                exec_creds_free(&creds);
-                                return -ENOMEM;
-                        }
-                        pico_log(PICO_LOG_WARNING,
-                                 "%s: could not build the child environment, starting without LISTEN_FDS/NOTIFY_SOCKET",
-                                 UNIT(s)->id);
-                        n_sock_fds = 0;
-                }
+        envp = build_exec_envp(
+                        creds.env,
+                        s->environment,
+                        file_env,
+                        service_standard_input_is_tty(s->standard_input),
+                        (unsigned) n_sock_fds,
+                        notify_socket,
+                        &pid_slot);
+        if (!envp) {
+                pico_log(PICO_LOG_ERR, "%s: could not build the child environment", UNIT(s)->id);
+                pico_strv_free(file_env);
+                exec_creds_free(&creds);
+                return -ENOMEM;
         }
         file_env = pico_strv_free(file_env);
 
-        /* Against exactly what the child will see: envp, or the inherited
-         * environ when there is none. */
-        r = expand_exec_argv(argv, envp ? envp : environ, &expanded_argv);
+        /* Against exactly what the child will see. */
+        r = expand_exec_argv(argv, envp, &expanded_argv);
         if (r < 0) {
                 pico_log(PICO_LOG_ERR,
                          "%s: could not expand $ variables in %s: %s",
