@@ -8,18 +8,79 @@
 
 #include "netd.h"
 
+#include <errno.h>
+#include <getopt.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "../util.h"
 
+/*
+ * systemd-networkd v262 takes --help, --version and --bus-introspect=PATH and
+ * rejects any other argument. There is no bus, so the introspection dump is
+ * refused rather than answered with nothing.
+ */
+static void netd_usage(void) {
+        puts("netd [OPTIONS...]\n"
+             "\n"
+             "Network manager.\n"
+             "\n"
+             "  -h --help      Show this help\n"
+             "     --version   Show version");
+}
+
+/* 0 to run, 1 when --help or --version was all there was to do, -EINVAL otherwise. */
+static int netd_parse_argv(int argc, char *argv[]) {
+        enum {
+                ARG_VERSION = 0x100,
+                ARG_BUS_INTROSPECT,
+        };
+        static const struct option options[] = {
+                {           "help",       no_argument, NULL,                'h' },
+                {        "version",       no_argument, NULL,        ARG_VERSION },
+                { "bus-introspect", required_argument, NULL, ARG_BUS_INTROSPECT },
+                {             NULL,                 0, NULL,                  0 },
+        };
+        int c;
+
+        optind = 0;
+        while ((c = getopt_long(argc, argv, "h", options, NULL)) >= 0) {
+                switch (c) {
+                case 'h':
+                        netd_usage();
+                        return 1;
+
+                case ARG_VERSION:
+                        puts("netd " PICO_INIT_VERSION);
+                        return 1;
+
+                case ARG_BUS_INTROSPECT:
+                        pico_log(PICO_LOG_ERR, "netd: --bus-introspect is not supported, there is no bus");
+                        return -EINVAL;
+
+                default:
+                        return -EINVAL;
+                }
+        }
+
+        if (optind < argc) {
+                pico_log(PICO_LOG_ERR, "netd: this program takes no arguments");
+                return -EINVAL;
+        }
+
+        return 0;
+}
+
 int main(int argc, char *argv[]) {
         Netd *n = NULL;
         int r;
 
-        (void) argc;
-        (void) argv;
+        r = netd_parse_argv(argc, argv);
+        if (r < 0)
+                return EXIT_FAILURE;
+        if (r > 0)
+                return EXIT_SUCCESS;
 
         r = netd_new(&n);
         if (r < 0) {

@@ -440,6 +440,8 @@ netd_tests = [
   'test-netd-lldp-table',
   # LLDP over a veth pair in a private network namespace.
   'test-netd-lldp-link',
+  # --help, --version and refused arguments.
+  'test-netd-opts',
 ]
 
 foreach t : netd_tests
