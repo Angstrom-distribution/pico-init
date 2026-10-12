@@ -156,6 +156,12 @@ static int config_parse_match_name(
         /* Heap, not a VLA: rvalue comes from conf-scan.c's unbounded
          * getline(), the same stack-overflow hazard unit-parse.c's
          * config_parse_unit_deps() documents -- see that file's header. */
+        /* An empty assignment resets the list, as in systemd. */
+        if (*rvalue == '\0') {
+                nw->match_name = pico_strv_free(nw->match_name);
+                return 0;
+        }
+
         copy = pico_strdup(rvalue);
         if (!copy)
                 return -ENOMEM;
@@ -222,6 +228,9 @@ static int config_parse_gateway(
         return 0;
 }
 
+/* systemd's MAX_NTP_SERVERS: a longer list is a misconfiguration. */
+#define NETWORK_ADDR_LIST_MAX 128
+
 /*
  * DNS=/NTP=: a space-separated list of address literals -- netd has no
  * resolver, so a hostname here is a parse error for that one token, not a
@@ -237,12 +246,30 @@ static int config_parse_addr_list(
                 size_t *n) {
         char *copy, *saveptr = NULL, *tok;
 
+        /* An empty assignment resets the list, as in systemd. */
+        if (*rvalue == '\0') {
+                free(*list);
+                *list = NULL;
+                *n = 0;
+                return 0;
+        }
+
         copy = pico_strdup(rvalue);
         if (!copy)
                 return -ENOMEM;
 
         for (tok = strtok_r(copy, " \t", &saveptr); tok; tok = strtok_r(NULL, " \t", &saveptr)) {
                 struct in_addr a, *grown;
+
+                if (*n >= NETWORK_ADDR_LIST_MAX) {
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s:%u: %s= holds more than %d entries, ignoring the rest",
+                                 path,
+                                 line,
+                                 lvalue,
+                                 NETWORK_ADDR_LIST_MAX);
+                        break;
+                }
 
                 if (inet_pton(AF_INET, tok, &a) != 1) {
                         pico_log(PICO_LOG_WARNING,
@@ -608,14 +635,28 @@ int network_load_all(Netd *n) {
 }
 
 bool network_matches(const Network *nw, const char *ifname) {
+        bool matched = false, has_positive = false;
+
         if (!nw || !ifname || !nw->match_name)
                 return false;
 
         for (char * const *p = nw->match_name; *p; p++)
-                if (fnmatch(*p, ifname, 0) == 0)
-                        return true;
+                if (**p != '!')
+                        has_positive = true;
 
-        return false;
+        /* A matching "!pattern" vetoes the file; a list of only negations
+         * matches every other name. */
+        for (char * const *p = nw->match_name; *p; p++) {
+                bool negated = **p == '!';
+
+                if (fnmatch(*p + negated, ifname, 0) != 0)
+                        continue;
+                if (negated)
+                        return false;
+                matched = true;
+        }
+
+        return matched || !has_positive;
 }
 
 Network *network_find(Netd *n, const char *ifname) {
@@ -630,9 +671,8 @@ Network *network_find(Netd *n, const char *ifname) {
 }
 
 /*
- * Value spellings. "yes"/"no"/"true"/"false"/"1"/"0" are handled by the
- * boolean parser; this table is only for the address-family words, plus the
- * truthy spellings that mean "both".
+ * Value spellings. This table holds the address-family words and the plain
+ * yes/no; every other boolean spelling goes through network_parse_bool().
  */
 static const char * const network_dhcp_table[_NETWORK_DHCP_MAX] = {
         [NETWORK_DHCP_NO] = "no",
@@ -649,18 +689,18 @@ const char *network_dhcp_to_string(NetworkDHCP d) {
 }
 
 NetworkDHCP network_dhcp_from_string(const char *s) {
+        bool b;
+
         if (!s)
                 return _NETWORK_DHCP_INVALID;
 
+        /* Case-insensitive like every boolean key in this file. */
         for (NetworkDHCP d = 0; d < _NETWORK_DHCP_MAX; d++)
-                if (strcmp(s, network_dhcp_table[d]) == 0)
+                if (strcasecmp(s, network_dhcp_table[d]) == 0)
                         return d;
 
-        /* The other truthy/falsy spellings systemd accepts everywhere. */
-        if (strcmp(s, "true") == 0 || strcmp(s, "1") == 0 || strcmp(s, "on") == 0)
-                return NETWORK_DHCP_YES;
-        if (strcmp(s, "false") == 0 || strcmp(s, "0") == 0 || strcmp(s, "off") == 0)
-                return NETWORK_DHCP_NO;
+        if (network_parse_bool(s, &b) == 0)
+                return b ? NETWORK_DHCP_YES : NETWORK_DHCP_NO;
 
         return _NETWORK_DHCP_INVALID;
 }

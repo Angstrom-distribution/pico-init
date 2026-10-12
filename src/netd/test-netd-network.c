@@ -67,6 +67,15 @@ static void test_dhcp_spellings(void) {
         ASSERT_EQ_INT(network_dhcp_from_string("off"), NETWORK_DHCP_NO);
         ASSERT_EQ_INT(network_dhcp_from_string("maybe"), _NETWORK_DHCP_INVALID);
 
+        /* networkd reads DHCP= with parse_boolean(): case-insensitive, with
+         * the one-letter forms. */
+        ASSERT_EQ_INT(network_dhcp_from_string("Yes"), NETWORK_DHCP_YES);
+        ASSERT_EQ_INT(network_dhcp_from_string("y"), NETWORK_DHCP_YES);
+        ASSERT_EQ_INT(network_dhcp_from_string("T"), NETWORK_DHCP_YES);
+        ASSERT_EQ_INT(network_dhcp_from_string("n"), NETWORK_DHCP_NO);
+        ASSERT_EQ_INT(network_dhcp_from_string("OFF"), NETWORK_DHCP_NO);
+        ASSERT_EQ_INT(network_dhcp_from_string("IPv4"), NETWORK_DHCP_IPV4);
+
         ASSERT_STREQ(network_dhcp_to_string(NETWORK_DHCP_IPV4), "ipv4");
 }
 
@@ -113,6 +122,82 @@ static void test_match_glob_and_no_match_matches_nothing(void) {
         ASSERT_TRUE(!network_matches(bare, "usb0"));
         ASSERT_TRUE(!network_matches(bare, "anything"));
         network_free(bare);
+}
+
+/* A leading '!' excludes; a list of only exclusions matches everything else. */
+static void test_match_negation(void) {
+        Network *nw = NULL;
+
+        ASSERT_EQ_INT(network_new(&nw), 0);
+        ASSERT_EQ_INT(pico_strv_extend(&nw->match_name, "!lo"), 0);
+        ASSERT_EQ_INT(pico_strv_extend(&nw->match_name, "!veth*"), 0);
+
+        ASSERT_TRUE(network_matches(nw, "eth0"));
+        ASSERT_TRUE(!network_matches(nw, "lo"));
+        ASSERT_TRUE(!network_matches(nw, "veth3"));
+        network_free(nw);
+
+        ASSERT_EQ_INT(network_new(&nw), 0);
+        ASSERT_EQ_INT(pico_strv_extend(&nw->match_name, "eth*"), 0);
+        ASSERT_EQ_INT(pico_strv_extend(&nw->match_name, "!eth1"), 0);
+
+        ASSERT_TRUE(network_matches(nw, "eth0"));
+        ASSERT_TRUE(!network_matches(nw, "eth1"));
+        ASSERT_TRUE(!network_matches(nw, "usb0"));
+        network_free(nw);
+}
+
+/* An empty Name=/DNS=/NTP= assignment resets what earlier lines gave. */
+static void test_empty_assignment_resets(void) {
+        char *dir, *path;
+        Network *nw = NULL;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "reset.network",
+                                      "[Match]\nName=eth0\nName=\nName=usb0\n\n"
+                                      "[Network]\nDNS=10.0.0.1\nDNS=\nDNS=10.0.0.2\n"
+                                      "NTP=10.0.0.3\nNTP=\n"),
+                      0);
+        path = join_path(dir, "reset.network");
+
+        ASSERT_EQ_INT(network_parse_file(path, &nw), 0);
+        ASSERT_TRUE(!network_matches(nw, "eth0"));
+        ASSERT_TRUE(network_matches(nw, "usb0"));
+        ASSERT_EQ_INT(nw->n_dns, 1);
+        ASSERT_EQ_INT(nw->dns[0].s_addr, htonl(0x0a000002));
+        ASSERT_EQ_INT(nw->n_ntp, 0);
+
+        network_free(nw);
+        free(path);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* A runaway NTP= list is cut off at 128 servers. */
+static void test_addr_list_is_bounded(void) {
+        char *dir, *path;
+        char content[4096];
+        size_t len;
+        Network *nw = NULL;
+
+        len = (size_t) snprintf(content, sizeof(content), "[Network]\nNTP=");
+        for (int i = 0; i < 200; i++)
+                len += (size_t) snprintf(content + len, sizeof(content) - len, "10.1.%d.%d ", i / 250, i % 250 + 1);
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        ASSERT_EQ_INT(test_write_file(dir, "many.network", content), 0);
+        path = join_path(dir, "many.network");
+
+        ASSERT_EQ_INT(network_parse_file(path, &nw), 0);
+        ASSERT_EQ_INT(nw->n_ntp, 128);
+
+        network_free(nw);
+        free(path);
+        test_rm_rf(dir);
+        free(dir);
 }
 
 /* A USB gadget link configured as a DHCP client. */
@@ -525,6 +610,9 @@ int main(void) {
         test_dhcp_spellings();
         test_dhcp4_enabled();
         test_match_glob_and_no_match_matches_nothing();
+        test_match_negation();
+        test_empty_assignment_resets();
+        test_addr_list_is_bounded();
         test_real_usb0_network_parses();
         test_real_usb0_server_network_parses();
         test_console_base_image_fixtures_parse();
