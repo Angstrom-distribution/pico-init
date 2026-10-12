@@ -1332,7 +1332,7 @@ static void test_list_units_colors(void) {
 
         snprintf(expected_row,
                  sizeof(expected_row),
-                 "%s%-32s%s %-8s %s%-10s%s %s%-13s%s %-8s %s\n",
+                 "%s%-32s%s %-8s %s%-10s%s %s%-13s%s %s\n",
                  TEST_ANSI_HIGHLIGHT_RED,
                  "demo.service",
                  TEST_ANSI_NORMAL,
@@ -1343,7 +1343,6 @@ static void test_list_units_colors(void) {
                  TEST_ANSI_HIGHLIGHT_RED,
                  "failed",
                  TEST_ANSI_NORMAL,
-                 "",
                  "Demo");
 
         setenv("SYSTEMD_COLORS", "true", 1);
@@ -1356,6 +1355,686 @@ static void test_list_units_colors(void) {
 
         test_rm_rf(root);
         free(root);
+}
+
+/* --- systemctl 262 option and verb set --- */
+
+static void fixture_unit_state(const char *root, const char *name, const char *content) {
+        char unitsdir[PATH_MAX + 16];
+
+        snprintf(unitsdir, sizeof(unitsdir), "%s%s/units", root, PICO_RUNTIME_DIR);
+        ASSERT_EQ_INT(fixture_mkdir_p(unitsdir), 0);
+        ASSERT_EQ_INT(test_write_file(unitsdir, name, content), 0);
+}
+
+static void fixture_manager_state(const char *root, const char *content) {
+        char rtdir[PATH_MAX];
+
+        snprintf(rtdir, sizeof(rtdir), "%s%s", root, PICO_RUNTIME_DIR);
+        ASSERT_EQ_INT(fixture_mkdir_p(rtdir), 0);
+        ASSERT_EQ_INT(test_write_file(rtdir, "manager", content), 0);
+}
+
+static void test_list_units_filters_and_legend(void) {
+        char *root = test_tmpdir_new();
+        struct run_result res;
+
+        ASSERT_TRUE(root != NULL);
+        fixture_unit_state(
+                        root,
+                        "demo.service",
+                        "ActiveState=active\nSubState=running\nLoadState=loaded\nDescription=Demo\n");
+        fixture_unit_state(
+                        root,
+                        "idle.service",
+                        "ActiveState=inactive\nSubState=dead\nLoadState=loaded\nDescription=Idle\n");
+        fixture_unit_state(
+                        root,
+                        "bad.service",
+                        "ActiveState=failed\nSubState=failed\nLoadState=loaded\nDescription=Bad\n");
+        fixture_unit_state(
+                        root,
+                        "busy.service",
+                        "ActiveState=inactive\nSubState=dead\nLoadState=loaded\nDescription=Busy\nJob=7 start\n");
+
+        /* inactive units stay hidden unless --all, they have a job, or --state asks */
+        RUN_PICOCTL(&res, "--root", root, "list-units");
+        ASSERT_EQ_INT(res.exit_code, 0);
+        ASSERT_TRUE(strstr(res.out, "demo.service") != NULL);
+        ASSERT_TRUE(strstr(res.out, "idle.service") == NULL);
+        ASSERT_TRUE(strstr(res.out, "busy.service") != NULL);
+        ASSERT_TRUE(strstr(res.out, " JOB ") != NULL);
+        ASSERT_TRUE(strstr(res.out, "3 loaded units listed. ") != NULL);
+        ASSERT_TRUE(strstr(res.out, "Pass --all to see loaded but inactive units, too.") != NULL);
+        ASSERT_TRUE(strstr(res.out, "JOB    \xe2\x86\x92 Pending job for the unit.") != NULL);
+
+        RUN_PICOCTL(&res, "--root", root, "list-units", "--all");
+        ASSERT_TRUE(strstr(res.out, "idle.service") != NULL);
+        ASSERT_TRUE(strstr(res.out, "4 loaded units listed.\n") != NULL);
+        ASSERT_TRUE(strstr(res.out, "Pass --all") == NULL);
+
+        RUN_PICOCTL(&res, "--root", root, "list-units", "--failed");
+        ASSERT_TRUE(strstr(res.out, "bad.service") != NULL);
+        ASSERT_TRUE(strstr(res.out, "demo.service") == NULL);
+        ASSERT_TRUE(strstr(res.out, "1 loaded units listed.\n") != NULL);
+
+        RUN_PICOCTL(&res, "--root", root, "--state=inactive", "list-units", "i*");
+        ASSERT_TRUE(strstr(res.out, "idle.service") != NULL);
+        ASSERT_TRUE(strstr(res.out, "busy.service") == NULL);
+
+        /* no job pending: the JOB column goes away, as upstream hides it */
+        RUN_PICOCTL(&res, "--root", root, "list-units", "demo*");
+        ASSERT_TRUE(strstr(res.out, "JOB") == NULL);
+        ASSERT_TRUE(strstr(res.out, "1 loaded units listed.") != NULL);
+
+        /* -q and --legend=no drop headers and footers, --legend=yes keeps them */
+        RUN_PICOCTL(&res, "--root", root, "-q", "list-units", "demo*");
+        ASSERT_TRUE(strstr(res.out, "UNIT") == NULL && strstr(res.out, "listed") == NULL);
+        RUN_PICOCTL(&res, "--root", root, "--legend=no", "list-units", "demo*");
+        ASSERT_TRUE(strstr(res.out, "UNIT") == NULL && strstr(res.out, "listed") == NULL);
+        RUN_PICOCTL(&res, "--root", root, "-q", "--legend=yes", "list-units", "demo*");
+        ASSERT_TRUE(strstr(res.out, "1 loaded units listed.") != NULL);
+        RUN_PICOCTL(&res, "--root", root, "--legend=maybe", "list-units");
+        ASSERT_EQ_INT(res.exit_code, 1);
+
+        /* options with nothing to act on are accepted */
+        RUN_PICOCTL(&res,
+                    "--root",
+                    root,
+                    "--no-ask-password",
+                    "--no-warn",
+                    "--no-pager",
+                    "-l",
+                    "--plain",
+                    "-T",
+                    "--check-inhibitors=no",
+                    "list-units");
+        ASSERT_EQ_INT(res.exit_code, 0);
+
+        test_rm_rf(root);
+        free(root);
+}
+
+static void test_json_output(void) {
+        char *root = test_tmpdir_new();
+        struct run_result res;
+
+        ASSERT_TRUE(root != NULL);
+        fixture_unit_state(
+                        root,
+                        "demo.service",
+                        "ActiveState=active\nSubState=running\nLoadState=loaded\nDescription=A \"Demo\"\n");
+
+        RUN_PICOCTL(&res, "--root", root, "-o", "json", "list-units");
+        ASSERT_EQ_INT(res.exit_code, 0);
+        ASSERT_STREQ(res.out,
+                     "[{\"unit\":\"demo.service\",\"load\":\"loaded\",\"active\":\"active\",\"sub\":\"running\","
+                     "\"description\":\"A \\\"Demo\\\"\"}]\n");
+
+        RUN_PICOCTL(&res, "--root", root, "--output=json-pretty", "list-units");
+        ASSERT_STREQ(res.out,
+                     "[\n"
+                     "\t{\n"
+                     "\t\t\"unit\" : \"demo.service\",\n"
+                     "\t\t\"load\" : \"loaded\",\n"
+                     "\t\t\"active\" : \"active\",\n"
+                     "\t\t\"sub\" : \"running\",\n"
+                     "\t\t\"description\" : \"A \\\"Demo\\\"\"\n"
+                     "\t}\n"
+                     "]\n");
+
+        RUN_PICOCTL(&res, "--root", root, "-o", "json-seq", "list-timers");
+        ASSERT_STREQ(res.out, "\x1e[]\n");
+        RUN_PICOCTL(&res, "--root", root, "-o", "json-sse", "list-timers");
+        ASSERT_STREQ(res.out, "data: []\n\n");
+
+        RUN_PICOCTL(&res, "--root", root, "-o", "help");
+        ASSERT_TRUE(strstr(res.out, "json-pretty\n") != NULL);
+        RUN_PICOCTL(&res, "--root", root, "-o", "bogus", "list-units");
+        ASSERT_EQ_INT(res.exit_code, 1);
+
+        /* the other modes only matter to journal entries and keep the table */
+        RUN_PICOCTL(&res, "--root", root, "-o", "verbose", "list-units");
+        ASSERT_TRUE(strstr(res.out, "demo.service") != NULL && res.out[0] != '[');
+
+        test_rm_rf(root);
+        free(root);
+}
+
+static void test_json_unit_files(void) {
+        char *root = test_tmpdir_new();
+        struct run_result res;
+
+        ASSERT_TRUE(root != NULL);
+        make_fixture_root(root);
+
+        RUN_PICOCTL(&res, "--root", root, "-o", "json", "list-unit-files", "static*");
+        ASSERT_STREQ(res.out, "[{\"unit_file\":\"static.service\",\"state\":\"static\",\"preset\":null}]\n");
+
+        RUN_PICOCTL(&res, "--root", root, "-o", "json", "list-unit-files", "foo*");
+        ASSERT_STREQ(res.out,
+                     "[{\"unit_file\":\"foo.service\",\"state\":\"disabled\",\"preset\":\"enabled\"}]\n");
+
+        RUN_PICOCTL(&res, "--root", root, "--state=static", "--no-legend", "list-unit-files");
+        ASSERT_TRUE(strstr(res.out, "static.service") != NULL && strstr(res.out, "foo.service") == NULL);
+
+        RUN_PICOCTL(&res, "--root", root, "-t", "target", "--no-legend", "list-unit-files");
+        ASSERT_STREQ(res.out, "");
+
+        test_rm_rf(root);
+        free(root);
+}
+
+static void test_empty_unit_types(void) {
+        char *root = test_tmpdir_new();
+        struct run_result res;
+
+        ASSERT_TRUE(root != NULL);
+        fixture_manager_state(root, "DefaultTarget=default.target\nNUnits=0\nNJobs=0\n");
+
+        RUN_PICOCTL(&res, "--root", root, "list-timers");
+        ASSERT_EQ_INT(res.exit_code, 0);
+        ASSERT_TRUE(strstr(res.out, "NEXT LEFT LAST PASSED UNIT ACTIVATES\n") != NULL);
+        ASSERT_TRUE(strstr(res.out, "0 timers listed.") != NULL);
+        ASSERT_TRUE(strstr(res.out, "Pass --all to see loaded but inactive timers, too.") != NULL);
+
+        RUN_PICOCTL(&res, "--root", root, "list-paths", "--no-legend");
+        ASSERT_STREQ(res.out, "");
+        RUN_PICOCTL(&res, "--root", root, "list-automounts");
+        ASSERT_TRUE(strstr(res.out, "0 automounts listed.") != NULL);
+
+        test_rm_rf(root);
+        free(root);
+}
+
+static void test_show_properties_and_manager(void) {
+        char *root = test_tmpdir_new();
+        struct run_result res;
+
+        ASSERT_TRUE(root != NULL);
+        fixture_unit_state(
+                        root,
+                        "demo.service",
+                        "ActiveState=active\nSubState=running\nLoadState=loaded\nDescription=Demo\nMainPID=42\n");
+        fixture_manager_state(root, "Objective=run\nDefaultTarget=multi-user.target\nNUnits=1\nNJobs=0\n");
+
+        RUN_PICOCTL(&res, "--root", root, "show", "-p", "ActiveState,SubState", "demo.service");
+        ASSERT_STREQ(res.out, "ActiveState=active\nSubState=running\n");
+
+        RUN_PICOCTL(&res, "--root", root, "show", "-p", "MainPID", "--property=Id", "demo.service");
+        ASSERT_STREQ(res.out, "Id=demo.service\nMainPID=42\n");
+
+        RUN_PICOCTL(&res, "--root", root, "show", "-P", "ActiveState", "demo.service");
+        ASSERT_STREQ(res.out, "active\n");
+
+        RUN_PICOCTL(&res, "--root", root, "show", "--value", "-p", "Description", "demo.service");
+        ASSERT_STREQ(res.out, "Demo\n");
+
+        /* no unit: the manager's own properties */
+        RUN_PICOCTL(&res, "--root", root, "show", "-p", "DefaultTarget");
+        ASSERT_STREQ(res.out, "DefaultTarget=multi-user.target\n");
+
+        RUN_PICOCTL(&res, "--root", root, "get-default");
+        ASSERT_STREQ(res.out, "multi-user.target\n");
+
+        test_rm_rf(root);
+        free(root);
+
+        /* nothing published: show says so, get-default falls back to the built-in name */
+        root = test_tmpdir_new();
+        ASSERT_TRUE(root != NULL);
+        RUN_PICOCTL(&res, "--root", root, "show");
+        ASSERT_EQ_INT(res.exit_code, 1);
+        RUN_PICOCTL(&res, "--root", root, "get-default");
+        ASSERT_STREQ(res.out, "default.target\n");
+        ASSERT_EQ_INT(res.exit_code, 0);
+        test_rm_rf(root);
+        free(root);
+}
+
+static void test_list_jobs(void) {
+        char *root = test_tmpdir_new();
+        struct run_result res;
+
+        ASSERT_TRUE(root != NULL);
+        fixture_unit_state(
+                        root,
+                        "a.service",
+                        "ActiveState=activating\nSubState=start\nLoadState=loaded\nJob=3 start\n");
+        fixture_unit_state(
+                        root,
+                        "b.service",
+                        "ActiveState=inactive\nSubState=dead\nLoadState=loaded\nJob=2 restart\n");
+        fixture_unit_state(root, "c.service", "ActiveState=active\nSubState=running\nLoadState=loaded\n");
+
+        RUN_PICOCTL(&res, "--root", root, "list-jobs");
+        ASSERT_EQ_INT(res.exit_code, 0);
+        ASSERT_TRUE(strstr(res.out, "JOB  UNIT") == res.out);
+        {
+                char *b = strstr(res.out, "b.service");
+                char *a = strstr(res.out, "a.service");
+
+                ASSERT_TRUE(a != NULL && b != NULL && b < a); /* by job id */
+                ASSERT_TRUE(strstr(b, "restart") != NULL && strstr(b, "waiting") != NULL);
+                ASSERT_TRUE(strstr(a, "start") != NULL && strstr(a, "running") != NULL);
+        }
+        ASSERT_TRUE(strstr(res.out, "2 jobs listed.") != NULL);
+
+        RUN_PICOCTL(&res, "--root", root, "-o", "json", "list-jobs", "a*");
+        ASSERT_STREQ(res.out,
+                     "[{\"job\":3,\"unit\":\"a.service\",\"type\":\"start\",\"state\":\"running\"}]\n");
+
+        RUN_PICOCTL(&res, "--root", root, "list-jobs", "c*");
+        ASSERT_STREQ(res.out, "No jobs running.\n");
+
+        test_rm_rf(root);
+        free(root);
+}
+
+static void test_is_system_running_options(void) {
+        char *root = test_tmpdir_new();
+        struct run_result res;
+
+        ASSERT_TRUE(root != NULL);
+        fixture_manager_state(root, "NUnits=1\nNJobs=0\n");
+        fixture_unit_state(root, "bad.service", "ActiveState=failed\nSubState=failed\nLoadState=loaded\n");
+
+        RUN_PICOCTL(&res, "--root", root, "is-system-running");
+        ASSERT_STREQ(res.out, "degraded\n");
+        ASSERT_EQ_INT(res.exit_code, 1);
+
+        /* -q drops the word, never the exit status */
+        RUN_PICOCTL(&res, "--root", root, "-q", "is-system-running");
+        ASSERT_STREQ(res.out, "");
+        ASSERT_EQ_INT(res.exit_code, 1);
+
+        /* --wait returns at once when startup is not in progress */
+        RUN_PICOCTL(&res, "--root", root, "--wait", "is-system-running");
+        ASSERT_STREQ(res.out, "degraded\n");
+
+        RUN_PICOCTL(&res, "--root", root, "--wait", "--no-block", "is-system-running");
+        ASSERT_EQ_INT(res.exit_code, 1);
+        ASSERT_STREQ(res.out, "");
+
+        /* no other verb can wait for a job to end */
+        RUN_PICOCTL(&res, "--root", root, "--wait", "start", "bad.service");
+        ASSERT_EQ_INT(res.exit_code, 1);
+
+        test_rm_rf(root);
+        free(root);
+}
+
+static void test_refused_options_and_verbs(void) {
+        char *root = test_tmpdir_new();
+        struct run_result res;
+        static const char * const refused_opts[] = {
+                "--user",
+                "--global",
+                "-H",
+                "-M",
+                "-C",
+                "-r",
+                "--runtime",
+                "--with-dependencies",
+                "--irreversible",
+                "--ignore-dependencies",
+                "--marked",
+                "--firmware-setup",
+                "--image",
+                "--when",
+                "--reboot-argument",
+                "--kernel-cmdline",
+        };
+        static const char * const refused_verbs[] = {
+                "isolate",          "set-default", "rescue", "suspend", "list-dependencies", "edit", "kexec",
+                "show-environment", "freeze",      "revert", "cancel",
+        };
+        size_t i;
+
+        ASSERT_TRUE(root != NULL);
+        fixture_unit_state(root, "x.service", "ActiveState=active\nSubState=running\nLoadState=loaded\n");
+
+        for (i = 0; i < sizeof(refused_opts) / sizeof(refused_opts[0]); i++) {
+                /* every option that takes an argument gets one, so only the refusal can fail it */
+                RUN_PICOCTL(&res, "--root", root, (char *) refused_opts[i], "x", "list-units");
+                ASSERT_EQ_INT(res.exit_code, 1);
+        }
+        for (i = 0; i < sizeof(refused_verbs) / sizeof(refused_verbs[0]); i++) {
+                RUN_PICOCTL(&res, "--root", root, (char *) refused_verbs[i], "x.service");
+                ASSERT_EQ_INT(res.exit_code, 1);
+                ASSERT_STREQ(res.out, "");
+        }
+
+        RUN_PICOCTL(&res, "--root", root, "--job-mode=isolate", "list-units");
+        ASSERT_EQ_INT(res.exit_code, 1);
+        RUN_PICOCTL(&res, "--root", root, "--job-mode=fail", "list-units");
+        ASSERT_EQ_INT(res.exit_code, 0);
+        RUN_PICOCTL(&res, "--root", root, "--fail", "list-units");
+        ASSERT_EQ_INT(res.exit_code, 0);
+        RUN_PICOCTL(&res, "--root", root, "--kill-whom=control", "kill", "x.service");
+        ASSERT_EQ_INT(res.exit_code, 1);
+        RUN_PICOCTL(&res, "--root", root, "--timestamp=bogus", "list-units");
+        ASSERT_EQ_INT(res.exit_code, 1);
+        RUN_PICOCTL(&res, "--root", root, "--preset-mode=bogus", "list-units");
+        ASSERT_EQ_INT(res.exit_code, 1);
+        RUN_PICOCTL(&res, "--root", root, "-s", "NOSUCH", "kill", "x.service");
+        ASSERT_EQ_INT(res.exit_code, 1);
+        RUN_PICOCTL(&res, "--root", root, "--kill-subgroup=../x", "kill", "x.service");
+        ASSERT_EQ_INT(res.exit_code, 1);
+
+        /* a verb that does not exist at all is still the upstream message and status */
+        RUN_PICOCTL(&res, "--root", root, "no-such-verb");
+        ASSERT_EQ_INT(res.exit_code, 1);
+
+        test_rm_rf(root);
+        free(root);
+}
+
+static void test_signal_names(void) {
+        struct run_result res;
+
+        RUN_PICOCTL(&res, "-s", "help");
+        ASSERT_EQ_INT(res.exit_code, 0);
+        ASSERT_TRUE(strstr(res.out, "SIGTERM\n") != NULL && strstr(res.out, "SIGPWR\n") != NULL);
+        RUN_PICOCTL(&res, "--timestamp=help");
+        ASSERT_TRUE(strstr(res.out, "us+utc\n") != NULL);
+        RUN_PICOCTL(&res, "--preset-mode=help");
+        ASSERT_TRUE(strstr(res.out, "enable-only\n") != NULL);
+}
+
+/*
+ * kill: a real child takes a real signal. SIGRTMIN+1 with --kill-value=5
+ * exercises both the name parser and the sigqueue() path; the child has no
+ * handler, so it dies of that exact signal.
+ */
+static void test_kill_signal_and_value(void) {
+        char *root = test_tmpdir_new();
+        struct run_result res;
+        char content[128];
+        pid_t pid;
+        int status;
+
+        ASSERT_TRUE(root != NULL);
+
+        pid = fork();
+        ASSERT_TRUE(pid >= 0);
+        if (pid == 0) {
+                for (;;)
+                        pause();
+        }
+
+        snprintf(content,
+                 sizeof(content),
+                 "ActiveState=active\nSubState=running\nLoadState=loaded\nMainPID=%d\n",
+                 (int) pid);
+        fixture_unit_state(root, "sleeper.service", content);
+
+        RUN_PICOCTL(&res, "--root", root, "kill", "--kill-whom=main", "-s", "SIGRTMIN+1", "--kill-value", "5", "sleeper");
+        ASSERT_EQ_INT(res.exit_code, 0);
+        ASSERT_EQ_INT(waitpid(pid, &status, 0), pid);
+        ASSERT_TRUE(WIFSIGNALED(status));
+        ASSERT_EQ_INT(WTERMSIG(status), SIGRTMIN + 1);
+
+        pid = fork();
+        ASSERT_TRUE(pid >= 0);
+        if (pid == 0) {
+                for (;;)
+                        pause();
+        }
+        snprintf(content,
+                 sizeof(content),
+                 "ActiveState=active\nSubState=running\nLoadState=loaded\nMainPID=%d\n",
+                 (int) pid);
+        fixture_unit_state(root, "sleeper.service", content);
+
+        RUN_PICOCTL(&res, "--root", root, "kill", "--kill-whom=main", "-s", "9", "sleeper.service");
+        ASSERT_EQ_INT(res.exit_code, 0);
+        ASSERT_EQ_INT(waitpid(pid, &status, 0), pid);
+        ASSERT_TRUE(WIFSIGNALED(status));
+        ASSERT_EQ_INT(WTERMSIG(status), SIGKILL);
+
+        test_rm_rf(root);
+        free(root);
+}
+
+/* --now acts on the unit after the symlinks, so without a manager it fails where plain enable does not. */
+static void test_enable_now(void) {
+        char *root = test_tmpdir_new();
+        struct run_result res;
+
+        ASSERT_TRUE(root != NULL);
+        make_fixture_root(root);
+
+        RUN_PICOCTL(&res, "--root", root, "enable", "foo.service");
+        ASSERT_EQ_INT(res.exit_code, 0);
+        RUN_PICOCTL(&res, "--root", root, "disable", "--now", "foo.service");
+        ASSERT_EQ_INT(res.exit_code, 1); /* stop could not reach a manager */
+        RUN_PICOCTL(&res, "--root", root, "is-enabled", "foo.service");
+        ASSERT_STREQ(res.out, "disabled\n"); /* but the symlinks went first */
+
+        RUN_PICOCTL(&res, "--root", root, "enable", "--now", "foo.service");
+        ASSERT_EQ_INT(res.exit_code, 1);
+        RUN_PICOCTL(&res, "--root", root, "is-enabled", "foo.service");
+        ASSERT_STREQ(res.out, "enabled\n");
+
+        /* mask --now stops the unit once it is masked */
+        RUN_PICOCTL(&res, "--root", root, "mask", "--now", "bar.service");
+        ASSERT_EQ_INT(res.exit_code, 1);
+        RUN_PICOCTL(&res, "--root", root, "is-enabled", "bar.service");
+        ASSERT_STREQ(res.out, "masked\n");
+
+        test_rm_rf(root);
+        free(root);
+}
+
+static void test_preset_all_and_mode(void) {
+        char *root = test_tmpdir_new();
+        char presetdir[PATH_MAX];
+        struct run_result res;
+
+        ASSERT_TRUE(root != NULL);
+        make_fixture_root(root);
+        snprintf(presetdir, sizeof(presetdir), "%s%s", root, PICO_PRESET_DIR);
+        ASSERT_EQ_INT(test_write_file(presetdir, "10-test.preset", "disable foo.service\nenable bar.service\n"),
+                      0);
+
+        /* disable-only leaves bar alone although the rule enables it */
+        RUN_PICOCTL(&res, "--root", root, "--preset-mode=disable-only", "preset-all");
+        ASSERT_EQ_INT(res.exit_code, 0);
+        RUN_PICOCTL(&res, "--root", root, "is-enabled", "bar.service");
+        ASSERT_STREQ(res.out, "disabled\n");
+
+        RUN_PICOCTL(&res, "--root", root, "preset-all");
+        ASSERT_EQ_INT(res.exit_code, 0);
+        RUN_PICOCTL(&res, "--root", root, "is-enabled", "bar.service");
+        ASSERT_STREQ(res.out, "enabled\n");
+        RUN_PICOCTL(&res, "--root", root, "is-enabled", "foo.service");
+        ASSERT_STREQ(res.out, "disabled\n");
+
+        /* enable-only does not undo what an enable rule does not cover */
+        RUN_PICOCTL(&res, "--root", root, "enable", "foo.service");
+        RUN_PICOCTL(&res, "--root", root, "--preset-mode=enable-only", "preset", "foo.service");
+        RUN_PICOCTL(&res, "--root", root, "is-enabled", "foo.service");
+        ASSERT_STREQ(res.out, "enabled\n");
+        RUN_PICOCTL(&res, "--root", root, "preset", "foo.service");
+        RUN_PICOCTL(&res, "--root", root, "is-enabled", "foo.service");
+        ASSERT_STREQ(res.out, "disabled\n");
+
+        test_rm_rf(root);
+        free(root);
+}
+
+static void test_add_dependency_and_link(void) {
+        char *root = test_tmpdir_new();
+        char path[PATH_MAX + 64], outside[PATH_MAX];
+        struct run_result res;
+        ssize_t n;
+        char target[PATH_MAX];
+
+        ASSERT_TRUE(root != NULL);
+        make_fixture_root(root);
+
+        RUN_PICOCTL(&res, "--root", root, "add-wants", "multi-user", "static.service");
+        ASSERT_EQ_INT(res.exit_code, 0);
+        ASSERT_TRUE(strstr(res.out, "multi-user.target.wants/static.service") != NULL);
+        snprintf(path, sizeof(path), "%s%s/multi-user.target.wants/static.service", root, PICO_UNIT_DIR);
+        n = readlink(path, target, sizeof(target) - 1);
+        ASSERT_TRUE(n > 0);
+        target[n] = '\0';
+        ASSERT_TRUE(strstr(target, PICO_PACKAGED_UNIT_DIR "/static.service") != NULL);
+
+        RUN_PICOCTL(&res, "--root", root, "add-requires", "foo.target", "static.service");
+        ASSERT_EQ_INT(res.exit_code, 0);
+        snprintf(path, sizeof(path), "%s%s/foo.target.requires/static.service", root, PICO_UNIT_DIR);
+        ASSERT_TRUE(readlink(path, target, sizeof(target)) > 0);
+
+        RUN_PICOCTL(&res, "--root", root, "add-wants", "multi-user.target", "nonexistent.service");
+        ASSERT_EQ_INT(res.exit_code, 1);
+        RUN_PICOCTL(&res, "--root", root, "add-wants", "multi-user.target");
+        ASSERT_EQ_INT(res.exit_code, 1);
+
+        /* link: an absolute file outside the search path */
+        snprintf(outside, sizeof(outside), "%s", root);
+        ASSERT_EQ_INT(test_write_file(outside, "ext.service", static_service), 0);
+        snprintf(path, sizeof(path), "%s/ext.service", root);
+        RUN_PICOCTL(&res, "--root", root, "link", path);
+        ASSERT_EQ_INT(res.exit_code, 0);
+        snprintf(path, sizeof(path), "%s%s/ext.service", root, PICO_UNIT_DIR);
+        n = readlink(path, target, sizeof(target) - 1);
+        ASSERT_TRUE(n > 0);
+        target[n] = '\0';
+        ASSERT_TRUE(strstr(target, "/ext.service") != NULL);
+
+        RUN_PICOCTL(&res, "--root", root, "link", "relative.service");
+        ASSERT_EQ_INT(res.exit_code, 1);
+        RUN_PICOCTL(&res, "--root", root, "link", "/nonexistent/x.service");
+        ASSERT_EQ_INT(res.exit_code, 1);
+
+        test_rm_rf(root);
+        free(root);
+}
+
+/* The personalities, run through a symlink so argv[0] names them. --dry-run, -w and -k
+ * succeed without signalling PID 1, which this unprivileged test could not do anyway. */
+static void run_as(const char *dir, const char *name, char * const rest[], struct run_result *res) {
+        char link[PATH_MAX], self[PATH_MAX];
+        char *args[8];
+        size_t i, n = 0;
+
+        ASSERT_EQ_INT(sibling_binary_path("picoctl", self, sizeof(self)), 0);
+        snprintf(link, sizeof(link), "%s/%s", dir, name);
+        unlink(link);
+        ASSERT_EQ_INT(symlink(self, link), 0);
+
+        args[n++] = link;
+        for (i = 0; rest[i] && n < 7; i++)
+                args[n++] = rest[i];
+        args[n] = NULL;
+        ASSERT_EQ_INT(run_binary(link, args, res), 0);
+}
+
+static void test_power_personalities(void) {
+        char *dir = test_tmpdir_new();
+        struct run_result res;
+
+        ASSERT_TRUE(dir != NULL);
+
+        {
+                char * const a[] = { "-w", NULL };
+                run_as(dir, "halt", a, &res);
+                ASSERT_EQ_INT(res.exit_code, 0);
+        }
+        {
+                char * const a[] = { "--reboot", "-w", "-f", "--no-wall", "-n", "-d", NULL };
+                run_as(dir, "poweroff", a, &res);
+                ASSERT_EQ_INT(res.exit_code, 0);
+        }
+        {
+                char * const a[] = { "--help", NULL };
+                run_as(dir, "reboot", a, &res);
+                ASSERT_EQ_INT(res.exit_code, 0);
+                ASSERT_TRUE(strstr(res.out, "reboot [OPTIONS...] [ARG]") != NULL);
+        }
+        {
+                char * const a[] = { "-w", "arg", NULL };
+                run_as(dir, "reboot", a, &res);
+                ASSERT_EQ_INT(res.exit_code, 1); /* a reboot argument has nowhere to go */
+        }
+        {
+                char * const a[] = { "-w", "extra", NULL };
+                run_as(dir, "halt", a, &res);
+                ASSERT_EQ_INT(res.exit_code, 1);
+        }
+        {
+                char * const a[] = { "--bogus", NULL };
+                run_as(dir, "halt", a, &res);
+                ASSERT_EQ_INT(res.exit_code, 1);
+        }
+
+        {
+                char * const a[] = { "-k", "now", "going", "down", NULL };
+                run_as(dir, "shutdown", a, &res);
+                ASSERT_EQ_INT(res.exit_code, 0);
+        }
+        {
+                char * const a[] = { "-r", "-k", "+0", NULL };
+                run_as(dir, "shutdown", a, &res);
+                ASSERT_EQ_INT(res.exit_code, 0);
+        }
+        {
+                char * const a[] = { "--show", NULL };
+                run_as(dir, "shutdown", a, &res);
+                ASSERT_STREQ(res.out, "No scheduled shutdown.\n");
+                ASSERT_EQ_INT(res.exit_code, 0);
+        }
+        {
+                char * const a[] = { "-c", NULL };
+                run_as(dir, "shutdown", a, &res);
+                ASSERT_EQ_INT(res.exit_code, 0);
+        }
+        {
+                char * const a[] = { "-k", "+5", NULL };
+                run_as(dir, "shutdown", a, &res);
+                ASSERT_EQ_INT(res.exit_code, 1); /* no scheduler */
+        }
+        {
+                char * const a[] = { "-k", "10:30", NULL };
+                run_as(dir, "shutdown", a, &res);
+                ASSERT_EQ_INT(res.exit_code, 1);
+        }
+        {
+                char * const a[] = { "-k", "tomorrow", NULL };
+                run_as(dir, "shutdown", a, &res);
+                ASSERT_EQ_INT(res.exit_code, 1);
+        }
+        {
+                char * const a[] = { "-K", NULL };
+                run_as(dir, "shutdown", a, &res);
+                ASSERT_EQ_INT(res.exit_code, 1);
+        }
+
+        /* the verbs: --dry-run does nothing, successfully; extra arguments are an error */
+        RUN_PICOCTL(&res, "--dry-run", "reboot");
+        ASSERT_EQ_INT(res.exit_code, 0);
+        RUN_PICOCTL(&res, "--dry-run", "poweroff");
+        ASSERT_EQ_INT(res.exit_code, 0);
+        RUN_PICOCTL(&res, "--dry-run", "halt", "x");
+        ASSERT_EQ_INT(res.exit_code, 1);
+
+        test_rm_rf(dir);
+        free(dir);
+}
+
+static void test_whoami(void) {
+        struct run_result res;
+
+        RUN_PICOCTL(&res, "whoami", "notapid");
+        ASSERT_EQ_INT(res.exit_code, 1);
+        RUN_PICOCTL(&res, "whoami", "0");
+        ASSERT_EQ_INT(res.exit_code, 1);
+        /* the test runs outside any unit's cgroup */
+        RUN_PICOCTL(&res, "whoami", "999999999");
+        ASSERT_EQ_INT(res.exit_code, 1);
 }
 
 int main(void) {
@@ -1372,6 +2051,21 @@ int main(void) {
         test_status_no_argument_system_overview();
         test_status_colors();
         test_list_units_colors();
+        test_list_units_filters_and_legend();
+        test_json_output();
+        test_json_unit_files();
+        test_empty_unit_types();
+        test_show_properties_and_manager();
+        test_list_jobs();
+        test_is_system_running_options();
+        test_refused_options_and_verbs();
+        test_signal_names();
+        test_kill_signal_and_value();
+        test_enable_now();
+        test_preset_all_and_mode();
+        test_add_dependency_and_link();
+        test_power_personalities();
+        test_whoami();
         /* Last: it exit(77)s on a host without systemctl, and a SKIP must not
          * hide the in-process checks above. */
         test_oracle_symlinks_byte_identical();
