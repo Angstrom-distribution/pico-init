@@ -48,6 +48,17 @@
 
 #include "util.h"
 
+/* An odd run of trailing backslashes continues the line; an even run is
+ * escaped backslashes (3dab29438c). */
+static bool cs_ends_in_escape(const char *l, size_t n) {
+        size_t k = 0;
+
+        while (k < n && l[n - 1 - k] == '\\')
+                k++;
+
+        return k % 2 == 1;
+}
+
 static char *cs_strip(char *s) {
         char *end;
 
@@ -102,21 +113,36 @@ static int
                 return 0;
 
         if (l[0] == '[') {
-                char *close = strchr(l, ']');
+                size_t k = strlen(l);
                 char *name;
 
-                if (!close) {
+                /*
+                 * A bad header also drops the section, so the assignments
+                 * below it are not attributed to the previous one.
+                 */
+                if (l[k - 1] != ']' || k < 2) {
                         pico_log(PICO_LOG_WARNING,
-                                 "%s:%u: '[' without closing ']', ignoring line",
+                                 "%s:%u: invalid section header, ignoring line",
                                  filename,
                                  line);
+                        *section = pico_mfree(*section);
                         return 0;
                 }
-                *close = '\0';
 
-                name = pico_strdup(l + 1);
+                name = strndup(l + 1, k - 2);
                 if (!name)
                         return -ENOMEM;
+
+                for (const char *c = name; *c; c++)
+                        if ((unsigned char) *c < ' ' || *c == 0x7f) {
+                                pico_log(PICO_LOG_WARNING,
+                                         "%s:%u: section name has control characters, ignoring line",
+                                         filename,
+                                         line);
+                                free(name);
+                                *section = pico_mfree(*section);
+                                return 0;
+                        }
 
                 *section = pico_mfree(*section); /* 91ffff962: free before replacing */
                 *section = name;
@@ -131,6 +157,10 @@ static int
         }
         *eq = '\0';
         lvalue = cs_strip(l);
+        if (*lvalue == '\0') {
+                pico_log(PICO_LOG_WARNING, "%s:%u: missing key name before '=', ignoring line", filename, line);
+                return 0;
+        }
         rvalue = cs_strip(eq + 1);
 
         return handler(filename, line, *section, lvalue, rvalue, userdata);
@@ -216,7 +246,7 @@ int pico_conf_scan(const char *filename, pico_conf_handler_t handler, void *user
                 }
 
                 n = (ssize_t) strlen(l);
-                if (n > 0 && l[n - 1] == '\\') {
+                if (n > 0 && cs_ends_in_escape(l, (size_t) n)) {
                         l[n - 1] = '\0';
 
                         if (l != continuation) {

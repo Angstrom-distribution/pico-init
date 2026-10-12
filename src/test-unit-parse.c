@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "conf-scan.h"
 #include "manager.h"
 #include "service.h"
 #include "test-util.h"
@@ -971,6 +972,102 @@ static void test_env_file_shell_quoting(void) {
 
         test_rm_rf(dir);
         free(dir);
+}
+
+struct scan_seen {
+        unsigned n;
+        char first_section[32];
+        char first_key[32];
+};
+
+static int
+                scan_record(const char *filename,
+                            unsigned line,
+                            const char *section,
+                            const char *key,
+                            const char *value,
+                            void *userdata) {
+        struct scan_seen *seen = userdata;
+
+        (void) filename;
+        (void) line;
+        (void) value;
+
+        if (seen->n++ == 0) {
+                snprintf(seen->first_section, sizeof(seen->first_section), "%s", section ? section : "(none)");
+                snprintf(seen->first_key, sizeof(seen->first_key), "%s", key);
+        }
+        return 0;
+}
+
+static int scan_string(const char *content, struct scan_seen *seen) {
+        char *dir = test_tmpdir_new();
+        char path[PATH_MAX];
+        int r;
+
+        ASSERT_TRUE(dir != NULL);
+        ASSERT_EQ_INT(test_write_file(dir, "f", content), 0);
+        snprintf(path, sizeof(path), "%s/f", dir);
+        memset(seen, 0, sizeof(*seen));
+        r = pico_conf_scan(path, scan_record, seen);
+        test_rm_rf(dir);
+        free(dir);
+        return r;
+}
+
+/* A line ending in an escaped backslash (an even run) is complete; only an
+ * odd run continues it. */
+static void test_backslash_pairs_do_not_continue(void) {
+        struct scan_seen seen;
+        Service *s;
+        Manager *m;
+        char *dir;
+        Unit *u;
+
+        ASSERT_EQ_INT(scan_string("[S]\nA=x\\\\\nB=y\n", &seen), 0);
+        ASSERT_EQ_INT(seen.n, 2);
+        ASSERT_STREQ(seen.first_key, "A");
+
+        ASSERT_EQ_INT(scan_string("[S]\nA=x\\\\\\\nB=y\n", &seen), 0);
+        ASSERT_EQ_INT(seen.n, 1);
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "bs.service",
+                                      "[Service]\n"
+                                      "Environment=FOO=C:\\\\\n"
+                                      "ExecStart=/bin/true\n"),
+                      0);
+        m = manager_for(dir);
+        u = load_one(m, "bs.service");
+        s = (Service *) u;
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        ASSERT_STREQ(s->environment[0], "FOO=C:\\");
+        ASSERT_STREQ(s->exec_start[0], "/bin/true");
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* A header must end in ']' and carry no control characters; an assignment
+ * with no key never reaches the handler. */
+static void test_section_header_and_key_validation(void) {
+        struct scan_seen seen;
+
+        ASSERT_EQ_INT(scan_string("[Service]\nA=1\n", &seen), 0);
+        ASSERT_STREQ(seen.first_section, "Service");
+
+        /* a refused header leaves its keys in no section, not the old one */
+        ASSERT_EQ_INT(scan_string("[S]\n[Service]junk\nA=1\n", &seen), 0);
+        ASSERT_STREQ(seen.first_section, "(none)");
+
+        ASSERT_EQ_INT(scan_string("[S]\n[Serv\001ice]\nA=1\n", &seen), 0);
+        ASSERT_STREQ(seen.first_section, "(none)");
+
+        ASSERT_EQ_INT(scan_string("[S]\n=nokey\nA=1\n", &seen), 0);
+        ASSERT_EQ_INT(seen.n, 1);
+        ASSERT_STREQ(seen.first_key, "A");
 }
 
 /*
@@ -2361,6 +2458,8 @@ int main(void) {
         test_quoting_and_glued_quotes();
         test_exec_c_escapes();
         test_env_file_shell_quoting();
+        test_backslash_pairs_do_not_continue();
+        test_section_header_and_key_validation();
         test_exec_start_pre_list_and_reset();
         test_standard_output_and_error();
         test_invalid_dependency_names_are_rejected();
