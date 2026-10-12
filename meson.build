@@ -3,7 +3,7 @@
 
 project(
   'pico-init', 'c',
-  version: '0.2.2',
+  version: '0.3.0',
   license: 'GPL-2.0-or-later',
   default_options: [
     'c_std=gnu17',
