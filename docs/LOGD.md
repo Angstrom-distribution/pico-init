@@ -46,12 +46,18 @@ unlinking a stale socket first. Failure to bind one socket is a warning;
 
 ## Command line
 
-`logd` takes two options, both of the form `--option=value`:
+`logd` takes these options, the first two of the form `--option=value`:
 
 | Option | Effect |
 |--------|--------|
 | `--runtime-dir=DIR` | Ring directory instead of `/run/logd`. In standalone mode the stdout socket moves to `DIR/stdout` too; `/dev/log` stays fixed. |
 | `--max-bytes=N` | Ring cap in bytes instead of 2 MiB. Values of 0 or less are ignored. |
+| `-h`, `--help`, `--version` | Print and exit 0. systemd-journald has neither and would read them as a namespace name. |
+
+systemd-journald takes one optional argument, a log namespace. `logd` has one
+ring, so a non-empty namespace name is refused with exit 1, and so is more
+than one argument or an unknown option. An empty argument means no namespace.
+The `systemd.journald.*` kernel parameters are not read.
 
 There is no configuration file and no `logd.conf`. `SIGTERM` and `SIGINT`
 flush the pending line tails (see below) and end `logd` with status 0.

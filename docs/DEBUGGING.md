@@ -25,10 +25,10 @@ version line:
 pico-init[info]: pico-init <version> (<git description>) running as PID 1
 ```
 
-There is no log-level setting. `pico_log()` has no runtime filter, and PID 1
-does not parse the kernel command line or read any environment variable to
-change its logging. Every record is written; `debug` records appear in the
-ring along with the rest. To see only the important ones, filter when
+There is no log-level setting. `pico_log()` has no runtime filter:
+`--log-level=`, `systemd.log_level=` and `debug` are accepted and change
+nothing. Every record is written; `debug` records appear in the ring along
+with the rest. To see only the important ones, filter when
 reading (`picolog -p warning`, below).
 
 Only PID 1 redirects to `/dev/kmsg`. `logd` and `netd` are supervised
@@ -40,17 +40,50 @@ Because `logd` reads `/dev/kmsg` from the start of the ring, everything PID 1
 logged before `logd` started is in the log once `logd` is up. Before that,
 read it on the console or with `dmesg`.
 
-### Kernel command line
+### Kernel command line and options
 
-PID 1 does not read `/proc/cmdline` for its own options. What the kernel
-command line controls is what the kernel does with the init process:
+PID 1 reads `/proc/cmdline` and its own argv, in the spelling of systemd's
+`src/core/main.c`; argv is applied last and wins. What is acted on:
+
+| Setting | Effect |
+|---------|--------|
+| `systemd.unit=UNIT`, `--unit=UNIT` | Boot this unit instead of `default.target`. An invalid name is ignored with a warning. |
+| `emergency`, `-b` | `emergency.target` |
+| `rescue`, `single`, `s`, `S`, `-s`, `1` | `rescue.target` |
+| `2`, `3`, `4` | `multi-user.target` |
+| `5` | `graphical.target` |
+| `systemd.show_status=BOOL`, `--show-status[=BOOL]` | A false value turns the console status channel and the greeting off. `auto` and `error` behave as `yes`. `quiet` does not change it. |
+| `systemd.gpt_auto=BOOL` | A false value skips swap-partition discovery. |
+| `fstab=BOOL` | A false value skips mounting `/etc/fstab` entries; the root check and swap detection still read the file. |
+
+The target must exist as a unit: this repository does not ship `rescue.target`
+or `emergency.target`, so those words boot only on images that provide them.
+The kernel command line is read up to a lone `--`, and double quotes group a
+value containing spaces. `rd.` spellings are for an initrd and are ignored.
+
+Every other documented `systemd.*` setting, and the matching options, is
+accepted and ignored, with one log line naming it. Settings that only tune
+diagnostics (`systemd.log_*`, `systemd.crash_*`, `systemd.dump_core`) log at
+info level; settings that change what the machine runs or how
+(`systemd.mask=`, `systemd.wants=`, `systemd.setenv=`, `systemd.machine_id=`,
+`systemd.confirm_spawn`, `systemd.default_standard_output=`, the watchdog,
+credential and timeout settings) log a warning. An unknown `systemd.*` key is
+silent. `--version` and `--help` print and exit when not PID 1.
+
+`--test`, `--user`, `--dump-configuration-items`, `--dump-bus-properties` and
+`--bus-introspect=` are refused with exit status 1: each asks for output or a
+mode that does not exist here. `--system`, `--no-pager`, `-D`, `--switched-root`
+and `--deserialize=` are accepted; there is no re-execution, so no state is
+restored. As PID 1 a bad option is reported and parsing stops; it never stops
+the boot.
+
+Beyond that, the kernel command line selects what the kernel does with init:
 
 - `init=/path` selects the binary the kernel runs as PID 1.
 - Console selection (`console=`) decides where `/dev/console` leads, and so
   where the console status channel appears.
 
-The only consumer of `/proc/cmdline` in PID 1 is the `/etc/fstab` pass
-(`fstab-mount.c`), which reads the `ubi.mtd=` parameters from it to attach UBI
+The `/etc/fstab` pass also reads `ubi.mtd=` from `/proc/cmdline` to attach UBI
 volumes before mounting.
 
 ## Reading unit state

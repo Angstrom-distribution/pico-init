@@ -10,7 +10,8 @@ daemon and does not talk to PID 1.
 
 ## Running devd
 
-devd takes no arguments and has no configuration file. The shipped unit is:
+devd has no configuration file. Its command line is udevd's; see
+[Command line](#command-line). The shipped unit is:
 
 ```ini
 [Unit]
@@ -29,6 +30,31 @@ Whether the unit is enabled is decided by the preset files, see
 [PRESET.md](PRESET.md). `SIGTERM` and `SIGINT` make devd exit; other signals
 are ignored. There is no reload: a restarted devd re-derives its state from
 `/sys` (see Coldplug below), so there is nothing to reload or to lose.
+
+## Command line
+
+The options of systemd-udevd v262:
+
+| Option | Effect |
+|--------|--------|
+| `-d`, `--daemon` | Real: fork, `setsid()`, `chdir("/")`, stdio to `/dev/null`, then run. |
+| `-h`, `--help`; `-V`, `--version` | Print and exit 0. |
+| `-D`, `--debug` | Accepted, no effect: every record is already written. |
+| `-c`, `--children-max=` | Accepted, no effect: events run in the one loop. |
+| `-e`, `--exec-delay=` | Accepted, no effect. |
+| `-t`, `--event-timeout=` | Accepted, no effect. |
+| `-N`, `--resolve-names=early\|late\|never` | Accepted, no effect. |
+| `--timeout-signal=` | Accepted, no effect. |
+
+A value that does not parse is a warning, as in udevd. An unknown option
+exits 1.
+
+The kernel parameters `udev.log_level=`, `udev.log_priority=`,
+`udev.children_max=`, `udev.exec_delay=`, `udev.event_timeout=`,
+`udev.timeout_signal=` and `udev.trace` (with the `rd.` prefix) are read and
+ignored. `udev.blockdev_read_only` is a safety setting that devd does not
+implement; when it is on, devd logs a warning at start and block devices stay
+writable.
 
 ## Startup and coldplug
 

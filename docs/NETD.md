@@ -20,6 +20,10 @@ interface that appears at any time is configured when it appears. The
 shipped unit is enabled or not by the distribution's preset file (see
 [PRESET.md](PRESET.md)). `network-online.target` is not provided.
 
+netd takes `--help` and `--version`, which print and exit 0, and no other
+argument, as systemd-networkd. `--bus-introspect=` is refused with exit 1:
+there is no bus to describe. Any other option or argument exits 1.
+
 Startup order:
 
 1. Write `net.core.default_qdisc` (the first of `fq_codel`, `fq`, `cake` the
