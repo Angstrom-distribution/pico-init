@@ -120,8 +120,8 @@ logged and skipped.
 | `ExecStop=`             | List.                                           |
 | `ExecStopPost=`         | List.                                           |
 | `ExecReload=`           | Stored, recorded as degraded, never run.        |
-| `Environment=`          | Quoting as in `ExecStart=`; accumulates.        |
-| `EnvironmentFile=`      | Absolute path, optional leading `-`; accumulates. |
+| `Environment=`          | Quoting and C escapes as in `ExecStart=`; accumulates. |
+| `EnvironmentFile=`      | Absolute path, optional leading `-`; accumulates. Values are unquoted as by the shell; a file over 4 MiB is refused. |
 | `User=`, `Group=`       | Name or numeric id, resolved at each start.     |
 | `SupplementaryGroups=`  | List; accumulates.                              |
 | `PIDFile=`              | Relative paths are taken under `/run/`.         |
@@ -313,6 +313,8 @@ builder:
   ships a `disable *` rule.
 - Only units that have `WantedBy=` or `RequiredBy=` and no symlink already
   deciding them are considered.
+- An `ignore` rule leaves the unit untouched at boot. `picoctl preset` and
+  `list-unit-files` read it as no rule, so `picoctl preset` enables the unit.
 
 ### Service environment
 
@@ -329,6 +331,10 @@ A unit with `User=` whose account exists in the passwd database gets `USER`,
 
 ### Other differences
 
+- An unknown escape such as `\q` in `Exec*=` or `Environment=` is kept as
+  written; systemd refuses `Environment=` with one.
+- A line in a unit file has no length limit; systemd refuses a line over
+  1 MiB.
 - There is no D-Bus. `BusName=` is recorded as dropped, and `Type=dbus`
   degrades as above.
 - Only `Requires=`, `Wants=`, `Before=`, `After=` and `Conflicts=` are

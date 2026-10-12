@@ -788,7 +788,7 @@ static void test_preset_ignore_leaves_the_unit_alone(void) {
                                       "foo.service",
                                       "[Unit]\n[Service]\nExecStart=/bin/true\n[Install]\nWantedBy=default.target\n"),
                       0);
-        ASSERT_EQ_INT(test_write_file(pdir, "10-test.preset", "ignore foo.service\ndisable *\n"), 0);
+        ASSERT_EQ_INT(test_write_file(pdir, "10-test.preset", "ignore foo.service\nenable *\n"), 0);
         ASSERT_EQ_INT(test_write_file(pdir, "20-test.preset", "enable foo.service\n"), 0);
 
         m = manager_for(udir);

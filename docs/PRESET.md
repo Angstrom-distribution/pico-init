@@ -42,14 +42,15 @@ disable *
 | --- | --- |
 | `enable GLOB` | Units whose name matches GLOB are enabled. |
 | `disable GLOB` | Units whose name matches GLOB are not enabled. |
+| `ignore GLOB` | Units whose name matches GLOB are left as they are: not enabled, and no later rule applies. |
 | empty, or starting with `#` or `;` | Ignored. |
 | anything else | Ignored. |
 
 Leading and trailing blanks are stripped. The keyword must be followed by a
 space or tab, and a rule with no glob is skipped. GLOB is matched against
-the complete unit name with `fnmatch(3)` and no flags, so `*`, `?` and
-`[...]` work. Only `enable` and `disable` exist; there are no
-`disable-all`-style directives, no instance lists, and no `ignore`.
+the complete unit name with `fnmatch(3)` and `FNM_NOESCAPE`, so `*`, `?` and
+`[...]` work and a backslash is literal. There are no `disable-all`-style
+directives and no instance lists.
 
 The first matching line wins, in file order and then line order within the
 file. A rule for a unit type pico-init does not implement, such as
