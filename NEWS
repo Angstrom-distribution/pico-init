@@ -1,3 +1,46 @@
+# CHANGES WITH 0.2.1:
+
+        A small release: unit files that ask for KillMode= are now honoured,
+        and the repository gained reference documentation.
+
+##        PID 1 and unit files:
+
+        * KillMode= (control-group, mixed, process and none), KillSignal=,
+          SendSIGHUP= and SendSIGKILL= are read from service units and shown
+          by picoctl show. Previously every unit behaved as control-group:
+          when the main process exited, the whole cgroup was killed. With
+          process or none, processes the service left behind (a screen or
+          tmux session started from an ssh login, for example) keep running
+          when the main process exits and when the unit is stopped, and a
+          stop does not wait for them. With mixed, the main process gets the
+          signal first and the rest of the cgroup is killed afterwards. A
+          stop that times out under none, or with SendSIGKILL=no, abandons
+          the remaining processes instead of killing them.
+
+        * A unit that is removed while processes still run in its cgroup
+          hands the bare cgroup to the manager, which removes it once it is
+          empty.
+
+        * At shutdown, PID 1 sends SIGTERM to every remaining process, waits
+          up to five seconds and then sends SIGKILL before the final sync,
+          as systemd-shutdown does. Processes left behind by KillMode=process
+          or none units are therefore no longer cut off by the reboot.
+
+##        Miscellaneous:
+
+        * The docs directory holds reference documentation modelled on
+          systemd's: the architecture and boot sequence, netd, logd and devd,
+          the compatibility libraries, differences from systemd, presets,
+          socket activation, cgroup delegation, distro porting, debugging,
+          coding style and the release process.
+
+        * The project URL compiled into the binaries points at the
+          Angstrom-distribution organisation on GitHub.
+
+##        Contributions from:
+
+        Koen Kooi
+
 # CHANGES WITH 0.2.0:
 
         This is the first tagged release of pico-init, a small
