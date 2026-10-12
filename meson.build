@@ -645,6 +645,12 @@ foreach t : tmpfiles_tests
   test(t, exe, depends: pico_tmpfiles_exe)
 endforeach
 
+test(
+  'test-tmpfiles-cli',
+  find_program('src/tmpfiles/test-tmpfiles-cli.sh'),
+  args: [pico_tmpfiles_exe],
+)
+
 # picoctl is defined after logd below, because it links logd's ring reader.
 
 # ---------------------------------------------------------------------------

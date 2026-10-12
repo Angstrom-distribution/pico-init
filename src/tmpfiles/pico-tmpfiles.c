@@ -7,7 +7,9 @@
  * this file into the binary alone and tmpfiles-core into every test, so
  * anything a test needs has to be defined in the core.
  *
- * --purge is refused rather than silently accepted as a no-op.
+ * --purge, --dry-run, --user, --image and --image-policy are refused rather
+ * than silently accepted as a no-op: a script passing them expects an effect
+ * this binary does not have. --no-pager is accepted, as there is no pager.
  */
 
 #include "tmpfiles.h"
@@ -20,6 +22,8 @@
 
 #include "../util.h"
 
+#define COMMENT_CHARS "#;"
+
 static void help(void) {
         printf("Usage: pico-tmpfiles [OPTIONS...] [CONFIGURATION FILE...]\n"
                "\n"
@@ -30,6 +34,8 @@ static void help(void) {
                "     --create               Create and adjust files and directories\n"
                "     --clean                Clean up files and directories\n"
                "     --remove               Remove files and directories marked for removal\n"
+               "     --cat-config           Show configuration files\n"
+               "     --tldr                 Show non-comment parts of configuration files\n"
                "  -h --help                 Show this help\n"
                "     --version              Show package version\n"
                "\n"
@@ -40,8 +46,173 @@ static void help(void) {
                "     --exclude-prefix=PATH  Ignore rules with the specified prefix\n"
                "  -E                        Ignore rules prefixed with /dev, /proc, /run, /sys\n"
                "     --root=PATH            Operate on an alternate filesystem root\n"
+               "     --replace=PATH         Treat arguments as replacement for PATH\n"
+               "     --inline               Treat arguments as configuration lines\n"
+               "     --no-pager             Accepted and ignored, there is no pager\n"
                "\n"
-               "--purge is not implemented.\n");
+               "--purge, -n/--dry-run, --user, --image and --image-policy are not implemented.\n");
+}
+
+static int refuse(const char *what) {
+        pico_log(PICO_LOG_ERR, "pico-tmpfiles: %s is not implemented", what);
+        return EXIT_FAILURE;
+}
+
+/* Same output as systemd's cat_file() without colour or hyperlinks. */
+static int cat_config(PicoTmpfiles *t, bool tldr) {
+        char **files = NULL, **f;
+        bool newline = false;
+        int r, ret = EXIT_SUCCESS;
+
+        r = pico_tmpfiles_list_config_files(t, &files);
+        if (r < 0)
+                return EXIT_FAILURE;
+
+        for (f = files; *f; f++) {
+                char *line = NULL;
+                size_t cap = 0;
+                ssize_t n;
+                FILE *fp = fopen(*f, "re");
+
+                if (!fp) {
+                        pico_log(PICO_LOG_ERR, "pico-tmpfiles: failed to open '%s': %s", *f, strerror(errno));
+                        ret = EXIT_FAILURE;
+                        continue;
+                }
+
+                if (newline)
+                        putchar('\n');
+                newline = true;
+                printf("# %s\n", *f);
+
+                while ((n = getline(&line, &cap, fp)) >= 0) {
+                        const char *l = line;
+
+                        if (n > 0 && line[n - 1] == '\n')
+                                line[--n] = '\0';
+
+                        while (*l == ' ' || *l == '\t')
+                                l++;
+
+                        if (tldr && (*l == '\0' || strchr(COMMENT_CHARS, *l) || strcmp(l, "\\") == 0))
+                                continue;
+
+                        printf("%s\n", line);
+                }
+
+                free(line);
+                fclose(fp);
+        }
+
+        pico_strv_free(files);
+        return ret;
+}
+
+static const char *base_name(const char *path) {
+        const char *b = strrchr(path, '/');
+
+        return b ? b + 1 : path;
+}
+
+/* Feed one argument to the parser: a configuration line, or a file found by
+ * path or, for a bare name, through the precedence walk. 0, -ENOMEM, or -1
+ * once it has been logged as fatal. */
+static int apply_arg(PicoTmpfiles *t, char **all, const char *arg, unsigned pos, bool inline_) {
+        const char *chosen = NULL;
+        char **f;
+        int r;
+
+        if (inline_) {
+                while (*arg == ' ' || *arg == '\t')
+                        arg++;
+                r = pico_tmpfiles_parse_line(t, "(argument)", pos, arg);
+                return r == -ENOMEM ? r : 0;
+        }
+
+        if (strchr(arg, '/'))
+                chosen = arg;
+        else
+                for (f = all; *f; f++)
+                        if (strcmp(base_name(*f), arg) == 0) {
+                                chosen = *f;
+                                break;
+                        }
+
+        if (!chosen) {
+                pico_log(PICO_LOG_ERR, "pico-tmpfiles: failed to find '%s'", arg);
+                return -1;
+        }
+
+        r = pico_tmpfiles_read_file(t, chosen);
+        if (r < 0) {
+                pico_log(PICO_LOG_ERR, "pico-tmpfiles: failed to read '%s': %s", chosen, strerror(-r));
+                return -1;
+        }
+        return 0;
+}
+
+/* Index into PICO_TMPFILES_CONF_DIRS of the directory holding `path`, -1 if none. */
+static int conf_dir_index(PicoTmpfiles *t, const char *path) {
+        static const char * const dirs[] = { PICO_TMPFILES_CONF_DIRS };
+        size_t k, rl = t->root ? strlen(t->root) : 0;
+
+        for (k = 0; k < sizeof(dirs) / sizeof(dirs[0]); k++) {
+                size_t dl = strlen(dirs[k]);
+
+                if (rl > 0 && strncmp(path, t->root, rl) != 0)
+                        continue;
+                if (strncmp(path + rl, dirs[k], dl) == 0 && path[rl + dl] == '/' &&
+                    strchr(path + rl + dl + 1, '/') == NULL)
+                        return (int) k;
+        }
+        return -1;
+}
+
+/* --replace=: the arguments take the place of PATH in the sorted walk over all
+ * files. A same-named file in a directory searched earlier still wins, as in
+ * systemd's conf_files_list_with_replacement(). */
+static int read_replaced(PicoTmpfiles *t, char **all, const char *replace, int argc, char **argv, bool inline_) {
+        const char *base = base_name(replace);
+        char *rooted = NULL;
+        bool skip = false, done = false;
+        int rd, r, k;
+        char **f;
+
+        r = asprintf(&rooted, "%s%s", t->root ? t->root : "", replace);
+        if (r < 0)
+                return -ENOMEM;
+        rd = conf_dir_index(t, rooted);
+        free(rooted);
+        if (rd < 0) {
+                pico_log(PICO_LOG_ERR, "pico-tmpfiles: --replace= must name a file in a tmpfiles.d directory");
+                return -1;
+        }
+
+        for (f = all; *f; f++)
+                if (strcmp(base_name(*f), base) == 0 && conf_dir_index(t, *f) < rd)
+                        skip = true;
+
+        for (f = all;; f++) {
+                bool end = !*f;
+
+                if (!skip && !done && (end || strcmp(base_name(*f), base) >= 0)) {
+                        for (k = 0; k < argc; k++) {
+                                r = apply_arg(t, all, argv[k], (unsigned) k + 1, inline_);
+                                if (r < 0)
+                                        return r;
+                        }
+                        done = true;
+                }
+                if (end)
+                        break;
+                if (!skip && strcmp(base_name(*f), base) == 0)
+                        continue;
+
+                r = pico_tmpfiles_read_file(t, *f);
+                if (r < 0)
+                        pico_log(PICO_LOG_WARNING, "failed to read %s: %s", *f, strerror(-r));
+        }
+        return 0;
 }
 
 int main(int argc, char *argv[]) {
@@ -56,6 +227,15 @@ int main(int argc, char *argv[]) {
                 ARG_PREFIX,
                 ARG_EXCLUDE_PREFIX,
                 ARG_ROOT,
+                ARG_CAT_CONFIG,
+                ARG_TLDR,
+                ARG_REPLACE,
+                ARG_INLINE,
+                ARG_NO_PAGER,
+                ARG_DRY_RUN,
+                ARG_USER,
+                ARG_IMAGE,
+                ARG_IMAGE_POLICY,
         };
         static const struct option options[] = {
                 {           "help",       no_argument, NULL,                'h' },
@@ -69,10 +249,20 @@ int main(int argc, char *argv[]) {
                 {         "prefix", required_argument, NULL,         ARG_PREFIX },
                 { "exclude-prefix", required_argument, NULL, ARG_EXCLUDE_PREFIX },
                 {           "root", required_argument, NULL,           ARG_ROOT },
+                {     "cat-config",       no_argument, NULL,     ARG_CAT_CONFIG },
+                {           "tldr",       no_argument, NULL,           ARG_TLDR },
+                {        "replace", required_argument, NULL,        ARG_REPLACE },
+                {         "inline",       no_argument, NULL,         ARG_INLINE },
+                {       "no-pager",       no_argument, NULL,       ARG_NO_PAGER },
+                {        "dry-run",       no_argument, NULL,        ARG_DRY_RUN },
+                {           "user",       no_argument, NULL,           ARG_USER },
+                {          "image", required_argument, NULL,          ARG_IMAGE },
+                {   "image-policy", required_argument, NULL,   ARG_IMAGE_POLICY },
                 {             NULL,                 0, NULL,                  0 },
         };
         PicoTmpfiles *t = NULL;
-        bool create = false;
+        bool create = false, cat = false, tldr = false, inline_ = false;
+        const char *replace = NULL;
         unsigned cleanup = 0;
         int c, r, q, ret = EXIT_FAILURE;
 
@@ -82,7 +272,7 @@ int main(int argc, char *argv[]) {
                 return EXIT_FAILURE;
         }
 
-        while ((c = getopt_long(argc, argv, "hE", options, NULL)) >= 0) {
+        while ((c = getopt_long(argc, argv, "hEn", options, NULL)) >= 0) {
                 switch (c) {
                 case 'h':
                         help();
@@ -107,8 +297,55 @@ int main(int argc, char *argv[]) {
                         break;
 
                 case ARG_PURGE:
-                        pico_log(PICO_LOG_ERR, "pico-tmpfiles: --purge is not implemented");
+                        ret = refuse("--purge");
                         goto finish;
+
+                case 'n':
+                case ARG_DRY_RUN:
+                        ret = refuse("--dry-run");
+                        goto finish;
+
+                case ARG_USER:
+                        ret = refuse("--user");
+                        goto finish;
+
+                case ARG_IMAGE:
+                        ret = refuse("--image");
+                        goto finish;
+
+                case ARG_IMAGE_POLICY:
+                        ret = refuse("--image-policy");
+                        goto finish;
+
+                case ARG_CAT_CONFIG:
+                        cat = true;
+                        break;
+
+                case ARG_TLDR:
+                        cat = tldr = true;
+                        break;
+
+                case ARG_REPLACE:
+                        if (optarg[0] != '/') {
+                                pico_log(PICO_LOG_ERR,
+                                         "pico-tmpfiles: the argument to --replace= must be an absolute path");
+                                goto finish;
+                        }
+                        r = (int) strlen(optarg);
+                        if (r < 5 || strcmp(optarg + r - 5, ".conf") != 0) {
+                                pico_log(PICO_LOG_ERR,
+                                         "pico-tmpfiles: the argument to --replace= must have the extension '.conf'");
+                                goto finish;
+                        }
+                        replace = optarg;
+                        break;
+
+                case ARG_INLINE:
+                        inline_ = true;
+                        break;
+
+                case ARG_NO_PAGER:
+                        break;
 
                 case ARG_BOOT:
                         t->boot = true;
@@ -161,15 +398,36 @@ int main(int argc, char *argv[]) {
                 }
         }
 
-        if (!create && cleanup == 0) {
+        if (!create && cleanup == 0 && !cat) {
                 pico_log(PICO_LOG_ERR,
-                         "pico-tmpfiles: you need to specify at least one of --clean, --create, --remove");
+                         "pico-tmpfiles: you need to specify at least one of --clean, --create, --remove, "
+                         "or --purge");
                 goto finish;
         }
 
-        if (optind < argc) {
-                /* named files only, as upstream: a path is read as is, a bare
-                 * name is found through the same precedence walk */
+        if (cat && replace) {
+                pico_log(PICO_LOG_ERR, "pico-tmpfiles: --replace= is not supported with --cat-config/--tldr");
+                goto finish;
+        }
+
+        if (cat && inline_) {
+                pico_log(PICO_LOG_ERR, "pico-tmpfiles: --inline is not supported with --cat-config/--tldr");
+                goto finish;
+        }
+
+        if (replace && optind >= argc) {
+                pico_log(PICO_LOG_ERR,
+                         "pico-tmpfiles: when --replace= is given, some configuration items must be specified");
+                goto finish;
+        }
+
+        if (cat) {
+                ret = cat_config(t, tldr);
+                goto finish;
+        }
+
+        if (optind < argc || replace) {
+                /* named files or lines only, as upstream */
                 char **all = NULL;
                 int k;
 
@@ -177,40 +435,18 @@ int main(int argc, char *argv[]) {
                 if (r < 0)
                         goto oom;
 
-                for (k = optind; k < argc; k++) {
-                        const char *arg = argv[k];
-                        const char *chosen = NULL;
-                        char **f;
-
-                        if (strchr(arg, '/'))
-                                chosen = arg;
-                        else
-                                for (f = all; *f; f++) {
-                                        const char *bn = strrchr(*f, '/');
-
-                                        if (bn && strcmp(bn + 1, arg) == 0) {
-                                                chosen = *f;
-                                                break;
-                                        }
-                                }
-
-                        if (!chosen) {
-                                pico_log(PICO_LOG_ERR, "pico-tmpfiles: failed to find '%s'", arg);
-                                pico_strv_free(all);
-                                goto finish;
-                        }
-
-                        r = pico_tmpfiles_read_file(t, chosen);
-                        if (r < 0) {
-                                pico_log(PICO_LOG_ERR,
-                                         "pico-tmpfiles: failed to read '%s': %s",
-                                         chosen,
-                                         strerror(-r));
-                                pico_strv_free(all);
-                                goto finish;
-                        }
+                if (replace)
+                        r = read_replaced(t, all, replace, argc - optind, argv + optind, inline_);
+                else {
+                        r = 0;
+                        for (k = optind; r >= 0 && k < argc; k++)
+                                r = apply_arg(t, all, argv[k], (unsigned) (k - optind) + 1, inline_);
                 }
                 pico_strv_free(all);
+                if (r == -ENOMEM)
+                        goto oom;
+                if (r < 0)
+                        goto finish;
         } else {
                 r = pico_tmpfiles_read_config(t);
                 if (r < 0)
