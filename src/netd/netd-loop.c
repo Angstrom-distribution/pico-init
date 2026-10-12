@@ -804,7 +804,9 @@ int netd_loop_run(Netd *n) {
                 if (n->reload_requested) {
                         n->reload_requested = false;
 
-                        if (n->reload_handler) {
+                        /* A reload queued alongside SIGTERM would reconfigure
+                         * links in the middle of shutdown. */
+                        if (n->reload_handler && n->objective == NETD_RUNNING) {
                                 int r = n->reload_handler(n);
 
                                 if (r < 0)

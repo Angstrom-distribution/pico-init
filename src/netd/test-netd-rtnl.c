@@ -593,12 +593,43 @@ static void test_netns_dhcp_end_to_end(void) {
         printf("test-netd-rtnl: DHCP client-vs-server end-to-end subtest ok\n");
 }
 
+static int reload_calls;
+
+static int count_reload(Netd *n) {
+        (void) n;
+        reload_calls++;
+        return 0;
+}
+
+/* SIGHUP read in the same batch as (or before) SIGTERM must not reconfigure
+ * links while the daemon is going down. */
+static void test_reload_dropped_after_exit_request(void) {
+        Netd *n = NULL;
+
+        enter_test_netns();
+
+        ASSERT_TRUE(netd_new(&n) == 0);
+        n->reload_handler = count_reload;
+
+        ASSERT_TRUE(raise(SIGHUP) == 0);
+        ASSERT_TRUE(raise(SIGTERM) == 0);
+
+        ASSERT_TRUE(netd_loop_run(n) == 0);
+        ASSERT_EQ_INT(n->objective, NETD_EXIT);
+        ASSERT_EQ_INT(reload_calls, 0);
+
+        netd_free(n);
+
+        printf("test-netd-rtnl: reload after SIGTERM subtest ok\n");
+}
+
 int main(void) {
         test_event_names();
         test_link_snapshot_shape();
         test_netns_rtnl();
         test_netns_static_network_and_sighup();
         test_netns_dhcp_end_to_end();
+        test_reload_dropped_after_exit_request();
 
         printf("test-netd-rtnl: ok\n");
         return EXIT_SUCCESS;
