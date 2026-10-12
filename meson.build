@@ -814,6 +814,11 @@ libsystemd_compat_sources = files(
   'src/compat/libsystemd/sd-login-cgroup.c',
   'src/compat/libsystemd/sd-login.c',
   'src/compat/libsystemd/sd-hwdb.c',
+  # sd-json: constructors, parsers and the builder fail, NULL-variant answers
+  # are in -noop, the dispatcher in -dispatch.
+  'src/compat/libsystemd/sd-json-stubs.c',
+  'src/compat/libsystemd/sd-json-noop.c',
+  'src/compat/libsystemd/sd-json-dispatch.c',
   # sd-device/sd-network: device-new.c (refcounting, the
   # sd_device_new_from_*() constructors, the parent walk), device-attr.c
   # (subsystem, driver, sysname), device-uevent.c (the property table),
@@ -949,6 +954,7 @@ libsystemd_public_headers = files(
   'src/compat/libsystemd/sd-hwdb.h',
   'src/compat/libsystemd/sd-device.h',
   'src/compat/libsystemd/sd-network.h',
+  'src/compat/libsystemd/sd-json.h',
 )
 install_headers(libsystemd_public_headers, subdir: 'systemd')
 
@@ -1100,6 +1106,14 @@ test_sd_bus_noop_exe = executable(
   link_with: libsystemd,
 )
 test('test-sd-bus-noop', test_sd_bus_noop_exe)
+
+test_sd_json_exe = executable(
+  'test-sd-json',
+  ['src/compat/libsystemd/test-sd-json.c'] + pico_test_sources,
+  include_directories: libsystemd_compat_includes,
+  link_with: libsystemd,
+)
+test('test-sd-json', test_sd_json_exe)
 
 # Creates and removes real /sys/fs/cgroup/system.slice/*.service directories
 # and moves a forked child into them, so needs root.
