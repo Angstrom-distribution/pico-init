@@ -772,6 +772,67 @@ static void test_startup_survives_a_cycle_outside_the_transaction(void) {
         free(udir);
 }
 
+/* An "ignore" rule is a verdict of its own: the first matching rule wins, so
+ * the unit is left alone instead of falling through to the default enable. */
+static void test_preset_ignore_leaves_the_unit_alone(void) {
+        Unit *target, *foo;
+        Manager *m;
+        char *udir, *pdir;
+
+        udir = test_tmpdir_new();
+        pdir = test_tmpdir_new();
+        ASSERT_TRUE(udir && pdir);
+
+        ASSERT_EQ_INT(test_write_file(udir, "default.target", default_target_unit), 0);
+        ASSERT_EQ_INT(test_write_file(udir,
+                                      "foo.service",
+                                      "[Unit]\n[Service]\nExecStart=/bin/true\n[Install]\nWantedBy=default.target\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(pdir, "10-test.preset", "ignore foo.service\ndisable *\n"), 0);
+        ASSERT_EQ_INT(test_write_file(pdir, "20-test.preset", "enable foo.service\n"), 0);
+
+        m = manager_for(udir);
+        set_one_preset_dir(m, pdir);
+        ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+
+        target = manager_get_unit(m, "default.target");
+        foo = manager_get_unit(m, "foo.service");
+        ASSERT_TRUE(target && foo);
+
+        ASSERT_EQ_INT(manager_apply_presets(m), 0);
+        ASSERT_TRUE(!foo->enabled);
+        ASSERT_TRUE(!unit_has_dependency(target, UNIT_WANTS, foo));
+        ASSERT_TRUE(!enable_symlink_on_disk(udir, "default.target", ".wants", "foo.service"));
+
+        manager_free(m);
+        test_rm_rf(udir);
+        test_rm_rf(pdir);
+        free(udir);
+        free(pdir);
+}
+
+/* Patterns are matched without backslash escapes, so the backslash in an
+ * escaped unit name (a\x2db) is literal. */
+static void test_preset_pattern_backslash_is_literal(void) {
+        Manager *m;
+        char *pdir;
+
+        pdir = test_tmpdir_new();
+        ASSERT_TRUE(pdir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(pdir, "10-test.preset", "disable a\\x2db.service\n"), 0);
+
+        m = manager_for(pdir);
+        set_one_preset_dir(m, pdir);
+
+        ASSERT_EQ_INT(manager_preset_query(m, "a\\x2db.service"), 0);
+        ASSERT_EQ_INT(manager_preset_query(m, "ax2db.service"), -ENOENT);
+
+        manager_free(m);
+        test_rm_rf(pdir);
+        free(pdir);
+}
+
 int main(void) {
         test_services_ordered_after_sockets_target();
         test_wants_dir_produces_wants_edges();
@@ -783,6 +844,8 @@ int main(void) {
         test_preset_filename_precedence();
         test_preset_dir_shadowing();
         test_preset_glob_matching();
+        test_preset_ignore_leaves_the_unit_alone();
+        test_preset_pattern_backslash_is_literal();
         test_symlink_enabled_survives_disable_preset();
         test_real_angstrom_pico_preset_parses();
         test_default_target_boots_hand_built_set();

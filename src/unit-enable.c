@@ -353,10 +353,14 @@ fail:
         return rc;
 }
 
+/* A preset verdict besides enable (1) and disable (0): the first matching rule
+ * said to leave the unit as it is. */
+#define PRESET_IGNORE 2
+
 /*
  * Scan one preset file for the first line matching unit_name. Returns 1 with
- * *decision set when a line matched, 0 when the file has no matching line
- * (the caller moves on to the next file), or -errno.
+ * *decision set (1, 0 or PRESET_IGNORE) when a line matched, 0 when the file
+ * has no matching line (the caller moves on to the next file), or -errno.
  */
 static int preset_file_query(const char *path, const char *unit_name, int *decision) {
         char line[LINE_MAX];
@@ -387,6 +391,9 @@ static int preset_file_query(const char *path, const char *unit_name, int *decis
                 } else if (strncmp(p, "disable", 7) == 0 && (p[7] == ' ' || p[7] == '\t')) {
                         action = 0;
                         p += 7;
+                } else if (strncmp(p, "ignore", 6) == 0 && (p[6] == ' ' || p[6] == '\t')) {
+                        action = PRESET_IGNORE;
+                        p += 6;
                 } else {
                         continue; /* not a directive this parser understands, ignore */
                 }
@@ -404,8 +411,9 @@ static int preset_file_query(const char *path, const char *unit_name, int *decis
                 /* shell-style wildcards, e.g. "foo-*.service"; this is also
                  * why a unit type pico-init has no vtable for (.timer,
                  * .path) still parses fine here -- it is just a glob that
-                 * happens never to match a loaded unit's name */
-                if (fnmatch(p, unit_name, 0) == 0) {
+                 * happens never to match a loaded unit's name. NOESCAPE: the
+                 * backslash in an escaped unit name (a\x2db) is literal. */
+                if (fnmatch(p, unit_name, FNM_NOESCAPE) == 0) {
                         *decision = action;
                         fclose(f);
                         return 1;
@@ -459,7 +467,8 @@ int manager_preset_query(Manager *m, const char *unit_name) {
 
         if (r < 0)
                 return r;
-        return r == 1 ? decision : -ENOENT; /* 0 matches: no rule matched */
+        /* An "ignore" rule is no verdict either, like no rule at all. */
+        return r == 1 && decision != PRESET_IGNORE ? decision : -ENOENT;
 }
 
 /*
@@ -553,6 +562,9 @@ int manager_apply_presets(Manager *m) {
                         pico_log(PICO_LOG_WARNING, "%s: preset query failed: %s", u->id, strerror(-r));
                         continue;
                 }
+
+                if (r == 1 && decision == PRESET_IGNORE)
+                        continue; /* the rule says to leave this unit alone */
 
                 /*
                  * No match (r == 0) means ENABLE, not disable: upstream's
