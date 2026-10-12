@@ -118,15 +118,59 @@ static bool syslog_parse_priority_prefix(const char **p, int *out_priority) {
 }
 
 /*
+ * The RFC 3164 "Mmm dd hh:mm:ss " stamp libc's syslog(3) puts between the
+ * priority and the tag (syslog_skip_timestamp(), 7c30c3c44f). Advances *p
+ * past it and returns the stamp without its trailing space in *ts; leaves
+ * *p alone and returns false if the text is not exactly that shape.
+ */
+static bool syslog_skip_timestamp(const char **p, const char **ts, size_t *ts_len) {
+        /* L letter, ' ' space, N digit, S space or digit, ':' colon */
+        static const char shape[] = "LLL SN SN:SN:SN ";
+        const char *s = *p;
+        size_t i;
+
+        for (i = 0; shape[i] != '\0'; i++) {
+                char c = s[i];
+
+                if (c == '\0')
+                        return false;
+
+                switch (shape[i]) {
+                case 'L':
+                        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')))
+                                return false;
+                        break;
+                case 'N':
+                        if (c < '0' || c > '9')
+                                return false;
+                        break;
+                case 'S':
+                        if (c != ' ' && (c < '0' || c > '9'))
+                                return false;
+                        break;
+                default:
+                        if (c != shape[i])
+                                return false;
+                }
+        }
+
+        *ts = s;
+        *ts_len = i - 1;
+        *p = s + i;
+        return true;
+}
+
+/*
  * "identifier[pid]: " or "identifier: " tag (journald-syslog.c's
  * syslog_parse_identifier()): a run of non-whitespace ending in ':', with
  * an optional "[...]" suffix immediately before the colon stripped from
  * the identifier regardless of whether its content is numeric. The
  * bracketed pid is discarded: _PID always comes from the kernel-verified
- * ucred, never from sender-controlled text. Returns
- * false (and leaves *p untouched) if no ':'-terminated tag is found.
+ * ucred, never from sender-controlled text. An over-long tag is consumed
+ * but yields no identifier (*ident stays NULL). Returns false (and leaves
+ * *p untouched) if no ':'-terminated tag is found.
  */
-static bool syslog_parse_tag(const char **p, const char **ident, size_t *ident_len) {
+bool logd_syslog_parse_tag(const char **p, const char **ident, size_t *ident_len) {
         const char *s = *p;
         size_t l, tag_len;
 
@@ -141,8 +185,6 @@ static bool syslog_parse_tag(const char **p, const char **ident, size_t *ident_l
                 return false;
 
         tag_len = l - 1;
-        if (tag_len > LOGD_UNIT_NAME_MAX)
-                return false; /* too long: treat as "no identifier" */
 
         if (tag_len > 0 && s[tag_len - 1] == ']') {
                 size_t k = tag_len - 1;
@@ -153,8 +195,10 @@ static bool syslog_parse_tag(const char **p, const char **ident, size_t *ident_l
                         tag_len = k;
         }
 
-        *ident = s;
-        *ident_len = tag_len;
+        if (tag_len <= LOGD_UNIT_NAME_MAX) {
+                *ident = s;
+                *ident_len = tag_len;
+        }
 
         s += l;
         if (*s == ' ' || *s == '\t')
@@ -699,9 +743,9 @@ int logd_recv_process_syslog(LogdRecv *r, const void *payload, size_t payload_le
         char *buf;
         const char *p;
         int priority = 6; /* LOG_INFO: journald-syslog.c's default */
-        const char *ident = NULL;
-        size_t ident_len = 0;
-        LogdField fields[9];
+        const char *ident = NULL, *ts = NULL;
+        size_t ident_len = 0, ts_len = 0;
+        LogdField fields[10];
         size_t n = 0;
         char prio_buf[4], pid_buf[16], uid_buf[16], gid_buf[16];
         char comm[LOGD_COMM_MAX] = "", unit[LOGD_UNIT_NAME_MAX + 1] = "";
@@ -722,7 +766,8 @@ int logd_recv_process_syslog(LogdRecv *r, const void *payload, size_t payload_le
 
         p = buf;
         (void) syslog_parse_priority_prefix(&p, &priority);
-        (void) syslog_parse_tag(&p, &ident, &ident_len);
+        (void) syslog_skip_timestamp(&p, &ts, &ts_len);
+        (void) logd_syslog_parse_tag(&p, &ident, &ident_len);
 
         fields[n++] = (LogdField){ "MESSAGE", p, strlen(p) };
 
@@ -732,6 +777,8 @@ int logd_recv_process_syslog(LogdRecv *r, const void *payload, size_t payload_le
 
         if (ident)
                 fields[n++] = (LogdField){ "SYSLOG_IDENTIFIER", ident, ident_len };
+        if (ts)
+                fields[n++] = (LogdField){ "SYSLOG_TIMESTAMP", ts, ts_len };
 
         if (cred) {
                 snprintf(pid_buf, sizeof(pid_buf), "%d", (int) cred->pid);

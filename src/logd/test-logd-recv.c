@@ -600,6 +600,64 @@ static void test_syslog_basic(void) {
                "kernel-verified ucred, never the spoofable bracket text\n");
 }
 
+/* Feeds each datagram to a fresh logd and checks the first entry's identifier
+ * (NULL: none), timestamp (NULL: none) and message. */
+static void check_syslog_datagram(const char *payload, const char *ident, const char *ts, const char *msg) {
+        char *dir = test_tmpdir_new();
+        LogdWriter *w = new_test_writer(dir);
+        LogdRecv *rc;
+        LogdRing *ring;
+        const LogdEntry *e;
+        const LogdReadField *f;
+
+        ASSERT_TRUE(dir != NULL);
+        ASSERT_EQ_INT(logd_recv_new(w, &rc), 0);
+        ASSERT_EQ_INT(logd_recv_process_syslog(rc, payload, strlen(payload), NULL), 0);
+        logd_recv_free(rc);
+        logd_writer_free(w);
+
+        ASSERT_EQ_INT(logd_ring_read(dir, &ring), 0);
+        ASSERT_EQ_INT((int) logd_ring_n_entries(ring), 1);
+        e = logd_ring_entry(ring, 0);
+
+        f = logd_entry_field(e, "SYSLOG_IDENTIFIER");
+        ASSERT_TRUE(ident ? logd_field_equals(f, ident) : f == NULL);
+        f = logd_entry_field(e, "SYSLOG_TIMESTAMP");
+        ASSERT_TRUE(ts ? logd_field_equals(f, ts) : f == NULL);
+        ASSERT_TRUE(logd_field_equals(logd_entry_field(e, "MESSAGE"), msg));
+
+        logd_ring_free(ring);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* libc's syslog(3) puts an RFC 3164 stamp between the priority and the tag. */
+static void test_syslog_timestamp(void) {
+        char longtag[300];
+
+        check_syslog_datagram(
+                        "<13>Oct  5 07:08:09 dropbear[42]: login ok", "dropbear", "Oct  5 07:08:09", "login ok");
+        check_syslog_datagram("<13>Oct 15 17:08:09 myapp: hi", "myapp", "Oct 15 17:08:09", "hi");
+        /* No stamp (dropbear/busybox style): unchanged. */
+        check_syslog_datagram("<13>dropbear[42]: login ok", "dropbear", NULL, "login ok");
+        /* Not exactly the stamp shape: left in the message, no tag recognised. */
+        check_syslog_datagram("<13>Oct 5 07:08:09 myapp: hi", NULL, NULL, "Oct 5 07:08:09 myapp: hi");
+        check_syslog_datagram("<13>Oct  5 07:08:0", NULL, NULL, "Oct  5 07:08:0");
+
+        /* An over-long tag is consumed but yields no identifier. */
+        memset(longtag, 'a', 256);
+        strcpy(longtag + 256, ": msg");
+        {
+                char payload[320];
+
+                snprintf(payload, sizeof(payload), "<13>%s", longtag);
+                check_syslog_datagram(payload, NULL, NULL, "msg");
+        }
+
+        printf("test-logd-recv: /dev/log RFC 3164 timestamps are split off into SYSLOG_TIMESTAMP and the tag "
+               "behind them is recognised\n");
+}
+
 /* A real syslog(3)/openlog()/closelog() call against a bound test socket.
  * Binds the receiving socket at the real /dev/log path for this check, since
  * glibc's syslog(3) has no override for that path; skipped if /dev/log
@@ -788,6 +846,7 @@ int main(void) {
         test_real_sockets_two_streams_same_pid();
         test_cgroup_unit_extraction_real_kernel();
         test_syslog_basic();
+        test_syslog_timestamp();
         test_syslog_real_client();
         test_shutdown_flushes_pending_tail();
         test_bind_socket_sets_passcred();
