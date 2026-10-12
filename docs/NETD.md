@@ -382,39 +382,85 @@ Any byte outside printable ASCII, and `%` and `=`, is written as `%XX`.
 
 netctl reads kernel state (sysfs, `getifaddrs(3)`, `/proc/net/route`, an
 rtnetlink query, `/etc/resolv.conf`) and the files above. It does not talk to
-netd, so `list`, `status` and `lldp` work when netd is not running; `reload`
-is the only verb that needs it. It is installed in `bindir`. Colours follow
-`networkctl`'s rules: on for a terminal, off for `NO_COLOR` or `TERM=dumb`,
-and forced by `SYSTEMD_COLORS`. Without a
-verb, `list` runs.
+netd, so `list`, `status`, `lldp` and the other read-only verbs work when netd
+is not running; `reload` and `reconfigure` need it. It is installed in
+`bindir`. Colours follow `networkctl`'s rules: on for a terminal, off for
+`NO_COLOR` or `TERM=dumb`, and forced by `SYSTEMD_COLORS`. Without a verb,
+`list` runs. The verbs and options follow networkctl v262. Options may appear
+before, between or after the verb and its arguments.
 
 | Verb | Description |
 | --- | --- |
-| `list` | One line per interface. |
-| `status [LINK]` | System status, or detail for one interface. |
-| `lldp [LINK...]` | Neighbours heard, optionally filtered by interface name. |
+| `list [PATTERN...]` | One line per interface. |
+| `status [PATTERN...]` | System status, or detail for each matching interface. |
+| `lldp [PATTERN...]` | Neighbours heard, optionally filtered by interface. |
+| `label` | The kernel's IPv6 address label table. |
+| `up DEVICE...`, `down DEVICE...` | Set or clear `IFF_UP`. |
+| `delete DEVICE...` | `RTM_DELLINK`; the kernel refuses for anything that is not virtual. |
 | `reload` | Send `SIGHUP` to netd. |
+| `reconfigure DEVICE...` | Same signal; a reload re-applies every link, not just the named ones. |
+| `cat FILE...`, `cat @DEVICE` | Print `.network` files, each after a `# path` line. |
+| `mask FILE...`, `unmask FILE...` | Create or remove a `/dev/null` symlink, then reload netd. |
+| `persistent-storage BOOL` | Parses the argument and does nothing; netd keeps no persistent state. |
+| `dhcp-lease`, `renew`, `forcerenew`, `edit` | Refused. |
 
-An unknown verb prints `networkctl: unknown command '<verb>'` and exits 2.
-Error messages are prefixed `networkctl:`.
+`PATTERN` is a shell glob matched against the interface name, its index and
+its alternative names. A pattern without glob characters that matches no
+interface is an error (`Interface "x" not found.`, exit 1); a glob may match
+nothing. `DEVICE` is a name or an index. Devices are resolved before anything
+is changed.
+
+### Options
+
+| Option | Behaviour |
+| --- | --- |
+| `-h`, `--help`, `--version` | As usual. |
+| `--no-legend` | Drops the header and footer lines of `list`, `lldp` and `label`. |
+| `-a`, `--all` | `status` shows every interface; with `--json`, `list` dumps all of them; `lldp` lists every capability in the legend. |
+| `-s`, `--stats` | `status LINK` ends with the sysfs packet, byte, error, drop, multicast and collision counters. |
+| `--json=pretty\|short\|off` | JSON output for `list`, `status` and `lldp`, see below. `--json=help` lists the formats. |
+| `--no-reload` | `mask` and `unmask` do not signal netd. |
+| `--runtime` | `mask` and `unmask` use `/run/systemd/network` instead of `/etc/systemd/network`. |
+| `--no-pager`, `--no-ask-password`, `-l`, `--full`, `-n`, `--lines=N`, `--stdin`, `--drop-in=NAME` | Accepted and ignored: there is no pager, authentication, ellipsizing, journal or `edit`. `--lines` still rejects a non-number and `--drop-in` an empty name. |
+| `--no-reconfigure` | Refused by `reload` (exit 1): netd cannot reload files without re-applying the links. Ignored by other verbs, as in networkctl. |
+
+Errors are prefixed `networkctl:`. An unknown verb prints
+`networkctl: Unknown command verb '<verb>'.`; that, a wrong argument count, an
+unknown option, an unknown interface and every refused verb exit 1.
+
+`dhcp-lease`, `renew`, `forcerenew` and `edit` print
+`networkctl: '<verb>' is not supported: <reason>.` and exit 1. netd keeps no
+DHCP message and cannot renew or force a renewal on demand, and a success
+status would tell a script that a lease was renewed or a file edited. Edit the
+file and run `reload` instead.
+
+`cat` with no argument fails: netd has no `networkd.conf`. `cat` searches
+`/etc/systemd/network`, `/run/systemd/network` and `/usr/lib/systemd/network`
+in that order, skips a masked file, and has no drop-in handling because netd
+reads none. `@DEVICE` prints the `.network` file netd matched (`NETWORK` in
+`links/<ifindex>`); `@DEVICE:link` and `@DEVICE:netdev` are errors because netd
+reads neither. `mask` and `unmask` accept `.network`, `.netdev` and `.link`
+names, refuse to mask over a real file in `/etc` (or in `/run` with
+`--runtime`), and signal netd only for `.network` and `.netdev` files and only
+when netd is running.
 
 ### list
 
 ```
-IDX LINK     TYPE     OPERATIONAL SETUP
-  2 eth0     ether    routable    configured
-  3 usb0     ether    no-carrier  configuring
+IDX LINK TYPE     OPERATIONAL SETUP
+  2 eth0 ether    routable    configured
+  3 usb0 ether    no-carrier  configuring
 
 2 links listed.
 ```
 
-`TYPE` is `bridge`, `loopback`, `ether` or `other`. `OPERATIONAL` comes from
-`/sys/class/net/<if>/operstate`: `up` is shown as `routable` when the link has
-an IPv4 or IPv6 address that is not loopback or link-local, and as `carrier`
-otherwise; `down` is shown as `no-carrier`; other kernel states are shown as
-they are. `SETUP` is `STATE` from `links/<ifindex>`, or `unmanaged` when that
-file does not exist. The trailer is always `N links listed.`, including
-for N = 1.
+Column widths follow the content. `TYPE` is `bridge`, `loopback`, `ether` or
+`other`. `OPERATIONAL` comes from `/sys/class/net/<if>/operstate`: `up` is
+shown as `routable` when the link has an IPv4 or IPv6 address that is not
+loopback or link-local, and as `carrier` otherwise; `down` is shown as
+`no-carrier`; other kernel states are shown as they are. `SETUP` is `STATE`
+from `links/<ifindex>`, or `unmanaged` when that file does not exist. The
+trailer is always `N links listed.`, including for N = 1.
 
 ### status
 
@@ -424,8 +470,9 @@ Without an argument, the system view: the interface indices, the aggregate
 from `/proc/net/route`), `DNS` and `Search Domains` from `/etc/resolv.conf`,
 and `NTP` collected from the `NTP=` lines of all lease files.
 
-With an interface name, the detail view. Rows are omitted when netd or the
-kernel has no value for them:
+With patterns, or `-a`, the detail view of each matching interface, separated
+by a blank line. Rows are omitted when netd or the kernel has no value for
+them:
 
 | Row | Source |
 | --- | --- |
@@ -444,9 +491,7 @@ kernel has no value for them:
 | `Number of Queues (Tx/Rx)` | rtnetlink. |
 | `Address` | `getifaddrs(3)`, without prefix length. |
 | `Gateway` | Default routes on that interface. |
-
-An unknown interface name prints `networkctl: unknown interface '<name>'` to
-standard error; the exit status is 0.
+| `Rx Packets` ... `Collisions` | With `-s`: ten counters from `statistics/` in sysfs. |
 
 Not shown, because netd computes none of it: `.link` and `.netdev` files,
 activation policy, required-for-online, route domains and offered DHCP
@@ -454,14 +499,16 @@ leases.
 
 ### lldp
 
-The columns are `LINK`, `CHASSIS-ID`, `SYSTEM-NAME`, `CAPS`, `PORT-ID` and
-`PORT-DESCRIPTION`. When there are neighbours, a capability legend follows.
-The last line is `N neighbors listed.` (`neighbor` for N = 1), also for 0.
-`CAPS` has eleven positions, one letter per capability or `.` when absent:
-`o` other, `p` repeater, `b` bridge, `w` WLAN access point, `r` router,
-`t` telephone, `d` DOCSIS, `a` station, `c` customer VLAN, `s` service VLAN,
-`m` TPMR. Rows are sorted by link, then chassis ID. At most 256 neighbours
-are listed. Entries whose expiry has passed, such as those left by a netd
+The columns are `LINK`, `SYSTEM-NAME`, `SYSTEM-DESCRIPTION`, `CHASSIS-ID`,
+`PORT-ID`, `PORT-DESCRIPTION` and `CAPS`; an empty value is shown as `-`.
+Below the table a legend names the capabilities some neighbour has (all of
+them with `-a`), wrapped to `$COLUMNS` or the terminal width. The last line is
+`N neighbor(s) listed.`, also for 0. `CAPS` has eleven positions, one letter
+per capability or `.` when absent: `o` other, `p` repeater, `b` bridge, `w`
+WLAN access point, `r` router, `t` telephone, `d` DOCSIS, `a` station, `c`
+customer VLAN, `s` service VLAN, `m` TPMR. Rows are sorted by link index,
+then system name. At most 256 neighbours are listed. Columns are never
+ellipsized. Entries whose expiry has passed, such as those left by a netd
 that is no longer running, are skipped. Every string comes from the network
 and is reduced to printable ASCII before it is shown.
 
@@ -472,4 +519,29 @@ and sends `SIGHUP`. It exits 1 with `networkctl: netd is not running` when no
 such process exists, and 0 once the signal is sent. It does not wait for the
 reload to finish. Copying a file into `/etc/systemd/network` and running
 `netctl reload` is the whole reconfiguration interface; netd has no D-Bus or
-Varlink API.
+Varlink API. `reconfigure` sends the same signal after checking that the named
+devices exist.
+
+### label
+
+`LABEL` and `PREFIX/PREFIXLEN`, both right-aligned and sorted by label, from
+an `RTM_GETADDRLABEL` dump. It fails with the kernel's error when the kernel
+has no IPv6.
+
+### JSON
+
+`--json=short` prints one line, `--json=pretty` the indented form with
+`"Key" : value` members, as networkctl does.
+
+- `list` and `status` print `{"Interfaces": [...]}` for all interfaces, or
+  when no pattern is given. With patterns, one object per matching interface
+  is printed instead. `-a` selects all of them. An interface has `Index`,
+  `Name`, `AlternativeNames`, `Type`, `Driver`, `Flags`,
+  `KernelOperationalState` and its `...String`, `MTU`, `MinimumMTU`,
+  `MaximumMTU`, `HardwareAddress` (an array of bytes), `AdministrativeState`
+  (the setup state), `OperationalState` and `NetworkFile`. Members netd has no
+  data for, such as addresses, DNS and DHCP details, are not emitted.
+- `lldp` prints `{"Neighbors": [...]}`: one object per interface with
+  `InterfaceIndex`, `InterfaceName` and a `Neighbors` array holding
+  `ChassisID`, `PortID`, `PortDescription`, `SystemName`, `SystemDescription`,
+  `EnabledCapabilities` and `VlanID` where present.
