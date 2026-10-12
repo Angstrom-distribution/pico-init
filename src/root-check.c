@@ -10,6 +10,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
@@ -101,10 +102,11 @@ PicoFsckVerdict pico_fsck_verdict(int code) {
 /*
  * Run `checker` over `node` and hand back its exit code.
  *
- * `-a` is preen mode: repair what can be repaired without asking, and give up
- * rather than guess at anything else. Never `-y` -- an appliance with no
+ * `-a` (preen) is the default: repair what can be repaired without asking,
+ * and give up rather than guess at anything else. `-y` and `-n` come only from
+ * an explicit fsck.repair= on the kernel command line -- an appliance with no
  * session in front of it must not be answering "yes" to questions about
- * destroying data on its own root filesystem.
+ * destroying data on its own root filesystem unless an administrator said so.
  *
  * No `-M`, which means "skip mounted filesystems" and would make this whole
  * step a no-op: root genuinely is mounted, read-only, which is exactly the
@@ -122,7 +124,55 @@ PicoFsckVerdict pico_fsck_verdict(int code) {
  * did not exit normally at all.
  */
 int pico_fsck_run(const char *checker, const char *node, int *ret_code) {
+        return pico_fsck_run_with(checker, node, PICO_FSCK_REPAIR_PREEN, false, ret_code);
+}
+
+void pico_fsck_options_parse(const char *cmdline, PicoFsckMode *mode, PicoFsckRepair *repair) {
+        const char *p = cmdline;
+
+        *mode = PICO_FSCK_MODE_AUTO;
+        *repair = PICO_FSCK_REPAIR_PREEN;
+
+        while (p && *p) {
+                size_t len;
+                char word[64];
+
+                while (*p == ' ' || *p == '\t' || *p == '\n')
+                        p++;
+                len = strcspn(p, " \t\n");
+                if (len > 0 && len < sizeof(word)) {
+                        memcpy(word, p, len);
+                        word[len] = '\0';
+
+                        if (strncmp(word, "fsck.mode=", 10) == 0) {
+                                if (strcmp(word + 10, "auto") == 0)
+                                        *mode = PICO_FSCK_MODE_AUTO;
+                                else if (strcmp(word + 10, "force") == 0)
+                                        *mode = PICO_FSCK_MODE_FORCE;
+                                else if (strcmp(word + 10, "skip") == 0)
+                                        *mode = PICO_FSCK_MODE_SKIP;
+                                else
+                                        pico_log(PICO_LOG_WARNING, "ignoring invalid %s", word);
+                        } else if (strncmp(word, "fsck.repair=", 12) == 0) {
+                                if (strcmp(word + 12, "preen") == 0)
+                                        *repair = PICO_FSCK_REPAIR_PREEN;
+                                else if (strcmp(word + 12, "yes") == 0)
+                                        *repair = PICO_FSCK_REPAIR_YES;
+                                else if (strcmp(word + 12, "no") == 0)
+                                        *repair = PICO_FSCK_REPAIR_NO;
+                                else
+                                        pico_log(PICO_LOG_WARNING, "ignoring invalid %s", word);
+                        }
+                }
+                p += len;
+        }
+}
+
+int pico_fsck_run_with(const char *checker, const char *node, PicoFsckRepair repair, bool force, int *ret_code) {
         const char *name;
+        const char *flag = repair == PICO_FSCK_REPAIR_YES ? "-y" :
+                        repair == PICO_FSCK_REPAIR_NO     ? "-n" :
+                                                            "-a";
         pid_t pid;
         int status;
 
@@ -137,7 +187,10 @@ int pico_fsck_run(const char *checker, const char *node, int *ret_code) {
                 return -errno;
 
         if (pid == 0) {
-                execl(checker, name, "-a", node, (char *) NULL);
+                if (force)
+                        execl(checker, name, flag, "-f", node, (char *) NULL);
+                else
+                        execl(checker, name, flag, node, (char *) NULL);
 
                 /* An exec that did not happen is an operational error in
                  * fsck(8)'s own vocabulary, which is what the parent's mapping
@@ -209,6 +262,8 @@ int pico_root_remount(const char *where, FstabEntry *root_line) {
 int pico_root_check(FstabEntry *root_line) {
         char part[PATH_MAX];
         PicoExtInfo fs;
+        PicoFsckMode fsck_mode;
+        PicoFsckRepair fsck_repair;
         bool read_only = false;
         int code = 0;
         int r;
@@ -261,6 +316,23 @@ int pico_root_check(FstabEntry *root_line) {
                 return pico_root_remount("/", root_line);
         }
 
+        {
+                char cmdline[4096] = "";
+                FILE *f = fopen("/proc/cmdline", "re");
+
+                if (f) {
+                        if (!fgets(cmdline, sizeof(cmdline), f))
+                                cmdline[0] = '\0';
+                        fclose(f);
+                }
+                pico_fsck_options_parse(cmdline, &fsck_mode, &fsck_repair);
+        }
+
+        if (fsck_mode == PICO_FSCK_MODE_SKIP) {
+                pico_log(PICO_LOG_INFO, "fsck.mode=skip, not checking %s", part);
+                return pico_root_remount("/", root_line);
+        }
+
         r = ext_super_read(part, &fs);
         if (r < 0) {
                 pico_log(PICO_LOG_WARNING,
@@ -277,10 +349,14 @@ int pico_root_check(FstabEntry *root_line) {
 
         switch (pico_root_verdict(&fs)) {
         case PICO_ROOT_CLEAN:
+                if (fsck_mode == PICO_FSCK_MODE_FORCE)
+                        break;
                 pico_log(PICO_LOG_DEBUG, "%s is marked clean, no check needed", part);
                 return pico_root_remount("/", root_line);
 
         case PICO_ROOT_REPLAY:
+                if (fsck_mode == PICO_FSCK_MODE_FORCE)
+                        break;
                 pico_log(PICO_LOG_INFO,
                          "%s has an unreplayed journal; the kernel will recover it on the remount",
                          part);
@@ -306,7 +382,7 @@ int pico_root_check(FstabEntry *root_line) {
                 return pico_root_remount("/", root_line);
         }
 
-        r = pico_fsck_run(PICO_FSCK_EXT4, part, &code);
+        r = pico_fsck_run_with(PICO_FSCK_EXT4, part, fsck_repair, fsck_mode == PICO_FSCK_MODE_FORCE, &code);
         if (r < 0) {
                 pico_log(PICO_LOG_WARNING,
                          "could not run %s on %s: %s, remounting unchecked",

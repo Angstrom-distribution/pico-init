@@ -364,13 +364,52 @@ static void test_fsck_run(void) {
 
         ASSERT_EQ_INT(pico_fsck_run(NULL, "/dev/sdz9", &code), -EINVAL);
 
+        /* The repair policy and -f reach the checker. */
+        snprintf(checker, sizeof(checker), "%s/fsck.vfat", dir);
+        ASSERT_EQ_INT(pico_fsck_run_with(checker, "/dev/sdz9", PICO_FSCK_REPAIR_YES, true, &code), 0);
+        f = fopen(args, "re");
+        ASSERT_TRUE(f != NULL);
+        ASSERT_TRUE(fgets(got, sizeof(got), f) != NULL);
+        fclose(f);
+        ASSERT_STREQ(got, "-y -f /dev/sdz9\n");
+
+        ASSERT_EQ_INT(pico_fsck_run_with(checker, "/dev/sdz9", PICO_FSCK_REPAIR_NO, false, &code), 0);
+        f = fopen(args, "re");
+        ASSERT_TRUE(f != NULL);
+        ASSERT_TRUE(fgets(got, sizeof(got), f) != NULL);
+        fclose(f);
+        ASSERT_STREQ(got, "-n /dev/sdz9\n");
+
         test_rm_rf(dir);
         free(dir);
+}
+
+static void test_fsck_options(void) {
+        PicoFsckMode mode;
+        PicoFsckRepair repair;
+
+        pico_fsck_options_parse("", &mode, &repair);
+        ASSERT_EQ_INT(mode, PICO_FSCK_MODE_AUTO);
+        ASSERT_EQ_INT(repair, PICO_FSCK_REPAIR_PREEN);
+
+        pico_fsck_options_parse("root=/dev/sda1 fsck.mode=force fsck.repair=yes quiet\n", &mode, &repair);
+        ASSERT_EQ_INT(mode, PICO_FSCK_MODE_FORCE);
+        ASSERT_EQ_INT(repair, PICO_FSCK_REPAIR_YES);
+
+        /* The last one wins; a bad value is ignored, not an error. */
+        pico_fsck_options_parse(
+                        "fsck.mode=skip fsck.mode=auto fsck.repair=no fsck.repair=maybe", &mode, &repair);
+        ASSERT_EQ_INT(mode, PICO_FSCK_MODE_AUTO);
+        ASSERT_EQ_INT(repair, PICO_FSCK_REPAIR_NO);
+
+        pico_fsck_options_parse("xfsck.mode=skip fsck.mode=skip", &mode, &repair);
+        ASSERT_EQ_INT(mode, PICO_FSCK_MODE_SKIP);
 }
 
 int main(void) {
         char *dir;
 
+        test_fsck_options();
         test_root_verdict();
         test_fsck_verdict();
         test_fsck_run();

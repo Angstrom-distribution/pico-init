@@ -170,3 +170,26 @@ PicoFsckVerdict pico_fsck_verdict(int code);
  * forked or did not exit normally.
  */
 int pico_fsck_run(const char *checker, const char *node, int *ret_code);
+
+/*
+ * fsck.mode= and fsck.repair= on the kernel command line, as systemd-fsck
+ * reads them: auto (default), force (check even a clean filesystem) or skip
+ * (no check at all); preen (default, -a), yes (-y) or no (-n). The last
+ * occurrence of each wins and an unrecognised value is ignored.
+ */
+typedef enum PicoFsckMode {
+        PICO_FSCK_MODE_AUTO,
+        PICO_FSCK_MODE_FORCE,
+        PICO_FSCK_MODE_SKIP,
+} PicoFsckMode;
+
+typedef enum PicoFsckRepair {
+        PICO_FSCK_REPAIR_PREEN,
+        PICO_FSCK_REPAIR_YES,
+        PICO_FSCK_REPAIR_NO,
+} PicoFsckRepair;
+
+void pico_fsck_options_parse(const char *cmdline, PicoFsckMode *mode, PicoFsckRepair *repair);
+
+/* pico_fsck_run() with the repair policy, and -f when `force` is set. */
+int pico_fsck_run_with(const char *checker, const char *node, PicoFsckRepair repair, bool force, int *ret_code);

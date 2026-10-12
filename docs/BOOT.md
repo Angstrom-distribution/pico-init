@@ -178,9 +178,7 @@ silent; any other read error is a warning.
    | not clean, journal present                                        | replay  | remount; the kernel replays it  |
    | not clean, no journal                                             | check   | run the checker                 |
 
-4. The checker is `/usr/sbin/fsck.ext4 -a <partition>`. Preen mode only; `-y`
-   is never used. If the binary is missing a warning is logged and the root
-   is remounted unchecked.
+4. The checker is `/usr/sbin/fsck.ext4 -a <partition>`. Preen mode is the default; `fsck.repair=yes` or `fsck.repair=no` on the kernel command line select `-y` or `-n`. `fsck.mode=force` runs the checker (with `-f`) whatever the superblock says, and `fsck.mode=skip` remounts without checking. If the binary is missing a warning is logged and the root is remounted unchecked.
 5. The exit status is a bitmask (`pico_fsck_verdict()`):
 
    | Exit status                  | Result    | Action                                 |
