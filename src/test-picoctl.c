@@ -454,6 +454,31 @@ static void test_preset(void) {
         free(root);
 }
 
+/* An ignore rule is a terminating no-op: the later catch-all enable must not
+ * reach the unit. */
+static void test_preset_ignore(void) {
+        char *root = test_tmpdir_new();
+        char presetdir[PATH_MAX];
+        struct run_result res;
+
+        ASSERT_TRUE(root != NULL);
+        make_fixture_root(root);
+
+        snprintf(presetdir, sizeof(presetdir), "%s%s", root, PICO_PRESET_DIR);
+        ASSERT_EQ_INT(test_write_file(presetdir, "10-test.preset", "ignore foo.service\nenable *\n"), 0);
+
+        RUN_PICOCTL(&res, "--root", root, "preset", "foo.service", "bar.service");
+        ASSERT_EQ_INT(res.exit_code, 0);
+
+        RUN_PICOCTL(&res, "--root", root, "is-enabled", "foo.service");
+        ASSERT_STREQ(res.out, "disabled\n");
+        RUN_PICOCTL(&res, "--root", root, "is-enabled", "bar.service");
+        ASSERT_STREQ(res.out, "enabled\n");
+
+        test_rm_rf(root);
+        free(root);
+}
+
 /* No preset file at all: manager_preset_query()'s own -ENOENT-means-enable
  * default, exercised through picoctl rather than re-asserted against
  * unit-enable.c directly (that is unit-enable.c's own test's job) -- this is
@@ -2040,6 +2065,7 @@ static void test_whoami(void) {
 int main(void) {
         test_enable_disable_is_enabled();
         test_preset();
+        test_preset_ignore();
         test_preset_default_enable();
         test_mask_unmask();
         test_list_unit_files();

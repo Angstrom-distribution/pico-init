@@ -313,8 +313,7 @@ builder:
   ships a `disable *` rule.
 - Only units that have `WantedBy=` or `RequiredBy=` and no symlink already
   deciding them are considered.
-- An `ignore` rule leaves the unit untouched at boot. `picoctl preset` and
-  `list-unit-files` read it as no rule, so `picoctl preset` enables the unit.
+- An `ignore` rule leaves the unit untouched at boot and under `picoctl preset`; `list-unit-files` shows `ignored` in the preset column.
 
 ### Service environment
 

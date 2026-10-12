@@ -467,8 +467,9 @@ int manager_preset_query(Manager *m, const char *unit_name) {
 
         if (r < 0)
                 return r;
-        /* An "ignore" rule is no verdict either, like no rule at all. */
-        return r == 1 && decision != PRESET_IGNORE ? decision : -ENOENT;
+        if (r == 1 && decision == PRESET_IGNORE)
+                return -ECANCELED;
+        return r == 1 ? decision : -ENOENT;
 }
 
 /*

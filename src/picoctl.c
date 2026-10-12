@@ -2131,7 +2131,7 @@ static int cmd_is_enabled(int argc, char *argv[]) {
  */
 /* One unit through the preset rules; *ret_enable is the verdict, whether or
  * not --preset-mode let it be acted on. */
-static int preset_unit(const char *name, bool *ret_enable) {
+static int preset_unit(const char *name, bool *ret_enable, bool *ret_ignored) {
         Manager *m = NULL;
         Unit *u = NULL;
         int r = load_install_info(name, &m, &u);
@@ -2144,6 +2144,13 @@ static int preset_unit(const char *name, bool *ret_enable) {
         }
 
         decision = manager_preset_query(m, u->id);
+        if (decision == -ECANCELED) {
+                /* "ignore": the unit is left exactly as it is. */
+                *ret_enable = false;
+                *ret_ignored = true;
+                manager_free(m);
+                return 0;
+        }
         if (decision < 0 && decision != -ENOENT) {
                 picoctl_error("Failed to query preset for %s: %s", name, strerror(-decision));
                 manager_free(m);
@@ -2179,11 +2186,11 @@ static int cmd_preset(int argc, char *argv[]) {
         }
 
         for (i = 0; i < argc; i++) {
-                bool enable = false;
-                int r = preset_unit(argv[i], &enable);
+                bool enable = false, ignored = false;
+                int r = preset_unit(argv[i], &enable, &ignored);
 
                 status |= r;
-                if (arg_now && r == 0 &&
+                if (arg_now && r == 0 && !ignored &&
                     cmd_verb_generic(1, &argv[i], enable ? "start" : "stop", enable ? "start" : "stop"))
                         status = 1;
         }
@@ -2473,7 +2480,10 @@ static const char *unit_file_state_of(const char *name, const char **ret_preset)
                         int decision = manager_preset_query(m, u->id);
 
                         state = "disabled";
-                        *ret_preset = (decision == 1 || decision == -ENOENT) ? "enabled" : "disabled";
+                        if (decision == -ECANCELED)
+                                *ret_preset = "ignored";
+                        else
+                                *ret_preset = (decision == 1 || decision == -ENOENT) ? "enabled" : "disabled";
                 }
         }
         manager_free(m);
@@ -2570,13 +2580,13 @@ static int cmd_preset_all(int argc, char *argv[]) {
                 qsort(entries, n, sizeof(*entries), unit_file_entry_cmp);
 
         for (i = 0; i < n; i++) {
-                bool enable;
+                bool enable, ignored;
 
                 if (unit_is_masked(entries[i].name))
                         continue;
                 /* a unit that does not parse is list-unit-files' "bad", not a
                  * reason to abandon the sweep */
-                if (preset_unit(entries[i].name, &enable) != 0)
+                if (preset_unit(entries[i].name, &enable, &ignored) != 0)
                         status = 1;
         }
 

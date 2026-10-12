@@ -42,7 +42,8 @@ int unit_install_enablement(Unit *u);
 
 /*
  * Look up `unit_name` in the preset files along the manager's preset search
- * path. Returns 1 to enable, 0 to disable, -ENOENT when no rule matched, or
+ * path. Returns 1 to enable, 0 to disable, -ENOENT when no rule matched,
+ * -ECANCELED when an "ignore" rule matched (leave the unit as it is), or
  * -errno on a read error.
  */
 int manager_preset_query(Manager *m, const char *unit_name);
