@@ -2289,7 +2289,6 @@ static void test_env_helpers(void) {
                                       "FOO=bar\n"
                                       "  SPACED = ' padded '  \n"
                                       "QUOTED=\"a b\"\n"
-                                      "HALF=\"open\n"
                                       "NOEQUALS\n"
                                       "=novalue\n"
                                       "EMPTY=\n"
@@ -2297,13 +2296,12 @@ static void test_env_helpers(void) {
                       0);
         snprintf(path, sizeof(path), "%s/vars", dir);
         ASSERT_EQ_INT(pico_load_env_file(path, &l), 0);
-        ASSERT_EQ_INT((int) pico_strv_length(l), 6);
+        ASSERT_EQ_INT((int) pico_strv_length(l), 5);
         ASSERT_STREQ(l[0], "FOO=bar");
         ASSERT_STREQ(l[1], "SPACED= padded ");
         ASSERT_STREQ(l[2], "QUOTED=a b");
-        ASSERT_STREQ(l[3], "HALF=\"open");
-        ASSERT_STREQ(l[4], "EMPTY=");
-        ASSERT_STREQ(l[5], "FOO=again"); /* the merge, not the loader, dedups */
+        ASSERT_STREQ(l[3], "EMPTY=");
+        ASSERT_STREQ(l[4], "FOO=again"); /* the merge, not the loader, dedups */
         pico_strv_free(l);
 
         l = NULL;

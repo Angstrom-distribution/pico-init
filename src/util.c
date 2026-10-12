@@ -605,94 +605,269 @@ int pico_replace_env_argv(char * const *argv, char * const *env, char ***strv) {
         return 0;
 }
 
-static char *env_strip(char *s) {
-        char *end;
+typedef struct {
+        char *p;
+        size_t n, cap;
+} Dyn;
 
-        s += strspn(s, " \t\n\r");
+static int dyn_putc(Dyn *d, char c) {
+        if (d->n + 1 >= d->cap) {
+                size_t cap = d->cap ? d->cap * 2 : 32;
+                char *t = realloc(d->p, cap);
 
-        end = s + strlen(s);
-        while (end > s && strchr(" \t\n\r", end[-1]))
-                end--;
-        *end = '\0';
-
-        return s;
+                if (!t)
+                        return -ENOMEM;
+                d->p = t;
+                d->cap = cap;
+        }
+        d->p[d->n++] = c;
+        return 0;
 }
 
-/* v30's unquote(): one matching pair of surrounding quotes, in place. */
-static char *env_unquote(char *v) {
-        size_t n = strlen(v);
+#define ENV_WHITESPACE " \t\n\r"
+#define ENV_NEWLINE "\n\r"
+#define ENV_FILE_MAX (4U * 1024U * 1024U)
 
-        if (n >= 2 && (v[0] == '"' || v[0] == '\'') && v[n - 1] == v[0]) {
-                v[n - 1] = '\0';
-                return v + 1;
+/* Appends NAME=value to *l, the key and value cut to the given lengths. */
+static int env_emit(char ***l, const Dyn *key, size_t key_len, const Dyn *value, size_t value_len) {
+        char *s = malloc(key_len + value_len + 2);
+        int r;
+
+        if (!s)
+                return -ENOMEM;
+        memcpy(s, key->p, key_len);
+        s[key_len] = '=';
+        if (value_len > 0)
+                memcpy(s + key_len + 1, value->p, value_len);
+        s[key_len + 1 + value_len] = '\0';
+
+        r = pico_strv_extend(l, s);
+        free(s);
+        return r;
+}
+
+static int env_read_all(FILE *f, char **ret) {
+        char *buf = NULL;
+        size_t n = 0, cap = 0;
+
+        for (;;) {
+                size_t got;
+
+                if (n + 1 >= cap) {
+                        char *t;
+
+                        if (cap >= ENV_FILE_MAX) {
+                                free(buf);
+                                return -EFBIG;
+                        }
+                        cap = cap ? cap * 2 : 4096;
+                        t = realloc(buf, cap);
+                        if (!t) {
+                                free(buf);
+                                return -ENOMEM;
+                        }
+                        buf = t;
+                }
+
+                got = fread(buf + n, 1, cap - n - 1, f);
+                n += got;
+                if (got == 0) {
+                        if (ferror(f)) {
+                                free(buf);
+                                return errno > 0 ? -errno : -EIO;
+                        }
+                        break;
+                }
         }
 
-        return v;
+        buf[n] = '\0';
+        *ret = buf;
+        return 0;
 }
 
 /*
- * v30's load_env_file() + normalize_env_assignment(), with three changes:
- * getline() instead of a LINE_MAX fgets() buffer (so a long line is never
- * silently split into two; see e6dde451a), NAME is
- * stripped as well as the value, and a line with no '=' or an empty NAME is
- * warned about and skipped rather than stored -- the same policy
- * Environment= itself applies at parse time.
+ * EnvironmentFile= reader. v30's load_env_file() only stripped one pair of
+ * quotes; this follows the shell-like rules of v262's env-file.c, written
+ * fresh: adjacent quoted and unquoted pieces join, a backslash escapes the
+ * next character (backslash-newline continues the line), inside double
+ * quotes only \" \\ \$ \` are unescaped, and quoted values may span lines.
+ * A line with no '=' or an empty NAME is warned about and skipped rather than
+ * stored -- the same policy Environment= applies at parse time.
  */
 int pico_load_env_file(const char *path, char ***ret) {
-        char **l = NULL, *line = NULL;
-        size_t cap = 0;
-        unsigned lineno = 0;
+        enum {
+                PRE_KEY,
+                KEY,
+                PRE_VALUE,
+                VALUE,
+                VALUE_ESCAPE,
+                SINGLE_QUOTE,
+                DOUBLE_QUOTE,
+                DOUBLE_QUOTE_ESCAPE,
+                COMMENT,
+                COMMENT_ESCAPE,
+                SKIP_LINE,
+        } state = PRE_KEY;
+        Dyn key = { 0 }, value = { 0 };
+        size_t key_ws = SIZE_MAX, value_ws = SIZE_MAX;
+        unsigned line = 1, key_line = 1;
+        char **l = NULL, *contents = NULL;
         int r = 0;
         FILE *f;
 
         f = fopen(path, "re");
         if (!f)
                 return -errno;
-
-        for (;;) {
-                char *p, *eq, *name, *value;
-                size_t nlen, vlen;
-
-                if (getline(&line, &cap, f) < 0) {
-                        if (ferror(f))
-                                r = errno > 0 ? -errno : -EIO;
-                        break;
-                }
-                lineno++;
-
-                p = env_strip(line);
-                if (*p == '\0' || *p == '#' || *p == ';')
-                        continue;
-
-                eq = strchr(p, '=');
-                if (!eq || eq == p) {
-                        pico_log(PICO_LOG_WARNING, "%s:%u: '%s' is not an assignment, ignoring", path, lineno, p);
-                        continue;
-                }
-
-                *eq = '\0';
-                name = env_strip(p);
-                value = env_unquote(env_strip(eq + 1));
-
-                /* Reassembled in place: value always sits after name. */
-                nlen = strlen(name);
-                vlen = strlen(value);
-                name[nlen] = '=';
-                memmove(name + nlen + 1, value, vlen + 1);
-
-                r = pico_strv_extend(&l, name);
-                if (r < 0)
-                        break;
-        }
-
-        free(line);
+        r = env_read_all(f, &contents);
         fclose(f);
-
-        if (r < 0) {
-                pico_strv_free(l);
+        if (r < 0)
                 return r;
+
+        for (const char *p = contents; *p; p++) {
+                char c = *p;
+
+                r = 0;
+                switch (state) {
+                case PRE_KEY:
+                        if (c == '#' || c == ';')
+                                state = COMMENT;
+                        else if (c == '=') {
+                                pico_log(PICO_LOG_WARNING, "%s:%u: empty name, ignoring", path, line);
+                                state = SKIP_LINE;
+                        } else if (!strchr(ENV_WHITESPACE, c)) {
+                                state = KEY;
+                                key_ws = SIZE_MAX;
+                                key_line = line;
+                                r = dyn_putc(&key, c);
+                        }
+                        break;
+
+                case KEY:
+                        if (strchr(ENV_NEWLINE, c)) {
+                                pico_log(PICO_LOG_WARNING, "%s:%u: not an assignment, ignoring", path, key_line);
+                                state = PRE_KEY;
+                                key.n = 0;
+                        } else if (c == '=') {
+                                state = PRE_VALUE;
+                                value_ws = SIZE_MAX;
+                        } else {
+                                if (!strchr(ENV_WHITESPACE, c))
+                                        key_ws = SIZE_MAX;
+                                else if (key_ws == SIZE_MAX)
+                                        key_ws = key.n;
+                                r = dyn_putc(&key, c);
+                        }
+                        break;
+
+                case PRE_VALUE:
+                case VALUE:
+                        if (strchr(ENV_NEWLINE, c)) {
+                                r = env_emit(&l,
+                                             &key,
+                                             key_ws != SIZE_MAX ? key_ws : key.n,
+                                             &value,
+                                             state == VALUE && value_ws != SIZE_MAX ? value_ws : value.n);
+                                state = PRE_KEY;
+                                key.n = value.n = 0;
+                        } else if (state == PRE_VALUE && c == '\'')
+                                state = SINGLE_QUOTE;
+                        else if (state == PRE_VALUE && c == '"')
+                                state = DOUBLE_QUOTE;
+                        else if (c == '\\') {
+                                state = VALUE_ESCAPE;
+                                value_ws = SIZE_MAX;
+                        } else if (state == PRE_VALUE && strchr(ENV_WHITESPACE, c)) {
+                                /* leading whitespace */
+                        } else {
+                                if (!strchr(ENV_WHITESPACE, c))
+                                        value_ws = SIZE_MAX;
+                                else if (value_ws == SIZE_MAX)
+                                        value_ws = value.n;
+                                state = VALUE;
+                                r = dyn_putc(&value, c);
+                        }
+                        break;
+
+                case VALUE_ESCAPE:
+                        state = VALUE;
+                        if (!strchr(ENV_NEWLINE, c))
+                                r = dyn_putc(&value, c);
+                        break;
+
+                case SINGLE_QUOTE:
+                        if (c == '\'')
+                                state = PRE_VALUE;
+                        else
+                                r = dyn_putc(&value, c);
+                        break;
+
+                case DOUBLE_QUOTE:
+                        if (c == '"')
+                                state = PRE_VALUE;
+                        else if (c == '\\')
+                                state = DOUBLE_QUOTE_ESCAPE;
+                        else
+                                r = dyn_putc(&value, c);
+                        break;
+
+                case DOUBLE_QUOTE_ESCAPE:
+                        state = DOUBLE_QUOTE;
+                        if (strchr("\"\\`$", c))
+                                r = dyn_putc(&value, c);
+                        else if (c != '\n') {
+                                /* like the shell, any other backslash stays */
+                                r = dyn_putc(&value, '\\');
+                                if (r >= 0)
+                                        r = dyn_putc(&value, c);
+                        }
+                        break;
+
+                case COMMENT:
+                        if (c == '\\')
+                                state = COMMENT_ESCAPE;
+                        else if (strchr(ENV_NEWLINE, c))
+                                state = PRE_KEY;
+                        break;
+
+                case COMMENT_ESCAPE:
+                        state = strchr(ENV_NEWLINE, c) ? PRE_KEY : COMMENT;
+                        break;
+
+                case SKIP_LINE:
+                        if (strchr(ENV_NEWLINE, c))
+                                state = PRE_KEY;
+                        break;
+                }
+
+                if (r < 0)
+                        goto fail;
+                if (c == '\n')
+                        line++;
         }
 
+        if (state == KEY)
+                pico_log(PICO_LOG_WARNING, "%s:%u: not an assignment, ignoring", path, key_line);
+        else if (state == PRE_VALUE || state == VALUE || state == VALUE_ESCAPE || state == SINGLE_QUOTE ||
+                 state == DOUBLE_QUOTE || state == DOUBLE_QUOTE_ESCAPE) {
+                r = env_emit(&l,
+                             &key,
+                             key_ws != SIZE_MAX ? key_ws : key.n,
+                             &value,
+                             state == VALUE && value_ws != SIZE_MAX ? value_ws : value.n);
+                if (r < 0)
+                        goto fail;
+        }
+
+        free(key.p);
+        free(value.p);
+        free(contents);
         *ret = l;
         return 0;
+
+fail:
+        free(key.p);
+        free(value.p);
+        free(contents);
+        pico_strv_free(l);
+        return r;
 }

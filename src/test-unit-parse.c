@@ -910,6 +910,69 @@ static void test_exec_c_escapes(void) {
         free(dir);
 }
 
+static char *load_env_value(const char *dir, const char *content, const char *name) {
+        char **l = NULL, *v = NULL;
+        char path[PATH_MAX];
+
+        ASSERT_EQ_INT(test_write_file(dir, "env", content), 0);
+        snprintf(path, sizeof(path), "%s/env", dir);
+        ASSERT_EQ_INT(pico_load_env_file(path, &l), 0);
+        if (l && pico_strv_env_get(l, name))
+                v = strdup(pico_strv_env_get(l, name));
+        pico_strv_free(l);
+        return v;
+}
+
+/* EnvironmentFile= values follow the shell's quoting, not just a stripped
+ * pair of outer quotes. */
+static void test_env_file_shell_quoting(void) {
+        char *dir = test_tmpdir_new();
+        char *v;
+
+        ASSERT_TRUE(dir != NULL);
+
+        v = load_env_value(dir, "A=\"say \\\"hi\\\" \\$HOME \\n\"\n", "A");
+        ASSERT_STREQ(v, "say \"hi\" $HOME \\n");
+        free(v);
+
+        v = load_env_value(dir, "A=\"one\"two'three'\n", "A");
+        ASSERT_STREQ(v, "onetwo'three'");
+        free(v);
+
+        v = load_env_value(dir, "A='it''s'\n", "A");
+        ASSERT_STREQ(v, "its");
+        free(v);
+
+        v = load_env_value(dir, "A=\"line1\nline2\"\nB=x\n", "A");
+        ASSERT_STREQ(v, "line1\nline2");
+        free(v);
+
+        v = load_env_value(dir, "A=one\\\ntwo \\ \n", "A");
+        ASSERT_STREQ(v, "onetwo  ");
+        free(v);
+
+        v = load_env_value(dir, "A=plain value  \n", "A");
+        ASSERT_STREQ(v, "plain value");
+        free(v);
+
+        /* a comment ending in a backslash does not swallow the next line */
+        v = load_env_value(dir, "# comment \\\nA=1\n", "A");
+        ASSERT_STREQ(v, "1");
+        free(v);
+
+        /* no '=' and an empty name cost only their own line */
+        v = load_env_value(dir, "NOEQ\n=x\nA=2\n", "A");
+        ASSERT_STREQ(v, "2");
+        free(v);
+
+        v = load_env_value(dir, "A=last", "A");
+        ASSERT_STREQ(v, "last");
+        free(v);
+
+        test_rm_rf(dir);
+        free(dir);
+}
+
 /*
  * A dependency token is a filename before it is anything else, so it must be
  * validated before it is ever concatenated into a search-path entry.
@@ -2297,6 +2360,7 @@ int main(void) {
         test_comment_inside_continuation_is_skipped();
         test_quoting_and_glued_quotes();
         test_exec_c_escapes();
+        test_env_file_shell_quoting();
         test_exec_start_pre_list_and_reset();
         test_standard_output_and_error();
         test_invalid_dependency_names_are_rejected();
