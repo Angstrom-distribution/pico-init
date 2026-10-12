@@ -43,6 +43,11 @@ static const char *crash_service =
                 "RestartSec=50ms\n"
                 "ExecStart=/bin/sh -c \"exit 7\"\n";
 
+static const char *steady_service =
+                "[Service]\n"
+                "Type=simple\n"
+                "ExecStart=/bin/sh -c \"exec sleep 30\"\n";
+
 static Manager *manager_for(const char *dir) {
         const char * const path[] = { dir, NULL };
         Manager *m = NULL;
@@ -169,7 +174,7 @@ static void test_cgroup_empty_dequeue_cancels(void) {
         ASSERT_TRUE(dir != NULL);
         m = manager_for(dir);
 
-        s = load_service(m, dir, "steady.service", crash_service);
+        s = load_service(m, dir, "steady.service", steady_service);
         ASSERT_EQ_INT(service_start(s), 0);
         ASSERT_EQ_INT(s->state, SERVICE_RUNNING);
         ASSERT_TRUE(s->main_pid > 0);
