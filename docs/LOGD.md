@@ -254,43 +254,129 @@ The output of `picolog -o export` can be piped to upstream
 ## picolog
 
 ```
-picolog [-f] [-u UNIT] [-p PRIO] [-k] [-n LINES] [-o short|export] [-a]
+picolog [OPTIONS...] [MATCHES...]
 ```
 
 `picolog` reads the ring files directly, rotated file first and then the
-active one, and does not talk to `logd`. A missing ring yields no output
-and success; an incomplete trailing entry is dropped. There is no `-b`: the
-ring only ever holds the current boot.
+active one, and does not talk to `logd`. Its options follow `journalctl` from
+systemd 262. A missing ring yields no entries and success; an incomplete
+trailing entry is dropped.
 
-| Option | Meaning |
-|--------|---------|
-| `-f` | Follow. Starts at the current end of the active file, reopens it when rotation replaces it, polls every 200 ms. With `-n`, the last N matching entries are printed first. |
-| `-u UNIT` | Only entries whose `_SYSTEMD_UNIT` equals UNIT. A name without a `.service`, `.socket` or `.target` suffix gets `.service` appended. |
-| `-p PRIO` | Entries at PRIO or more severe. PRIO is a name (`emerg`, `alert`, `crit`, `err`, `warning`, `notice`, `info`, `debug`) or 0 to 7. Entries without a parseable `PRIORITY` do not match. |
-| `-k` | Only entries with `_TRANSPORT=kernel`. |
-| `-n LINES` | Only the last LINES matching entries. 0 means all. |
-| `-o short` | Default. `Mon DD HH:MM:SS host identifier[pid]: message` in local time. |
-| `-o export` | The stored bytes of each matching entry, unchanged. |
-| `-a` | In `short`, print a message that is not valid text with `\xNN` escapes instead of a placeholder. |
-| `-h` | Print usage. |
+Every option is one of three kinds. *Real* options work on the stored fields.
+*No-op* options are accepted and do nothing, where doing nothing is the right
+outcome for a log that lives in RAM. *Refused* options print a one-line
+`picolog: ...` message on stderr and exit with status 1, because accepting
+them silently would let a script believe that a rotation, a sync or a
+verification had happened.
 
-Details of the `short` format:
+A ring in `/run` holds the current boot only. The boot filter that
+`journalctl` implies for `-k`, `-f` and `-e` is therefore not applied, `-b`
+selects by an explicit boot ID, and a boot offset other than 0 prints
+`Specifying boot ID or boot offset has no effect, no persistent journal was
+found.` and shows nothing, which is what `journalctl` does for a runtime-only
+journal.
 
-- The host name is that of the machine running `picolog`; it is not stored in
-  the ring.
-- The identifier is `SYSLOG_IDENTIFIER`, else `_COMM`, else `unknown`. As
-  kernel records have neither, they print as `unknown`. `[pid]` follows when
-  the entry has `_PID`.
-- A binary-encoded `MESSAGE` prints as `[N bytes blob data]` unless `-a`.
-- Only the message text is coloured, by priority as `journalctl` does:
-  red for 0 to 3, yellow for 4, bold for 5, grey for 7, none for 6. Colour
-  is off when `NO_COLOR` is set, stdout is not a terminal or `TERM` is unset
-  or `dumb`; `SYSTEMD_COLORS` overrides all of these.
+### Sources
+
+| Option | Kind | Meaning |
+|--------|------|---------|
+| `-D`, `--directory=PATH` | real | Ring files in `PATH` instead of `/run/logd`. |
+| `-i`, `--file=PATH` | real | Read an export-format file, repeatable. The output of `picolog -o export` can be read back this way; `-` (stdin) is refused. |
+| `--root=PATH` | real | Ring at `PATH/run/logd`; also locates `/etc/machine-id` for `--list-namespaces`. |
+| `--namespace=NAME` | real | Only the default namespace has entries. An empty name, `*` and `+NAME` read the ring; any other name reads nothing. |
+| `--system`, `-m`, `--merge` | no-op | There is one ring. `-m` still conflicts with `-b` and `--list-boots`, as upstream. |
+| `--user`, `--user-unit=`, `-M`, `--image=`, `--image-policy=` | refused | No per-user journals, no container transport, no disk images. |
+
+`LOGD_RUNTIME_DIR` in the environment replaces `/run/logd` when none of the
+above is given; the test suite uses this.
+
+### Filters
+
+| Option | Kind | Meaning |
+|--------|------|---------|
+| `-u`, `--unit=UNIT` | real | `_SYSTEMD_UNIT` equals `UNIT`; repeatable, any match counts. A name without a unit suffix gets `.service`; a name with `*`, `?` or `[` is a glob. |
+| `-t`, `--identifier=ID` | real | `SYSLOG_IDENTIFIER` equals `ID`; repeatable. |
+| `-T`, `--exclude-identifier=ID` | real | Hide entries with that identifier; repeatable. |
+| `-p`, `--priority=RANGE` | real | `LEVEL` is that level and everything more severe; `FROM..TO` is the inclusive range in either order. Levels are `emerg`, `alert`, `crit`, `err`, `warning`, `notice`, `info`, `debug` or 0 to 7. Entries without a parseable `PRIORITY` do not match. |
+| `-k`, `--dmesg` | real | `_TRANSPORT=kernel`. |
+| `-g`, `--grep=PATTERN` | real | `MESSAGE` matches a POSIX extended regular expression. Case-insensitive unless the pattern has an upper-case letter or `--case-sensitive[=BOOL]` says otherwise. Exits 1 when nothing matches. With `-n N` and no `-f`, as in `journalctl`, the last N matches are printed newest first. |
+| `-S`, `--since=DATE`, `-U`, `--until=DATE` | real | Entries within the range, by `__REALTIME_TIMESTAMP`. Dates: `now`, `today`, `yesterday`, `tomorrow`, `@EPOCH`, `+5min`, `-1h`, `5min ago`, `5min left`, `[WEEKDAY] YYYY-MM-DD [HH:MM[:SS[.FRAC]]] [UTC\|Z\|+HH:MM]` or a bare `HH:MM[:SS]`. Local time unless a zone is given. |
+| `-b`, `--boot[=ID]`, `--this-boot` | real | See above: `ID` selects by `_BOOT_ID` and fails if the ring has no such boot; `all`, no argument and `0` select everything. |
+| `-c`, `--cursor=C`, `--after-cursor=C`, `--cursor-file=FILE` | real | Start at, or after, the entry named by a cursor. `--cursor-file` starts after the cursor in `FILE` (everything if it is missing) and rewrites it on exit. |
+| `--facility=LIST` | real | `SYSLOG_FACILITY` is one of the listed facilities. `logd` does not store the facility, so nothing matches. `--facility=help` lists the names. |
+| `FIELD=VALUE ...` | real | Matches: terms on the same field are alternatives, different fields must all match, and a `+` word starts an alternative group. |
+| `/path/to/executable` | real | Matches the executable's `_COMM` (its first 15 characters). `_EXE` is not stored, so unlike upstream this can also match other programs of the same name. A device node is refused: `_KERNEL_DEVICE` is not stored. |
+| `-I`, `--invocation=ID` | refused | Invocation IDs are not stored. The lookup fails the way an unknown ID does in `journalctl`: `No journal entry found for the invocation (...)`, status 1. |
+
+Cursors are `b=BOOTID;m=MONOTONIC-HEX;t=REALTIME-HEX`. The ring has no
+sequence numbers, so they are not interchangeable with cursors from a binary
+journal.
+
+### Output
+
+| Option | Kind | Meaning |
+|--------|------|---------|
+| `-o`, `--output=MODE` | real | `short` (default), `short-iso`, `short-iso-precise`, `short-precise`, `short-monotonic`, `short-delta`, `short-unix`, `short-full`, `verbose`, `export`, `json`, `json-pretty`, `json-sse`, `json-seq`, `cat`, `with-unit`. `-o help` lists them. |
+| `--output-fields=LIST` | real | Fields shown by `verbose`, `export`, `json*` and `cat`. The timestamps and `_BOOT_ID` stay in `export` and `json*`. |
+| `-n`, `--lines[=[+]N]` | real | The last `N` entries (default 10 with a bare `-n`), or the first `N` with `+N`. `all` shows everything, `0` nothing. With `-f` and no `-n` or `--since`, 10. `-e` makes the default 1000. |
+| `--no-tail` | real | All entries, even with `-f`. |
+| `-r`, `--reverse` | real | Newest first. |
+| `-f`, `--follow` | real | Print the last `-n` entries, then new ones as they arrive (polled every 200 ms). `SIGINT` and `SIGTERM` end it with status 0. Not combinable with `-r`, `-i`. |
+| `--show-cursor` | real | Print `-- cursor: C` after the last entry. |
+| `--utc` | real | UTC instead of local time. |
+| `-W`, `--no-hostname` | real | Drop the host name column. |
+| `-a`, `--all` | real | Show long and unprintable fields. Characters that are not printable text are written as `\xNN`. |
+| `-l`, `--full`, `--no-full` | real | Without `--no-full`, long lines are never cut. `--no-full` ellipsizes to the terminal width, to 3 lines and to 300 characters. The ellipsis is ASCII `...`. |
+| `--truncate-newline` | real | In `short` modes, cut a message at its first newline. |
+| `-q`, `--quiet` | real | No `-- No entries --`, `-- Boot ... --`, table headers or notices. Implied by `export`, `json*` and `cat`. |
+| `-x`, `--catalog` | no-op | There is no message catalog. |
+| `--no-pager`, `-e`, `--synchronize-on-exit=BOOL` | no-op | There is no pager and nothing to synchronize (`-e` still sets the line default). |
+
+Details of the `short` family:
+
+- The host name is `_HOSTNAME` when the entry has one, else that of the
+  machine running `picolog`; `logd` does not store it.
+- The identifier is `SYSLOG_IDENTIFIER`, else `_COMM`, else `unknown`
+  (`with-unit` prefers `_SYSTEMD_UNIT`). As kernel records have neither, they
+  print as `unknown`. `[pid]` follows when the entry has `_PID` or
+  `SYSLOG_PID`.
+- Lines after the first of a multi-line message are indented under the
+  first. TAB becomes 8 spaces and ANSI colour sequences are removed, unless
+  `-a`.
+- A message that is not valid printable text prints as `[NB blob data]`,
+  with `N` the size in `journalctl`'s units (`7B`, `1.5K`).
+- Only the message text is coloured, by priority as `journalctl` does: red
+  for 0 to 3, yellow for 4, bold for 5, grey for 7, none for 6. A `--grep`
+  match is highlighted inside it. Colour is off when `NO_COLOR` is set,
+  stdout is not a terminal or `TERM` is unset or `dumb`; `SYSTEMD_COLORS`
+  overrides all of these.
 - Entries without a valid `__REALTIME_TIMESTAMP` are skipped.
 
-`-u`, `-p` and `-k` combine with AND. The environment variable
-`LOGD_RUNTIME_DIR`, when set, replaces `/run/logd` as the ring location;
-this exists for the test suite.
+`export` passes the stored bytes of each entry through unchanged, so a
+filtered subset still feeds `systemd-journal-remote`; it carries no
+`__CURSOR`, `__SEQNUM` or `__SEQNUM_ID`, which the ring does not have.
+`json*` has `__CURSOR` but no sequence number either. Values that are not
+text are arrays of byte values, and values of 4096 bytes or more are `null`,
+unless `-a`. JSON output is not coloured.
+
+### Commands
+
+| Command | Kind | Meaning |
+|---------|------|---------|
+| `-h`, `--help`, `--version` | real | |
+| `-N`, `--fields` | real | Field names present in the ring. |
+| `-F`, `--field=FIELD` | real | Distinct values of a field, in order of first appearance; `-n` limits. Neither accepts filters. |
+| `--list-boots` | real | One row per `_BOOT_ID` with first and last entry. `-n` and `-r` as upstream. |
+| `--list-namespaces` | real | Namespaces under `/var/log/journal` and `/run/log/journal`. |
+| `--disk-usage` | real | Disk usage of the ring files. |
+| `--vacuum-size=`, `--vacuum-files=`, `--vacuum-time=` | real | Remove the rotated file (the only archived one) when the total size, the file count or its age is over the limit. The active file stays. Needs write access to the ring directory. |
+| `--new-id128` | real | A new random ID in `journalctl`'s four notations. |
+| `--flush`, `--relinquish-var`, `--smart-relinquish-var` | no-op | Nothing is stored on disk. |
+| `--list-invocations` | refused | As `-I`. |
+| `--sync`, `--rotate` | refused | `logd` has no control interface. Upstream's versions also fail when `journald` is not running. |
+| `--header`, `--verify` | refused | The ring has no journal header and nothing to verify. |
+| `--interval=`, `--verify-key=`, `--force`, `--setup-keys` | refused | `Compiled without forward-secure sealing support.`, as an upstream build without OpenSSL says. |
+| `--list-catalog`, `--dump-catalog`, `--update-catalog` | refused | There is no catalog database. |
 
 `picoctl status UNIT` uses the same reader for its per-unit log tail.
 
@@ -333,6 +419,7 @@ push every other service's older records out of it.
   `_SYSTEMD_INVOCATION_ID`, `_MACHINE_ID`, `_HOSTNAME`, `MESSAGE_ID`,
   `CODE_FILE` and `__CURSOR`/`__SEQNUM`; audit records.
 - Kernel timestamps and sequence numbers on `_TRANSPORT=kernel` entries.
-- `picolog` has no `--since`, `--until`, `--grep`, `-b`, `-r`, `-o json`,
-  field matches (`FIELD=value`), `--list-boots`, `--vacuum-*`, `--rotate`
-  or `--flush`; filtering is limited to the options in the table above.
+- What `picolog` cannot do, for lack of data or a daemon to ask: header
+  display, verification, sync and rotate requests, invocation IDs, per-user
+  journals, catalogs, and sequence numbers in cursors and `export`. The
+  tables in [picolog](#picolog) say what each such option does instead.
