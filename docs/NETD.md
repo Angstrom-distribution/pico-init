@@ -41,7 +41,7 @@ way `systemd-networkd` does for `MACAddressPolicy=persistent`.
 
 | Signal | Effect |
 | --- | --- |
-| `SIGHUP` | Re-read all `.network` files, re-match and reconfigure every link. |
+| `SIGHUP` | Re-read all `.network` files, re-match and reconfigure every link. Ignored once a shutdown has been requested. |
 | `SIGTERM`, `SIGINT` | Leave the event loop and exit 0. |
 
 A reload replaces the running configuration only after the new set has been
@@ -85,10 +85,11 @@ Booleans accept `1`, `yes`, `y`, `true`, `t`, `on` and `0`, `no`, `n`,
 
 | Key | Meaning |
 | --- | --- |
-| `Name=` | Space-separated list of `fnmatch(3)` globs matched against the interface name. |
+| `Name=` | Space-separated list of `fnmatch(3)` globs matched against the interface name. A leading `!` excludes. An empty `Name=` clears the list. |
 
 `Name=` is the only match key. A file without `Name=` matches nothing; there
-is no unconditional catch-all. Other `[Match]` keys (`MACAddress=`, `Driver=`,
+is no unconditional catch-all. A glob starting with `!` vetoes any interface
+it matches, and a list of only `!` globs matches every other interface. Other `[Match]` keys (`MACAddress=`, `Driver=`,
 `Type=`, `Host=` and so on) are not implemented, and a file using them
 matches on `Name=` alone, or not at all if it has none.
 
@@ -96,7 +97,7 @@ matches on `Name=` alone, or not at all if it has none.
 
 | Key | Values | Behaviour |
 | --- | --- | --- |
-| `DHCP=` | `no`, `ipv4`, `ipv6`, `yes` (also `true`/`1`/`on`, `false`/`0`/`off`) | `yes` and `ipv4` start the DHCPv4 client. `ipv6` parses and does nothing. `yes` is IPv4 only in practice. Default `no`. |
+| `DHCP=` | `no`, `ipv4`, `ipv6`, `yes` (also any other boolean spelling, case-insensitive) | `yes` and `ipv4` start the DHCPv4 client. `ipv6` parses and does nothing. `yes` is IPv4 only in practice. Default `no`. |
 | `Address=` | `a.b.c.d/nn` | Static IPv4 address. Only the first valid line is applied; later ones are parsed and ignored. A value without a prefix length is rejected. |
 | `Gateway=` | IPv4 address | Static default route. |
 | `DNS=` | IPv4 address literals, space-separated | Written to `/etc/resolv.conf`. A host name is rejected: netd has no resolver. |
@@ -106,7 +107,14 @@ matches on `Name=` alone, or not at all if it has none.
 | `EmitLLDP=` | boolean, `nearest-bridge`, `non-tpmr-bridge`, `customer-bridge` | Transmit LLDP to the given group address. `yes` means `nearest-bridge`. Default no. |
 
 For `DNS=` and `NTP=` an invalid token is dropped and the remaining tokens
-on the line are kept, and values accumulate across lines.
+on the line are kept, and values accumulate across lines. An empty
+assignment clears the list. A list holds at most 128 entries; the rest are
+ignored with a warning.
+
+A lease's router is the first non-zero entry of option 3. When it lies
+outside the leased address and netmask, netd first adds a link-scope host
+route to it, and removes that route together with the default route. A
+renewed lease without a router removes the default route a lease installed.
 
 Each link has one default route, whether from `Gateway=` or from a lease. It
 is installed with a metric of 100 plus the interface index, so two managed
