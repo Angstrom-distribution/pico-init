@@ -734,6 +734,8 @@ logd_tests = [
   'test-logd-recv',
   'test-logd-kmsg',
   'test-picolog',
+  # logd's options and the refused log namespace argument.
+  'test-logd-opts',
 ]
 
 foreach t : logd_tests

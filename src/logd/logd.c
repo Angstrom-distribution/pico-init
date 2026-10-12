@@ -78,6 +78,62 @@ static bool get_listen_fds(int *stdout_fd, int *syslog_fd) {
         return true;
 }
 
+static void logd_usage(void) {
+        puts("logd [OPTIONS...]\n"
+             "\n"
+             "Log daemon.\n"
+             "\n"
+             "  -h --help             Show this help\n"
+             "     --version          Show version\n"
+             "     --runtime-dir=DIR  Ring directory instead of /run/logd\n"
+             "     --max-bytes=N      Ring cap in bytes instead of 2 MiB");
+}
+
+/*
+ * systemd-journald v262 takes no options and one optional log namespace name.
+ * Namespaces are not supported, so a non-empty one is refused rather than
+ * served from the main ring. --help and --version are additions; upstream
+ * would take them for a namespace.
+ *
+ * 0 to run, 1 when --help or --version was all there was to do, -EINVAL on a
+ * bad command line.
+ */
+static int logd_parse_argv(int argc, char *argv[], const char **runtime_dir, long *max_bytes) {
+        const char *ns = NULL;
+        int n_args = 0;
+
+        for (int i = 1; i < argc; i++) {
+                if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+                        logd_usage();
+                        return 1;
+                } else if (strcmp(argv[i], "--version") == 0) {
+                        puts("logd " PICO_INIT_VERSION);
+                        return 1;
+                } else if (strncmp(argv[i], "--runtime-dir=", 14) == 0)
+                        *runtime_dir = argv[i] + 14;
+                else if (strncmp(argv[i], "--max-bytes=", 12) == 0)
+                        *max_bytes = strtol(argv[i] + 12, NULL, 10);
+                else if (argv[i][0] == '-' && argv[i][1] != '\0') {
+                        fprintf(stderr, "logd: unrecognized option '%s'\n", argv[i]);
+                        return -EINVAL;
+                } else {
+                        ns = argv[i];
+                        n_args++;
+                }
+        }
+
+        if (n_args > 1) {
+                fprintf(stderr, "logd: this program takes one or no arguments\n");
+                return -EINVAL;
+        }
+        if (ns && *ns) {
+                fprintf(stderr, "logd: log namespaces are not supported, refusing namespace '%s'\n", ns);
+                return -EINVAL;
+        }
+
+        return 0;
+}
+
 int main(int argc, char *argv[]) {
         LogdWriter *writer = NULL;
         LogdRecv *recv_ctx = NULL;
@@ -90,12 +146,11 @@ int main(int argc, char *argv[]) {
         bool activated;
         int r;
 
-        for (int i = 1; i < argc; i++) {
-                if (strncmp(argv[i], "--runtime-dir=", 14) == 0)
-                        runtime_dir_override = argv[i] + 14;
-                else if (strncmp(argv[i], "--max-bytes=", 12) == 0)
-                        max_bytes_override = strtol(argv[i] + 12, NULL, 10);
-        }
+        r = logd_parse_argv(argc, argv, &runtime_dir_override, &max_bytes_override);
+        if (r < 0)
+                return 1;
+        if (r > 0)
+                return 0;
 
         r = logd_writer_new(&writer);
         if (r < 0) {
