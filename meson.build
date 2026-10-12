@@ -1190,7 +1190,7 @@ foreach t : libsystemd_compat_device_tests
     include_directories: libsystemd_compat_includes,
     link_with: libsystemd_compat,
   )
-  test(t, exe)
+  test(t, exe, is_parallel: t != 'test-sd-device-monitor')
 endforeach
 
 # ---------------------------------------------------------------------------
@@ -1309,4 +1309,6 @@ test_libudev_monitor_exe = executable(
   include_directories: libudev_includes,
   link_with: libudev,
 )
-test('test-libudev-monitor', test_libudev_monitor_exe)
+# Both monitor tests join the kernel uevent group, so a packet sent by one
+# makes the other's "no events" poll return early.
+test('test-libudev-monitor', test_libudev_monitor_exe, is_parallel: false)
