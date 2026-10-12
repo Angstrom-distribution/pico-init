@@ -445,6 +445,52 @@ int logd_ring_read(const char *runtime_dir, LogdRing **ret) {
         return 0;
 }
 
+int logd_ring_read_files(const char * const *paths, size_t n_paths, LogdRing **ret) {
+        char *buf = NULL;
+        size_t len = 0, consumed = 0;
+        LogdEntry *entries = NULL;
+        size_t n_entries = 0;
+        LogdRing *ring;
+        int r = 0;
+
+        if ((!paths && n_paths > 0) || !ret)
+                return -EINVAL;
+
+        for (size_t i = 0; i < n_paths && r == 0; i++) {
+                struct stat st;
+
+                if (stat(paths[i], &st) < 0)
+                        r = -errno;
+                else
+                        r = append_file_contents(paths[i], &buf, &len);
+        }
+
+        if (r < 0) {
+                free(buf);
+                return r;
+        }
+
+        r = parse_entries(buf, len, &entries, &n_entries, &consumed);
+        if (r < 0) {
+                free(buf);
+                return r;
+        }
+
+        ring = calloc(1, sizeof(*ring));
+        if (!ring) {
+                for (size_t i = 0; i < n_entries; i++)
+                        free(entries[i].fields);
+                free(entries);
+                free(buf);
+                return -ENOMEM;
+        }
+
+        ring_init(ring, buf, len, entries, n_entries);
+
+        *ret = ring;
+        return 0;
+}
+
 LogdRing *logd_ring_free(LogdRing *r) {
         if (!r)
                 return NULL;

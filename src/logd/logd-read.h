@@ -74,6 +74,12 @@ typedef struct LogdRing LogdRing;
 int logd_ring_read(const char *runtime_dir, LogdRing **ret);
 LogdRing *logd_ring_free(LogdRing *r);
 
+/*
+ * As logd_ring_read(), but for explicit export-format files, read in the
+ * order given. Unlike the ring's own two files, a missing file is an error.
+ */
+int logd_ring_read_files(const char * const *paths, size_t n_paths, LogdRing **ret);
+
 size_t logd_ring_n_entries(const LogdRing *r);
 const LogdEntry *logd_ring_entry(const LogdRing *r, size_t index); /* index must be < logd_ring_n_entries() */
 
