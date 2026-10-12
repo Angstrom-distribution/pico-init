@@ -262,9 +262,17 @@ same subset. It skips removed devices and names USB serial adapters:
 
 ```
 ACTION=="remove", GOTO="pico_serial_end"
-SUBSYSTEM=="tty", KERNEL=="ttyUSB*|ttyACM*", SYMLINK+="serial/by-id/usb-$attr{manufacturer}_$attr{product}_$attr{serial}-if$attr{bInterfaceNumber}"
+SUBSYSTEM!="tty", GOTO="pico_serial_end"
+KERNEL!="ttyUSB*|ttyACM*", GOTO="pico_serial_end"
+...
 LABEL="pico_serial_end"
 ```
+
+The link is `serial/by-id/usb-<manufacturer>_<product>[_<serial>]-if<N>`, with a
+`-port<N>` suffix on `ttyUSB` devices (not `ttyACM`). A missing manufacturer
+or product is replaced by `idVendor` or `idProduct`, and the serial component
+is left out when the adapter has none. An adapter without an interface number
+gets no link.
 
 ### Syntax understood
 
@@ -383,7 +391,7 @@ skipped them.
 | `TEST`, `TAG`, `TAGS`, `OPTIONS`, `NAME`, `DRIVER`, `DRIVERS`, `SUBSYSTEMS`, `KERNELS`, `SECLABEL` | skipped |
 | `ATTR{}=` (sysfs writes) | skipped |
 | `e"..."` strings, backward `GOTO`, labels across files | not supported |
-| `by-path` links, `by-id` hex fallbacks | not created |
+| `by-path` links | not created |
 | MBR and FAT/exFAT filesystems | not identified, not mounted |
 | tags (`G:`, `Q:`), device link priorities (`L:`), inotify watches (`W:`) | not recorded |
 | rules reload on change | none; restart the unit |

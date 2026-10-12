@@ -126,7 +126,7 @@ record emitted before it existed. The first record is
 `status_enable()` opens `/dev/console` for write (falling back to stdout) and
 `status_welcome()` prints the greeting. The greeting is the systemd one:
 a blank line, `Welcome to <name>!`, a blank line, where the name is
-`PRETTY_NAME` from os-release, else `NAME`, else `Linux`. If the console is
+`PRETTY_NAME` from os-release (`/etc/os-release`, else `/usr/lib/os-release`), else `NAME`, else `Linux`. If the console is
 colourable the name uses the SGR parameters of `ANSI_COLOR=` (bold when
 absent or when the value contains anything other than digits and `;`).
 Colour is on unless `TERM` is literally `dumb`; `$NO_COLOR` and
