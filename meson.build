@@ -820,6 +820,10 @@ libsystemd_compat_sources = files(
   'src/compat/libsystemd/sd-json-noop.c',
   'src/compat/libsystemd/sd-json-dispatch.c',
   'src/compat/libsystemd/sd-path-stubs.c',
+  # sd-varlink: connecting, the server constructor and the IDL formatter and
+  # parser fail, NULL-handle answers and the handle-free helpers are in -noop.
+  'src/compat/libsystemd/sd-varlink-stubs.c',
+  'src/compat/libsystemd/sd-varlink-noop.c',
   # sd-device/sd-network: device-new.c (refcounting, the
   # sd_device_new_from_*() constructors, the parent walk), device-attr.c
   # (subsystem, driver, sysname), device-uevent.c (the property table),
@@ -957,6 +961,8 @@ libsystemd_public_headers = files(
   'src/compat/libsystemd/sd-network.h',
   'src/compat/libsystemd/sd-json.h',
   'src/compat/libsystemd/sd-path.h',
+  'src/compat/libsystemd/sd-varlink.h',
+  'src/compat/libsystemd/sd-varlink-idl.h',
 )
 install_headers(libsystemd_public_headers, subdir: 'systemd')
 
@@ -1116,6 +1122,14 @@ test_sd_json_exe = executable(
   link_with: libsystemd,
 )
 test('test-sd-json', test_sd_json_exe)
+
+test_sd_varlink_exe = executable(
+  'test-sd-varlink',
+  ['src/compat/libsystemd/test-sd-varlink.c'] + pico_test_sources,
+  include_directories: libsystemd_compat_includes,
+  link_with: libsystemd,
+)
+test('test-sd-varlink', test_sd_varlink_exe)
 
 test_sd_path_exe = executable(
   'test-sd-path',
