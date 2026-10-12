@@ -314,6 +314,19 @@ builder:
 - Only units that have `WantedBy=` or `RequiredBy=` and no symlink already
   deciding them are considered.
 
+### Service environment
+
+Like systemd's system manager, pico-init starts services with a clean
+environment instead of its own: `PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin`
+and nothing else. What the kernel hands PID 1 (`HOME=/`, `TERM=linux` and
+every unrecognised `name=value` boot-command-line word) does not reach
+services; a unit that needs a variable sets it with `Environment=`. A unit
+with `StandardInput=tty*` also receives `TERM`.
+
+A unit with `User=` whose account exists in the passwd database gets `USER`,
+`LOGNAME`, `HOME` and `SHELL` for that account (`SHELL` falls back to
+`/bin/sh`). `Environment=` and `EnvironmentFile=` override all of them.
+
 ### Other differences
 
 - There is no D-Bus. `BusName=` is recorded as dropped, and `Type=dbus`
