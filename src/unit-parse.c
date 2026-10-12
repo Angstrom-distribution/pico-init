@@ -35,9 +35,10 @@
  *    the historical assert(path_is_absolute(path)) with an explicit
  *    validate-and-reject chain; parse_exec_line() follows that template.
  *  - a2a5291b3 / b2fadec60 "conf-parser: fix potentially bad memory
- *    accesses" -- an unterminated quote or trailing garbage after a
- *    closing quote was silently accepted; pico_extract_first_word() (util.c,
- *    shared with $VAR splitting at spawn time) rejects both.
+ *    accesses" -- an unterminated quote was silently accepted;
+ *    pico_extract_first_word() (util.c, shared with $VAR splitting at spawn
+ *    time) rejects it. Text glued to a closing quote is not garbage there:
+ *    it continues the word, as in extract_first_word().
  *  - 92c1622e14 / 36c16a7cdd -- TimeoutStartSec=/TimeoutStopSec= and
  *    RestartSec= have opposite zero-semantics upstream (0 means "never time
  *    out" for the former, "restart immediately" for the latter).

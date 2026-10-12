@@ -20,6 +20,7 @@
 #include <limits.h> /* NAME_MAX, for pico_exec_path_is_valid() */
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -284,10 +285,138 @@ char *pico_strv_env_get(char * const *l, const char *name) {
         return env_get_n(l, name, strlen(name));
 }
 
+static int hex_digit(char c) {
+        if (c >= '0' && c <= '9')
+                return c - '0';
+        if (c >= 'a' && c <= 'f')
+                return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F')
+                return c - 'A' + 10;
+        return -1;
+}
+
+static size_t utf8_encode(uint32_t c, char *out) {
+        if (c < 0x80) {
+                out[0] = (char) c;
+                return 1;
+        }
+        if (c < 0x800) {
+                out[0] = (char) (0xC0 | (c >> 6));
+                out[1] = (char) (0x80 | (c & 0x3F));
+                return 2;
+        }
+        if (c < 0x10000) {
+                out[0] = (char) (0xE0 | (c >> 12));
+                out[1] = (char) (0x80 | ((c >> 6) & 0x3F));
+                out[2] = (char) (0x80 | (c & 0x3F));
+                return 3;
+        }
+        out[0] = (char) (0xF0 | (c >> 18));
+        out[1] = (char) (0x80 | ((c >> 12) & 0x3F));
+        out[2] = (char) (0x80 | ((c >> 6) & 0x3F));
+        out[3] = (char) (0x80 | (c & 0x3F));
+        return 4;
+}
+
+/* Reads `n` hex digits at p; -1 if any is not one. */
+static int64_t hex_number(const char *p, int n) {
+        int64_t v = 0;
+
+        for (int i = 0; i < n; i++) {
+                int d = hex_digit(p[i]);
+
+                if (d < 0)
+                        return -1;
+                v = (v << 4) | d;
+        }
+
+        return v;
+}
+
 /*
- * Pico's own tokenizer, carrying two upstream fixes: a2a5291b3/b2fadec60
- * "conf-parser: fix potentially bad memory accesses" -- an unterminated quote
- * or trailing garbage after a closing quote used to be silently accepted.
+ * The C escape starting at p (just past the backslash). Returns how many
+ * characters it spans and puts the bytes it stands for in out[0..*n_out), or
+ * -EINVAL for anything that is not a complete, valid escape: the caller keeps
+ * those verbatim. A NUL is never produced.
+ */
+static int c_unescape(const char *p, char out[4], size_t *n_out) {
+        int64_t v;
+
+        *n_out = 1;
+
+        switch (*p) {
+        case 'a':
+                out[0] = '\a';
+                return 1;
+        case 'b':
+                out[0] = '\b';
+                return 1;
+        case 'f':
+                out[0] = '\f';
+                return 1;
+        case 'n':
+                out[0] = '\n';
+                return 1;
+        case 'r':
+                out[0] = '\r';
+                return 1;
+        case 't':
+                out[0] = '\t';
+                return 1;
+        case 'v':
+                out[0] = '\v';
+                return 1;
+        case '\\':
+        case '"':
+        case '\'':
+                out[0] = *p;
+                return 1;
+        case 's':
+                out[0] = ' ';
+                return 1;
+        case 'x':
+                v = hex_number(p + 1, 2);
+                if (v <= 0)
+                        return -EINVAL;
+                out[0] = (char) v;
+                return 3;
+        case 'u':
+                v = hex_number(p + 1, 4);
+                if (v <= 0 || (v >= 0xD800 && v <= 0xDFFF))
+                        return -EINVAL;
+                *n_out = utf8_encode((uint32_t) v, out);
+                return 5;
+        case 'U':
+                v = hex_number(p + 1, 8);
+                if (v <= 0 || v > 0x10FFFF || (v >= 0xD800 && v <= 0xDFFF) || (v & 0xFFFE) == 0xFFFE ||
+                    (v >= 0xFDD0 && v <= 0xFDEF))
+                        return -EINVAL;
+                *n_out = utf8_encode((uint32_t) v, out);
+                return 9;
+        case '0':
+        case '1':
+        case '2':
+        case '3':
+        case '4':
+        case '5':
+        case '6':
+        case '7':
+                if (p[1] < '0' || p[1] > '7' || p[2] < '0' || p[2] > '7')
+                        return -EINVAL;
+                v = ((p[0] - '0') << 6) | ((p[1] - '0') << 3) | (p[2] - '0');
+                if (v == 0 || v > 255)
+                        return -EINVAL;
+                out[0] = (char) v;
+                return 3;
+        default:
+                return -EINVAL;
+        }
+}
+
+/*
+ * Pico's own tokenizer. A quote closing does not end the word (foo="a"b is
+ * one word), and an unknown or incomplete escape stays as written, so a
+ * sed expression like s/\./_/ survives intact.
  */
 int pico_extract_first_word(const char **state, char **ret) {
         const char *p = *state;
@@ -301,6 +430,7 @@ int pico_extract_first_word(const char **state, char **ret) {
                 return 0;
         }
 
+        /* An escape never decodes to more bytes than it spans. */
         buf = malloc(strlen(p) + 1);
         if (!buf)
                 return -ENOMEM;
@@ -320,27 +450,34 @@ int pico_extract_first_word(const char **state, char **ret) {
                  * character is literal.
                  */
                 if ((*p == '"' || *p == '\'') && (!quote || *p == quote)) {
-                        if (quote) {
-                                /*
-                                 * Closing a quote: the next character must be
-                                 * unquoted whitespace or end-of-string, or
-                                 * it is trailing garbage right after the
-                                 * quote (foo="bar"baz). This is the
-                                 * a2a5291b3/b2fadec60 check; after the loop
-                                 * it could never fire.
-                                 */
-                                if (p[1] != '\0' && p[1] != ' ' && p[1] != '\t') {
-                                        free(buf);
-                                        return -EINVAL;
-                                }
-                        }
                         quote = quote ? '\0' : *p;
                         p++;
                         continue;
                 }
-                if (*p == '\\' && p[1] != '\0') {
-                        *w++ = p[1];
-                        p += 2;
+                if (*p == '\\') {
+                        char dec[4];
+                        size_t n;
+                        int len;
+
+                        if (p[1] == '\0') {
+                                if (quote) {
+                                        free(buf);
+                                        return -EINVAL;
+                                }
+                                *w++ = *p++; /* trailing backslash, kept */
+                                continue;
+                        }
+
+                        len = c_unescape(p + 1, dec, &n);
+                        if (len > 0) {
+                                memcpy(w, dec, n);
+                                w += n;
+                                p += 1 + len;
+                        } else {
+                                *w++ = p[0];
+                                *w++ = p[1];
+                                p += 2;
+                        }
                         continue;
                 }
                 if (!quote && (*p == ' ' || *p == '\t'))
@@ -348,9 +485,6 @@ int pico_extract_first_word(const char **state, char **ret) {
                 *w++ = *p++;
         }
         *w = '\0';
-
-        /* No trailing-garbage check here: the loop only exits with *p == '\0'
-         * or an unquoted space/tab; the rejection happens when a quote closes. */
 
         *state = p;
         *ret = buf;

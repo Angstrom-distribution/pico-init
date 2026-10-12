@@ -98,11 +98,12 @@ char *pico_strv_env_get(char * const *l, const char *name);
 int pico_load_env_file(const char *path, char ***ret);
 
 /*
- * Extracts one whitespace-separated word from *state, honoring double quotes
- * ("a b" is one word) and backslash escapes. *state is advanced past the
- * word. 1 with *ret set (caller owns it), 0 at end of string, -EINVAL on an
- * unterminated quote or trailing garbage right after a closing quote, or
- * -ENOMEM. ExecStart=, Environment= and $VAR splitting all use this one.
+ * Extracts one whitespace-separated word from *state. Single and double
+ * quotes group and are removed, and may be glued to unquoted text. C escapes
+ * (\n, \t, \xNN, \NNN, \uNNNN, ...) are decoded; an unknown one stays as
+ * written. *state is advanced past the word. 1 with *ret set (caller owns
+ * it), 0 at end of string, -EINVAL on an unterminated quote, or -ENOMEM.
+ * ExecStart=, Environment= and $VAR splitting all use this one.
  */
 int pico_extract_first_word(const char **state, char **ret);
 

@@ -777,7 +777,7 @@ static void test_exec_start_pre_list_and_reset(void) {
         free(dir);
 }
 
-static void test_quoting_and_trailing_garbage(void) {
+static void test_quoting_and_glued_quotes(void) {
         Service *s;
         Manager *m;
         char *dir;
@@ -839,9 +839,11 @@ static void test_quoting_and_trailing_garbage(void) {
         ASSERT_STREQ(s->exec_start[3], "it's");
         ASSERT_TRUE(s->exec_start[4] == NULL);
 
+        /* Text glued to a closing quote continues the word. */
         u = manager_get_unit(m, "h.service");
         ASSERT_TRUE(u != NULL);
-        ASSERT_EQ_INT(u->load_state, UNIT_ERROR);
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        ASSERT_STREQ(((Service *) u)->exec_start[1], "barbaz");
         u = manager_get_unit(m, "i.service");
         ASSERT_TRUE(u != NULL);
         ASSERT_EQ_INT(u->load_state, UNIT_ERROR);
@@ -856,22 +858,52 @@ static void test_quoting_and_trailing_garbage(void) {
         ASSERT_STREQ(s->exec_start[2], "plain");
         ASSERT_TRUE(s->exec_start[3] == NULL);
 
-        /*
-         * Garbage after a closing quote is refused rather than glued together
-         * into a value nobody wrote. Two rules meet here and the order matters:
-         * the malformed ExecStart= line skips itself, exactly like any other
-         * malformed directive -- and then the unit is left with no valid
-         * ExecStart= at all, which a Service cannot load without. So the file
-         * parses to the end (Description= is still read) and the unit resolves
-         * to UNIT_ERROR rather than to a service that would be started with a
-         * command line the file did not contain.
-         */
         u = manager_get_unit(m, "f.service");
         ASSERT_TRUE(u != NULL);
         s = (Service *) u;
-        ASSERT_EQ_INT(u->load_state, UNIT_ERROR);
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
         ASSERT_STREQ(u->description, "F");
-        ASSERT_TRUE(s->exec_start == NULL);
+        ASSERT_STREQ(s->exec_start[1], "barbaz");
+        ASSERT_TRUE(s->exec_start[2] == NULL);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * Exec*= and Environment= decode C escapes (printf's \n, \x41, \101) and keep
+ * an unknown one as written, so a sed expression's \. survives. Quotes may be
+ * glued to the text around them.
+ */
+static void test_exec_c_escapes(void) {
+        Service *s;
+        Manager *m;
+        char *dir;
+        Unit *u;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "esc.service",
+                                      "[Service]\n"
+                                      "ExecStart=/bin/sh -c \"printf a\\nb\" 's/\\./_/' \\x41\\101\\s\\\\ \"${DIR}\"/sub\n"
+                                      "Environment=\"TABBED=a\\tb\" KEEP=\\q\n"),
+                      0);
+
+        m = manager_for(dir);
+        u = load_one(m, "esc.service");
+        s = (Service *) u;
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        ASSERT_STREQ(s->exec_start[1], "-c");
+        ASSERT_STREQ(s->exec_start[2], "printf a\nb");
+        ASSERT_STREQ(s->exec_start[3], "s/\\./_/");
+        ASSERT_STREQ(s->exec_start[4], "AA \\");
+        ASSERT_STREQ(s->exec_start[5], "${DIR}/sub");
+        ASSERT_TRUE(s->exec_start[6] == NULL);
+        ASSERT_STREQ(s->environment[0], "TABBED=a\tb");
+        ASSERT_STREQ(s->environment[1], "KEEP=\\q");
 
         manager_free(m);
         test_rm_rf(dir);
@@ -2263,7 +2295,8 @@ int main(void) {
         test_malformed_line_skips_only_that_line();
         test_bom_comments_and_continuations();
         test_comment_inside_continuation_is_skipped();
-        test_quoting_and_trailing_garbage();
+        test_quoting_and_glued_quotes();
+        test_exec_c_escapes();
         test_exec_start_pre_list_and_reset();
         test_standard_output_and_error();
         test_invalid_dependency_names_are_rejected();
