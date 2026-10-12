@@ -46,7 +46,7 @@ the DHCP and SNTP code in `netd` is lifted from current systemd.
 - **`pico-tmpfiles`**: `systemd-tmpfiles --create`, `--clean` and
   `--remove` over the `tmpfiles.d` files packages install.
 - **`libsystemd.so.0`** and **`libudev.so.1`**, compatibility libraries
-  with the symbol versions and `pkg-config` files of systemd v259. A
+  with the symbol versions and `pkg-config` files of systemd v262. A
   function is real where pico-init has a real mechanism (`sd-daemon`,
   `sd-event`, `sd-id128`, `sd-journal` over `logd`, `sd-device` and
   `libudev` over sysfs and devd's udev database, the cgroup half of

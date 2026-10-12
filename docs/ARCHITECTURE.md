@@ -427,7 +427,7 @@ refused with exit status 1, since a caller expects an effect they do not have.
 ## Compatibility libraries
 
 `libsystemd.so.0` carries systemd's SONAME, symbol versions (from the
-`libsystemd-v259.sym` file vendored from the systemd v259 tag) and
+`libsystemd-v262.sym` file vendored from the systemd v262 tag) and
 `libsystemd.pc`/`systemd.pc`, so recipes built for systemd link and run
 unchanged. It is built from the same `sd-event`, `sd-daemon` and `sd-id128`
 code that PID 1 uses, an `sd-journal` over `logd`, `sd-login` cgroup, unit

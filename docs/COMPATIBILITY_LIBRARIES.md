@@ -16,8 +16,8 @@ For the daemons the libraries talk to, see [LOGD.md](LOGD.md),
 
 | File | Content |
 |------|---------|
-| `${libdir}/libsystemd.so.0.42.0` | SONAME `libsystemd.so.0` |
-| `${libdir}/libudev.so.1.7.12` | SONAME `libudev.so.1`, links `libsystemd.so.0` |
+| `${libdir}/libsystemd.so.0.45.0` | SONAME `libsystemd.so.0` |
+| `${libdir}/libudev.so.1.7.15` | SONAME `libudev.so.1`, links `libsystemd.so.0` |
 | `${includedir}/systemd/sd-*.h` | `sd-daemon`, `sd-event`, `sd-id128`, `sd-journal`, `sd-bus`, `sd-bus-protocol`, `sd-bus-vtable`, `sd-login`, `sd-hwdb`, `sd-device`, `sd-network`, `_sd-common.h` |
 | `${includedir}/libudev.h` | libudev API |
 | `${libdir}/pkgconfig/libsystemd.pc` | `-lsystemd` |
@@ -25,7 +25,7 @@ For the daemons the libraries talk to, see [LOGD.md](LOGD.md),
 | `${libdir}/pkgconfig/systemd.pc` | directory and uid-range variables, no `Libs` |
 | `${libdir}/pkgconfig/udev.pc` | `udevdir` |
 
-The library file versions (`0.42.0`, `1.7.12`) are upstream's
+The library file versions (`0.45.0`, `1.7.15`) are upstream's
 `libsystemd_version` and `libudev_version` at the release the symbol files
 were taken from. No static library is installed.
 
@@ -38,15 +38,15 @@ answered by a library whose version script assigns the symbol to that exact
 node, so the nodes are not designed here. `tools/gen-libsystemd-sym.py`
 derives them:
 
-- The input is upstream's version script for systemd v259, vendored as
-  `src/compat/libsystemd/libsystemd-v259.sym` and
-  `src/compat/libudev/libudev-v259.sym`.
+- The input is upstream's version script for systemd v262, vendored as
+  `src/compat/libsystemd/libsystemd-v262.sym` and
+  `src/compat/libudev/libudev-v262.sym`.
 - A symbol the compat archive defines, that a public header declares and
   that upstream lists, gets its upstream node, in upstream's order.
 - A symbol the archive defines and a header declares, but upstream does not
   export from `libsystemd.so` (the `sd_network_*` family, which upstream
   keeps in an internal library), goes on one trailing node,
-  `PICO_LIBSYSTEMD_0`, whose parent is `LIBSYSTEMD_259`. `libudev.so` has
+  `PICO_LIBSYSTEMD_0`, whose parent is `LIBSYSTEMD_262`. `libudev.so` has
   the equivalent `PICO_LIBUDEV_0`, omitted when empty.
 - Everything else is `local`. Internal helpers are not exported.
 - A public header that declares a function the archive does not define, or
@@ -54,12 +54,12 @@ derives them:
   declares, is a generator error.
 
 The result is committed as `libsystemd.sym` and `libudev.sym`. The `.pc`
-version, which consumers compare with `systemd >= N`, is `259` for all four
+version, which consumers compare with `systemd >= N`, is `262` for all four
 files; it is the release the symbol files match.
 
 Upstream names that are absent from `libsystemd.so.0`: the `sd_json_*` and
-`sd_varlink_*` families (216 names) and `sd_path_lookup`,
-`sd_path_lookup_strv` (218 in all). A program that references one fails to
+`sd_varlink_*` families (224 names) and `sd_path_lookup`,
+`sd_path_lookup_strv` (226 in all). A program that references one fails to
 load with an undefined-symbol error; there is no stub. `libudev.so.1` exports
 all 92 names of the vendored upstream file.
 
@@ -102,7 +102,7 @@ success or empty answer that does nothing.
 All source constructors are implemented. Not implemented, each returning
 `-EOPNOTSUPP`:
 
-- `sd_event_add_memory_pressure()`.
+- `sd_event_add_memory_pressure()`, `sd_event_add_cpu_pressure()` and `sd_event_add_io_pressure()`.
 - `sd_event_add_child()` with `WSTOPPED` or `WCONTINUED`; only exit is
   observed (pidfd based).
 - Rate limiting: `sd_event_source_set_ratelimit()` and
@@ -216,7 +216,7 @@ why Xorg and libinput work without changes.
 ## pkg-config
 
 `libsystemd.pc` and `libudev.pc` have the shape of the upstream files and
-`Version: 259`. `systemd.pc` carries the same variables as upstream's, name
+`Version: 262`. `systemd.pc` carries the same variables as upstream's, name
 for name, so recipes that run
 
 ```

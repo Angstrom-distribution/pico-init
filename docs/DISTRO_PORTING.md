@@ -46,8 +46,8 @@ so a multilib layout keeps them in `/usr/lib`.
 | `picolog` | `bindir` | `journalctl` equivalent |
 | `pico-tmpfiles` | `bindir` | `systemd-tmpfiles` equivalent |
 | `pico-unit-lint` | `bindir` | build-time unit checker |
-| `libsystemd.so.0.42.0`, `libsystemd.so.0` | `libdir` | compatibility library |
-| `libudev.so.1.7.12`, `libudev.so.1` | `libdir` | compatibility library |
+| `libsystemd.so.0.45.0`, `libsystemd.so.0` | `libdir` | compatibility library |
+| `libudev.so.1.7.15`, `libudev.so.1` | `libdir` | compatibility library |
 | `systemd/*.h`, `libudev.h` | `includedir` | public headers |
 | `libsystemd.pc`, `systemd.pc`, `libudev.pc`, `udev.pc` | `libdir/pkgconfig` | |
 | `netd.service`, `network.target` | `$prefix/lib/systemd/system` | |
@@ -59,7 +59,7 @@ so a multilib layout keeps them in `/usr/lib`.
 The build installs no `/sbin/init` link. The kernel starts `/sbin/init`, so
 the layer must provide it, for example as a symlink to `pico-init`.
 
-The `.pc` files report systemd release 259, because consumers gate on
+The `.pc` files report systemd release 262, because consumers gate on
 `systemd >= N`, and `systemd.pc` carries the directory variables recipes ask
 for (`systemdsystemunitdir`, `systemdsystempresetdir`, `tmpfilesdir`,
 `udevdir` through `udev.pc`). The shared libraries carry upstream's symbol
