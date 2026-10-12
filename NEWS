@@ -1,3 +1,32 @@
+# CHANGES WITH 0.3.0:
+
+        pico-init now boots on its own: the build installs the targets it
+        and its units refer to. Packaging changes for existing images are
+        called out below.
+
+##        PID 1 and unit files:
+
+        * The build installs default.target (a link to multi-user.target),
+          multi-user.target, sysinit.target, sockets.target and
+          bluetooth.target in lib/systemd/system. multi-user.target wants
+          sockets.target, sysinit.target and bluetooth.target and runs after
+          sysinit.target. Until now a distribution had to supply all of
+          them, and PID 1 loaded no units without a default.target. A
+          distribution with its own targets overwrites these files or
+          points default.target elsewhere; docs/DISTRO_PORTING.md has the
+          list of what the build ships and what the image still has to
+          provide (getty units, the preset, base-files' volatile
+          directories).
+
+##        Build and tests:
+
+        * test-shipped-units lints the installed units as one tree and
+          checks what multi-user.target wants.
+
+##        Contributions from:
+
+        Koen Kooi
+
 # CHANGES WITH 0.2.2:
 
         This release brings the command-line tools, the compatibility
