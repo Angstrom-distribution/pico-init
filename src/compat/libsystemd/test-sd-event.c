@@ -454,6 +454,11 @@ static void test_error_paths(void) {
         /* Pressure and ratelimit families always fail the same way. */
         ASSERT_EQ_INT(sd_event_add_memory_pressure(e, NULL, NULL, NULL), -EOPNOTSUPP);
         ASSERT_EQ_INT(sd_event_source_set_memory_pressure_type(s, "some"), -EDOM);
+        ASSERT_EQ_INT(sd_event_add_cpu_pressure(e, NULL, NULL, NULL), -EOPNOTSUPP);
+        ASSERT_EQ_INT(sd_event_add_io_pressure(e, NULL, NULL, NULL), -EOPNOTSUPP);
+        ASSERT_EQ_INT(sd_event_source_set_cpu_pressure_type(s, "some"), -EDOM);
+        ASSERT_EQ_INT(sd_event_source_set_io_pressure_period(s, 1000, 2000), -EDOM);
+        ASSERT_EQ_INT(sd_event_source_set_cpu_pressure_period(NULL, 1000, 2000), -EINVAL);
         ASSERT_EQ_INT(sd_event_source_set_ratelimit(s, 1000, 4), -EOPNOTSUPP);
         ASSERT_EQ_INT(sd_event_source_is_ratelimited(s), 0);
         ASSERT_EQ_INT(sd_event_source_leave_ratelimit(NULL), 0);

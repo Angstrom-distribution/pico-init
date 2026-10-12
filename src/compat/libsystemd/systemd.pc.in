@@ -1,7 +1,7 @@
 #  SPDX-FileCopyrightText: 2026 Koen Kooi
 #  SPDX-License-Identifier: GPL-2.0-or-later
 #
-#  The variable set real systemd's systemd.pc defines (systemd-v259.pc.in),
+#  The variable set real systemd's systemd.pc defines (systemd-v262.pc.in),
 #  name for name and value for value: recipes read systemdsystemunitdir
 #  and its siblings from here to decide where units land, and pico-init
 #  reads units from exactly those directories. test-systemd-pc fails on

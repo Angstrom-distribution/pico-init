@@ -977,6 +977,22 @@ int sd_event_add_memory_pressure(sd_event *e, sd_event_source **ret, sd_event_ha
         return -EOPNOTSUPP;
 }
 
+int sd_event_add_cpu_pressure(sd_event *e, sd_event_source **ret, sd_event_handler_t callback, void *userdata) {
+        (void) e;
+        (void) ret;
+        (void) callback;
+        (void) userdata;
+        return -EOPNOTSUPP;
+}
+
+int sd_event_add_io_pressure(sd_event *e, sd_event_source **ret, sd_event_handler_t callback, void *userdata) {
+        (void) e;
+        (void) ret;
+        (void) callback;
+        (void) userdata;
+        return -EOPNOTSUPP;
+}
+
 /* ---- the loop itself -------------------------------------------------- */
 
 static bool event_is_idle(sd_event *e) {

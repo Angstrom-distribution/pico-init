@@ -58,6 +58,8 @@ static void test_session_functions(void) {
         ASSERT_EQ_INT(sd_session_get_state("1", NULL), -ENXIO);
         ASSERT_EQ_INT(sd_session_get_uid("1", NULL), -ENXIO);
         ASSERT_EQ_INT(sd_session_get_vt("1", NULL), -ENXIO);
+        ASSERT_EQ_INT(sd_session_get_extra_device_access("1", NULL), -ENXIO);
+        ASSERT_EQ_INT(sd_session_get_extra_device_access(NULL, NULL), -ENODATA);
 }
 
 static void test_seat_functions(void) {

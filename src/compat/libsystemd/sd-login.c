@@ -261,6 +261,10 @@ int sd_session_get_display(const char *session, char **ret_display) {
         (void) ret_display;
         return session_or_seat_errno(session);
 }
+int sd_session_get_extra_device_access(const char *session, char ***ret_ids) {
+        (void) ret_ids;
+        return session_or_seat_errno(session);
+}
 int sd_session_get_leader(const char *session, pid_t *ret_leader) {
         (void) ret_leader;
         return session_or_seat_errno(session);

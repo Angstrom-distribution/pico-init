@@ -1,7 +1,7 @@
 #  SPDX-FileCopyrightText: 2026 Koen Kooi
 #  SPDX-License-Identifier: GPL-2.0-or-later
 #
-#  Same shape as real systemd's libsystemd.pc (libsystemd-v259.pc.in);
+#  Same shape as real systemd's libsystemd.pc (libsystemd-v262.pc.in);
 #  test-systemd-pc keeps it that way.
 
 prefix=@PREFIX@

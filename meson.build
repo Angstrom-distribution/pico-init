@@ -854,13 +854,13 @@ libsystemd_compat = static_library(
 # The installed library, ${libdir}/libsystemd.so.0.<minor>.<micro> with SONAME
 # libsystemd.so.0: the name, path and SONAME of real systemd's libsystemd, so
 # consumers' -lsystemd resolves to it. Two version numbers go with the vendored
-# libsystemd-v259.sym and change together on a systemd bump: upstream's
+# libsystemd-v262.sym and change together on a systemd bump: upstream's
 # libsystemd_version at that tag, and the systemd release number the .pc files
 # report, since consumers gate on `systemd >= N`. meson's default b_lundef makes
 # an undefined symbol a link error here rather than a load failure on the
 # target.
-libsystemd_version = '0.42.0'
-libsystemd_compat_systemd_version = '259'
+libsystemd_version = '0.45.0'
+libsystemd_compat_systemd_version = '262'
 libsystemd_sym = files('src/compat/libsystemd/libsystemd.sym')
 libsystemd = shared_library(
   'systemd',
@@ -954,8 +954,8 @@ install_headers(libsystemd_public_headers, subdir: 'systemd')
 
 # Symbol versions are real systemd's, so a binary linked against real
 # libsystemd (sd_bus_message_append@LIBSYSTEMD_209) resolves against this
-# library too. libsystemd.sym is generated: the upstream libsystemd-v259.sym
-# (verbatim from systemd's v259 tag) intersected with what the archive
+# library too. libsystemd.sym is generated: the upstream libsystemd-v262.sym
+# (verbatim from systemd's v262 tag) intersected with what the archive
 # defines, each symbol on its upstream node, except the sd_network_* family
 # (not exported by upstream's libsystemd) on a trailing PICO_LIBSYSTEMD_0. A
 # systemd version bump is: replace the upstream file,
@@ -963,7 +963,7 @@ install_headers(libsystemd_public_headers, subdir: 'systemd')
 # on a stale committed file, on a public header declaring an undefined
 # function, and on an sd_*-named internal helper leaking out of the archive.
 libsystemd_sym_gen = files('tools/gen-libsystemd-sym.py')
-libsystemd_sym_upstream = files('src/compat/libsystemd/libsystemd-v259.sym')
+libsystemd_sym_upstream = files('src/compat/libsystemd/libsystemd-v262.sym')
 python3 = find_program('python3', required: false)
 nm = find_program('nm', required: false)
 if python3.found() and nm.found()
@@ -980,8 +980,8 @@ endif
 
 if python3.found()
   check_pc = files('tools/check-pc.py')
-  test('test-libsystemd-pc', python3, args: [check_pc, '--upstream', files('src/compat/libsystemd/libsystemd-v259.pc.in'), '--generated', libsystemd_pc])
-  test('test-systemd-pc', python3, args: [check_pc, '--upstream', files('src/compat/libsystemd/systemd-v259.pc.in'), '--generated', systemd_pc])
+  test('test-libsystemd-pc', python3, args: [check_pc, '--upstream', files('src/compat/libsystemd/libsystemd-v262.pc.in'), '--generated', libsystemd_pc])
+  test('test-systemd-pc', python3, args: [check_pc, '--upstream', files('src/compat/libsystemd/systemd-v262.pc.in'), '--generated', systemd_pc])
 endif
 
 # A built .so checked as the file a consumer gets: SONAME, the
@@ -1157,7 +1157,7 @@ endforeach
 
 # ---------------------------------------------------------------------------
 # libudev shim -- ${libdir}/libudev.so.1 with real libudev's SONAME, symbol
-# versions (libudev-v259.sym, all 92 exports on their upstream nodes) and
+# versions (libudev-v262.sym, all 92 exports on their upstream nodes) and
 # libudev.pc, for consumers that want the library rather than the daemon. As
 # upstream does, every udev_* entry point is a thin wrapper over sd_device_*,
 # so the shared object links libsystemd.so.0 and carries no device code.
@@ -1186,8 +1186,8 @@ libudev_compat = static_library(
   include_directories: libsystemd_compat_includes,
 )
 
-# Upstream's libudev_version at v259; bump with the vendored files.
-libudev_version = '1.7.12'
+# Upstream's libudev_version at v262; bump with the vendored files.
+libudev_version = '1.7.15'
 libudev_sym = files('src/compat/libudev/libudev.sym')
 libudev = shared_library(
   'udev',
@@ -1222,13 +1222,13 @@ udev_pc = configure_file(
 )
 
 if python3.found()
-  test('test-udev-pc', python3, args: [check_pc, '--upstream', files('src/compat/libudev/udev-v259.pc.in'), '--generated', udev_pc])
+  test('test-udev-pc', python3, args: [check_pc, '--upstream', files('src/compat/libudev/udev-v262.pc.in'), '--generated', udev_pc])
 endif
 
 if python3.found() and nm.found()
   libudev_sym_args = [
     libsystemd_sym_gen,
-    '--upstream', files('src/compat/libudev/libudev-v259.sym'),
+    '--upstream', files('src/compat/libudev/libudev-v262.sym'),
     '--nm', nm.full_path(),
     '--archive', libudev_compat,
     '--header', files('src/compat/libudev/libudev.h'),
@@ -1244,7 +1244,7 @@ if python3.found() and nm.found()
 endif
 
 if python3.found()
-  test('test-libudev-pc', python3, args: [check_pc, '--upstream', files('src/compat/libudev/libudev-v259.pc.in'), '--generated', libudev_pc])
+  test('test-libudev-pc', python3, args: [check_pc, '--upstream', files('src/compat/libudev/libudev-v262.pc.in'), '--generated', libudev_pc])
 endif
 
 test(

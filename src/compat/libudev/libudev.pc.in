@@ -1,7 +1,7 @@
 #  SPDX-FileCopyrightText: 2026 Koen Kooi
 #  SPDX-License-Identifier: GPL-2.0-or-later
 #
-#  Same shape as real systemd's libudev.pc (libudev-v259.pc.in);
+#  Same shape as real systemd's libudev.pc (libudev-v262.pc.in);
 #  test-libudev-pc keeps it that way.
 
 prefix=@PREFIX@
@@ -13,5 +13,4 @@ Name: libudev
 Description: Library to access udev device information (pico-init's libudev shim)
 Version: @PROJECT_VERSION@
 Libs: -L${libdir} -ludev
-Libs.private: -lrt -pthread
 Cflags: -I${includedir}

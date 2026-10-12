@@ -16,18 +16,18 @@ path = [
 SPDX-FileCopyrightText = "Koen Kooi"
 SPDX-License-Identifier = "GPL-2.0-or-later"
 
-# Verbatim copies from systemd v259: the libsystemd.sym and libudev.sym that
+# Verbatim copies from systemd v262: the libsystemd.sym and libudev.sym that
 # tools/gen-libsystemd-sym.py reads to produce the compat libraries' version
 # scripts, and the pkg-config templates the test-*-pc tests diff the
 # generated .pc files against.
 [[annotations]]
 path = [
-  "src/compat/libsystemd/libsystemd-v259.sym",
-  "src/compat/libsystemd/libsystemd-v259.pc.in",
-  "src/compat/libsystemd/systemd-v259.pc.in",
-  "src/compat/libudev/libudev-v259.sym",
-  "src/compat/libudev/libudev-v259.pc.in",
-  "src/compat/libudev/udev-v259.pc.in",
+  "src/compat/libsystemd/libsystemd-v262.sym",
+  "src/compat/libsystemd/libsystemd-v262.pc.in",
+  "src/compat/libsystemd/systemd-v262.pc.in",
+  "src/compat/libudev/libudev-v262.sym",
+  "src/compat/libudev/libudev-v262.pc.in",
+  "src/compat/libudev/udev-v262.pc.in",
 ]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "systemd contributors"

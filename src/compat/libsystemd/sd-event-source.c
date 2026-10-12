@@ -439,6 +439,25 @@ int sd_event_source_set_memory_pressure_period(sd_event_source *s, uint64_t thre
         return -EDOM;
 }
 
+int sd_event_source_set_cpu_pressure_type(sd_event_source *s, const char *ty) {
+        (void) ty;
+        return s ? -EDOM : -EINVAL;
+}
+int sd_event_source_set_cpu_pressure_period(sd_event_source *s, uint64_t threshold_usec, uint64_t window_usec) {
+        (void) threshold_usec;
+        (void) window_usec;
+        return s ? -EDOM : -EINVAL;
+}
+int sd_event_source_set_io_pressure_type(sd_event_source *s, const char *ty) {
+        (void) ty;
+        return s ? -EDOM : -EINVAL;
+}
+int sd_event_source_set_io_pressure_period(sd_event_source *s, uint64_t threshold_usec, uint64_t window_usec) {
+        (void) threshold_usec;
+        (void) window_usec;
+        return s ? -EDOM : -EINVAL;
+}
+
 /* ---- destroy callback / floating / exit-on-failure ----------------------------- */
 
 int sd_event_source_set_destroy_callback(sd_event_source *s, sd_event_destroy_t callback) {

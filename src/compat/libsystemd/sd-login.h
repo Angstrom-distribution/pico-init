@@ -91,6 +91,8 @@ int sd_session_get_type(const char *session, char **ret_type);
 int sd_session_get_class(const char *session, char **ret_clazz);
 int sd_session_get_desktop(const char *session, char **ret_desktop);
 int sd_session_get_display(const char *session, char **ret_display);
+/* Extra devices the session may access: every device udev tags "xaccess-$ID" for each returned $ID. */
+int sd_session_get_extra_device_access(const char *session, char ***ret_ids);
 int sd_session_get_leader(const char *session, pid_t *ret_leader);
 int sd_session_get_remote_host(const char *session, char **ret_remote_host);
 int sd_session_get_remote_user(const char *session, char **ret_remote_user);

@@ -1,7 +1,7 @@
 #  SPDX-FileCopyrightText: 2026 Koen Kooi
 #  SPDX-License-Identifier: GPL-2.0-or-later
 #
-#  Same shape as real systemd's udev.pc.in (udev-v259.pc.in) -- vendored
+#  Same shape as real systemd's udev.pc.in (udev-v262.pc.in) -- vendored
 #  verbatim, not libudev.pc's own package. Real consumers (alsa-utils'
 #  PACKAGECONFIG[udev] is the one that found this the hard way, 2026-09-13:
 #  its configure script does `pkg-config --variable=udevdir udev`, gets

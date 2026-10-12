@@ -3,7 +3,7 @@
 
 /*
  * pico-init's own libudev.h: the 92-function ABI real systemd's libudev
- * exports at v259 (libudev-v259.sym), written from scratch against that
+ * exports at v262 (libudev-v262.sym), written from scratch against that
  * header's signatures only -- no text from the LGPL-2.1-or-later original
  * is reproduced. Every entry point is a thin wrapper over the sd-device
  * family in <systemd/sd-device.h>, which is how upstream builds its own
