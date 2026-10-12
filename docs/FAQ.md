@@ -98,7 +98,8 @@ picoctl halt
 
 Each sends a signal to PID 1 (`SIGINT` for reboot, `SIGRTMIN+4` for poweroff,
 `SIGRTMIN+3` for halt) and acts immediately; there is no scheduler or wall
-message, and `-f`/`--force` is accepted and ignored. `shutdown [-r|-h|-P]
-[now]` is not a `picoctl` verb. `picoctl` dispatches on its own name when it
-is invoked as `reboot`, `poweroff`, `halt` or `shutdown`, so those names work
-once the packaging provides symlinks to the binary; the build installs none.
+message, and `-f`/`--force` is accepted and ignored. `picoctl` dispatches on
+its own name when it is invoked as `reboot`, `poweroff`, `halt` or
+`shutdown`, so those names work once the packaging provides symlinks to the
+binary; the build installs none. `shutdown [-r|-h|-P|-H] [now|+0]` is
+immediate too and refuses any other time. See [PICOCTL.md](PICOCTL.md).

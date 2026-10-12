@@ -323,7 +323,8 @@ shutdown, `start` and `restart` are refused.
 Reboot and poweroff do not use the socket. `picoctl reboot` sends SIGINT to
 PID 1, `poweroff` and `halt` send SIGRTMIN+4 and SIGRTMIN+3. When invoked
 as `reboot`, `poweroff`, `halt` or `shutdown`, `picoctl` behaves as that
-command.
+command and takes its options; `--dry-run` and `-w` stop short of the
+signal.
 
 ### picoctl
 
@@ -332,18 +333,20 @@ of these sources:
 
 | Verbs | Source of truth |
 |-------|-----------------|
-| `status`, `show`, `list-units`, `is-active`, `is-failed`, `is-system-running`, `cat`, `list-unit-files` | State files and unit files; no IPC |
-| `enable`, `disable`, `reenable`, `is-enabled`, `preset`, `mask`, `unmask` | The `.wants`/`.requires` symlinks and preset files, using the same code as boot |
+| `status`, `show`, `list-units`, `list-jobs`, `is-active`, `is-failed`, `is-system-running`, `get-default`, `cat`, `list-unit-files` | State files and unit files; no IPC |
+| `whoami` | `/proc/<pid>/cgroup` |
+| `enable`, `disable`, `reenable`, `is-enabled`, `preset`, `preset-all`, `mask`, `unmask`, `link`, `add-wants`, `add-requires` | The `.wants`/`.requires` symlinks and preset files, using the same code as boot |
 | `start`, `stop`, `restart`, `try-restart`, `reload-or-restart`, `reset-failed`, `daemon-reload` | Control socket |
-| `kill` | `kill(2)` on `MainPID` from the state file, or on every pid in the unit's `cgroup.procs` |
+| `kill` | `kill(2)` or `sigqueue(3)` on `MainPID` from the state file, or on every pid in the unit's `cgroup.procs` |
 | `reboot`, `poweroff`, `halt` | Signal to PID 1, see above |
 | `reload` | Always fails: `ExecReload=` and reload jobs do not exist |
 
 `picoctl status` also prints the last log lines of the unit by reading
 `logd`'s ring directly. `--root DIR` prefixes every path it touches, which
 is how the symlink verbs are tested. Verbs without a backing here (for
-example `isolate`, `list-dependencies`, `edit`) report `Unknown command
-verb`.
+example `isolate`, `list-dependencies`, `edit`) are refused by name, and
+options follow the same rule. [PICOCTL.md](PICOCTL.md) lists what is real,
+accepted and refused.
 
 ## Cgroups
 

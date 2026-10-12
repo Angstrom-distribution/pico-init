@@ -21,13 +21,16 @@ the DHCP and SNTP code in `netd` is lifted from current systemd.
   a hardware watchdog when one exists, listens for `sd_notify()`, and
   re-reads unit files on `SIGHUP`.
 - **`picoctl`**, the `systemctl` equivalent: `status`, `list-units`,
-  `list-unit-files`, `show`, `cat`, `is-active`, `is-failed`,
-  `is-enabled`, `is-system-running`, `enable`, `disable`, `reenable`,
-  `preset`, `mask`, `unmask`, `start`, `stop`, `restart`, `try-restart`,
+  `list-unit-files`, `list-jobs`, `show`, `cat`, `is-active`, `is-failed`,
+  `is-enabled`, `is-system-running`, `get-default`, `whoami`, `enable`,
+  `disable`, `reenable`, `preset`, `preset-all`, `mask`, `unmask`, `link`,
+  `add-wants`, `add-requires`, `start`, `stop`, `restart`, `try-restart`,
   `reload-or-restart`, `kill`, `reset-failed`, `daemon-reload`, `reboot`,
-  `poweroff`, `halt`. Output and colours follow `systemctl`. The read verbs
-  work from state files under `/run/pico-init` and keep working when PID 1
-  is wedged; `--root` works for the file verbs.
+  `poweroff`, `halt`. Options, JSON output and colours follow systemd 262's
+  `systemctl`; what it cannot do it refuses by name. The read verbs work
+  from state files under `/run/pico-init` and keep working when PID 1 is
+  wedged; `--root` works for the file verbs. Invoked as `reboot`,
+  `poweroff`, `halt` or `shutdown` it takes those commands' options.
 - **`netd`**, a network daemon reading `.network` files from the
   `systemd-networkd` directories: static addresses, a DHCPv4 client and
   server, DNS into `/etc/resolv.conf`, an SNTP client, the time zone from
@@ -144,8 +147,7 @@ rest.
 - Mount, swap, timer, path, device, scope and slice units. `/etc/fstab` is
   handled by PID 1 at boot instead.
 - Running `ExecReload=`: it is parsed and recorded as degraded, and
-  `picoctl reload` refuses. `isolate`, `get-default` and `set-default` are
-  not available.
+  `picoctl reload` refuses. `isolate` and `set-default` are not available.
 - Resource-control directives (`CPUWeight=`, `MemoryHigh=`, `MemoryMax=`,
   `TasksMax=`, ...) and sandboxing directives (`ProtectSystem=`,
   `PrivateTmp=`, `NoNewPrivileges=`, ...).
@@ -161,7 +163,7 @@ The `docs/` directory follows the layout of systemd's own `docs/`.
 |-------|-----------|
 | Design | [ARCHITECTURE](docs/ARCHITECTURE.md), [BOOT](docs/BOOT.md), [API_FILE_SYSTEMS](docs/API_FILE_SYSTEMS.md), [CGROUP_DELEGATION](docs/CGROUP_DELEGATION.md), [DAEMON_SOCKET_ACTIVATION](docs/DAEMON_SOCKET_ACTIVATION.md) |
 | Unit files | [INCOMPATIBILITIES](docs/INCOMPATIBILITIES.md), [PRESET](docs/PRESET.md) |
-| Daemons and libraries | [NETD](docs/NETD.md), [LOGD](docs/LOGD.md), [DEVD](docs/DEVD.md), [COMPATIBILITY_LIBRARIES](docs/COMPATIBILITY_LIBRARIES.md) |
+| Daemons and libraries | [PICOCTL](docs/PICOCTL.md), [NETD](docs/NETD.md), [LOGD](docs/LOGD.md), [DEVD](docs/DEVD.md), [COMPATIBILITY_LIBRARIES](docs/COMPATIBILITY_LIBRARIES.md) |
 | Using and packaging | [DISTRO_PORTING](docs/DISTRO_PORTING.md), [DEBUGGING](docs/DEBUGGING.md), [FAQ](docs/FAQ.md) |
 | Development | [HACKING](docs/HACKING.md), [CODING_STYLE](docs/CODING_STYLE.md), [RELEASE](docs/RELEASE.md) |
 
