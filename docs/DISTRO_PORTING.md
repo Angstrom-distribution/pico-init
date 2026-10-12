@@ -87,24 +87,25 @@ together. `logd.socket` makes `logd` socket-activated: PID 1 binds and holds
 service's stdout. `netd`, `logd` and `devd` ship `WantedBy=default.target` and
 rely on the preset file to decide whether they run.
 
-## Units the image must provide
+## Units the build ships and the image must provide
 
 The build ships four service units (`netd`, `logd`, `devd`, `pico-tmpfiles`),
-`logd.socket` and `network.target`.
-It ships no `default.target`, `sysinit.target`, `sockets.target`,
-`multi-user.target` or `basic.target`. The shipped units and PID 1 refer to
-these names:
+`logd.socket` and these targets:
 
 | Unit | Why |
 |------|-----|
-| `default.target` | Root of the boot transaction. If it cannot be loaded, startup fails; PID 1 still enters its event loop so the console stays usable. |
+| `default.target` | A link to `multi-user.target`. Root of the boot transaction. If it cannot be loaded, startup fails; PID 1 still enters its event loop so the console stays usable. |
+| `multi-user.target` | Wants `sockets.target`, `sysinit.target` and `bluetooth.target` and runs after `sysinit.target`, in place of systemd's multi-user, basic, sysinit and sockets chain. |
 | `sockets.target` | `.socket` units install with `WantedBy=sockets.target`, and PID 1 adds `After=sockets.target` to every service when the target exists. |
 | `sysinit.target` | `pico-tmpfiles.service` installs `WantedBy=sysinit.target` and runs `Before=` it. |
+| `bluetooth.target` | Units that are only `WantedBy=bluetooth.target` get their start job because `multi-user.target` wants it. |
+| `network.target` | Passive. `netd.service` orders itself before it; `network-online.target` is not provided. |
 
-`default.target` can be an alias, as OpenEmbedded produces it:
+A distribution that has its own targets overwrites them, or replaces
+`default.target` by an alias in `/etc/systemd/system`:
 
 ```sh
-ln -s multi-user.target /etc/systemd/system/default.target
+ln -s graphical.target /etc/systemd/system/default.target
 ```
 
 Aliases are resolved when a name is loaded, so the symlink needs no
@@ -112,11 +113,10 @@ Aliases are resolved when a name is loaded, so the symlink needs no
 `Wants=` or `Requires=`, so a target marks a point in the boot without
 needing explicit `After=` lines.
 
-`multi-user.target`, `basic.target` and the other targets that packages
-name in `WantedBy=` or `After=` are ordinary target units, and the image has
-to supply whichever of them its packages reference.
-`network.target` is passive and `netd.service` orders itself before it;
-`network-online.target` is not provided.
+`basic.target` and the other targets that packages name in `WantedBy=` or
+`After=` are ordinary target units, and the image has to supply whichever of
+them its packages reference. Getty units are not shipped, see
+[Getty and login units](#getty-and-login-units).
 
 Pico-init has no mount, swap, timer, path, device, scope or slice units.
 `/etc/fstab` is processed by PID 1 itself, before any unit loads. A
@@ -299,7 +299,7 @@ directives.
 
 - `/sbin/init` points at `pico-init`.
 - `default.target`, `sockets.target` and `sysinit.target` exist, directly or
-  as aliases.
+  as aliases; the build installs them.
 - A preset file enables the daemons the image wants.
 - `/etc/machine-id` is empty or absent in the image, and `/etc` is writable
   on first boot, or the `.wants/` links are created at build time and an
