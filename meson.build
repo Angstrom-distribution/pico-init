@@ -573,6 +573,8 @@ devd_tests = [
   'test-devd-media',
   'test-devd-input-id',
   'test-devd-udev-db',
+  # The udevd-compatible command line and udev.* kernel parameters.
+  'test-devd-opts',
 ]
 
 # PICO_SOURCE_DIR lets test-devd-match.c parse the rules file that is
