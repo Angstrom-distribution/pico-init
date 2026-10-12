@@ -120,9 +120,12 @@ follows `journald-syslog.c`:
 - An optional `<N>` prefix of one to three decimal digits. Only `N & 7`
   becomes `PRIORITY`; there is no `SYSLOG_FACILITY`. Without a valid prefix
   `PRIORITY` is 6.
+- An optional RFC 3164 stamp (`Mmm dd hh:mm:ss `, as `syslog(3)` sends it)
+  follows the prefix and is stored as `SYSLOG_TIMESTAMP` without its trailing
+  space. Text that is not exactly that shape stays in `MESSAGE`.
 - An optional `identifier[pid]: ` or `identifier: ` tag becomes
-  `SYSLOG_IDENTIFIER`. A bracketed suffix is stripped and discarded, and the
-  tag is ignored if longer than 255 bytes. `_PID` always comes from the
+  `SYSLOG_IDENTIFIER`. A bracketed suffix is stripped and discarded. A tag
+  longer than 255 bytes is removed from `MESSAGE` but sets no identifier. `_PID` always comes from the
   kernel credentials, never from the text.
 - The rest is `MESSAGE`, taken up to the first NUL byte.
 - `_TRANSPORT=syslog`.
@@ -147,19 +150,24 @@ descriptor becomes readable.
 
 Per record:
 
-- The severity is `prefix & 7`; the facility is discarded. An unparseable
+- The severity is `prefix & 7`; the facility is not stored. An unparseable
   prefix yields priority 0.
-- `MESSAGE` is the text after the first `;` up to the first newline. The
-  `KEY=VALUE` continuation lines of the kmsg record are not stored.
+- `MESSAGE` is the text after the first `;` up to the first newline, with
+  the kernel's `\xNN` escapes decoded. The `KEY=VALUE` continuation lines of
+  the kmsg record are not stored.
+- A record with a non-kernel facility was written by a userspace process;
+  a leading `identifier[pid]: ` tag is split off into `SYSLOG_IDENTIFIER`.
 - The fields are `MESSAGE`, `PRIORITY` and `_TRANSPORT=kernel`. The kernel
-  timestamp and sequence number are not stored: the entry's
+  timestamp is not stored: the entry's
   `__REALTIME_TIMESTAMP` and `__MONOTONIC_TIMESTAMP` are the time `logd`
   wrote it, so backfilled records all carry roughly the same time.
 - A record without `;` is discarded and ends the current drain pass; the next
   readiness event continues with the following record.
-- `EPIPE` (the reader fell behind and the kernel dropped records) logs a
-  warning and ends the current drain pass the same way; reading resumes after
-  the gap.
+- The next expected sequence number is kept in `kmsg-seqnum` beside the
+  ring and updated after each drain. After a `logd` restart in the same boot,
+  records below it are skipped instead of being logged again. A jump in the
+  sequence (the reader fell behind and the kernel dropped records) logs a
+  warning with the number of missed messages.
 
 If `/dev/kmsg` cannot be opened (missing node, no `CAP_SYSLOG`), `logd`
 logs a warning and runs without the kernel transport.
