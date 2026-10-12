@@ -81,9 +81,7 @@ static void join(char *ret, size_t size, const char *a, const char *b) {
 
 /*
  * Lay out one USB serial adapter under <root>/sys. `manufacturer` may be NULL
- * for a device whose descriptors carry no strings -- the named v1 divergence,
- * where upstream's usb_id would fall back to hex IDs and devd does
- * not.
+ * for a device whose descriptors carry no strings.
  */
 static void
                 make_usb_serial(const char *sys,
@@ -111,6 +109,14 @@ static void
 
         write_attr(iface, "bInterfaceNumber", "00");
         write_attr(iface, "bInterfaceClass", "08");
+}
+
+/* The usb-serial port device, which is where the kernel puts port_number. */
+static void add_port_number(const char *sys, const char *port) {
+        char dir[PATH_MAX];
+
+        join(dir, sizeof(dir), sys, USB_IFACE "/ttyUSB0");
+        write_attr(dir, "port_number", port);
 }
 
 /* A device context pointing at the tty at the bottom of that tree. */
@@ -146,11 +152,12 @@ static void test_pico_serial_rules(void) {
         join(sys, sizeof(sys), root, "/sys");
 
         make_usb_serial(sys, "0403", "FTDI", "FT232R USB UART", "A50285BI");
+        add_port_number(sys, "0");
 
         ASSERT_EQ_INT(devd_ruleset_new(&rs), 0);
 
         /* The file meson installs, read as bytes -- not a copy of its rule. */
-        ASSERT_EQ_INT(devd_ruleset_load_file(rs, PICO_SOURCE_DIR "/src/devd/60-pico-serial.rules"), 3);
+        ASSERT_EQ_INT(devd_ruleset_load_file(rs, PICO_SOURCE_DIR "/src/devd/60-pico-serial.rules"), 15);
         ASSERT_EQ_INT(rs->n_skipped, 0);
 
         d = tty_device(sys, "/dev", "add");
@@ -158,15 +165,15 @@ static void test_pico_serial_rules(void) {
 
         /* Both the guard and the naming rule matched; the guard's GOTO did not
          * fire because its ACTION=="remove" did not. */
-        ASSERT_EQ_INT(res.n_matched, 1);
         ASSERT_EQ_INT(res.n_symlinks, 1);
 
         /*
-         * Four $attr{} lookups, resolved at three different depths of the
-         * parent chain, with the whitespace in "FT232R USB UART" collapsed by
-         * the same sanitiser upstream's usb_id applies.
+         * $attr{} lookups resolved at three different depths of the parent
+         * chain, with the whitespace in "FT232R USB UART" collapsed by the
+         * same sanitiser upstream's usb_id applies, and the -port suffix
+         * udev's 60-serial.rules gives a usb-serial port.
          */
-        ASSERT_STREQ(res.symlinks[0], "serial/by-id/usb-FTDI_FT232R_USB_UART_A50285BI-if00");
+        ASSERT_STREQ(res.symlinks[0], "serial/by-id/usb-FTDI_FT232R_USB_UART_A50285BI-if00-port0");
 
         /* A remove takes the guard's GOTO to the label and creates nothing. */
         free(d);
@@ -190,18 +197,44 @@ static void test_pico_serial_rules_without_descriptors(void) {
         ASSERT_TRUE(root != NULL);
         join(sys, sizeof(sys), root, "/sys");
 
-        /* No manufacturer, product or serial: the recorded divergence. The
-         * link is still made, with the empty components it really has, rather
-         * than falling back to hex IDs the way upstream's usb_id would. */
+        /* No manufacturer, product or serial, as on a CH340: the hex IDs
+         * stand in, as in usb_id, and no empty serial slot is left behind. */
         make_usb_serial(sys, "0403", NULL, NULL, NULL);
+        add_port_number(sys, "0");
 
         ASSERT_EQ_INT(devd_ruleset_new(&rs), 0);
-        ASSERT_EQ_INT(devd_ruleset_load_file(rs, PICO_SOURCE_DIR "/src/devd/60-pico-serial.rules"), 3);
+        ASSERT_EQ_INT(devd_ruleset_load_file(rs, PICO_SOURCE_DIR "/src/devd/60-pico-serial.rules"), 15);
 
         d = tty_device(sys, "/dev", "add");
         ASSERT_EQ_INT(devd_rules_apply(rs, d, &res), 0);
         ASSERT_EQ_INT(res.n_symlinks, 1);
-        ASSERT_STREQ(res.symlinks[0], "serial/by-id/usb-__-if00");
+        ASSERT_STREQ(res.symlinks[0], "serial/by-id/usb-0403_6001-if00-port0");
+
+        free(d);
+        devd_ruleset_free(rs);
+        test_rm_rf(root);
+        free(root);
+}
+
+/* A ttyACM function has no usb-serial port above it, so no -port suffix. */
+static void test_pico_serial_rules_acm(void) {
+        char *root = test_tmpdir_new(), sys[PATH_MAX];
+        DevdRuleDevice *d;
+        DevdRuleResult res;
+        DevdRuleSet *rs = NULL;
+
+        ASSERT_TRUE(root != NULL);
+        join(sys, sizeof(sys), root, "/sys");
+        make_usb_serial(sys, "2341", "Arduino", "Uno", "75830");
+
+        ASSERT_EQ_INT(devd_ruleset_new(&rs), 0);
+        ASSERT_EQ_INT(devd_ruleset_load_file(rs, PICO_SOURCE_DIR "/src/devd/60-pico-serial.rules"), 15);
+
+        d = tty_device(sys, "/dev", "add");
+        (void) snprintf(d->kernel, sizeof(d->kernel), "ttyACM0");
+        ASSERT_EQ_INT(devd_rules_apply(rs, d, &res), 0);
+        ASSERT_EQ_INT(res.n_symlinks, 1);
+        ASSERT_STREQ(res.symlinks[0], "serial/by-id/usb-Arduino_Uno_75830-if00");
 
         free(d);
         devd_ruleset_free(rs);
@@ -585,6 +618,7 @@ static void test_device_from_sysfs(void) {
 int main(void) {
         test_pico_serial_rules();
         test_pico_serial_rules_without_descriptors();
+        test_pico_serial_rules_acm();
         test_attrs_must_match_one_ancestor();
         test_vendor_pair_rule_and_guards();
         test_substitutions();

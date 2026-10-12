@@ -19,13 +19,31 @@
 # bInterfaceNumber on the interface -- so $attr{} substitution, which walks the
 # parent chain for each, replaces all three builtins here.
 #
-# The named divergences from upstream's link, both recorded rather than silent:
-# a device whose descriptors carry no strings gets no link at all (upstream's
-# usb_id falls back to hex vendor:product IDs), and there is no by-path link
+# Names match upstream's: vendor_model[_serial] with hex IDs standing in for a
+# missing descriptor string, and a -port<N> suffix on ttyUSB (never ttyACM). The
+# one divergence from upstream's links is that there is no by-path link
 # (path_id is topology-walking C with no sysfs shortcut).
 
 ACTION=="remove", GOTO="pico_serial_end"
+SUBSYSTEM!="tty", GOTO="pico_serial_end"
+KERNEL!="ttyUSB*|ttyACM*", GOTO="pico_serial_end"
 
-SUBSYSTEM=="tty", KERNEL=="ttyUSB*|ttyACM*", SYMLINK+="serial/by-id/usb-$attr{manufacturer}_$attr{product}_$attr{serial}-if$attr{bInterfaceNumber}"
+# No interface number, no stable name.
+ENV{.PICO_IF}="$attr{bInterfaceNumber}"
+ENV{.PICO_IF}=="", GOTO="pico_serial_end"
+
+ENV{.PICO_VENDOR}="$attr{manufacturer}"
+ENV{.PICO_VENDOR}=="", ENV{.PICO_VENDOR}="$attr{idVendor}"
+ENV{.PICO_MODEL}="$attr{product}"
+ENV{.PICO_MODEL}=="", ENV{.PICO_MODEL}="$attr{idProduct}"
+
+# The underscore belongs to the serial, so an adapter without one has none.
+ENV{.PICO_SERIAL}="$attr{serial}"
+ENV{.PICO_SERIAL}=="?*", ENV{.PICO_SERIAL}="_$env{.PICO_SERIAL}"
+
+# Only usb-serial ports carry port_number, so ttyACM stays suffix-free.
+ENV{.PICO_PORT}="$attr{port_number}"
+ENV{.PICO_PORT}=="", SYMLINK+="serial/by-id/usb-$env{.PICO_VENDOR}_$env{.PICO_MODEL}$env{.PICO_SERIAL}-if$env{.PICO_IF}"
+ENV{.PICO_PORT}=="?*", SYMLINK+="serial/by-id/usb-$env{.PICO_VENDOR}_$env{.PICO_MODEL}$env{.PICO_SERIAL}-if$env{.PICO_IF}-port$env{.PICO_PORT}"
 
 LABEL="pico_serial_end"
