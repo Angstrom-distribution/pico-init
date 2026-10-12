@@ -9,6 +9,13 @@
 
 #pragma once
 
+#include <errno.h>
+#include <inttypes.h>
+#include <stdarg.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <sys/types.h>
+
 /* Same guard as upstream's private header, so a stray direct #include fails
  * the same way it would against a real libsystemd install. */
 #if defined(__INCLUDE_LEVEL__) && __INCLUDE_LEVEL__ <= 1 && !defined(__COVERITY__) && \
@@ -77,4 +84,18 @@
                                 func(*p);                   \
                 }                                           \
                 struct _sd_useless_struct_to_allow_trailing_semicolon_
+#endif
+
+/* Public enums carry two members at the ends of the int64_t range so they are
+ * 64 bits wide and can grow without an ABI break. */
+#ifndef _SD_ENUM_FORCE_S64
+#        define _SD_ENUM_FORCE_S64(id) _SD_##id##_INT64_MIN = INT64_MIN, _SD_##id##_INT64_MAX = INT64_MAX
+#endif
+
+#ifndef _SD_ENUM_TYPE_S64
+#        if ((__GNUC__ >= 14) || (__STDC_VERSION__ >= 202311L)) && !defined(__cplusplus)
+#                define _SD_ENUM_TYPE_S64(id) id : int64_t
+#        else
+#                define _SD_ENUM_TYPE_S64(id) id
+#        endif
 #endif
