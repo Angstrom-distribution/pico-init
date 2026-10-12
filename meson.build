@@ -261,6 +261,8 @@ pico_tests = [
   # Orderly shutdown: waiting on running stop jobs, cancelling queued start
   # jobs, the signal-to-objective mapping and the deadline.
   'test-manager-shutdown',
+  # PID 1's argv and kernel command line.
+  'test-init-opts',
 ]
 
 # manager.h includes sd-event.h, so every test that reaches it (through

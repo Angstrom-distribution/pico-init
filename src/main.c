@@ -8,12 +8,16 @@
  * the core library directly rather than through here.
  */
 
+#include <ctype.h>
 #include <errno.h>
+#include <getopt.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/reboot.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -29,6 +33,7 @@
 #include "mount-setup.h"
 #include "root-check.h"
 #include "status.h"
+#include "unit.h"
 #include "util.h"
 
 /*
@@ -105,7 +110,580 @@ static void kill_remaining_processes(void) {
                 ;
 }
 
-int main(void) {
+/*
+ * What PID 1 takes from its command line, in the spelling of systemd v262's
+ * src/core/main.c: argv (parse_argv()) and the kernel command line
+ * (parse_proc_cmdline_item()). Most of those settings configure subsystems
+ * pico-init does not have; they are accepted so one command line works with
+ * either init, and logged once so the omission is visible. The few that map
+ * onto something real are in BootOpts.
+ */
+typedef struct BootOpts {
+        char unit[256];  /* "" when unset: boot PICO_DEFAULT_TARGET */
+        int show_status; /* -1 unset, 0 off, 1 on */
+        int gpt_auto;    /* systemd.gpt_auto=: -1 unset, 0 no swap discovery */
+        int fstab;       /* fstab=: -1 unset, 0 no /etc/fstab mounts */
+} BootOpts;
+
+#define BOOT_OPTS_INIT \
+        { .unit = "", .show_status = -1, .gpt_auto = -1, .fstab = -1 }
+
+/* systemd.* keys with no counterpart here whose absence changes nothing a
+ * running system depends on. */
+static const char * const boot_ignored_quiet[] = {
+        "systemd.dump_core",
+        "systemd.early_core_pattern",
+        "systemd.crash_chvt",
+        "systemd.crash_shell",
+        "systemd.crash_reboot",
+        "systemd.crash_action",
+        "systemd.status_unit_format",
+        "systemd.log_color",
+        "systemd.log_level",
+        "systemd.log_location",
+        "systemd.log_target",
+        "systemd.log_time",
+        "systemd.log_tid",
+        "systemd.log_ratelimit_kmsg",
+        "systemd.debug_shell",
+        "systemd.default_debug_tty",
+        "systemd.reload_limit_interval_sec",
+        "systemd.reload_limit_burst",
+        "systemd.event_loop_ratelimit_interval_sec",
+        "systemd.event_loop_ratelimit_burst",
+        "systemd.minimum_uptime_sec",
+        NULL,
+};
+
+/* The ones whose omission changes what the machine does, so they are warned
+ * about rather than noted. */
+static const char * const boot_ignored_loud[] = {
+        "systemd.confirm_spawn",
+        "systemd.service_watchdogs",
+        "systemd.default_standard_output",
+        "systemd.default_standard_error",
+        "systemd.setenv",
+        "systemd.machine_id",
+        "systemd.default_timeout_start_sec",
+        "systemd.default_device_timeout_sec",
+        "systemd.cpu_affinity",
+        "systemd.watchdog_device",
+        "systemd.watchdog_sec",
+        "systemd.watchdog_pre_sec",
+        "systemd.watchdog_pretimeout_governor",
+        "systemd.clock_usec",
+        "systemd.random_seed",
+        "systemd.restrict_filesystem_access",
+        "systemd.mask",
+        "systemd.wants",
+        "systemd.set_credential",
+        "systemd.set_credential_binary",
+        "systemd.import_credentials",
+        "systemd.credentials_boot_policy",
+        NULL,
+};
+
+/* Keys differ by '-' versus '_' only count as the same, as proc_cmdline_key_streq(). */
+static bool key_is(const char *key, const char *want) {
+        for (; *key && *want; key++, want++) {
+                char a = *key == '-' ? '_' : *key;
+                char b = *want == '-' ? '_' : *want;
+
+                if (a != b)
+                        return false;
+        }
+        return *key == *want;
+}
+
+static bool key_in(const char *key, const char * const *set) {
+        for (; *set; set++)
+                if (key_is(key, *set))
+                        return true;
+        return false;
+}
+
+/* 1 or 0 for the spellings parse_boolean() takes, -EINVAL otherwise. */
+static int parse_bool(const char *s) {
+        static const char * const yes[] = { "1", "yes", "y", "true", "t", "on", NULL };
+        static const char * const no[] = { "0", "no", "n", "false", "f", "off", NULL };
+
+        for (size_t i = 0; yes[i]; i++)
+                if (strcasecmp(s, yes[i]) == 0)
+                        return 1;
+        for (size_t i = 0; no[i]; i++)
+                if (strcasecmp(s, no[i]) == 0)
+                        return 0;
+        return -EINVAL;
+}
+
+static bool in_list(const char *s, const char * const *set) {
+        for (; *set; set++)
+                if (strcmp(s, *set) == 0)
+                        return true;
+        return false;
+}
+
+static bool valid_log_level(const char *s) {
+        static const char * const names[] = {
+                "emerg", "alert", "crit", "err", "warning", "notice", "info", "debug", NULL,
+        };
+
+        return in_list(s, names) || (s[0] >= '0' && s[0] <= '7' && s[1] == '\0');
+}
+
+static bool valid_log_target(const char *s) {
+        static const char * const names[] = {
+                "console", "console-prefixed", "kmsg", "journal", "journal-or-kmsg",
+                "syslog",  "syslog-or-kmsg",   "auto", "null",    NULL,
+        };
+
+        return in_list(s, names);
+}
+
+static bool valid_exec_output(const char *s) {
+        static const char * const names[] = {
+                "inherit", "null",           "tty",    "journal", "kmsg", "journal+console", "kmsg+console",
+                "syslog",  "syslog+console", "socket", NULL,
+        };
+
+        return in_list(s, names) || strncmp(s, "fd:", 3) == 0 || strncmp(s, "file:", 5) == 0 ||
+                        strncmp(s, "append:", 7) == 0 || strncmp(s, "truncate:", 9) == 0;
+}
+
+static bool valid_crash_action(const char *s) {
+        static const char * const names[] = { "freeze", "reboot", "poweroff", NULL };
+
+        return in_list(s, names);
+}
+
+static bool valid_machine_id(const char *s) {
+        size_t i;
+        bool nonzero = false;
+
+        for (i = 0; s[i]; i++) {
+                if (!isxdigit((unsigned char) s[i]))
+                        return false;
+                if (s[i] != '0')
+                        nonzero = true;
+        }
+        return i == 32 && nonzero;
+}
+
+static bool valid_number(const char *s, long max) {
+        char *end;
+        long v;
+
+        if (!*s)
+                return false;
+        errno = 0;
+        v = strtol(s, &end, 10);
+        return errno == 0 && *end == '\0' && v >= 0 && v <= max;
+}
+
+/*
+ * The target a SysV-style kernel command line word asks for, or NULL. As
+ * systemd's runlevel_to_target(): "emergency" and "rescue" also work as
+ * systemd.unit= shortcuts, "single"/"1" are rescue mode.
+ */
+static const char *runlevel_target(const char *word) {
+        static const struct {
+                const char *word;
+                const char *target;
+        } map[] = {
+                { "emergency",  "emergency.target" },
+                {        "-b",  "emergency.target" },
+                {    "rescue",     "rescue.target" },
+                {    "single",     "rescue.target" },
+                {         "s",     "rescue.target" },
+                {         "S",     "rescue.target" },
+                {        "-s",     "rescue.target" },
+                {         "1",     "rescue.target" },
+                {         "2", "multi-user.target" },
+                {         "3", "multi-user.target" },
+                {         "4", "multi-user.target" },
+                {         "5",  "graphical.target" },
+        };
+
+        for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); i++)
+                if (strcmp(word, map[i].word) == 0)
+                        return map[i].target;
+        return NULL;
+}
+
+static void boot_set_unit(BootOpts *o, const char *unit) {
+        if (!unit_name_is_valid(unit) || strlen(unit) >= sizeof(o->unit)) {
+                pico_log(PICO_LOG_WARNING, "unit name \"%s\" is not valid, ignoring", unit);
+                return;
+        }
+        strcpy(o->unit, unit);
+}
+
+static void boot_set_show_status(BootOpts *o, const char *value) {
+        int r;
+
+        if (!value) {
+                o->show_status = 1;
+                return;
+        }
+
+        /* "auto" and "error" are the other two spellings systemd has; with
+         * no per-job suppression here they show everything, like "yes". */
+        if (strcmp(value, "auto") == 0 || strcmp(value, "error") == 0) {
+                o->show_status = 1;
+                return;
+        }
+
+        r = parse_bool(value);
+        if (r < 0)
+                pico_log(PICO_LOG_WARNING, "invalid show status \"%s\", ignoring", value);
+        else
+                o->show_status = r;
+}
+
+static void boot_set_switch(int *ret, const char *name, const char *value) {
+        int r = value ? parse_bool(value) : 1;
+
+        if (r < 0)
+                pico_log(PICO_LOG_WARNING, "invalid %s=%s, ignoring", name, value);
+        else
+                *ret = r;
+}
+
+static void boot_cmdline_item(BootOpts *o, const char *key, const char *value) {
+        if (key_is(key, "systemd.unit")) {
+                if (!value || !*value)
+                        pico_log(PICO_LOG_WARNING, "%s= needs a value, ignoring", key);
+                else
+                        boot_set_unit(o, value);
+        } else if (key_is(key, "systemd.show_status"))
+                boot_set_show_status(o, value);
+        else if (key_is(key, "systemd.gpt_auto"))
+                boot_set_switch(&o->gpt_auto, "systemd.gpt_auto", value);
+        else if (key_is(key, "fstab"))
+                boot_set_switch(&o->fstab, "fstab", value);
+        else if (key_in(key, boot_ignored_quiet))
+                pico_log(PICO_LOG_INFO, "kernel command line: %s is not implemented, ignored", key);
+        else if (key_in(key, boot_ignored_loud))
+                pico_log(PICO_LOG_WARNING, "kernel command line: %s is not implemented, ignored", key);
+        else if (!value) {
+                /* "quiet" and "debug" are the kernel's as much as ours: the
+                 * kernel logging they select has no pico-init counterpart, and
+                 * "quiet" would hide failures if it silenced the console. */
+                const char *target = runlevel_target(key);
+
+                if (target)
+                        boot_set_unit(o, target);
+        }
+}
+
+/*
+ * Whitespace-separated words, double quotes grouping and dropped, key=value
+ * split at the first '='. Stops at "--": what follows is for the init process
+ * and reaches main() as argv.
+ */
+static void boot_cmdline_parse(const char *cmdline, BootOpts *o) {
+        char word[512];
+        const char *p = cmdline;
+
+        while (*p) {
+                size_t n = 0;
+                bool quoted = false;
+                char *eq;
+
+                while (isspace((unsigned char) *p))
+                        p++;
+                if (!*p)
+                        break;
+
+                for (; *p && (quoted || !isspace((unsigned char) *p)); p++) {
+                        if (*p == '"')
+                                quoted = !quoted;
+                        else if (n < sizeof(word) - 1)
+                                word[n++] = *p;
+                }
+                word[n] = '\0';
+
+                if (strcmp(word, "--") == 0)
+                        break;
+
+                eq = strchr(word, '=');
+                if (eq)
+                        *eq++ = '\0';
+                boot_cmdline_item(o, word, eq);
+        }
+}
+
+static void boot_cmdline_load(BootOpts *o) {
+        static char buf[4096];
+        FILE *f = fopen("/proc/cmdline", "re");
+
+        if (!f)
+                return;
+        if (fgets(buf, sizeof(buf), f))
+                boot_cmdline_parse(buf, o);
+        fclose(f);
+}
+
+static void usage(void) {
+        puts("pico-init [OPTIONS...]\n"
+             "\n"
+             "Start and monitor system services.\n"
+             "\n"
+             "  -h --help                   Show this help\n"
+             "     --version                Show version\n"
+             "     --unit=UNIT              Set default unit\n"
+             "     --show-status[=BOOL]     Show status updates on the console during boot\n"
+             "     --system                 Accepted, the only mode there is\n"
+             "\n"
+             "Accepted and ignored, with a note in the log:\n"
+             "     --dump-core[=BOOL]  --crash-chvt=NR  --crash-action=ACTION\n"
+             "     --crash-shell[=BOOL]  --crash-reboot[=BOOL]  --confirm-spawn[=BOOL]\n"
+             "     --log-target=TARGET  --log-level=LEVEL  --log-color[=BOOL]\n"
+             "     --log-location[=BOOL]  --log-time[=BOOL]  --service-watchdogs=BOOL\n"
+             "     --default-standard-output=OUT  --default-standard-error=OUT\n"
+             "     --machine-id=ID  --switched-root  --deserialize=FD  --no-pager\n"
+             "     -D  -b  -s  -z ARG\n"
+             "\n"
+             "Refused: --test  --user  --dump-configuration-items  --dump-bus-properties\n"
+             "         --bus-introspect=PATH\n"
+             "\n"
+             "Kernel command line: systemd.unit=, systemd.show_status=, systemd.gpt_auto=,\n"
+             "fstab=, and the single, rescue, emergency, 1-5 shortcuts. Other systemd.*\n"
+             "settings are accepted and ignored.");
+}
+
+/*
+ * Returns 0 to run, 1 when the options were all there was to do (--help,
+ * --version), -EINVAL on a bad command line. As PID 1 a bad option is
+ * reported and parsing stops: refusing to boot over an argument the kernel
+ * passed along would be worse.
+ */
+static int boot_argv_parse(int argc, char *argv[], bool pid1, BootOpts *o) {
+        enum {
+                ARG_VERSION = 0x100,
+                ARG_TEST,
+                ARG_SYSTEM,
+                ARG_USER,
+                ARG_DUMP_CONFIGURATION_ITEMS,
+                ARG_DUMP_BUS_PROPERTIES,
+                ARG_BUS_INTROSPECT,
+                ARG_UNIT,
+                ARG_DUMP_CORE,
+                ARG_CRASH_CHVT,
+                ARG_CRASH_ACTION,
+                ARG_CRASH_SHELL,
+                ARG_CRASH_REBOOT,
+                ARG_CONFIRM_SPAWN,
+                ARG_SHOW_STATUS,
+                ARG_LOG_TARGET,
+                ARG_LOG_LEVEL,
+                ARG_LOG_COLOR,
+                ARG_LOG_LOCATION,
+                ARG_LOG_TIME,
+                ARG_DEFAULT_STDOUT,
+                ARG_DEFAULT_STDERR,
+                ARG_NO_PAGER,
+                ARG_SERVICE_WATCHDOGS,
+                ARG_DESERIALIZE,
+                ARG_SWITCHED_ROOT,
+                ARG_MACHINE_ID,
+        };
+        static const struct option options[] = {
+                {                     "help",       no_argument, NULL,                          'h' },
+                {                  "version",       no_argument, NULL,                  ARG_VERSION },
+                {                     "test",       no_argument, NULL,                     ARG_TEST },
+                {                   "system",       no_argument, NULL,                   ARG_SYSTEM },
+                {                     "user",       no_argument, NULL,                     ARG_USER },
+                { "dump-configuration-items",       no_argument, NULL, ARG_DUMP_CONFIGURATION_ITEMS },
+                {      "dump-bus-properties",       no_argument, NULL,      ARG_DUMP_BUS_PROPERTIES },
+                {           "bus-introspect", required_argument, NULL,           ARG_BUS_INTROSPECT },
+                {                     "unit", required_argument, NULL,                     ARG_UNIT },
+                {                "dump-core", optional_argument, NULL,                ARG_DUMP_CORE },
+                {               "crash-chvt", required_argument, NULL,               ARG_CRASH_CHVT },
+                {                 "crash-vt", required_argument, NULL,               ARG_CRASH_CHVT },
+                {             "crash-action", required_argument, NULL,             ARG_CRASH_ACTION },
+                {              "crash-shell", optional_argument, NULL,              ARG_CRASH_SHELL },
+                {             "crash-reboot", optional_argument, NULL,             ARG_CRASH_REBOOT },
+                {            "confirm-spawn", optional_argument, NULL,            ARG_CONFIRM_SPAWN },
+                {              "show-status", optional_argument, NULL,              ARG_SHOW_STATUS },
+                {               "log-target", required_argument, NULL,               ARG_LOG_TARGET },
+                {                "log-level", required_argument, NULL,                ARG_LOG_LEVEL },
+                {                "log-color", optional_argument, NULL,                ARG_LOG_COLOR },
+                {             "log-location", optional_argument, NULL,             ARG_LOG_LOCATION },
+                {                 "log-time", optional_argument, NULL,                 ARG_LOG_TIME },
+                {  "default-standard-output", required_argument, NULL,           ARG_DEFAULT_STDOUT },
+                {   "default-standard-error", required_argument, NULL,           ARG_DEFAULT_STDERR },
+                {                 "no-pager",       no_argument, NULL,                 ARG_NO_PAGER },
+                {        "service-watchdogs", required_argument, NULL,        ARG_SERVICE_WATCHDOGS },
+                {              "deserialize", required_argument, NULL,              ARG_DESERIALIZE },
+                {            "switched-root",       no_argument, NULL,            ARG_SWITCHED_ROOT },
+                {               "machine-id", required_argument, NULL,               ARG_MACHINE_ID },
+                {                       NULL,                 0, NULL,                            0 },
+        };
+        const char *bad = NULL;
+        bool ignored;
+        int c;
+
+        optind = 0;
+        opterr = pid1 ? 0 : 1;
+
+        while ((c = getopt_long(argc, argv, "hDbsz:", options, NULL)) >= 0) {
+                ignored = false;
+
+                switch (c) {
+                case 'h':
+                        if (pid1)
+                                return 0;
+                        usage();
+                        return 1;
+
+                case ARG_VERSION:
+                        if (pid1)
+                                return 0;
+                        puts("pico-init " PICO_INIT_VERSION_STRING);
+                        return 1;
+
+                case ARG_TEST:
+                case ARG_DUMP_CONFIGURATION_ITEMS:
+                case ARG_DUMP_BUS_PROPERTIES:
+                case ARG_BUS_INTROSPECT:
+                        /* Output a script would parse; an empty success would be a lie. */
+                        pico_log(PICO_LOG_ERR, "%s is not supported by pico-init", argv[optind - 1]);
+                        return -EINVAL;
+
+                case ARG_USER:
+                        pico_log(PICO_LOG_ERR, "--user is not supported: pico-init is a system manager only");
+                        return -EINVAL;
+
+                case ARG_SYSTEM:
+                        break;
+
+                case ARG_UNIT:
+                        if (!unit_name_is_valid(optarg) || strlen(optarg) >= sizeof(o->unit)) {
+                                pico_log(PICO_LOG_ERR,
+                                         "Failed to set default unit \"%s\": invalid unit name",
+                                         optarg);
+                                return -EINVAL;
+                        }
+                        strcpy(o->unit, optarg);
+                        break;
+
+                case ARG_SHOW_STATUS:
+                        if (optarg && strcmp(optarg, "auto") != 0 && strcmp(optarg, "error") != 0 &&
+                            parse_bool(optarg) < 0) {
+                                pico_log(PICO_LOG_ERR, "Failed to parse show status boolean: \"%s\"", optarg);
+                                return -EINVAL;
+                        }
+                        boot_set_show_status(o, optarg);
+                        break;
+
+                case ARG_DUMP_CORE:
+                case ARG_CRASH_SHELL:
+                case ARG_CRASH_REBOOT:
+                case ARG_LOG_COLOR:
+                case ARG_LOG_LOCATION:
+                case ARG_LOG_TIME:
+                case ARG_SERVICE_WATCHDOGS:
+                        if (optarg && parse_bool(optarg) < 0)
+                                bad = optarg;
+                        ignored = true;
+                        break;
+
+                case ARG_CONFIRM_SPAWN:
+                        if (optarg && parse_bool(optarg) < 0 && optarg[0] != '/')
+                                bad = optarg;
+                        ignored = true;
+                        break;
+
+                case ARG_CRASH_CHVT:
+                        if (!valid_number(optarg, 63) && parse_bool(optarg) < 0)
+                                bad = optarg;
+                        ignored = true;
+                        break;
+
+                case ARG_CRASH_ACTION:
+                        if (!valid_crash_action(optarg))
+                                bad = optarg;
+                        ignored = true;
+                        break;
+
+                case ARG_LOG_TARGET:
+                        if (!valid_log_target(optarg))
+                                bad = optarg;
+                        ignored = true;
+                        break;
+
+                case ARG_LOG_LEVEL:
+                        if (!valid_log_level(optarg))
+                                bad = optarg;
+                        ignored = true;
+                        break;
+
+                case ARG_DEFAULT_STDOUT:
+                case ARG_DEFAULT_STDERR:
+                        if (!valid_exec_output(optarg))
+                                bad = optarg;
+                        ignored = true;
+                        break;
+
+                case ARG_MACHINE_ID:
+                        if (!valid_machine_id(optarg))
+                                bad = optarg;
+                        ignored = true;
+                        break;
+
+                case ARG_DESERIALIZE:
+                        if (!valid_number(optarg, INT_MAX))
+                                bad = optarg;
+                        ignored = true;
+                        break;
+
+                case ARG_SWITCHED_ROOT:
+                        ignored = true;
+                        break;
+
+                case ARG_NO_PAGER:
+                case 'D':
+                        break;
+
+                case 'b':
+                case 's':
+                case 'z':
+                        if (!pid1) {
+                                pico_log(PICO_LOG_ERR, "Switch -%c is only supported when running as PID 1.", c);
+                                return -EINVAL;
+                        }
+                        break;
+
+                default:
+                        if (pid1)
+                                return 0;
+                        return -EINVAL;
+                }
+
+                if (bad || ignored) {
+                        const struct option *opt = options;
+
+                        while (opt->name && opt->val != c)
+                                opt++;
+                        if (bad) {
+                                pico_log(PICO_LOG_ERR, "Failed to parse --%s: \"%s\"", opt->name, bad);
+                                return -EINVAL;
+                        }
+                        pico_log(PICO_LOG_INFO, "--%s is not implemented, ignored", opt->name);
+                }
+        }
+
+        if (!pid1 && optind < argc) {
+                pico_log(PICO_LOG_ERR, "Excess arguments.");
+                return -EINVAL;
+        }
+
+        return 0;
+}
+
+int main(int argc, char *argv[]) {
+        BootOpts boot = BOOT_OPTS_INIT;
         FstabTable fstab = { 0 };
         bool fstab_swap;
         bool first_boot = false;
@@ -116,6 +694,12 @@ int main(void) {
         int r;
 
         if (getpid() != 1) {
+                r = boot_argv_parse(argc, argv, false, &boot);
+                if (r < 0)
+                        return EXIT_FAILURE;
+                if (r > 0)
+                        return EXIT_SUCCESS;
+
                 puts("pico-init: not running as PID 1, exiting");
                 return EXIT_SUCCESS;
         }
@@ -198,6 +782,10 @@ int main(void) {
          */
         pico_log(PICO_LOG_INFO, "pico-init " PICO_INIT_VERSION_STRING " running as PID 1");
 
+        /* argv after the kernel command line, as upstream: it wins. */
+        boot_cmdline_load(&boot);
+        (void) boot_argv_parse(argc, argv, true, &boot);
+
         /* The restore above ran before this process logged anywhere that is kept,
          * so it is reported here. */
         if (clock_restored > 0) {
@@ -216,8 +804,10 @@ int main(void) {
          * a console -- before any unit starts reporting progress against it.
          * Needs the /dev mount_setup() made above.
          */
-        status_enable();
-        status_welcome(NULL);
+        if (boot.show_status != 0) {
+                status_enable();
+                status_welcome(NULL);
+        }
 
         /*
          * The root filesystem's integrity, before anything is allowed to write
@@ -256,7 +846,11 @@ int main(void) {
          * ordering, can see an fstab path before it is mounted.
          * fstab-mount.h has the rest of the reasoning.
          */
-        r = fstab_pass(&fstab, NULL);
+        if (boot.fstab == 0) {
+                pico_log(PICO_LOG_INFO, "fstab=no, not mounting /etc/fstab entries");
+                r = 0;
+        } else
+                r = fstab_pass(&fstab, NULL);
         if (r < 0)
                 pico_log(PICO_LOG_WARNING, "fstab_pass: %s", strerror(-r));
         else if (r > 0)
@@ -281,6 +875,8 @@ int main(void) {
          */
         if (fstab_swap)
                 pico_log(PICO_LOG_INFO, "/etc/fstab names swap, not discovering swap partitions");
+        else if (boot.gpt_auto == 0)
+                pico_log(PICO_LOG_INFO, "systemd.gpt_auto=no, not discovering swap partitions");
         else {
                 r = dps_scan();
                 if (r < 0)
@@ -331,7 +927,7 @@ int main(void) {
          * useful sitting in the event loop with a console than dead, because
          * that is exactly the state someone needs to debug it from.
          */
-        r = manager_startup(m, NULL);
+        r = manager_startup(m, boot.unit[0] ? boot.unit : NULL);
         if (r < 0)
                 pico_log(PICO_LOG_WARNING, "startup failed: %s, entering the event loop anyway", strerror(-r));
 

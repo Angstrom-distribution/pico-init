@@ -14,6 +14,14 @@ bin="$1"
 #    main must detect that and exit 0 rather than loop or reboot()).
 "$bin"
 
+# 1b. The version and help text, and a refusal that must not look like success.
+"$bin" --version | grep -q '^pico-init '
+"$bin" --help | grep -q 'Kernel command line'
+if "$bin" --test >/dev/null 2>&1; then
+        echo "FAIL: --test must be refused" >&2
+        exit 1
+fi
+
 # 2. Symbol presence. Leading underscore is optional (Mach-O vs ELF).
 symbols=$(nm "$bin")
 
