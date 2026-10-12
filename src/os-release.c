@@ -83,8 +83,33 @@ static int os_release_handler(
         return 0;
 }
 
+/*
+ * os-release(5) lets /usr/lib/os-release stand in for an absent /etc/os-release,
+ * which is what a stateless-/etc image has. Applies to any path ending in
+ * /etc/os-release, so a tmpfiles --root gets the fallback under that root.
+ */
+static int os_release_fallback(const char *path, char **ret) {
+        static const char suffix[] = "/etc/os-release", alt[] = "/usr/lib/os-release";
+        size_t n = strlen(path), s = sizeof(suffix) - 1;
+        char *p;
+
+        if (n < s || strcmp(path + n - s, suffix) != 0)
+                return -ENOENT;
+
+        p = malloc(n - s + sizeof(alt));
+        if (!p)
+                return -ENOMEM;
+
+        memcpy(p, path, n - s);
+        memcpy(p + n - s, alt, sizeof(alt));
+        *ret = p;
+
+        return 0;
+}
+
 int os_release_get(const char *path, const char *key, char **ret) {
         OsReleaseLookup l = { .key = key };
+        char *alt = NULL;
         int r;
 
         if (!path || !key || !ret)
@@ -94,6 +119,10 @@ int os_release_get(const char *path, const char *key, char **ret) {
          * returns, which is already the answer this reports for a missing
          * key -- so no case below has to tell them apart. */
         r = pico_conf_scan(path, os_release_handler, &l);
+        if (r == -ENOENT && os_release_fallback(path, &alt) == 0) {
+                r = pico_conf_scan(alt, os_release_handler, &l);
+                free(alt);
+        }
         if (r < 0) {
                 l.value = pico_mfree(l.value);
                 return r;

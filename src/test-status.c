@@ -133,6 +133,35 @@ static void test_os_release_missing_file(void) {
         ASSERT_TRUE(v == NULL);
 }
 
+/* A root with no /etc/os-release reads /usr/lib/os-release; one that has
+ * both prefers /etc. */
+static void test_os_release_usr_lib_fallback(void) {
+        char *dir = test_tmpdir_new(), path[PATH_MAX], *v = NULL;
+
+        ASSERT_TRUE(dir != NULL);
+        ASSERT_EQ_INT(test_mkdir(dir, "etc"), 0);
+        ASSERT_EQ_INT(test_mkdir(dir, "usr"), 0);
+        ASSERT_EQ_INT(test_mkdir(dir, "usr/lib"), 0);
+        ASSERT_EQ_INT(test_write_file(dir, "usr/lib/os-release", "PRETTY_NAME=\"Stateless\"\n"), 0);
+        ASSERT_TRUE((size_t) snprintf(path, sizeof(path), "%s/etc/os-release", dir) < sizeof(path));
+
+        ASSERT_EQ_INT(os_release_get(path, "PRETTY_NAME", &v), 0);
+        ASSERT_STREQ(v, "Stateless");
+        free(v);
+        v = NULL;
+
+        /* A missing key is still a missing key. */
+        ASSERT_EQ_INT(os_release_get(path, "NAME", &v), -ENOENT);
+
+        ASSERT_EQ_INT(test_write_file(dir, "etc/os-release", "PRETTY_NAME=\"Etc\"\n"), 0);
+        ASSERT_EQ_INT(os_release_get(path, "PRETTY_NAME", &v), 0);
+        ASSERT_STREQ(v, "Etc");
+        free(v);
+
+        test_rm_rf(dir);
+        free(dir);
+}
+
 /*
  * The per-unit progress line, byte for byte. "[" then the colour, then six
  * columns with OK centred, then the reset, then "] " -- systemd's own
@@ -320,6 +349,7 @@ static void test_version_string(void) {
 int main(void) {
         test_os_release_lookup();
         test_os_release_missing_file();
+        test_os_release_usr_lib_fallback();
         test_status_line();
         test_status_line_failed_timeout_dependency();
         test_status_line_truncated();

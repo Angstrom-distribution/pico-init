@@ -122,7 +122,7 @@ void status_printf(const char *word, const char *color, const char *format, ...)
 size_t status_format_line(char *buf, size_t size, const char *word, const char *color, const char *text);
 
 /* Greet the console with the distribution name from `path` (NULL for
- * OS_RELEASE_PATH). */
+ * OS_RELEASE_PATH, which falls back to /usr/lib/os-release when absent). */
 void status_welcome(const char *path);
 
 /* As above, composed into `buf` rather than written, for the reason
