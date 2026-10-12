@@ -416,6 +416,14 @@ from `/sys`. See [DEVD.md](DEVD.md).
 (`--create --remove --boot`) before `sysinit.target`. Line types it does not
 implement are logged and skipped.
 
+Beyond those three operations it takes `--boot`, `--graceful`, `--prefix=`,
+`--exclude-prefix=`, `-E` and `--root=`, plus `--cat-config` and `--tldr`
+(print the configuration files that apply, with the same `# path` headers),
+`--inline` (arguments are configuration lines) and `--replace=PATH` (arguments
+stand in for `PATH` in the file order). `--no-pager` is accepted and ignored.
+`--purge`, `-n`/`--dry-run`, `--user`, `--image` and `--image-policy` are
+refused with exit status 1, since a caller expects an effect they do not have.
+
 ## Compatibility libraries
 
 `libsystemd.so.0` carries systemd's SONAME, symbol versions (from the

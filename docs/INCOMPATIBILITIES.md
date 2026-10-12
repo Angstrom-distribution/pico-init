@@ -70,7 +70,7 @@ The same parser is available at build time as `pico-unit-lint`, which loads
 every unit under the given directories without booting anything:
 
 ```sh
-pico-unit-lint [--warn-only] [--verbose] DIR...
+pico-unit-lint [OPTIONS...] DIR...
 ```
 
 It prints one line per finding and a summary:
@@ -86,6 +86,17 @@ own name. `--verbose` also lists units with nothing dropped. The exit status
 is 0 with no findings, 1 with any finding unless `--warn-only` is given, and
 2 when a directory could not be scanned or the command line is wrong. A
 masked unit does not load and is reported as `FAILED TO LOAD`.
+
+The options of `systemd-analyze verify` that make sense for a directory lint
+are accepted. `-q`/`--quiet` omits the summary line, `--root=PATH` resolves
+each `DIR` below `PATH`, `--instance=NAME` sets the instance name templates
+are loaded under (default `lint`), and `--version` and `--help` work. `--system`
+and `--no-pager` are accepted and change nothing. `--recursive-errors=MODE`
+(`yes`, `no`, `one`, or `help` to list them), `--man[=BOOL]` and
+`--generators[=BOOL]` are validated and ignored: only units in the tree are
+reported, man pages are not checked and no generator runs. `--user`,
+`--global`, `--image` and `--image-policy` would change what is verified and
+exit 2. The arguments are directories, not unit files.
 
 A drop is silent in one respect that matters: a dropped directive is treated
 as absent. An unrecognised `Condition*=` or `Assert*=` line is not
