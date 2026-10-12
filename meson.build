@@ -486,6 +486,13 @@ test_netctl_color_exe = executable(
 )
 test('test-netctl-color', test_netctl_color_exe)
 
+# netctl's options, verbs and exit statuses; same subprocess approach.
+test_netctl_opts_exe = executable(
+  'test-netctl-opts',
+  ['src/netd/test-netctl-opts.c'] + pico_test_sources,
+)
+test('test-netctl-opts', test_netctl_opts_exe)
+
 # ---------------------------------------------------------------------------
 # devd -- the device hotplug daemon. Built like netd, and a separate daemon
 # rather than PID 1 code so that a crash costs a unit restart, not the machine.
