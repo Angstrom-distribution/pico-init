@@ -18,7 +18,7 @@ For the daemons the libraries talk to, see [LOGD.md](LOGD.md),
 |------|---------|
 | `${libdir}/libsystemd.so.0.45.0` | SONAME `libsystemd.so.0` |
 | `${libdir}/libudev.so.1.7.15` | SONAME `libudev.so.1`, links `libsystemd.so.0` |
-| `${includedir}/systemd/sd-*.h` | `sd-daemon`, `sd-event`, `sd-id128`, `sd-journal`, `sd-bus`, `sd-bus-protocol`, `sd-bus-vtable`, `sd-login`, `sd-hwdb`, `sd-device`, `sd-network`, `_sd-common.h` |
+| `${includedir}/systemd/sd-*.h` | `sd-daemon`, `sd-event`, `sd-id128`, `sd-journal`, `sd-bus`, `sd-bus-protocol`, `sd-bus-vtable`, `sd-login`, `sd-hwdb`, `sd-device`, `sd-network`, `sd-json`, `sd-path`, `_sd-common.h` |
 | `${includedir}/libudev.h` | libudev API |
 | `${libdir}/pkgconfig/libsystemd.pc` | `-lsystemd` |
 | `${libdir}/pkgconfig/libudev.pc` | `-ludev` |
@@ -57,11 +57,10 @@ The result is committed as `libsystemd.sym` and `libudev.sym`. The `.pc`
 version, which consumers compare with `systemd >= N`, is `262` for all four
 files; it is the release the symbol files match.
 
-Upstream names that are absent from `libsystemd.so.0`: the `sd_json_*` and
-`sd_varlink_*` families (224 names) and `sd_path_lookup`,
-`sd_path_lookup_strv` (226 in all). A program that references one fails to
-load with an undefined-symbol error; there is no stub. `libudev.so.1` exports
-all 92 names of the vendored upstream file.
+Upstream names that are absent from `libsystemd.so.0`: the `sd_varlink_*`
+family (117 names). A program that references one fails to load with an
+undefined-symbol error; there is no stub. `libudev.so.1` exports all 92 names
+of the vendored upstream file.
 
 Regenerate and check:
 
@@ -96,6 +95,8 @@ success or empty answer that does nothing.
 | `sd-hwdb` | Error. No `hwdb.bin` reader exists. |
 | `sd-device` | Real over sysfs and netlink. Partial. See below. |
 | `sd-network` | Partly real, mostly `-EOPNOTSUPP`. See below. |
+| `sd-json` | No JSON engine: constructors, parsers and the builder fail, NULL-variant calls answer as upstream. See below. |
+| `sd-path` | `-EOPNOTSUPP`. See below. |
 
 ### sd-event
 
@@ -192,6 +193,35 @@ read `netd`'s state under `/run/netd` instead (see [NETD.md](NETD.md)).
   Per-link calls return `-EINVAL` first for `ifindex <= 0`.
 
 The `sd_network_*` symbols are on the `PICO_LIBSYSTEMD_0` node.
+
+### sd-json
+
+All 107 `sd_json_*` names, the types, flag enums and `SD_JSON_BUILD_*` macros of `sd-json.h` are present, so a program that uses JSON loads and takes its failure path. There is no JSON engine, so no `sd_json_variant` can exist, and NULL is the only variant a program can hold.
+
+| Call | Result |
+|------|--------|
+| `sd_json_variant_new_*()` | `-EINVAL` for a NULL `ret`, a NULL buffer with a non-zero length, a NULL array with a non-zero count, an odd object count or a string with an embedded NUL; otherwise `-EOPNOTSUPP`. `ret` is not touched. |
+| `sd_json_build()`, `sd_json_buildv()`, `sd_json_buildo()` | `-EINVAL` for a NULL `ret`, otherwise `-EOPNOTSUPP`. |
+| `sd_json_parse*()` | `-ENODATA` for a NULL or empty string (`sd_json_parse()` and `sd_json_parse_with_source()`), `-EBADF` for a negative fd (`sd_json_parse_fd()`), otherwise `-EOPNOTSUPP`. A fd passed with `SD_JSON_PARSE_DONATE_FD` is closed. |
+| `sd_json_variant_ref()`, `_unref()` | NULL. `sd_json_variant_unref_many()` frees the array. |
+| `sd_json_variant_string()`, `_integer()`, `_unsigned()`, `_real()`, `_boolean()` | NULL or zero. |
+| `sd_json_variant_type()`, `_has_type()`, `sd_json_variant_is_*()` | `_SD_JSON_VARIANT_TYPE_INVALID` and false. |
+| `sd_json_variant_is_blank_object()`, `_is_blank_array()`, `_is_normalized()`, `_is_sorted()` | True, as upstream for NULL. |
+| `sd_json_variant_elements()`, `_by_index()`, `_by_key*()`, `_find()` | 0 or NULL. |
+| `sd_json_variant_equal()` | True for two NULLs. |
+| `sd_json_variant_dump()` | Prints nothing for NULL, or `[]` with `SD_JSON_FORMAT_EMPTY_ARRAY`. |
+| `sd_json_variant_format()`, `sd_json_variant_get_source()`, `sd_json_variant_unbase64()`, `_unhex()` | `-EINVAL`. |
+| `sd_json_variant_strv()` | An empty, NULL-terminated list. |
+| `sd_json_variant_filter()`, `_sort()`, `_normalize()` | `-EINVAL` for a NULL handle, 0 for a NULL variant. |
+| `sd_json_variant_merge_object()` | `-EINVAL` for a NULL handle, 0 for a NULL variant and a NULL argument, otherwise `-EOPNOTSUPP`. |
+| `sd_json_variant_set_field*()`, `_append_array()`, `_append_array_nodup()` | `-EINVAL` for a NULL handle, field or element, otherwise `-EOPNOTSUPP`. The `b()` forms, including `_merge_objectb()`, build their argument first and always give `-EOPNOTSUPP`. |
+| `sd_json_dispatch()`, `sd_json_dispatch_full()` | A NULL variant is an empty object: 0, or `-ENXIO` for a mandatory field (`reterr_bad_field` is set), unless permissive. Nothing is logged for `SD_JSON_LOG`. |
+| `sd_json_dispatch_*()` callbacks | `-EINVAL` for a NULL variant or NULL userdata. `sd_json_dispatch_unsupported()` is `-EINVAL` always. |
+| `sd_json_variant_type_to_string()`, `_from_string()` | Real. |
+
+### sd-path
+
+`sd_path_lookup()` and `sd_path_lookup_strv()` are present with the `SD_PATH_*` enum, and return `-EOPNOTSUPP` for every type, the error upstream gives a type it does not know. A NULL `ret` is `-EINVAL`. Upstream's answers come from systemd's build-time directory layout, its unit and generator search, NSS and a parse of xdg-user-dirs; pico-init has no single mechanism behind them.
 
 ## libudev
 

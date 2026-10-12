@@ -51,7 +51,7 @@ the DHCP and SNTP code in `netd` is lifted from current systemd.
   `sd-event`, `sd-id128`, `sd-journal` over `logd`, `sd-device` and
   `libudev` over sysfs and devd's udev database, the cgroup half of
   `sd-login`) and returns an error where it has none (`sd-bus`
-  never connects, there is no hwdb, no logind data). An image that runs a
+  never connects, there is no hwdb, no logind data, no JSON engine). An image that runs a
   real D-Bus daemon needs real libsystemd.
 - **`pico-unit-lint`**, PID 1's own unit parser run over an installed unit
   tree, so a build log shows which directives a booted system would drop.
