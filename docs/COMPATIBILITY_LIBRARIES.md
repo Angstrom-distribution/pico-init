@@ -18,7 +18,7 @@ For the daemons the libraries talk to, see [LOGD.md](LOGD.md),
 |------|---------|
 | `${libdir}/libsystemd.so.0.45.0` | SONAME `libsystemd.so.0` |
 | `${libdir}/libudev.so.1.7.15` | SONAME `libudev.so.1`, links `libsystemd.so.0` |
-| `${includedir}/systemd/sd-*.h` | `sd-daemon`, `sd-event`, `sd-id128`, `sd-journal`, `sd-bus`, `sd-bus-protocol`, `sd-bus-vtable`, `sd-login`, `sd-hwdb`, `sd-device`, `sd-network`, `sd-json`, `sd-path`, `_sd-common.h` |
+| `${includedir}/systemd/sd-*.h` | `sd-daemon`, `sd-event`, `sd-id128`, `sd-journal`, `sd-bus`, `sd-bus-protocol`, `sd-bus-vtable`, `sd-login`, `sd-hwdb`, `sd-device`, `sd-network`, `sd-json`, `sd-path`, `sd-varlink`, `sd-varlink-idl`, `_sd-common.h` |
 | `${includedir}/libudev.h` | libudev API |
 | `${libdir}/pkgconfig/libsystemd.pc` | `-lsystemd` |
 | `${libdir}/pkgconfig/libudev.pc` | `-ludev` |
@@ -57,10 +57,9 @@ The result is committed as `libsystemd.sym` and `libudev.sym`. The `.pc`
 version, which consumers compare with `systemd >= N`, is `262` for all four
 files; it is the release the symbol files match.
 
-Upstream names that are absent from `libsystemd.so.0`: the `sd_varlink_*`
-family (117 names). A program that references one fails to load with an
-undefined-symbol error; there is no stub. `libudev.so.1` exports all 92 names
-of the vendored upstream file.
+`libsystemd.so.0` exports every name of the vendored upstream file; the
+only difference is the additional `sd_network_*` family described above. `libudev.so.1`
+exports all 92 names of its vendored upstream file.
 
 Regenerate and check:
 
@@ -97,6 +96,7 @@ success or empty answer that does nothing.
 | `sd-network` | Partly real, mostly `-EOPNOTSUPP`. See below. |
 | `sd-json` | No JSON engine: constructors, parsers and the builder fail, NULL-variant calls answer as upstream. See below. |
 | `sd-path` | `-EOPNOTSUPP`. See below. |
+| `sd-varlink` | No Varlink engine: connecting and creating a server fail, NULL-handle calls answer as upstream, a few helpers are real. See below. |
 
 ### sd-event
 
@@ -222,6 +222,29 @@ All 107 `sd_json_*` names, the types, flag enums and `SD_JSON_BUILD_*` macros of
 ### sd-path
 
 `sd_path_lookup()` and `sd_path_lookup_strv()` are present with the `SD_PATH_*` enum, and return `-EOPNOTSUPP` for every type, the error upstream gives a type it does not know. A NULL `ret` is `-EINVAL`. Upstream's answers come from systemd's build-time directory layout, its unit and generator search, NSS and a parse of xdg-user-dirs; pico-init has no single mechanism behind them.
+
+### sd-varlink
+
+All 117 `sd_varlink_*` names, the types, flag enums, callback types, `SD_VARLINK_ERROR_*` strings and `sd_varlink_*bo()` macros of `sd-varlink.h`, and the interface description types and `SD_VARLINK_DEFINE_*` macros of `sd-varlink-idl.h`, are present, so a Varlink client or service loads and takes its failure path. There is no Varlink engine, so no `sd_varlink` or `sd_varlink_server` can exist, and NULL is the only handle a program can hold. A handle this library did not hand out is refused like NULL.
+
+| Call | Result |
+|------|--------|
+| `sd_varlink_connect_address()`, `_connect_exec()` | `-EINVAL` for a NULL `ret`, address or command; otherwise `-EOPNOTSUPP`. `ret` is not touched. |
+| `sd_varlink_connect_fd()`, `_connect_fd_pair()` | `-EINVAL` for a NULL `ret`, `-EBADF` for a negative fd; otherwise `-EOPNOTSUPP`. |
+| `sd_varlink_connect_url()` | `-EINVAL` for a NULL `ret` or URL, or a `unix:` or `exec:` path that is not absolute and normalized; `-EPROTONOSUPPORT` for parameters (`;`, `?`, `#`) and for any scheme other than `unix:`, `exec:`, `ssh:`, `ssh-unix:` and `ssh-exec:`, as no bridge helper is run; otherwise `-EOPNOTSUPP`. |
+| `sd_varlink_server_new()` | `-EINVAL` for a NULL `ret` or an unknown flag; otherwise `-EOPNOTSUPP`. |
+| `sd_varlink_ref()`, `_unref()`, `_close_unref()`, `_flush_close_unref()`, `sd_varlink_server_ref()`, `_unref()` | NULL. |
+| `sd_varlink_get_server()`, `_get_event()`, `_get_description()`, `_get_userdata()`, `_set_userdata()`, `sd_varlink_server_get_event()`, `_get_userdata()`, `_set_userdata()` | NULL. |
+| `sd_varlink_detach_event()` | Nothing. |
+| `sd_varlink_server_current_connections()` | 0. |
+| `sd_varlink_server_connections_max()`, `_connections_per_uid_max()` | Real: upstream's defaults, 4096 connections capped at three quarters of the descriptor table, and 128 per UID capped at three quarters of that. |
+| Every other call taking a handle, including the `b()` forms | `-EINVAL`. |
+| `sd_varlink_invocation()` | Real: `SYSTEMD_VARLINK_LISTEN`, or exactly one passed descriptor named `varlink` of the kind the flags allow. |
+| `sd_varlink_error_to_errno()` | Real: the table of upstream's Varlink errors. `io.systemd.System` and unknown errors are `-EBADR`, as no parameters object exists to carry an errno. |
+| `sd_varlink_error_is_invalid_parameter()` | True only for the `InvalidParameter` error with no name asked for. |
+| `sd_varlink_idl_dump()`, `_idl_format()`, `_idl_format_full()` | `-EINVAL` for a NULL interface; otherwise `-EOPNOTSUPP`. Interface descriptions are plain C data and can be defined and passed around, but there is no formatter. |
+| `sd_varlink_idl_parse()` | `-EOPNOTSUPP`. |
+| `sd_varlink_interface_free()` | NULL. The parser never allocates, and a static description must not be freed. |
 
 ## libudev
 
