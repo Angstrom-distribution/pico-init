@@ -1,3 +1,124 @@
+# CHANGES WITH 0.2.2:
+
+        This release brings the command-line tools, the compatibility
+        libraries and the code derived from systemd up to systemd v262.
+        Behaviour that changes for existing images is called out below.
+
+##        Command-line tools:
+
+        * picoctl follows systemctl 262: list-units hides inactive units
+          unless --all or --state= is given, list-unit-files and list-jobs
+          take patterns, -o json, json-pretty, json-sse, json-seq and cat
+          are available, and show takes -p, -P and --value. kill knows the
+          full signal table, --kill-whom= and --kill-value=. New verbs are
+          list-jobs, get-default, whoami, link, add-wants and add-requires;
+          enable, disable, mask and preset take --now, and preset-all and
+          --preset-mode= exist. The reboot, poweroff, halt and shutdown
+          personalities parse the options of the real tools. Verbs and
+          options the system cannot honour fail with a reason and a
+          non-zero status instead of reporting success; docs/PICOCTL.md
+          lists which are real, accepted and refused. A preset ignore rule
+          now leaves the unit alone in picoctl preset, and list-unit-files
+          shows ignored.
+
+        * picolog follows journalctl 262: all sixteen output formats,
+          --output-fields=, priority ranges, repeated -u with globs,
+          FIELD=VALUE matches, -g, --since and --until, cursors, -b, -r,
+          -n and -f, --file=, --list-boots, --disk-usage and --new-id128.
+          Options that a RAM-only journal makes moot are accepted; options
+          that would change state (--rotate, --verify, --user and others)
+          exit with a diagnostic.
+
+        * netctl follows networkctl 262: list, status and lldp take
+          interface patterns, and label, up, down, delete, reconfigure,
+          cat, mask, unmask and persistent-storage work. --no-legend, -a,
+          -s, --json= and --runtime are available. dhcp-lease, renew,
+          forcerenew and edit are refused with a reason.
+
+        * pico-tmpfiles gains --cat-config, --tldr, --inline and --replace=;
+          --dry-run, --user, --image and --purge are refused.
+          pico-unit-lint takes -q, --root=, --instance=, --version and the
+          systemd-analyze verify options that apply to it.
+
+        * pico-init, devd, netd and logd accept the command lines of
+          systemd, systemd-udevd, systemd-networkd and systemd-journald.
+          PID 1 reads --unit=, systemd.unit=, the single, rescue,
+          emergency and 1-5 words, --show-status, systemd.show_status=,
+          systemd.gpt_auto= and fstab= from the kernel command line.
+          Options that need machinery pico-init does not have are accepted
+          and logged as ignored, or refused where ignoring them would
+          change what runs.
+
+##        PID 1 and unit files:
+
+        * Exec*= words decode C escapes, keep unknown escapes, and join text
+          glued to a closing quote, as systemd 262 does. EnvironmentFile=
+          is read with shell-like quoting, escapes and line continuation.
+          A line ending in an escaped backslash no longer continues, a
+          malformed section header drops its section, and an assignment
+          with an empty key is skipped. A preset ignore rule is a
+          terminating rule, and preset patterns match without backslash
+          escapes. Unterminated quotes in an EnvironmentFile= now run to
+          the end of the file, as upstream.
+
+        * Services start with a clean environment: PATH, TERM for
+          tty-attached units, and USER, LOGNAME, HOME and SHELL for User=.
+          They no longer inherit PID 1's environment or stray name=value
+          words from the kernel command line. Environment= and
+          EnvironmentFile= still override.
+
+        * The root filesystem check reads fsck.mode=force|skip|auto and
+          fsck.repair=preen|yes|no from the kernel command line.
+
+        * os-release falls back to /usr/lib/os-release when
+          /etc/os-release is missing.
+
+##        netd:
+
+        * A lease whose router lies outside the leased subnet gets a
+          link-scope host route first, and a renewal that drops the router
+          removes the default route the old lease installed.
+
+        * DHCP= accepts every boolean spelling in either case, Name= in
+          [Match] understands !pattern, and an empty Name=, DNS= or NTP=
+          clears earlier values. DNS= and NTP= stop at 128 entries.
+
+        * A reload requested after SIGTERM is dropped.
+
+##        logd:
+
+        * RFC 3164 timestamps in /dev/log datagrams are split off, so the
+          syslog tag becomes SYSLOG_IDENTIFIER and the stamp is stored as
+          SYSLOG_TIMESTAMP. Kernel-escaped bytes in /dev/kmsg messages are
+          decoded, and a logd restart within one boot resumes after the last
+          stored record instead of replaying the ring.
+
+##        devd:
+
+        * by-id links for USB serial devices carry the -port<N> suffix and
+          omit the serial component when the device has no serial string,
+          as udev names them.
+
+##        libsystemd and libudev compatibility:
+
+        * Both libraries follow systemd v262: libsystemd.so.0.45.0 and
+          libudev.so.1.7.15, the LIBSYSTEMD_260, LIBSYSTEMD_261 and
+          LIBSYSTEMD_262 symbol versions, and a pkg-config version of 262.
+
+        * Every name in upstream's libsystemd symbol file is now exported.
+          The sd_json_*, sd_varlink_* and sd_path_lookup* families are
+          stubs: with no JSON or varlink machinery behind them, calls that
+          need a real implementation return -EOPNOTSUPP and functions that
+          take an object handle answer for a NULL handle as upstream does.
+          sd_path_lookup() and sd_path_lookup_strv() return -EOPNOTSUPP for
+          every type. The cpu and io pressure event sources fail like the
+          memory pressure source, and sd_session_get_extra_device_access()
+          reports that there is no logind.
+
+##        Contributions from:
+
+        Koen Kooi
+
 # CHANGES WITH 0.2.1:
 
         A small release: unit files that ask for KillMode= are now honoured,
