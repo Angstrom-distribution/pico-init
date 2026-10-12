@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Koen Kooi
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Socket units install into it, and PID 1 orders every service after it.
+
+[Unit]
+Description=Socket units

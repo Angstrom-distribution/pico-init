@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: 2026 Koen Kooi
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# The boot target. default.target is a link to this one. It wants the two
+# passive targets directly, in place of systemd's multi-user -> basic ->
+# sysinit/sockets chain, and bluetooth.target, which devd cannot pull in by
+# itself the way udev's SYSTEMD_WANTS= does.
+
+[Unit]
+Description=Multi-User System
+Wants=sockets.target
+Wants=sysinit.target
+After=sysinit.target
+Wants=bluetooth.target

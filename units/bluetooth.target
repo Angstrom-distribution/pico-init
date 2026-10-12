@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: 2026 Koen Kooi
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Units that are only WantedBy=bluetooth.target (bluetooth-hciattach)
+# get a start job through multi-user.target wanting this one.
+
+[Unit]
+Description=Bluetooth

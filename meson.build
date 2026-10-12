@@ -305,6 +305,11 @@ test(
   find_program('src/test-unit-lint.sh'),
   args: [pico_unit_lint_exe],
 )
+test(
+  'shipped-units',
+  find_program('src/test-shipped-units.sh'),
+  args: [pico_unit_lint_exe, meson.project_source_root()],
+)
 
 # ---------------------------------------------------------------------------
 # netd -- the network daemon. Built like PID 1: one static library the tests
@@ -419,6 +424,21 @@ install_data(
   'src/netd/netd.service',
   'src/netd/network.target',
   install_dir: get_option('prefix') / 'lib' / 'systemd' / 'system',
+)
+
+# The targets PID 1 and the shipped units refer to. default.target is a link,
+# as OpenEmbedded produces it; a distro with its own set can overwrite them.
+install_data(
+  'units/multi-user.target',
+  'units/sysinit.target',
+  'units/sockets.target',
+  'units/bluetooth.target',
+  install_dir: get_option('prefix') / 'lib' / 'systemd' / 'system',
+)
+install_symlink(
+  'default.target',
+  install_dir: get_option('prefix') / 'lib' / 'systemd' / 'system',
+  pointing_to: 'multi-user.target',
 )
 
 # test-netd-codec checks the wire format against fixed golden bytes, so client
