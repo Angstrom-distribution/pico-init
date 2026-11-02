@@ -107,8 +107,9 @@ tagged:
 
 The tests run as root; the workflow comment gives the reason as real cgroups
 and veth pairs, and that unprivileged they fail rather than skip. clang-format
-is pinned to version 18 so a runner image update cannot change the
-formatting rules.
+is pinned to version 18 and the runner image to ubuntu-24.04, so a
+runner image update cannot change the formatting rules or the environment
+the tests run in.
 
 `werror=true` and `warning_level=3` are project defaults in meson.build,
 so a warning breaks the `build` job.

@@ -9,9 +9,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# The runner image is pinned: ubuntu-latest moved to 26.04, whose clang-format-18
+# flags files the 24.04 one accepts and where test-fstab-mount fails.
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
       - name: Install meson and ninja
@@ -27,7 +29,7 @@ jobs:
         run: sudo -E meson test -C build --print-errorlogs
 
   format:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
       - name: Install clang-format
@@ -40,7 +42,7 @@ jobs:
           find src -name '*.c' -o -name '*.h' | xargs -r clang-format-18 --dry-run --Werror
 
   reuse:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
       - name: REUSE license compliance
