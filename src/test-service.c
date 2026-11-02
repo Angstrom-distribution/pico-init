@@ -3424,6 +3424,111 @@ static void kill_mode_leftover(const char *mode, bool stop, bool want_survive) {
         free(dir);
 }
 
+/* mkdir <cgroup>/<name> and move pid into it; false when the kernel or our privileges refuse. */
+static bool move_pid_to_subgroup(const char *cgroup, const char *name, pid_t pid) {
+        char sub[PATH_MAX + 64], procs[PATH_MAX + 128];
+        FILE *f;
+        bool ok;
+
+        snprintf(sub, sizeof(sub), "%s/%s", cgroup, name);
+        snprintf(procs, sizeof(procs), "%s/cgroup.procs", sub);
+        if (mkdir(sub, 0755) != 0 && errno != EEXIST)
+                return false;
+
+        f = fopen(procs, "w");
+        if (!f)
+                return false;
+        ok = fprintf(f, "%d\n", (int) pid) > 0;
+        return fclose(f) == 0 && ok;
+}
+
+/*
+ * The leftover lives in <unit cgroup>/apps, as a launcher that parks its
+ * apps in a sibling subgroup does. A control-group stop must still SIGTERM
+ * it: TimeoutStopSec=20 is far past the drive_until() budget, so reaching
+ * DEAD proves the stop signal got there rather than the timeout's SIGKILL.
+ * KillMode=process must leave it alone.
+ */
+static void stop_signals_subgroup(const char *mode, bool want_survive) {
+        Manager *m;
+        Service *s;
+        char *dir;
+        char body[PATH_MAX * 2], path[PATH_MAX], name[64];
+        pid_t leftover, pids[8];
+        size_t n = 0, i;
+        bool listed = false;
+        int tries;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+        write_kill_script(dir);
+
+        snprintf(name, sizeof(name), "subgroup-%s.service", mode);
+        snprintf(path, sizeof(path), "%s/leftover", dir);
+        snprintf(body,
+                 sizeof(body),
+                 "[Service]\nType=simple\nKillMode=%s\nTimeoutStopSec=20\nExecStart=%s/tree.sh %s wait\n",
+                 mode,
+                 dir,
+                 path);
+        s = load_service(m, dir, name, body);
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+
+        if (!s->cgroup) {
+                printf("test-service: no cgroup, skipping the sub-cgroup stop check (KillMode=%s)\n", mode);
+                ASSERT_EQ_INT(unit_stop(UNIT(s)), 0);
+                ASSERT_TRUE(drive_until(m, service_settled_done, s, 600));
+                manager_free(m);
+                test_rm_rf(dir);
+                free(dir);
+                return;
+        }
+
+        for (tries = 0; tries < 1000 && access(path, F_OK) != 0; tries++)
+                test_sleep_ms(2);
+        ASSERT_EQ_INT(access(path, F_OK), 0);
+        leftover = read_pid_file(path);
+        ASSERT_TRUE(leftover > 0);
+
+        if (!move_pid_to_subgroup(s->cgroup->path, "apps", leftover)) {
+                printf("test-service: cannot move a pid into a sub-cgroup, skipping the stop check\n");
+                (void) kill(leftover, SIGKILL);
+                ASSERT_EQ_INT(unit_stop(UNIT(s)), 0);
+                ASSERT_TRUE(drive_until(m, service_settled_done, s, 1500));
+                manager_free(m);
+                test_rm_rf(dir);
+                free(dir);
+                return;
+        }
+
+        /* the production situation: not listed by the unit's own cgroup.procs */
+        ASSERT_EQ_INT(cgroup_v2_get_pids(s->cgroup, pids, 8, &n), 0);
+        for (i = 0; i < n && i < 8; i++)
+                if (pids[i] == leftover)
+                        listed = true;
+        ASSERT_TRUE(!listed);
+
+        ASSERT_EQ_INT(unit_stop(UNIT(s)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, s, 600));
+        ASSERT_EQ_INT(s->state, SERVICE_DEAD);
+
+        if (want_survive) {
+                ASSERT_TRUE(pid_is_running(leftover));
+                (void) kill(leftover, SIGKILL);
+        }
+        ASSERT_TRUE(pid_dies_within(leftover, 2000));
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+static void test_stop_signals_subgroups(void) {
+        stop_signals_subgroup("control-group", false);
+        stop_signals_subgroup("process", true);
+}
+
 static void test_kill_mode_leftovers(void) {
         kill_mode_leftover("control-group", false, false); /* main exits: the rest is killed */
         kill_mode_leftover("process", false, true);        /* main exits: the rest lives on */
@@ -3576,6 +3681,7 @@ int main(void) {
         test_start_limit_from_failed_finishes_job();
         test_stop_signals_whole_cgroup();
         test_kill_mode_leftovers();
+        test_stop_signals_subgroups();
         test_kill_mode_none_abandons_on_timeout();
         test_kill_signal_is_sent();
         test_orphaned_cgroup_is_reaped();
