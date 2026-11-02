@@ -705,7 +705,7 @@ int cgroup_v2_get_pids_in(const char *dir, pid_t *pids, size_t max, size_t *ret_
  * once (the root counts) and the number of cgroups visited. A real service
  * tree is a handful of cgroups, a couple of levels deep.
  */
-#define CGROUP_TREE_MAX_DEPTH  8
+#define CGROUP_TREE_MAX_DEPTH 8
 #define CGROUP_TREE_MAX_GROUPS 256
 
 /* cgroup.procs of `dir` into c. 0 or -errno; the same pid rules as cgroup_v2_get_pids(). */
