@@ -700,6 +700,114 @@ int cgroup_v2_get_pids_in(const char *dir, pid_t *pids, size_t max, size_t *ret_
         return r;
 }
 
+/*
+ * Bounds of cgroup_v2_get_pids_tree(): the number of DIR handles held open at
+ * once (the root counts) and the number of cgroups visited. A real service
+ * tree is a handful of cgroups, a couple of levels deep.
+ */
+#define CGROUP_TREE_MAX_DEPTH  8
+#define CGROUP_TREE_MAX_GROUPS 256
+
+/* cgroup.procs of `dir` into c. 0 or -errno; the same pid rules as cgroup_v2_get_pids(). */
+static int cgroup_v2_tree_read_procs(const char *dir, struct get_pids_ctx *c) {
+        struct pico_cgroup cg = { .procs_fd = -1, .events_fd = -1, .kill_fd = -1 };
+        int r;
+
+        cg.procs_fd = open_ctrl_file(dir, "cgroup.procs", O_RDONLY);
+        if (cg.procs_fd < 0)
+                return cg.procs_fd;
+
+        r = cgroup_v2_foreach_pid(&cg, cgroup_v2_get_pids_cb, c);
+        close(cg.procs_fd);
+        return r < 0 ? r : 0;
+}
+
+int cgroup_v2_get_pids_tree(const char *dir, pid_t *pids, size_t max, size_t *ret_n, bool *ret_truncated) {
+        DIR *dirs[CGROUP_TREE_MAX_DEPTH];
+        size_t path_len[CGROUP_TREE_MAX_DEPTH];
+        struct get_pids_ctx c = { .pids = pids, .max = max, .n = 0 };
+        char path[PATH_MAX];
+        size_t depth = 0, n_groups = 1, len;
+        bool truncated = false;
+        int r;
+
+        if (!dir || !ret_n || (max > 0 && !pids))
+                return -EINVAL;
+
+        len = strlen(dir);
+        if (len >= sizeof(path))
+                return -ENAMETOOLONG;
+        memcpy(path, dir, len + 1);
+
+        r = cgroup_v2_tree_read_procs(path, &c);
+        if (r < 0)
+                return r;
+
+        dirs[0] = opendir(path);
+        if (dirs[0]) {
+                path_len[0] = len;
+                depth = 1;
+        } else if (errno != ENOENT) {
+                truncated = true;
+        }
+
+        /* Iterative depth-first walk. path always holds the directory of the
+         * innermost open DIR plus, transiently, the entry being visited. */
+        while (depth > 0) {
+                DIR *d = dirs[depth - 1];
+                size_t base = path_len[depth - 1];
+                struct dirent *e;
+                struct stat st;
+                DIR *sub;
+                int n;
+
+                e = readdir(d);
+                if (!e) {
+                        closedir(d);
+                        depth--;
+                        continue;
+                }
+
+                if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+                        continue;
+                /* symlinks are not followed: a service must not be able to point PID 1 at foreign pids */
+                if (fstatat(dirfd(d), e->d_name, &st, AT_SYMLINK_NOFOLLOW) < 0 || !S_ISDIR(st.st_mode))
+                        continue;
+
+                if (depth >= CGROUP_TREE_MAX_DEPTH || n_groups >= CGROUP_TREE_MAX_GROUPS) {
+                        truncated = true;
+                        continue;
+                }
+
+                path[base] = '\0';
+                n = snprintf(path + base, sizeof(path) - base, "/%s", e->d_name);
+                if (n < 0 || (size_t) n >= sizeof(path) - base) {
+                        path[base] = '\0';
+                        truncated = true;
+                        continue;
+                }
+                n_groups++;
+
+                /* a cgroup that cannot be read or has just gone is skipped, not an error */
+                (void) cgroup_v2_tree_read_procs(path, &c);
+
+                sub = opendir(path);
+                if (!sub) {
+                        if (errno != ENOENT)
+                                truncated = true;
+                        continue;
+                }
+                dirs[depth] = sub;
+                path_len[depth] = base + (size_t) n;
+                depth++;
+        }
+
+        *ret_n = c.n;
+        if (ret_truncated)
+                *ret_truncated = truncated;
+        return 0;
+}
+
 struct signal_ctx {
         int sig;
         const char *path;

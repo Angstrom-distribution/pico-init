@@ -183,5 +183,17 @@ int cgroup_v2_make_subgroup(const char *parent, const char *name, char *buf, siz
 /* cgroup_v2_get_pids() for the cgroup directory `dir`, without a struct pico_cgroup. */
 int cgroup_v2_get_pids_in(const char *dir, pid_t *pids, size_t max, size_t *ret_n);
 
+/*
+ * cgroup_v2_get_pids_in() for `dir` and every cgroup below it, so processes
+ * moved into a child cgroup are listed too. Same pid rules and *ret_n
+ * semantics. The walk is iterative and allocation free, never follows
+ * symlinks, and is capped at 8 levels (the root included) and 256 cgroups;
+ * *ret_truncated (may be NULL) is set when a cap stopped it, so some
+ * descendants are not listed. A descendant that cannot be read or vanishes
+ * mid-walk is skipped. Only a missing or unreadable `dir` itself is an
+ * error. 0 or -errno.
+ */
+int cgroup_v2_get_pids_tree(const char *dir, pid_t *pids, size_t max, size_t *ret_n, bool *ret_truncated);
+
 /* Close fds, remove the cgroup directory and any empty cgroups below it, free. Returns NULL. */
 struct pico_cgroup *cgroup_v2_free(struct pico_cgroup *cg);
