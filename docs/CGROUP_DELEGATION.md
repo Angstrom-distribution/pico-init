@@ -126,11 +126,19 @@ starting with `.` or `_`, not starting with `cgroup.`, and without `/`.
 Anything else is ignored with a warning. An empty assignment clears the
 setting.
 
-When listing the processes of a unit (for `PIDFile=` validation and for the
-stop signal), PID 1 reads `cgroup.procs` of the unit cgroup and of the
+When listing the processes of a unit for `PIDFile=` validation and
+`GuessMainPID=`, PID 1 reads `cgroup.procs` of the unit cgroup and of the
 `DelegateSubgroup=` directory. Processes in `.control` or in cgroups the
-service created itself are not listed there; they are still reached by
-`cgroup.kill` because it is recursive.
+service created itself are not listed there.
+
+The stop signal of `KillMode=control-group` reaches every cgroup below the
+unit cgroup as well, so processes a service moved into a sibling subgroup
+(a launcher's `apps/`) get `SIGTERM` at stop. The walk is bounded: at most 8
+levels deep, 256 cgroups and 64 processes. Past the depth or cgroup cap the
+remainder is left to the final `cgroup.kill`, which is recursive; with more
+than 64 processes only the unit cgroup itself gets a complete pass (without
+`SendSIGHUP=`) and the descendants beyond the first 64 are left to the final
+`cgroup.kill`.
 
 ## Cleanup and stale cgroups
 
@@ -165,7 +173,7 @@ they are left alone and a warning is logged.
 
 | `KillMode=`     | stop                                      | main process exits on its own |
 |-----------------|-------------------------------------------|-------------------------------|
-| `control-group` | `KillSignal=` to main, control and all other cgroup members | rest of the cgroup killed |
+| `control-group` | `KillSignal=` to main, control and all other members of the cgroup and its child cgroups | rest of the cgroup killed |
 | `mixed`         | `KillSignal=` to main and control process only, then `SIGKILL` to the whole cgroup once the main process is gone (with `SendSIGKILL=yes`) | rest of the cgroup killed |
 | `process`       | `KillSignal=` to main and control process | cgroup left alone |
 | `none`          | no signal                                 | cgroup left alone |
@@ -173,7 +181,7 @@ they are left alone and a warning is logged.
 Details:
 
 - `SendSIGHUP=yes` adds `SIGHUP` after the stop signal for the main and
-  control process.
+  control process, and with `control-group` for the other cgroup members too.
 - `SendSIGKILL=yes` (the default) makes the stop timeout escalate: with
   `control-group` or `mixed` the whole cgroup is killed; with `process` the
   main and control PIDs are sent `SIGKILL`. With `KillMode=none` or

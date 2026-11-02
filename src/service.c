@@ -801,25 +801,46 @@ static void service_enter_dead(Service *s) {
 
 /*
  * v30's default KillMode=control-group (service_enter_signal()): a stop
- * signals every process in the unit's cgroup, main and control pids
- * excluded so they are not signalled twice. More members than fit here
- * get one cgroup-wide pass instead.
+ * signals every process in the unit's cgroup and in all cgroups below it
+ * (apps parked in a sibling subgroup), main and control pids excluded so
+ * they are not signalled twice. SendSIGHUP= applies to them as to the main
+ * process, for the stop signal only.
+ *
+ * Bounds: with more than 64 members the unit's own cgroup gets one
+ * cgroup-wide pass (no SIGHUP, and main and control are signalled by it as
+ * before) and only the descendants that fit the 64 collected, listed after
+ * the unit's own members, are signalled one by one, so nobody gets the
+ * signal twice. If the walk hit its depth or cgroup cap, the rest is left
+ * to the stop timeout's cgroup.kill, which is recursive. Either way the
+ * unit still stops, at worst at the timeout.
  */
 static void service_signal_cgroup_rest(Service *s, int sig) {
         pid_t pids[64];
-        size_t n = 0, i;
+        size_t n = 0, i, first = 0;
+        bool hup = sig == s->kill_signal && s->send_sighup && sig != SIGHUP;
 
-        if (!s->cgroup || service_get_pids(s, pids, sizeof(pids) / sizeof(pids[0]), &n) < 0)
+        if (!s->cgroup ||
+            cgroup_v2_get_pids_tree(s->cgroup->path, pids, sizeof(pids) / sizeof(pids[0]), &n, NULL) < 0)
                 return;
 
         if (n > sizeof(pids) / sizeof(pids[0])) {
+                pid_t one[1];
+                size_t root_n = 0;
+
                 (void) cgroup_v2_signal(s->cgroup, sig);
-                return;
+                if (cgroup_v2_get_pids(s->cgroup, one, 1, &root_n) < 0)
+                        root_n = sizeof(pids) / sizeof(pids[0]);
+                first = root_n < sizeof(pids) / sizeof(pids[0]) ? root_n : sizeof(pids) / sizeof(pids[0]);
+                n = sizeof(pids) / sizeof(pids[0]);
         }
 
-        for (i = 0; i < n; i++)
-                if (pids[i] != s->main_pid && pids[i] != s->control_pid)
-                        (void) kill(pids[i], sig);
+        for (i = first; i < n; i++) {
+                if (pids[i] == s->main_pid || pids[i] == s->control_pid)
+                        continue;
+                (void) kill(pids[i], sig);
+                if (hup)
+                        (void) kill(pids[i], SIGHUP);
+        }
 }
 
 /* Spawns ExecStopPost= line exec_stop_post_idx as the control process. A
@@ -884,7 +905,7 @@ static void service_enter_stop(Service *s) {
                 if (s->kill_mode == KILL_MIXED)
                         cgroup_v2_kill(s->cgroup);
                 else
-                        cgroup_v2_signal(s->cgroup, s->kill_signal);
+                        service_signal_cgroup_rest(s, s->kill_signal);
                 service_arm_timeout(s, s->timeout_stop_usec, service_timer_stop_timeout);
                 return;
         }
