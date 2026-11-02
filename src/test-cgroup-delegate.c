@@ -266,6 +266,129 @@ static void test_remove_below(void) {
         free(root);
 }
 
+static bool has_pid(const pid_t *pids, size_t n, pid_t pid) {
+        size_t i;
+
+        for (i = 0; i < n; i++)
+                if (pids[i] == pid)
+                        return true;
+        return false;
+}
+
+static int count_open_fds(void) {
+        int fd, n = 0;
+
+        for (fd = 0; fd < 1024; fd++)
+                if (fcntl(fd, F_GETFD) >= 0)
+                        n++;
+        return n;
+}
+
+static void test_get_pids_tree(void) {
+        pid_t pids[512];
+        char path[PATH_MAX], content[64];
+        char *root, *outside;
+        size_t n = 0;
+        bool truncated;
+        int i, fds;
+
+        root = test_tmpdir_new();
+        outside = test_tmpdir_new();
+        ASSERT_TRUE(root != NULL && outside != NULL);
+
+        /* pid 1 and the caller are never reported */
+        snprintf(content, sizeof(content), "100\n101\n1\n%d\n", (int) getpid());
+        ASSERT_EQ_INT(test_write_file(root, "cgroup.procs", content), 0);
+        ASSERT_EQ_INT(test_write_file(root, "plain-file", "x"), 0);
+        mkdir_in(root, "apps");
+        path_in(path, sizeof(path), root, "apps");
+        ASSERT_EQ_INT(test_write_file(path, "cgroup.procs", "200\n"), 0);
+        mkdir_in(path, "x");
+        path_in(path, sizeof(path), root, "apps/x");
+        ASSERT_EQ_INT(test_write_file(path, "cgroup.procs", "300\n"), 0);
+        mkdir_in(root, ".control");
+        path_in(path, sizeof(path), root, ".control");
+        ASSERT_EQ_INT(test_write_file(path, "cgroup.procs", "400\n"), 0);
+        /* a cgroup without a readable cgroup.procs is skipped, its children are not */
+        mkdir_in(root, "nocg");
+        path_in(path, sizeof(path), root, "nocg");
+        mkdir_in(path, "inner");
+        path_in(path, sizeof(path), root, "nocg/inner");
+        ASSERT_EQ_INT(test_write_file(path, "cgroup.procs", "500\n"), 0);
+        /* a symlink is not followed */
+        ASSERT_EQ_INT(test_write_file(outside, "cgroup.procs", "999\n"), 0);
+        path_in(path, sizeof(path), root, "link");
+        ASSERT_EQ_INT(symlink(outside, path), 0);
+
+        fds = count_open_fds();
+        truncated = true;
+        ASSERT_EQ_INT(cgroup_v2_get_pids_tree(root, pids, 512, &n, &truncated), 0);
+        ASSERT_EQ_INT((int) n, 6);
+        ASSERT_TRUE(!truncated);
+        ASSERT_TRUE(has_pid(pids, n, 100) && has_pid(pids, n, 101));
+        ASSERT_TRUE(has_pid(pids, n, 200) && has_pid(pids, n, 300));
+        ASSERT_TRUE(has_pid(pids, n, 400) && has_pid(pids, n, 500));
+        ASSERT_TRUE(!has_pid(pids, n, 999));
+        ASSERT_EQ_INT(count_open_fds(), fds);
+
+        /* a short array still reports the full count; the truncation pointer is optional */
+        ASSERT_EQ_INT(cgroup_v2_get_pids_tree(root, pids, 2, &n, NULL), 0);
+        ASSERT_EQ_INT((int) n, 6);
+        ASSERT_EQ_INT(cgroup_v2_get_pids_tree(root, NULL, 0, &n, NULL), 0);
+        ASSERT_EQ_INT((int) n, 6);
+
+        ASSERT_EQ_INT(cgroup_v2_get_pids_tree("/nonexistent/cgroup", pids, 8, &n, NULL), -ENOENT);
+        ASSERT_EQ_INT(cgroup_v2_get_pids_tree(NULL, pids, 8, &n, NULL), -EINVAL);
+
+        unlink(path);
+        done(outside);
+        done(root);
+
+        /* Nesting past the depth cap stops the walk and says so; shallower members are still listed. */
+        root = test_tmpdir_new();
+        ASSERT_TRUE(root != NULL);
+        ASSERT_EQ_INT(test_write_file(root, "cgroup.procs", "1000\n"), 0);
+        {
+                char deep[PATH_MAX];
+                size_t len = (size_t) snprintf(deep, sizeof(deep), "%s", root);
+
+                for (i = 1; i <= 12; i++) {
+                        ASSERT_TRUE(len + 3 < sizeof(deep));
+                        len += (size_t) snprintf(deep + len, sizeof(deep) - len, "/d");
+                        ASSERT_EQ_INT(mkdir(deep, 0755), 0);
+                        snprintf(content, sizeof(content), "%d\n", 1000 + i);
+                        ASSERT_EQ_INT(test_write_file(deep, "cgroup.procs", content), 0);
+                }
+        }
+        fds = count_open_fds();
+        ASSERT_EQ_INT(cgroup_v2_get_pids_tree(root, pids, 512, &n, &truncated), 0);
+        ASSERT_TRUE(truncated);
+        ASSERT_TRUE(has_pid(pids, n, 1000) && has_pid(pids, n, 1001) && has_pid(pids, n, 1007));
+        ASSERT_TRUE(!has_pid(pids, n, 1008) && !has_pid(pids, n, 1012));
+        ASSERT_EQ_INT(count_open_fds(), fds);
+        done(root);
+
+        /* So does a flat tree with more cgroups than the cap. */
+        root = test_tmpdir_new();
+        ASSERT_TRUE(root != NULL);
+        ASSERT_EQ_INT(test_write_file(root, "cgroup.procs", ""), 0);
+        for (i = 0; i < 300; i++) {
+                char name[16];
+
+                snprintf(name, sizeof(name), "g%d", i);
+                mkdir_in(root, name);
+                path_in(path, sizeof(path), root, name);
+                snprintf(content, sizeof(content), "%d\n", 2000 + i);
+                ASSERT_EQ_INT(test_write_file(path, "cgroup.procs", content), 0);
+        }
+        fds = count_open_fds();
+        ASSERT_EQ_INT(cgroup_v2_get_pids_tree(root, pids, 512, &n, &truncated), 0);
+        ASSERT_TRUE(truncated);
+        ASSERT_EQ_INT((int) n, 255);
+        ASSERT_EQ_INT(count_open_fds(), fds);
+        done(root);
+}
+
 /* A unit cgroup directory with the control files cgroup_v2_new() opens. */
 static char *fake_unit(const char *events, const char *subtree_control) {
         char *dir = test_tmpdir_new();
@@ -398,6 +521,7 @@ int main(void) {
         test_disable();
         test_prepare_root();
         test_remove_below();
+        test_get_pids_tree();
         test_stale_unit_cgroup();
         test_delegate_to();
         test_subgroup();
