@@ -1093,7 +1093,10 @@ static void test_pass_ubi(void) {
                       FSTAB_FAILED);
         ASSERT_EQ_INT(k.calls, 1);
         ASSERT_TRUE(reached_mount(reason));
-        ASSERT_TRUE(strstr(reason, "ubifs") != NULL);
+        /* Only fsopen() names the type; a kernel that has ubifs gets further
+         * and reports what the kernel says. */
+        if (strncmp(reason, "fsopen", 6) == 0)
+                ASSERT_TRUE(strstr(reason, "ubifs") != NULL);
 
         /* Attached already, by the kernel: no ioctl; and a volume it does
          * not have fails at once rather than after a wait. */
