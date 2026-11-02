@@ -1,3 +1,37 @@
+# CHANGES WITH 0.3.1:
+
+        Stopping a service now signals every process of it, including the
+        ones it moved into other cgroups.
+
+##        PID 1 and unit files:
+
+        * With KillMode=control-group the stop signal reaches the processes
+          in all cgroups below the unit's cgroup, not only those in the
+          unit cgroup and the DelegateSubgroup=. A service that parks the
+          processes it starts in a sibling subgroup, as picowl does with
+          apps/, kept its unit alive until TimeoutStopSec= and the final
+          SIGKILL, so "systemctl stop picowl" took 90 s although the main
+          process had exited after two. SendSIGHUP= applies to those
+          processes too.
+
+        * The walk below the unit cgroup is bounded: 8 levels, 256 cgroups
+          and 64 processes. Past the first two limits the rest is left to
+          the final SIGKILL, which is recursive; with more than 64
+          processes the unit cgroup itself gets a complete pass and only
+          the descendants that fit are signalled one by one. PIDFile= and
+          GuessMainPID= still read the unit cgroup and the
+          DelegateSubgroup= only.
+
+##        Build and tests:
+
+        * test-cgroup-delegate covers the new cgroup walk, and test-service
+          checks that a process in a sibling subgroup gets the stop signal
+          and that KillMode=process leaves it alone.
+
+##        Contributions from:
+
+        Koen Kooi
+
 # CHANGES WITH 0.3.0:
 
         pico-init now boots on its own: the build installs the targets it
