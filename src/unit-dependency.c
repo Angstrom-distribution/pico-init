@@ -200,7 +200,7 @@ void unit_stop_conflicting(Unit *u) {
                         UnitActiveState st = unit_active_state(other);
                         int r;
 
-                        if (st != UNIT_ACTIVE && st != UNIT_ACTIVATING)
+                        if (st != UNIT_ACTIVE && st != UNIT_ACTIVATING && st != UNIT_RELOADING)
                                 continue;
 
                         /*

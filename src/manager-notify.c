@@ -169,7 +169,9 @@ static void notify_apply(Manager *m, Unit *u, const struct ucred *ucred, char *b
                 } else if (strcmp(line, "STOPPING=1") == 0) {
                         pico_log(PICO_LOG_INFO, "%s: STOPPING=1 (no stop-by-notify path yet)", u->id);
                 } else if (strcmp(line, "RELOADING=1") == 0) {
-                        pico_log(PICO_LOG_INFO, "%s: RELOADING=1 (no reload machinery yet)", u->id);
+                        pico_log(PICO_LOG_INFO,
+                                 "%s: RELOADING=1 (the notify-reload handshake is not implemented)",
+                                 u->id);
                 } else if (strncmp(line, "WATCHDOG", 8) == 0) {
                         /* Covers WATCHDOG=1/WATCHDOG=trigger and
                          * WATCHDOG_USEC= alike: no watchdog machinery

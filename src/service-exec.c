@@ -322,11 +322,14 @@ static int load_environment_files(Service *s, char ***ret) {
  * parent is computed there instead" this file's header promises.
  *
  * Merge order, a later NAME= replacing an earlier one: the manager's default
- * environment, then NOTIFY_SOCKET=/LISTEN_FDS=, then the User= account's
- * USER=/LOGNAME=/HOME=/SHELL=, then Environment=, then EnvironmentFile=
- * contents. The order matters: a file beats Environment= (oe-core's
- * read-only-rootfs hook overrides a unit's default that way), and both beat
- * the account defaults.
+ * environment, then NOTIFY_SOCKET=/LISTEN_FDS=/MAINPID=, then the User=
+ * account's USER=/LOGNAME=/HOME=/SHELL=, then Environment=, then
+ * EnvironmentFile= contents. The order matters: a file beats Environment=
+ * (oe-core's read-only-rootfs hook overrides a unit's default that way), and
+ * both beat the account defaults. MAINPID= is there for every command but
+ * the main one while a main pid is known (main_pid > 0), as upstream's
+ * service_spawn_internal(), which is what `ExecReload=kill -HUP $MAINPID`
+ * expands against.
  *
  * Like systemd's system manager the default environment is clean: PATH
  * only, plus TERM for a tty-attached unit. PID 1's own environ is what the
@@ -350,10 +353,11 @@ static char **
                                 bool tty,
                                 unsigned n_fds,
                                 const char *notify_socket,
+                                pid_t main_pid,
                                 size_t *ret_pid_slot) {
-        char *ours[3] = { NULL, NULL, NULL };
+        char *ours[4] = { NULL, NULL, NULL, NULL };
         char *base[3] = { "PATH=" PICO_DEFAULT_PATH, NULL, NULL };
-        char fds_buf[32], term_buf[64];
+        char fds_buf[32], term_buf[64], mainpid_buf[32];
         char **envp = NULL;
         size_t idx = 0;
 
@@ -379,6 +383,13 @@ static char **
                 if (r < 0 || (size_t) r >= sizeof(fds_buf))
                         goto finish;
                 ours[idx++] = fds_buf;
+        }
+        if (main_pid > 0) {
+                int r = snprintf(mainpid_buf, sizeof(mainpid_buf), "MAINPID=%d", (int) main_pid);
+
+                if (r < 0 || (size_t) r >= sizeof(mainpid_buf))
+                        goto finish;
+                ours[idx++] = mainpid_buf;
         }
 
         envp = pico_strv_env_merge(5, base, ours, creds_env, unit_env, file_env);
@@ -1427,6 +1438,7 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
                         service_standard_input_is_tty(s->standard_input),
                         (unsigned) n_sock_fds,
                         notify_socket,
+                        is_main ? 0 : s->main_pid,
                         &pid_slot);
         if (!envp) {
                 pico_log(PICO_LOG_ERR, "%s: could not build the child environment", UNIT(s)->id);

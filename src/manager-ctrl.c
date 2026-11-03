@@ -9,12 +9,17 @@
  * text line "PICO1 <verb> <unit>[ --no-block]" parsed out of a fixed
  * PICO_CTRL_LINE_MAX-byte on-stack buffer with strict single-space
  * tokenization -- no allocation is ever derived from client bytes. Verbs:
- * start/stop/restart map 1:1 onto manager_add_job()'s JobTypes; reset-failed
- * is a direct action, no job involved. Replies are one line each: "ok ..."
- * or "err <reason>". start/stop/restart replies are DEFERRED until the job
- * finishes (job_finish_full() calls manager_ctrl_notify_job_finished()) so
- * picoctl's exit code reports the real result, not mere enqueueing --
- * --no-block skips the wait and replies "ok queued" immediately instead.
+ * start/stop/restart/reload map 1:1 onto manager_add_job()'s JobTypes;
+ * reload-or-restart and try-reload-or-restart pick reload, start or restart
+ * from the unit's state when the request arrives (ctrl_resolve_job()), the
+ * collapse upstream does on its own job types; reset-failed is a direct
+ * action, no job involved. Replies are one line each: "ok ..." or "err
+ * <reason>". Job replies are DEFERRED until the job finishes
+ * (job_finish_full() calls manager_ctrl_notify_job_finished()) so picoctl's
+ * exit code reports the real result, not mere enqueueing -- --no-block skips
+ * the wait and replies "ok queued" immediately instead. A reload merges into
+ * a job its unit already has (job.c's job_install()), so several clients can
+ * wait on one job, and every one of them gets the reply.
  *
  * The deferred-reply record is keyed by job id, never by Job*: every Job is
  * one malloc size class, so a stale pointer could be handed a *different*
@@ -33,7 +38,7 @@
  * capped at PICO_CTRL_MAX_CONNS, beyond which a new connection is accepted
  * (draining the listen backlog) and immediately rejected with
  * "err too-many-connections" rather than tracked. Once a shutdown is pending,
- * start/restart are refused with "err shutting-down".
+ * every verb but stop and reset-failed is refused with "err shutting-down".
  *
  * daemon-reload is the one verb with no <unit> token at all ("PICO1
  * daemon-reload"): a direct, synchronous call into manager_reload() (unit-
@@ -241,6 +246,9 @@ typedef enum {
         CTRL_VERB_RESTART,
         CTRL_VERB_RESET_FAILED,
         CTRL_VERB_DAEMON_RELOAD,
+        CTRL_VERB_RELOAD,
+        CTRL_VERB_RELOAD_OR_RESTART,
+        CTRL_VERB_TRY_RELOAD_OR_RESTART,
         _CTRL_VERB_INVALID,
 } CtrlVerb;
 
@@ -255,20 +263,77 @@ static CtrlVerb ctrl_verb_parse(const struct ctrl_word *w) {
                 return CTRL_VERB_RESET_FAILED;
         if (ctrl_word_is(w, "daemon-reload"))
                 return CTRL_VERB_DAEMON_RELOAD;
+        if (ctrl_word_is(w, "reload"))
+                return CTRL_VERB_RELOAD;
+        if (ctrl_word_is(w, "reload-or-restart"))
+                return CTRL_VERB_RELOAD_OR_RESTART;
+        if (ctrl_word_is(w, "try-reload-or-restart"))
+                return CTRL_VERB_TRY_RELOAD_OR_RESTART;
 
         return _CTRL_VERB_INVALID;
 }
 
-static JobType ctrl_verb_job_type(CtrlVerb v) {
+/*
+ * The job a verb queues on u, decided from u's state now: upstream collapses
+ * RELOAD_OR_START and TRY_RELOAD/TRY_RESTART the same way, but at transaction
+ * time, on job types pico does not have. NULL with *ret set, NULL with
+ * *ret_nop for a try-* verb with nothing to do, or the "err" reason.
+ *
+ * A reload while a stop job is pending is refused rather than cancelling the
+ * stop, as upstream would: pico has no job modes to keep a shutdown's stop
+ * from being displaced.
+ */
+static const char *ctrl_resolve_job(Unit *u, CtrlVerb v, JobType *ret, bool *ret_nop) {
+        UnitActiveState st = unit_active_state(u);
+        bool up = st == UNIT_ACTIVE || st == UNIT_RELOADING;
+        bool reloadable = up && !(u->job && u->job->type == JOB_STOP);
+
+        *ret_nop = false;
+
         switch (v) {
         case CTRL_VERB_START:
-                return JOB_START;
+                *ret = JOB_START;
+                return NULL;
+
         case CTRL_VERB_STOP:
-                return JOB_STOP;
+                *ret = JOB_STOP;
+                return NULL;
+
         case CTRL_VERB_RESTART:
-                return JOB_RESTART;
+                *ret = JOB_RESTART;
+                return NULL;
+
+        case CTRL_VERB_RELOAD:
+                /* Upstream's BUS_ERROR_JOB_TYPE_NOT_APPLICABLE, checked
+                 * before any job exists. */
+                if (!unit_can_reload(u))
+                        return "not-applicable";
+                if (u->job && u->job->type == JOB_STOP)
+                        return "invalid";
+                *ret = JOB_RELOAD;
+                return NULL;
+
+        case CTRL_VERB_RELOAD_OR_RESTART:
+                if (!unit_can_reload(u))
+                        *ret = JOB_RESTART;
+                else
+                        *ret = reloadable ? JOB_RELOAD : JOB_START;
+                return NULL;
+
+        case CTRL_VERB_TRY_RELOAD_OR_RESTART:
+                if (unit_can_reload(u)) {
+                        if (reloadable)
+                                *ret = JOB_RELOAD;
+                        else
+                                *ret_nop = true;
+                } else if (up || st == UNIT_ACTIVATING)
+                        *ret = JOB_RESTART;
+                else
+                        *ret_nop = true;
+                return NULL;
+
         default:
-                return _JOB_TYPE_INVALID;
+                return "unknown-verb";
         }
 }
 
@@ -357,7 +422,7 @@ static const char *ctrl_reset_failed(Unit *u) {
                 s->start_limit_begin = 0;
                 s->start_limit_num = 0;
                 s->state = SERVICE_DEAD;
-                unit_notify(u, UNIT_FAILED, UNIT_INACTIVE);
+                unit_notify(u, UNIT_FAILED, UNIT_INACTIVE, true);
                 return NULL;
         }
 
@@ -367,7 +432,7 @@ static const char *ctrl_reset_failed(Unit *u) {
                 sk->trigger_ratelimit_begin = 0;
                 sk->trigger_ratelimit_num = 0;
                 sk->state = SOCKET_DEAD;
-                unit_notify(u, UNIT_FAILED, UNIT_INACTIVE);
+                unit_notify(u, UNIT_FAILED, UNIT_INACTIVE, true);
                 return NULL;
         }
 
@@ -428,9 +493,10 @@ static void ctrl_handle_request(struct ctrl_conn *conn, const char *buf, size_t 
                 return;
         }
 
-        /* manager_shutdown() cancelled every start; do not queue new ones. */
-        if (ctrl->manager->pending_objective != MANAGER_RUNNING &&
-            (req.verb == CTRL_VERB_START || req.verb == CTRL_VERB_RESTART)) {
+        /* manager_shutdown() cancelled every start and replaced every
+         * reload with a stop; do not queue new ones. */
+        if (ctrl->manager->pending_objective != MANAGER_RUNNING && req.verb != CTRL_VERB_STOP &&
+            req.verb != CTRL_VERB_RESET_FAILED) {
                 ctrl_send_err(conn->fd, "shutting-down");
                 ctrl_conn_free(conn);
                 return;
@@ -440,10 +506,12 @@ static void ctrl_handle_request(struct ctrl_conn *conn, const char *buf, size_t 
 
         /*
          * The instancing entry point: "picoctl start serial-getty@ttyUSB0.
-         * service" against a tty no unit file was ever shipped for. stop/
-         * reset-failed do not fall back: loading a unit just to stop or
-         * reset one that was never running would let a typo silently create
-         * a table entry on every miss.
+         * service" against a tty no unit file was ever shipped for, and
+         * reload-or-restart, which starts a unit that is not up. stop,
+         * reset-failed, reload and try-reload-or-restart do not fall back:
+         * none of them acts on a unit that was never running, and loading
+         * one anyway would let a typo silently create a table entry on
+         * every miss.
          *
          * A template id never reaches here: ctrl_parse_request() already
          * validated req.unit through unit_name_is_valid(), and manager_
@@ -451,7 +519,9 @@ static void ctrl_handle_request(struct ctrl_conn *conn, const char *buf, size_t 
          * "picoctl start foo@.service" falls straight into the no-such-unit
          * reply below with the real reason logged at WARNING.
          */
-        if (!u && (req.verb == CTRL_VERB_START || req.verb == CTRL_VERB_RESTART)) {
+        if (!u &&
+            (req.verb == CTRL_VERB_START || req.verb == CTRL_VERB_RESTART ||
+             req.verb == CTRL_VERB_RELOAD_OR_RESTART)) {
                 if (manager_load_unit(ctrl->manager, req.unit, &u) < 0)
                         u = NULL;
                 else if (u && u->load_state != UNIT_LOADED) {
@@ -499,11 +569,26 @@ static void ctrl_handle_request(struct ctrl_conn *conn, const char *buf, size_t 
         }
 
         {
-                JobType type = ctrl_verb_job_type(req.verb);
+                JobType type = _JOB_TYPE_INVALID;
                 Job *job = NULL;
                 struct ctrl_pending *pending;
-                int r = manager_add_job(ctrl->manager, type, u, &job);
+                const char *resolve_err;
+                bool nop;
+                int r;
 
+                resolve_err = ctrl_resolve_job(u, req.verb, &type, &nop);
+                if (resolve_err) {
+                        ctrl_send_err(conn->fd, resolve_err);
+                        ctrl_conn_free(conn);
+                        return;
+                }
+                if (nop) {
+                        ctrl_send_line(conn->fd, "ok done\n");
+                        ctrl_conn_free(conn);
+                        return;
+                }
+
+                r = manager_add_job(ctrl->manager, type, u, &job);
                 if (r < 0) {
                         char line[96];
 
@@ -522,9 +607,11 @@ static void ctrl_handle_request(struct ctrl_conn *conn, const char *buf, size_t 
                 /*
                  * Defer: manager_add_job() only installs the job onto the
                  * run queue (job_run() happens later, out of manager_
-                 * dispatch_run_queue()), so `job` is guaranteed alive and
-                 * still JOB_WAITING here -- reading job->id is never a
-                 * use-after-free. The reply is written only once job_
+                 * dispatch_run_queue()), or hands back the unit's own job a
+                 * reload merged into, which may already be JOB_RUNNING;
+                 * either way nothing has finished it, so `job` is alive
+                 * here -- reading job->id is never a use-after-free. The
+                 * reply is written only once job_
                  * finish_full() reports the real result (manager_ctrl_
                  * notify_job_finished(), below), which is what makes the
                  * exit code the real job result rather than mere
@@ -810,30 +897,13 @@ void manager_ctrl_done(Manager *m) {
 
 void manager_ctrl_notify_job_finished(Job *j, JobResult result) {
         struct pico_manager_ctrl *ctrl;
-        struct ctrl_pending *p, *prev = NULL;
-        struct ctrl_conn *conn;
+        struct ctrl_pending **pp;
         const char *line;
 
         if (!j || !j->manager || !j->manager->ctrl)
                 return;
 
         ctrl = j->manager->ctrl;
-
-        for (p = ctrl->pending; p; prev = p, p = p->next)
-                if (p->job_id == j->id)
-                        break;
-
-        if (!p)
-                return; /* nobody is listening for this job's result any more */
-
-        if (prev)
-                prev->next = p->next;
-        else
-                ctrl->pending = p->next;
-
-        conn = p->conn;
-        free(p);
-        conn->pending = NULL; /* ctrl_conn_free() below must not try to unlink this again */
 
         switch (result) {
         case JOB_DONE:
@@ -851,13 +921,34 @@ void manager_ctrl_notify_job_finished(Job *j, JobResult result) {
         case JOB_DEPENDENCY:
                 line = "err dependency\n";
                 break;
+        case JOB_INVALID:
+                line = "err invalid\n";
+                break;
         default:
                 line = "err unknown\n";
                 break;
         }
 
-        ctrl_send_line(conn->fd, line);
-        ctrl_conn_free(conn);
+        /* Every waiting client, not the first: a merged reload has several
+         * (job_install()). None left means nobody is listening any more. */
+        pp = &ctrl->pending;
+        while (*pp) {
+                struct ctrl_pending *p = *pp;
+                struct ctrl_conn *conn;
+
+                if (p->job_id != j->id) {
+                        pp = &p->next;
+                        continue;
+                }
+
+                *pp = p->next;
+                conn = p->conn;
+                free(p);
+                conn->pending = NULL; /* ctrl_conn_free() below must not try to unlink this again */
+
+                ctrl_send_line(conn->fd, line);
+                ctrl_conn_free(conn);
+        }
 }
 
 size_t manager_ctrl_debug_n_conns(Manager *m) {

@@ -10,17 +10,20 @@
  * but the listener and every accepted connection each get their own io
  * source on the manager's own m->event, at EVENT_PRIORITY_CTRL (manager.h).
  *
- * It carries what nothing else can: start/stop/restart (which need
+ * It carries what nothing else can: start, stop, restart, reload,
+ * reload-or-restart and try-reload-or-restart (which need
  * manager_add_job()), reset-failed, and daemon-reload (manager_reload(),
  * also still reachable via SIGHUP for compatibility -- see unit-reload.c).
  * Every read verb stays on the state files (manager-state.h), and
  * reboot/poweroff stay on the existing signals -- both keep working when
  * the socket or the loop is wedged, which is the point.
  *
- * Replies for start/stop/restart are DEFERRED until the job finishes, so
- * picoctl's exit code reports the real job result rather than mere
- * enqueueing (systemctl's own default wait behaviour). reset-failed and
- * daemon-reload have no job to wait on and always reply immediately.
+ * Replies for the job verbs, reloads included, are DEFERRED until the job
+ * finishes, so picoctl's exit code reports the real job result rather than
+ * mere enqueueing (systemctl's own default wait behaviour). One job can have
+ * several waiting replies, when a reload merged into it. reset-failed,
+ * daemon-reload and a try-reload-or-restart with nothing to do have no job
+ * to wait on and always reply immediately.
  */
 
 #pragma once
@@ -43,7 +46,7 @@ int manager_ctrl_setup(Manager *m);
 /* Close the socket, unlink its path, drop every pending reply. */
 void manager_ctrl_done(Manager *m);
 
-/* Resolve any deferred reply waiting on this job. Called from
+/* Resolve every deferred reply waiting on this job. Called from
  * job_finish_full(), which is the only place a job result becomes final.
  *
  * This can retire the client's connection from deep inside a dispatch of

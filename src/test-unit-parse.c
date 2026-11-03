@@ -293,22 +293,25 @@ static void test_degradation_record(void) {
         ASSERT_STREQ(((Service *) u)->exec_start_pre[0].argv[1], "one");
         ASSERT_STREQ(((Service *) u)->exec_start_pre[1].argv[1], "two");
 
-        ASSERT_EQ_INT(u->n_degraded_directives, 4);
+        /* ExecReload= runs now, so it is kept and not degraded. */
+        ASSERT_EQ_INT(((Service *) u)->n_exec_reload, 1);
+        ASSERT_STREQ(((Service *) u)->exec_reload[0].argv[2], "$MAINPID");
+
+        ASSERT_EQ_INT(u->n_degraded_directives, 3);
         ASSERT_STREQ(u->degraded_directives[0], "ConditionPathExists=|");
         ASSERT_STREQ(u->degraded_directives[1], "ExecStart=@");
-        ASSERT_STREQ(u->degraded_directives[2], "ExecReload");
-        ASSERT_STREQ(u->degraded_directives[3], "Alias");
-        ASSERT_TRUE(u->degraded_directives[4] == NULL);
+        ASSERT_STREQ(u->degraded_directives[2], "Alias");
+        ASSERT_TRUE(u->degraded_directives[3] == NULL);
 
         joined = unit_degraded_directives_string(u);
         ASSERT_STREQ(joined,
                      "ConditionPathExists=| "
-                     "ExecStart=@ ExecReload Alias");
+                     "ExecStart=@ Alias");
         free(joined);
 
         /* a second identical drop is not a second entry */
         ASSERT_EQ_INT(unit_add_degradation(u, "Alias"), 0);
-        ASSERT_EQ_INT(u->n_degraded_directives, 4);
+        ASSERT_EQ_INT(u->n_degraded_directives, 3);
 
         ASSERT_EQ_INT(clean->load_state, UNIT_LOADED);
         ASSERT_EQ_INT(clean->n_degraded_directives, 0);
@@ -2145,9 +2148,9 @@ static void test_exec_stop_lines(void) {
 /*
  * ExecCondition=, ExecStopPost= and ExecReload= share ExecStop='s list
  * semantics: each line appends with its own '-' flag, an empty value
- * resets, a malformed line is refused alone. The first two are honoured and
- * leave no degradation; ExecReload= is stored but, with nothing to run it,
- * is recorded exactly once however many lines it has.
+ * resets, a malformed line is refused alone. All three are honoured and
+ * leave no degradation; an unsupported prefix is dropped and recorded per
+ * directive, as for ExecStop=.
  */
 static void test_exec_condition_stop_post_reload_lines(void) {
         Manager *m;
@@ -2171,6 +2174,7 @@ static void test_exec_condition_stop_post_reload_lines(void) {
                                       "ExecStopPost=bin/true relative\n"
                                       "ExecStopPost=-/bin/false second\n"
                                       "ExecReload=/bin/kill -HUP $MAINPID\n"
+                                      "ExecReload=@/bin/true dropped\n"
                                       "ExecReload=/bin/true again\n"),
                       0);
         ASSERT_EQ_INT(test_write_file(dir,
@@ -2207,7 +2211,7 @@ static void test_exec_condition_stop_post_reload_lines(void) {
         ASSERT_STREQ(s->exec_reload[1].argv[1], "again");
 
         joined = unit_degraded_directives_string(u);
-        ASSERT_STREQ(joined, "ExecReload");
+        ASSERT_STREQ(joined, "ExecReload=@");
         free(joined);
 
         u = load_one(m, "reload-reset.service");

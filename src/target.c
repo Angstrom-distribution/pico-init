@@ -31,7 +31,7 @@ static void target_set_state(Target *t, TargetState state) {
         old_active = target_active_state_of(old);
         t->state = state;
 
-        unit_notify(TARGET_UNIT(t), old_active, target_active_state_of(state));
+        unit_notify(TARGET_UNIT(t), old_active, target_active_state_of(state), true);
 }
 
 int target_start(Target *t) {

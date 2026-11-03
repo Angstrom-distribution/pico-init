@@ -24,6 +24,7 @@ typedef enum JobType {
         JOB_START,
         JOB_STOP,
         JOB_RESTART,
+        JOB_RELOAD,
         _JOB_TYPE_MAX,
         _JOB_TYPE_INVALID = -1,
 } JobType;
@@ -41,6 +42,7 @@ typedef enum JobResult {
         JOB_TIMEOUT,
         JOB_DEPENDENCY, /* a required dependency job did not result in JOB_DONE, byte for byte systemd's
                          * own src/core/job.h comment for the same value */
+        JOB_INVALID,    /* JOB_RELOAD on an inactive unit, upstream's name */
         _JOB_RESULT_MAX,
         _JOB_RESULT_INVALID =
                         -1, /* a fresh job has no result yet; don't let 0 (JOB_DONE) mean that by accident */
@@ -91,6 +93,10 @@ struct Job {
          * breaking may only ever delete a job for which this is false.
          */
         bool matters_to_anchor;
+
+        /* A reload request merged into this JOB_RELOAD while it was running:
+         * run the reload once more before finishing (unit_notify()). */
+        bool reload_again;
 };
 
 /* --- job.c --- */

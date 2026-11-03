@@ -538,12 +538,12 @@ static int config_parse_type(Unit *u, const char *path, unsigned line, const cha
         else if (strcmp(rvalue, "forking") == 0)
                 s->type = SERVICE_TYPE_FORKING;
         else if (strcmp(rvalue, "notify-reload") == 0) {
-                /* notify-reload only adds a reload protocol over notify, and
-                 * there is no reload verb for it to differ on; the degradation
-                 * record keeps that visible. */
+                /* notify-reload adds a reload signal and the RELOADING=1
+                 * handshake over notify; neither exists here (ExecReload=
+                 * does), and the degradation record keeps that visible. */
                 s->type = SERVICE_TYPE_NOTIFY;
                 pico_log(PICO_LOG_WARNING,
-                         "%s:%u: Type=notify-reload: no reload machinery, running as Type=notify",
+                         "%s:%u: Type=notify-reload: no reload signal or RELOADING=1, running as Type=notify",
                          path,
                          line);
                 return unit_add_degradation(u, "Type=notify-reload");
@@ -1271,24 +1271,14 @@ static int config_parse_exec_stop_post(
         return parse_exec_list(u, path, line, lvalue, rvalue, &s->exec_stop_post, &s->n_exec_stop_post);
 }
 
-/* Stored for whatever later asks one unit to reload, and a degradation until
- * then: nothing in pico-init runs it, and picoctl show and pico-unit-lint
- * must keep saying so. */
 static int config_parse_exec_reload(
                 Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
         Service *s = unit_to_service(u, path, line);
-        int r;
 
         if (!s)
                 return 0;
 
-        r = parse_exec_list(u, path, line, lvalue, rvalue, &s->exec_reload, &s->n_exec_reload);
-        if (r < 0)
-                return r;
-
-        if (s->n_exec_reload > 0)
-                (void) unit_add_degradation(u, "ExecReload");
-        return 0;
+        return parse_exec_list(u, path, line, lvalue, rvalue, &s->exec_reload, &s->n_exec_reload);
 }
 
 /*

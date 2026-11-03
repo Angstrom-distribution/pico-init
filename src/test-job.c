@@ -361,6 +361,381 @@ static void test_conflicting_job_types(void) {
         free(dir);
 }
 
+/*
+ * The reload rows of the merge table, on a service that can reload (nothing
+ * runs: the transactions are only built and installed). START or STOP with
+ * RELOAD conflicts, RESTART absorbs it, RELOAD with RELOAD stays RELOAD.
+ */
+static void test_conflicting_reload_job_types(void) {
+        static const struct {
+                JobType first, second;
+                int r;
+                JobType merged;
+        } rows[] = {
+                {   JOB_START,  JOB_RELOAD, -EDEADLK,   JOB_START },
+                {    JOB_STOP,  JOB_RELOAD, -EDEADLK,    JOB_STOP },
+                {  JOB_RELOAD,   JOB_START, -EDEADLK,  JOB_RELOAD },
+                { JOB_RESTART,  JOB_RELOAD,        0, JOB_RESTART },
+                {  JOB_RELOAD, JOB_RESTART,        0, JOB_RESTART },
+                {  JOB_RELOAD,  JOB_RELOAD,        0,  JOB_RELOAD },
+        };
+        Manager *m;
+        char *dir;
+        Unit *a;
+        size_t i;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "a.service",
+                                      "[Service]\nExecStart=/bin/sleep 300\nExecReload=/bin/true\n"),
+                      0);
+
+        m = manager_for(dir);
+        ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+        a = manager_get_unit(m, "a.service");
+        ASSERT_TRUE(a != NULL);
+
+        for (i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+                Transaction *tx = NULL;
+
+                ASSERT_EQ_INT(transaction_new(m, &tx), 0);
+                ASSERT_EQ_INT(transaction_add_job(tx, rows[i].first, a, false), 0);
+                ASSERT_EQ_INT(transaction_add_job(tx, rows[i].second, a, false), rows[i].r);
+                ASSERT_EQ_INT(transaction_n_jobs(tx), 1);
+                ASSERT_EQ_INT(transaction_activate(tx), 0);
+                ASSERT_TRUE(a->job != NULL);
+                ASSERT_EQ_INT(a->job->type, rows[i].merged);
+                transaction_free(tx);
+
+                ASSERT_EQ_INT(job_finish_full(a->job, JOB_CANCELED, false), 0);
+                ASSERT_TRUE(a->job == NULL);
+        }
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* A reload of a unit without ExecReload=, or of a type that has none, is
+ * refused before any job exists. */
+static void test_reload_not_applicable(void) {
+        Manager *m;
+        char *dir;
+        Unit *plain, *t;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir, "plain.service", "[Service]\nExecStart=/bin/sleep 300\n"), 0);
+        ASSERT_EQ_INT(test_write_file(dir, "t.target", "[Unit]\nDescription=T\n"), 0);
+
+        m = manager_for(dir);
+        ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+        plain = manager_get_unit(m, "plain.service");
+        t = manager_get_unit(m, "t.target");
+        ASSERT_TRUE(plain != NULL && t != NULL);
+
+        ASSERT_TRUE(!unit_can_reload(plain));
+        ASSERT_TRUE(!unit_can_reload(t));
+        ASSERT_EQ_INT(manager_add_job(m, JOB_RELOAD, plain, NULL), -EOPNOTSUPP);
+        ASSERT_EQ_INT(manager_add_job(m, JOB_RELOAD, t, NULL), -EOPNOTSUPP);
+        ASSERT_EQ_INT(m->n_jobs, 0);
+        ASSERT_TRUE(plain->job == NULL && t->job == NULL);
+        ASSERT_STREQ(job_type_to_string(JOB_RELOAD), "reload");
+        ASSERT_STREQ(job_result_to_string(JOB_INVALID), "invalid");
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* Lines in the reload counter file, which every reload appends one to. */
+static int count_reloads(const char *dir) {
+        char path[PATH_MAX];
+        int c, n = 0;
+        FILE *f;
+
+        snprintf(path, sizeof(path), "%s/reloads", dir);
+        f = fopen(path, "re");
+        if (!f)
+                return 0;
+        while ((c = fgetc(f)) != EOF)
+                if (c == '\n')
+                        n++;
+        fclose(f);
+        return n;
+}
+
+/* A service whose reload takes 0.2s, so a running reload can be observed. */
+static Unit *load_reloadable(Manager *m, const char *dir, const char *name) {
+        char unit[2 * PATH_MAX];
+        Unit *u;
+
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Service]\nType=simple\nExecStart=/bin/sleep 300\n"
+                 "ExecReload=/bin/sh -c \"sleep 0.2; echo r >> %s/reloads\"\n",
+                 dir);
+        ASSERT_EQ_INT(test_write_file(dir, name, unit), 0);
+        ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+        u = manager_get_unit(m, name);
+        ASSERT_TRUE(u != NULL);
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        return u;
+}
+
+static bool unit_is_active(Manager *m, void *ctx) {
+        (void) m;
+        return unit_active_state(ctx) == UNIT_ACTIVE && ((Unit *) ctx)->job == NULL;
+}
+
+/* A reload job runs while the unit is up and finishes when the unit is back
+ * to active, the daemon untouched; on an inactive unit it runs nothing. */
+static void test_reload_job_lifecycle(void) {
+        char cgroup_root[PATH_MAX];
+        Manager *m;
+        char *dir;
+        Unit *a;
+        Job *j = NULL;
+        pid_t main_pid;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+        use_private_cgroup_root(m, "reload-life", cgroup_root, sizeof(cgroup_root));
+        a = load_reloadable(m, dir, "a.service");
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, a, NULL), 0);
+        manager_dispatch_run_queue(m);
+        ASSERT_EQ_INT(unit_active_state(a), UNIT_ACTIVE);
+        main_pid = SERVICE(a)->main_pid;
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_RELOAD, a, &j), 0);
+        ASSERT_TRUE(j != NULL && j == a->job);
+        ASSERT_EQ_INT(j->type, JOB_RELOAD);
+        manager_dispatch_run_queue(m);
+        ASSERT_TRUE(a->job == j);
+        ASSERT_EQ_INT(j->state, JOB_RUNNING);
+        ASSERT_EQ_INT(unit_active_state(a), UNIT_RELOADING);
+
+        ASSERT_TRUE(drive_until_idle(m, 300));
+        ASSERT_TRUE(a->job == NULL);
+        ASSERT_EQ_INT(unit_active_state(a), UNIT_ACTIVE);
+        ASSERT_EQ_INT(SERVICE(a)->main_pid, main_pid);
+        ASSERT_EQ_INT(count_reloads(dir), 1);
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_STOP, a, NULL), 0);
+        ASSERT_TRUE(drive_until_idle(m, 300));
+        ASSERT_EQ_INT(unit_active_state(a), UNIT_INACTIVE);
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_RELOAD, a, NULL), 0);
+        ASSERT_TRUE(drive_until_idle(m, 300));
+        ASSERT_TRUE(a->job == NULL);
+        ASSERT_EQ_INT(unit_active_state(a), UNIT_INACTIVE);
+        ASSERT_EQ_INT(SERVICE(a)->control_pid, 0);
+        ASSERT_EQ_INT(count_reloads(dir), 1);
+
+        manager_free(m);
+        free_private_cgroup_root(cgroup_root);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * A reload request merges into the job its unit already has: a start that
+ * has not run on an inactive unit is kept, one on an active unit becomes the
+ * reload, a restart is kept, and a running reload runs once more.
+ */
+static void test_reload_merges_into_installed(void) {
+        char cgroup_root[PATH_MAX];
+        Manager *m;
+        char *dir;
+        Unit *a;
+        Job *j = NULL, *k = NULL;
+        pid_t main_pid;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+        use_private_cgroup_root(m, "reload-merge", cgroup_root, sizeof(cgroup_root));
+        a = load_reloadable(m, dir, "a.service");
+
+        /* Inactive, start not yet run: the start stays. */
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, a, &j), 0);
+        ASSERT_EQ_INT(manager_add_job(m, JOB_RELOAD, a, &k), 0);
+        ASSERT_TRUE(k == j);
+        ASSERT_EQ_INT(j->type, JOB_START);
+        ASSERT_EQ_INT(m->n_jobs, 1);
+        ASSERT_TRUE(drive_until(m, unit_is_active, a, 300));
+        ASSERT_EQ_INT(count_reloads(dir), 0);
+
+        /* Active, start waiting: it becomes the reload. */
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, a, &j), 0);
+        ASSERT_EQ_INT(j->state, JOB_WAITING);
+        ASSERT_EQ_INT(manager_add_job(m, JOB_RELOAD, a, &k), 0);
+        ASSERT_TRUE(k == j);
+        ASSERT_EQ_INT(j->type, JOB_RELOAD);
+        ASSERT_EQ_INT(m->n_jobs, 1);
+        ASSERT_TRUE(drive_until_idle(m, 300));
+        ASSERT_EQ_INT(count_reloads(dir), 1);
+
+        /* A waiting restart stays a restart. */
+        main_pid = SERVICE(a)->main_pid;
+        ASSERT_EQ_INT(manager_add_job(m, JOB_RESTART, a, &j), 0);
+        ASSERT_EQ_INT(manager_add_job(m, JOB_RELOAD, a, &k), 0);
+        ASSERT_TRUE(k == j);
+        ASSERT_EQ_INT(j->type, JOB_RESTART);
+        ASSERT_TRUE(drive_until(m, unit_is_active, a, 300));
+        ASSERT_TRUE(SERVICE(a)->main_pid != main_pid);
+        ASSERT_EQ_INT(count_reloads(dir), 1);
+
+        /* A running reload runs again, under the same job. */
+        ASSERT_EQ_INT(manager_add_job(m, JOB_RELOAD, a, &j), 0);
+        manager_dispatch_run_queue(m);
+        ASSERT_EQ_INT(j->state, JOB_RUNNING);
+        ASSERT_EQ_INT(manager_add_job(m, JOB_RELOAD, a, &k), 0);
+        ASSERT_TRUE(k == j);
+        ASSERT_TRUE(j->reload_again);
+        ASSERT_EQ_INT(m->n_jobs, 1);
+        ASSERT_TRUE(drive_until_idle(m, 300));
+        ASSERT_EQ_INT(count_reloads(dir), 3);
+        ASSERT_EQ_INT(unit_active_state(a), UNIT_ACTIVE);
+
+        manager_free(m);
+        free_private_cgroup_root(cgroup_root);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+static bool unit_is_down(Manager *m, void *ctx) {
+        UnitActiveState st = unit_active_state(ctx);
+
+        (void) m;
+        return (st == UNIT_INACTIVE || st == UNIT_FAILED) && ((Unit *) ctx)->job == NULL;
+}
+
+/* A stop replaces a running reload job and the unit goes down. */
+static void test_stop_displaces_reload(void) {
+        char cgroup_root[PATH_MAX];
+        Manager *m;
+        char *dir;
+        Unit *a;
+        Job *j = NULL, *k = NULL;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+        use_private_cgroup_root(m, "reload-stop", cgroup_root, sizeof(cgroup_root));
+        a = load_reloadable(m, dir, "a.service");
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, a, NULL), 0);
+        manager_dispatch_run_queue(m);
+        ASSERT_EQ_INT(manager_add_job(m, JOB_RELOAD, a, &j), 0);
+        manager_dispatch_run_queue(m);
+        ASSERT_EQ_INT(unit_active_state(a), UNIT_RELOADING);
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_STOP, a, &k), 0);
+        ASSERT_TRUE(k != NULL && a->job == k);
+        ASSERT_EQ_INT(k->type, JOB_STOP);
+        ASSERT_EQ_INT(m->n_jobs, 1);
+
+        ASSERT_TRUE(drive_until(m, unit_is_down, a, 300));
+        ASSERT_EQ_INT(count_reloads(dir), 0);
+
+        manager_free(m);
+        free_private_cgroup_root(cgroup_root);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * A start for a unit that is up merges into its reload job rather than
+ * cancelling it: sent directly or pulled in by a Wants= while the reload
+ * runs, or either while the reload still waits for an After= unit. The
+ * reload job stays the unit's job and its reload runs.
+ */
+static void test_start_merges_into_reload(void) {
+        char cgroup_root[PATH_MAX];
+        char unit[2 * PATH_MAX];
+        Manager *m;
+        char *dir;
+        Unit *a, *b, *c;
+        Job *j = NULL, *k = NULL;
+        uint32_t id;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Unit]\nAfter=b.service\n[Service]\nType=simple\nExecStart=/bin/sleep 300\n"
+                 "ExecReload=/bin/sh -c \"sleep 0.2; echo r >> %s/reloads\"\n",
+                 dir);
+        ASSERT_EQ_INT(test_write_file(dir, "a.service", unit), 0);
+        ASSERT_EQ_INT(test_write_file(dir, "b.service", "[Service]\nType=oneshot\nExecStart=/bin/sleep 0.3\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir, "c.target", "[Unit]\nWants=a.service\n"), 0);
+        m = manager_for(dir);
+        use_private_cgroup_root(m, "reload-start", cgroup_root, sizeof(cgroup_root));
+        ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+        a = manager_get_unit(m, "a.service");
+        b = manager_get_unit(m, "b.service");
+        c = manager_get_unit(m, "c.target");
+        ASSERT_TRUE(a != NULL && b != NULL && c != NULL);
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, a, NULL), 0);
+        manager_dispatch_run_queue(m);
+        ASSERT_EQ_INT(unit_active_state(a), UNIT_ACTIVE);
+
+        /* The reload is running. */
+        ASSERT_EQ_INT(manager_add_job(m, JOB_RELOAD, a, &j), 0);
+        manager_dispatch_run_queue(m);
+        ASSERT_EQ_INT(unit_active_state(a), UNIT_RELOADING);
+        id = j->id;
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, a, &k), 0);
+        ASSERT_TRUE(k == j && a->job == j);
+        ASSERT_EQ_INT(j->type, JOB_RELOAD);
+        ASSERT_EQ_INT(j->state, JOB_RUNNING);
+        ASSERT_EQ_INT(m->n_jobs, 1);
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, c, NULL), 0);
+        ASSERT_TRUE(a->job == j && j->id == id);
+        ASSERT_EQ_INT(m->n_jobs, 2);
+        ASSERT_EQ_INT(SERVICE(a)->state, SERVICE_RELOAD);
+
+        ASSERT_TRUE(drive_until(m, unit_is_active, a, 300));
+        ASSERT_EQ_INT(SERVICE(a)->state, SERVICE_RUNNING);
+        ASSERT_EQ_INT(SERVICE(a)->reload_result, SERVICE_SUCCESS);
+        ASSERT_EQ_INT(unit_active_state(c), UNIT_ACTIVE);
+        ASSERT_EQ_INT(count_reloads(dir), 1);
+
+        /* The reload waits for b's start job. */
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, b, NULL), 0);
+        manager_dispatch_run_queue(m);
+        ASSERT_TRUE(b->job != NULL && b->job->state == JOB_RUNNING);
+        ASSERT_EQ_INT(manager_add_job(m, JOB_RELOAD, a, &j), 0);
+        manager_dispatch_run_queue(m);
+        ASSERT_EQ_INT(j->state, JOB_WAITING);
+        id = j->id;
+
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, c, NULL), 0);
+        ASSERT_TRUE(a->job == j && j->id == id);
+        ASSERT_EQ_INT(manager_add_job(m, JOB_START, a, &k), 0);
+        ASSERT_TRUE(k == j && a->job == j);
+        ASSERT_EQ_INT(j->type, JOB_RELOAD);
+
+        ASSERT_TRUE(drive_until_idle(m, 300));
+        ASSERT_EQ_INT(unit_active_state(a), UNIT_ACTIVE);
+        ASSERT_EQ_INT(count_reloads(dir), 2);
+
+        manager_free(m);
+        free_private_cgroup_root(cgroup_root);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 /* Starting a target actually reaches it, and the job completes. */
 static void test_target_start_completes(void) {
         Manager *m;
@@ -1574,6 +1949,12 @@ int main(void) {
         test_transaction_ownership();
         test_restart_pulls_start_deps();
         test_conflicting_job_types();
+        test_conflicting_reload_job_types();
+        test_reload_not_applicable();
+        test_reload_job_lifecycle();
+        test_reload_merges_into_installed();
+        test_stop_displaces_reload();
+        test_start_merges_into_reload();
         test_target_start_completes();
         test_redundant_job_dropped();
         test_condition_skipped_job_completes_done();
