@@ -10,6 +10,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <net/if.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -22,6 +23,11 @@
 #include "../test-util.h"
 
 #define RUNTIME_DIR "/run/systemd/network"
+#define LLDP_DIR "/run/netd/lldp"
+/* Files are named after an ifindex: lo's for the fixture, ones no link has for the rest. */
+#define LLDP_OTHER LLDP_DIR "/999999"
+#define LLDP_STALE LLDP_DIR "/999998"
+static char lldp_fixture[64];
 #define FIXTURE "picotest-netctl-opts.network"
 
 #define STARTS(s, lit) (strncmp((s), (lit), sizeof(lit) - 1) == 0)
@@ -252,6 +258,190 @@ static void test_lldp(void) {
         ASSERT_STREQ(r.out, "");
 }
 
+static void write_file(const char *path, const char *content) {
+        FILE *f = fopen(path, "we");
+
+        ASSERT_TRUE(f != NULL);
+        fputs(content, f);
+        fclose(f);
+}
+
+/* The neighbours of one link in the file netd would write; "lo" is the only link every namespace has. */
+#define LLDP_ONE      \
+        "IFNAME=lo\n" \
+        "N chassis=4:%00%11%22%aa%bb%cc port=5:Gi0/1 name=sw-1 sysdescr=Switch%20OS descr=uplink enabled=0014 vlan=7\n"
+#define LLDP_TWO LLDP_ONE "N chassis=4:%00%11%22%aa%bb%dd port=5:eth9 name=alpha\n"
+
+/* Spaces to the value column of print_field_plain(): LABEL_WIDTH, the colon and one space. */
+#define PAD "                              "
+
+static bool made_netd, made_lldp;
+
+/* Also on a failed assertion, so a leftover fixture cannot break the other tests. */
+static void lldp_cleanup(void) {
+        (void) unlink(lldp_fixture);
+        (void) unlink(LLDP_OTHER);
+        (void) unlink(LLDP_STALE);
+        if (made_lldp)
+                (void) rmdir(LLDP_DIR);
+        if (made_netd)
+                (void) rmdir("/run/netd");
+}
+
+static void test_status_lldp(void) {
+        struct run_result r;
+        bool absent;
+        struct stat st;
+
+        /* The rest writes to /run, which only root may. */
+        if (geteuid() != 0)
+                return;
+        snprintf(lldp_fixture, sizeof lldp_fixture, LLDP_DIR "/%u", if_nametoindex("lo"));
+        absent = stat(LLDP_DIR, &st) < 0;
+        atexit(lldp_cleanup);
+
+        /* Neither a missing directory nor an empty one is an error. */
+        if (absent) {
+                run(&r, "status", "lo", NULL);
+                ASSERT_EQ_INT(r.exit_code, 0);
+                ASSERT_TRUE(strstr(r.out, "Connected To") == NULL);
+                run(&r, "--json=short", "status", "lo", NULL);
+                ASSERT_EQ_INT(r.exit_code, 0);
+                ASSERT_TRUE(strstr(r.out, "LLDPNeighbors") == NULL);
+                made_netd = mkdir("/run/netd", 0755) == 0;
+                made_lldp = mkdir(LLDP_DIR, 0755) == 0;
+                ASSERT_TRUE(made_lldp);
+                run(&r, "status", "lo", NULL);
+                ASSERT_EQ_INT(r.exit_code, 0);
+                ASSERT_TRUE(strstr(r.out, "Connected To") == NULL);
+        }
+        if (!absent && !S_ISDIR(st.st_mode))
+                return;
+
+        /* One neighbour: system name, description and port with its description. */
+        write_file(lldp_fixture, LLDP_ONE);
+        run(&r, "status", "lo", NULL);
+        ASSERT_EQ_INT(r.exit_code, 0);
+        ASSERT_TRUE(strstr(r.out, "Connected To: sw-1 (Switch OS) on port Gi0/1 (uplink)\n") != NULL);
+
+        /* A pattern selects the link by index, glob or name, -a shows every link. */
+        run(&r, "status", "1", NULL);
+        ASSERT_TRUE(strstr(r.out, "Connected To: sw-1 ") != NULL);
+        run(&r, "status", "l*", NULL);
+        ASSERT_TRUE(strstr(r.out, "Connected To: sw-1 ") != NULL);
+        run(&r, "status", "-a", NULL);
+        ASSERT_EQ_INT(r.exit_code, 0);
+        ASSERT_TRUE(strstr(r.out, "Connected To: sw-1 ") != NULL);
+        run(&r, "status", "picotest-nomatch*", NULL);
+        ASSERT_EQ_INT(r.exit_code, 0);
+        ASSERT_STREQ(r.out, "");
+
+        /* The system view has no per-link neighbours. */
+        run(&r, "status", NULL);
+        ASSERT_TRUE(strstr(r.out, "Connected To") == NULL);
+
+        /* Two neighbours: the first line carries the label, the next is indented, both sorted by name. */
+        write_file(lldp_fixture, LLDP_TWO);
+        run(&r, "status", "lo", NULL);
+        ASSERT_TRUE(strstr(r.out,
+                           "Connected To: alpha on port eth9\n" PAD
+                           "sw-1 (Switch OS) on port Gi0/1 (uplink)\n") != NULL);
+
+        /* A neighbour that sent no system name, or an empty one, is n/a. */
+        write_file(lldp_fixture,
+                   "IFNAME=lo\nN chassis=4:%00%11%22%aa%bb%cc port=5:Gi0/1\nN chassis=4:%00%11%22%aa%bb%dd port=5:Gi0/2 name=\n");
+        run(&r, "status", "lo", NULL);
+        ASSERT_TRUE(strstr(r.out, "Connected To: n/a on port Gi0/1\n" PAD "n/a on port Gi0/2\n") != NULL);
+
+        /* Control characters from the wire never reach the terminal. */
+        write_file(lldp_fixture,
+                   "IFNAME=lo\nN chassis=4:%00%11%22%aa%bb%cc port=5:Gi0/1 name=a%1b[31m%07b sysdescr=x%0ay descr=%1b[2J\n");
+        run(&r, "status", "lo", NULL);
+        ASSERT_TRUE(strstr(r.out, "Connected To: a?[31m?b (x?y) on port Gi0/1 (?[2J)\n") != NULL);
+        ASSERT_TRUE(strchr(r.out, '\x1b') == NULL && strchr(r.out, '\x07') == NULL);
+        run(&r, "--json=short", "status", "lo", NULL);
+        ASSERT_TRUE(strstr(r.out, "\"SystemName\":\"a?[31m?b\"") != NULL);
+        ASSERT_TRUE(strchr(r.out, '\x1b') == NULL && strchr(r.out, '\x07') == NULL);
+
+        /* JSON: the neighbours of the link, in the shape of `lldp --json`. */
+        write_file(lldp_fixture, LLDP_TWO);
+        run(&r, "--json=short", "status", "lo", NULL);
+        ASSERT_EQ_INT(r.exit_code, 0);
+        ASSERT_TRUE(strstr(r.out,
+                           "\"LLDPNeighbors\":[{\"ChassisID\":\"00:11:22:aa:bb:dd\",\"PortID\":\"eth9\","
+                           "\"SystemName\":\"alpha\"},{\"ChassisID\":\"00:11:22:aa:bb:cc\",\"PortID\":\"Gi0/1\","
+                           "\"PortDescription\":\"uplink\",\"SystemName\":\"sw-1\",\"SystemDescription\":\"Switch OS\","
+                           "\"EnabledCapabilities\":20,\"VlanID\":7}]}") != NULL);
+        run(&r, "--json=pretty", "status", "lo", NULL);
+        ASSERT_TRUE(strstr(r.out, "\n  \"LLDPNeighbors\" : [\n    {\n      \"ChassisID\" : ") != NULL);
+        run(&r, "--json=short", "-a", "status", NULL);
+        ASSERT_TRUE(STARTS(r.out, "{\"Interfaces\":[") && strstr(r.out, "\"LLDPNeighbors\":[") != NULL);
+
+        /* Neighbours of another link, expired ones and a link without any do not show up. */
+        write_file(lldp_fixture,
+                   "IFNAME=lo\nN expires=1 chassis=4:%00%11%22%aa%bb%cc port=5:Gi0/1 name=old\n");
+        write_file(LLDP_OTHER,
+                   "IFNAME=picotest-nolink\nN chassis=4:%00%11%22%aa%bb%cc port=5:Gi0/1 name=elsewhere\n");
+        run(&r, "status", "lo", NULL);
+        ASSERT_EQ_INT(r.exit_code, 0);
+        ASSERT_TRUE(strstr(r.out, "Connected To") == NULL);
+        run(&r, "--json=short", "status", "lo", NULL);
+        ASSERT_TRUE(strstr(r.out, "LLDPNeighbors") == NULL);
+
+        /* A file of an ifindex the link no longer has is stale, whatever its IFNAME says. */
+        write_file(lldp_fixture, LLDP_ONE);
+        write_file(LLDP_STALE, "IFNAME=lo\nN chassis=4:%00%11%22%aa%bb%ee port=5:Gi0/9 name=stale\n");
+        run(&r, "status", "lo", NULL);
+        ASSERT_TRUE(strstr(r.out, "Connected To: sw-1 (Switch OS) on port Gi0/1 (uplink)\n") != NULL);
+        ASSERT_TRUE(strstr(r.out, "stale") == NULL);
+        run(&r, "--json=short", "status", "lo", NULL);
+        ASSERT_TRUE(strstr(r.out, "sw-1") != NULL && strstr(r.out, "stale") == NULL);
+        run(&r, "--json=short", "lldp", NULL);
+        ASSERT_TRUE(strstr(r.out, "sw-1") != NULL && strstr(r.out, "stale") == NULL);
+
+        /* So is the file of this ifindex when it names another link. */
+        write_file(lldp_fixture,
+                   "IFNAME=picotest-nolink\nN chassis=4:%00%11%22%aa%bb%cc port=5:Gi0/1 name=wrong\n");
+        run(&r, "status", "lo", NULL);
+        ASSERT_TRUE(strstr(r.out, "Connected To") == NULL);
+        run(&r, "--json=short", "lldp", NULL);
+        ASSERT_TRUE(strstr(r.out, "wrong") == NULL);
+
+        /* Runs of spaces from the network become one in the status line. */
+        write_file(lldp_fixture,
+                   "IFNAME=lo\nN chassis=4:%00%11%22%aa%bb%cc port=5:Gi%20%20%20%20%200/1 "
+                   "name=a%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20b "
+                   "sysdescr=%20%20x%20%20%20y%20%20 descr=u%20%20%20%20p\n");
+        run(&r, "status", "lo", NULL);
+        ASSERT_TRUE(strstr(r.out, "Connected To: a b ( x y ) on port Gi 0/1 (u p)\n") != NULL);
+
+        /* A line longer than any fixed buffer: the tokens after the long ones must survive. */
+        {
+                char line[8192], *w = line;
+
+                w += snprintf(line, sizeof line, "IFNAME=lo\nN chassis=7:");
+                for (int i = 0; i < 255; i++)
+                        w += snprintf(w, 4, "%%41");
+                w += snprintf(w, 16, " port=7:");
+                for (int i = 0; i < 255; i++)
+                        w += snprintf(w, 4, "%%42");
+                w += snprintf(w, 16, " descr=");
+                for (int i = 0; i < 255; i++)
+                        w += snprintf(w, 4, "%%43");
+                snprintf(w, sizeof line - (size_t) (w - line), " name=late sysdescr=tail%%20OS vlan=9\n");
+                ASSERT_TRUE(strlen(line) > 2048);
+                write_file(lldp_fixture, line);
+        }
+        run(&r, "status", "lo", NULL);
+        ASSERT_TRUE(strstr(r.out, "Connected To: late (tail OS) on port BBBB") != NULL);
+        run(&r, "--json=short", "status", "lo", NULL);
+        ASSERT_TRUE(strstr(r.out, "\"SystemName\":\"late\"") != NULL);
+        ASSERT_TRUE(strstr(r.out, "\"SystemDescription\":\"tail OS\"") != NULL);
+        ASSERT_TRUE(strstr(r.out, "\"VlanID\":9") != NULL);
+
+        lldp_cleanup();
+}
+
 static void test_label(void) {
         struct run_result r;
 
@@ -372,6 +562,7 @@ int main(void) {
         test_json();
         test_status();
         test_lldp();
+        test_status_lldp();
         test_label();
         test_failures();
         test_config_files();

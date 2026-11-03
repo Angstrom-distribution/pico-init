@@ -928,6 +928,10 @@ static void status_statistics(const char *ifname) {
         }
 }
 
+/* Defined with the LLDP code below. */
+static void status_lldp(unsigned idx);
+static void json_link_lldp(const LinkRef *l);
+
 static void status_one(const char *ifname) {
         unsigned idx = if_nametoindex(ifname);
         char buf[128];
@@ -1127,6 +1131,8 @@ static void status_one(const char *ifname) {
                 collect_default_gateways(ifname, &gw);
                 field_print("Gateway", &gw);
         }
+
+        status_lldp(idx);
 
         if (arg_stats)
                 status_statistics(ifname);
@@ -1393,6 +1399,7 @@ static void json_link(const LinkRef *l) {
         json_str("OperationalState", op);
         if (iface_network_file(l->name, buf, sizeof buf))
                 json_str("NetworkFile", buf);
+        json_link_lldp(l);
         json_close('}');
 
         netctl_link_info_free(&info);
@@ -1663,6 +1670,23 @@ static const char *dash(const char *s) {
         return s[0] ? s : "-";
 }
 
+static void lldp_json_neighbor(const LldpEntry *e) {
+        json_open('{');
+        json_str("ChassisID", e->row.chassis);
+        json_str("PortID", e->row.port);
+        if (e->row.descr[0])
+                json_str("PortDescription", e->row.descr);
+        if (e->row.name[0])
+                json_str("SystemName", e->row.name);
+        if (e->sysdescr[0])
+                json_str("SystemDescription", e->sysdescr);
+        if (e->caps)
+                json_uint("EnabledCapabilities", e->caps);
+        if (e->vlan)
+                json_uint("VlanID", e->vlan);
+        json_close('}');
+}
+
 static void lldp_json(const LldpEntry *e, size_t n) {
         json_open('{');
         json_key("Neighbors");
@@ -1675,22 +1699,8 @@ static void lldp_json(const LldpEntry *e, size_t n) {
                 json_str("InterfaceName", e[i].row.link);
                 json_key("Neighbors");
                 json_open('[');
-                for (; j < n && e[j].idx == e[i].idx; j++) {
-                        json_open('{');
-                        json_str("ChassisID", e[j].row.chassis);
-                        json_str("PortID", e[j].row.port);
-                        if (e[j].row.descr[0])
-                                json_str("PortDescription", e[j].row.descr);
-                        if (e[j].row.name[0])
-                                json_str("SystemName", e[j].row.name);
-                        if (e[j].sysdescr[0])
-                                json_str("SystemDescription", e[j].sysdescr);
-                        if (e[j].caps)
-                                json_uint("EnabledCapabilities", e[j].caps);
-                        if (e[j].vlan)
-                                json_uint("VlanID", e[j].vlan);
-                        json_close('}');
-                }
+                for (; j < n && e[j].idx == e[i].idx; j++)
+                        lldp_json_neighbor(&e[j]);
                 json_close(']');
                 json_close('}');
                 i = j;
@@ -1700,52 +1710,139 @@ static void lldp_json(const LldpEntry *e, size_t n) {
         json_finish();
 }
 
-/* networkctl lldp [PATTERN...]: the neighbours netd heard, from the files it publishes. */
-static int cmd_lldp(int argc, char *argv[]) {
-        static LldpEntry rows[LLDP_ROWS_MAX];
-        size_t n = 0, i, w_link = 4, w_name = 11, w_desc = 18, w_chassis = 10, w_port = 7, w_pdesc = 16;
-        uint16_t seen = 0;
+static LldpEntry lldp_rows[LLDP_ROWS_MAX];
+
+/* The ifindex a lldp/ file is named after, 0 for anything else. */
+static unsigned lldp_file_ifindex(const char *name) {
+        char *end;
+        unsigned long v;
+
+        if (name[0] < '0' || name[0] > '9')
+                return 0;
+        v = strtoul(name, &end, 10);
+        return *end == '\0' && v <= UINT_MAX ? (unsigned) v : 0;
+}
+
+/*
+ * The live neighbours from the files netd publishes, sorted, into lldp_rows.
+ * Only the link with ifindex `only` when it is set, otherwise the links
+ * matching the patterns (all of them without). The file name is the link's
+ * identity: a file whose IFNAME is not what that ifindex is called now was
+ * left behind by a netd that died, and is skipped. A missing directory or
+ * unreadable file just yields fewer rows.
+ */
+static size_t lldp_load(unsigned only, char **patterns, int npat) {
+        size_t n = 0;
         struct timespec now;
         DIR *d = opendir(NETD_LLDP_DIR);
         struct dirent *e;
+        char *line = NULL;
+        size_t cap = 0;
 
         clock_gettime(CLOCK_MONOTONIC, &now);
 
         while (d && (e = readdir(d)) != NULL && n < LLDP_ROWS_MAX) {
-                char path[PATH_MAX], ifname[IFNAMSIZ], line[2048];
-                unsigned idx;
+                char path[PATH_MAX], ifname[IFNAMSIZ], cur[IF_NAMESIZE];
+                unsigned idx = lldp_file_ifindex(e->d_name);
                 FILE *f;
 
-                if (e->d_name[0] == '.' || strstr(e->d_name, ".netd-tmp"))
+                if (idx == 0 || (only && idx != only))
                         continue;
                 snprintf(path, sizeof path, "%s/%s", NETD_LLDP_DIR, e->d_name);
                 if (!read_keyvalue(path, "IFNAME", ifname, sizeof ifname))
                         continue;
-                idx = if_nametoindex(ifname);
-                if (argc > 1 && link_match_pos(ifname, idx, argv + 1, argc - 1) < 0)
+                if (!if_indextoname(idx, cur) || strcmp(cur, ifname) != 0)
+                        continue;
+                if (npat > 0 && link_match_pos(ifname, idx, patterns, npat) < 0)
                         continue;
 
                 f = fopen(path, "re");
                 if (!f)
                         continue;
-                while (n < LLDP_ROWS_MAX && fgets(line, sizeof line, f)) {
+                /* getline(): netd writes lines of several KiB, no fixed buffer fits them all. */
+                while (n < LLDP_ROWS_MAX && getline(&line, &cap, f) >= 0) {
                         line[strcspn(line, "\n")] = '\0';
-                        memset(&rows[n], 0, sizeof rows[n]);
-                        if (!netctl_lldp_parse_row(line, ifname, &rows[n].row))
+                        memset(&lldp_rows[n], 0, sizeof lldp_rows[n]);
+                        if (!netctl_lldp_parse_row(line, ifname, &lldp_rows[n].row))
                                 continue;
                         /* A file left behind by a netd that is no longer running. */
-                        if (rows[n].row.expires != 0 && rows[n].row.expires <= (uint64_t) now.tv_sec)
+                        if (lldp_rows[n].row.expires != 0 && lldp_rows[n].row.expires <= (uint64_t) now.tv_sec)
                                 continue;
-                        rows[n].idx = idx;
-                        lldp_extras(line, &rows[n]);
+                        lldp_rows[n].idx = idx;
+                        lldp_extras(line, &lldp_rows[n]);
                         n++;
                 }
                 fclose(f);
         }
+        free(line);
         if (d)
                 closedir(d);
 
-        qsort(rows, n, sizeof rows[0], lldp_entry_compare);
+        qsort(lldp_rows, n, sizeof lldp_rows[0], lldp_entry_compare);
+        return n;
+}
+
+/* Runs of spaces to one: a neighbour must not pad a line until the terminal wraps it into something else. */
+static void squeeze_spaces(char *s) {
+        char *w = s;
+
+        for (char *r = s; *r; r++)
+                if (*r != ' ' || w == s || w[-1] != ' ')
+                        *w++ = *r;
+        *w = '\0';
+}
+
+/* networkctl status: "Connected To", one line per neighbour, as networkctl formats it. */
+static void status_lldp(unsigned idx) {
+        size_t n = lldp_load(idx, NULL, 0);
+
+        for (size_t i = 0; i < n; i++) {
+                LldpEntry *e = &lldp_rows[i];
+                char buf[512];
+
+                squeeze_spaces(e->row.name);
+                squeeze_spaces(e->sysdescr);
+                squeeze_spaces(e->row.port);
+                squeeze_spaces(e->row.descr);
+
+                snprintf(buf,
+                         sizeof buf,
+                         "%s%s%s%s on port %s%s%s%s",
+                         e->row.name[0] ? e->row.name : "n/a",
+                         e->sysdescr[0] ? " (" : "",
+                         e->sysdescr,
+                         e->sysdescr[0] ? ")" : "",
+                         e->row.port,
+                         e->row.descr[0] ? " (" : "",
+                         e->row.descr,
+                         e->row.descr[0] ? ")" : "");
+                if (i == 0)
+                        print_field_plain("Connected To", buf);
+                else
+                        printf("%*s  %s\n", LABEL_WIDTH, "", buf);
+        }
+}
+
+/* networkctl has no LLDP neighbours in Describe, so this key is netd's own; "Neighbors" there is the static neighbour table. */
+static void json_link_lldp(const LinkRef *l) {
+        size_t n = lldp_load(l->idx, NULL, 0);
+
+        if (n == 0)
+                return;
+        json_key("LLDPNeighbors");
+        json_open('[');
+        for (size_t i = 0; i < n; i++)
+                lldp_json_neighbor(&lldp_rows[i]);
+        json_close(']');
+}
+
+/* networkctl lldp [PATTERN...]: the neighbours netd heard, from the files it publishes. */
+static int cmd_lldp(int argc, char *argv[]) {
+        LldpEntry *rows = lldp_rows;
+        size_t n, i, w_link = 4, w_name = 11, w_desc = 18, w_chassis = 10, w_port = 7, w_pdesc = 16;
+        uint16_t seen = 0;
+
+        n = lldp_load(0, argv + 1, argc - 1);
 
         if (arg_json != JSON_OFF) {
                 lldp_json(rows, n);
