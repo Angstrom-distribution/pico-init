@@ -21,6 +21,7 @@
 #include <netinet/in.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 typedef struct Netd Netd;
 typedef struct Network Network;
@@ -123,14 +124,25 @@ struct Network {
          * a core netd feature. An explicit UseTimezone=no is honoured.
          */
         bool dhcp_use_timezone;
+
+        /*
+         * RouteMetric=, from [DHCPv4] or the legacy [DHCP]. Unset means
+         * networkd's default, 1024. _v4 records that [DHCPv4] set it,
+         * so a [DHCP] line, earlier or later, cannot override it, as in
+         * networkd.
+         */
+        uint32_t dhcp_route_metric;
+        bool dhcp_route_metric_set;
+        bool dhcp_route_metric_v4;
 };
 
 /* --- netd-network.c --- */
 
 /* Parse one file. The Network is fully defaulted first, so a file that sets
- * nothing still comes back with UseDNS/UseNTP/UseTimezone at yes. 0 or
- * -errno; -EINVAL only for a file that cannot be made sense of at all, since
- * an unknown section or directive is a debug message, not an error. */
+ * nothing still comes back with UseDNS/UseNTP/UseTimezone at yes and no
+ * RouteMetric=. 0 or -errno; -EINVAL only for a file that cannot be made
+ * sense of at all, since an unknown section or directive is a debug message,
+ * not an error. */
 int network_parse_file(const char *path, Network **ret);
 
 /* Allocate a Network with every default applied and nothing set. 0 or -errno. */

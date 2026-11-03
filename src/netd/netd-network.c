@@ -367,6 +367,66 @@ static int config_parse_use_timezone(
         return config_parse_bool_field(path, line, lvalue, rvalue, &nw->dhcp_use_timezone);
 }
 
+/*
+ * Plain decimal only, 0..UINT32_MAX. networkd's safe_atou32() takes any base,
+ * so "010" or "0x10" would mean something else there; rejecting every
+ * spelling the two parsers could read differently keeps a value netd accepts
+ * meaning the same to both. strtoull because unsigned long is 32 bits on
+ * ARMv5; the explicit bound for the same reason as unit-parse.c's
+ * parse_usec().
+ */
+static int parse_route_metric(const char *s, uint32_t *ret) {
+        unsigned long long v;
+        char *end;
+
+        if (*s == '\0' || strspn(s, "0123456789") != strlen(s) || (s[0] == '0' && s[1] != '\0'))
+                return -EINVAL;
+
+        errno = 0;
+        v = strtoull(s, &end, 10);
+        if (errno == ERANGE || *end != '\0' || v > UINT32_MAX)
+                return -EINVAL;
+
+        *ret = (uint32_t) v;
+        return 0;
+}
+
+/* A rejected value, the empty one included, keeps any earlier value: networkd
+ * logs and ignores it too, rather than resetting. */
+static int config_parse_dhcp4_route_metric(
+                Network *nw, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        uint32_t v;
+
+        if (parse_route_metric(rvalue, &v) < 0) {
+                pico_log(PICO_LOG_WARNING, "%s:%u: invalid %s= value '%s', ignoring", path, line, lvalue, rvalue);
+                return 0;
+        }
+
+        nw->dhcp_route_metric = v;
+        nw->dhcp_route_metric_set = true;
+        nw->dhcp_route_metric_v4 = true;
+        return 0;
+}
+
+/* [DHCP] RouteMetric=: networkd's config_parse_dhcp_route_metric() lets it
+ * apply only while no [DHCPv4] value has been seen. */
+static int config_parse_dhcp_legacy_route_metric(
+                Network *nw, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        uint32_t v;
+
+        if (parse_route_metric(rvalue, &v) < 0) {
+                pico_log(PICO_LOG_WARNING, "%s:%u: invalid %s= value '%s', ignoring", path, line, lvalue, rvalue);
+                return 0;
+        }
+
+        if (nw->dhcp_route_metric_v4)
+                return 0;
+
+        nw->dhcp_route_metric = v;
+        nw->dhcp_route_metric_set = true;
+        return 0;
+}
+
 typedef int (*NetworkParseFn)(
                 Network *nw, const char *path, unsigned line, const char *lvalue, const char *rvalue);
 
@@ -377,18 +437,20 @@ typedef struct NetworkConfigItem {
 } NetworkConfigItem;
 
 static const NetworkConfigItem network_config_items[] = {
-        {   "Match",        "Name",   config_parse_match_name },
-        { "Network",        "DHCP",         config_parse_dhcp },
-        { "Network",     "Address",      config_parse_address },
-        { "Network",     "Gateway",      config_parse_gateway },
-        { "Network",         "DNS",          config_parse_dns },
-        { "Network",         "NTP",          config_parse_ntp },
-        { "Network",  "DHCPServer",  config_parse_dhcp_server },
-        { "Network",        "LLDP",         config_parse_lldp },
-        { "Network",    "EmitLLDP",    config_parse_emit_lldp },
-        {  "DHCPv4",      "UseDNS",      config_parse_use_dns },
-        {  "DHCPv4",      "UseNTP",      config_parse_use_ntp },
-        {  "DHCPv4", "UseTimezone", config_parse_use_timezone },
+        {   "Match",        "Name",               config_parse_match_name },
+        { "Network",        "DHCP",                     config_parse_dhcp },
+        { "Network",     "Address",                  config_parse_address },
+        { "Network",     "Gateway",                  config_parse_gateway },
+        { "Network",         "DNS",                      config_parse_dns },
+        { "Network",         "NTP",                      config_parse_ntp },
+        { "Network",  "DHCPServer",              config_parse_dhcp_server },
+        { "Network",        "LLDP",                     config_parse_lldp },
+        { "Network",    "EmitLLDP",                config_parse_emit_lldp },
+        {  "DHCPv4",      "UseDNS",                  config_parse_use_dns },
+        {  "DHCPv4",      "UseNTP",                  config_parse_use_ntp },
+        {  "DHCPv4", "UseTimezone",             config_parse_use_timezone },
+        {  "DHCPv4", "RouteMetric",       config_parse_dhcp4_route_metric },
+        {    "DHCP", "RouteMetric", config_parse_dhcp_legacy_route_metric },
 };
 
 /*
@@ -396,7 +458,8 @@ static const NetworkConfigItem network_config_items[] = {
  * network_config_items[], and logs-and-drops anything not in it -- the same
  * drop-in tolerance rule unit-parse.c's own handler applies (see that file),
  * so a section this parser has never heard of (e.g. [IPv6AcceptRA]) simply
- * never matches a row here and falls straight to the debug log below.
+ * never matches a row here and falls straight to the debug log below. [DHCP]
+ * has a row for RouteMetric= only; its other keys take the same path.
  */
 static int network_conf_handler(
                 const char *path,
