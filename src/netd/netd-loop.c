@@ -501,18 +501,23 @@ int netd_reload(Netd *n) {
 
         /*
          * network_load_all() replaces n->networks wholesale on success, which
-         * frees every Network a Link may be pointing at -- every Link->network
-         * is dangling from this line until link_reconfigure() re-matches it
-         * below. Safe because netd_reload() only ever runs from
-         * netd_loop_run()'s post-batch check (via n->reload_handler), never
-         * nested inside a callback still holding a borrowed Network*
-         * (netd-loop.h's whole reason for deferring the reload).
+         * frees every Network a Link may be pointing at. netd_reload() only
+         * ever runs from netd_loop_run()'s post-batch check (via
+         * n->reload_handler), never nested inside a callback still holding a
+         * borrowed Network* (netd-loop.h's whole reason for deferring the
+         * reload).
          */
         r = network_load_all(n);
         if (r < 0) {
                 pico_log(PICO_LOG_ERR, "netd: reload: failed to load .network files: %s", strerror(-r));
                 return r;
         }
+
+        /* Re-point every link before reconfiguring any: each reconfigure
+         * writes resolv.conf, which reads every link's Network, including
+         * those of links not yet reconfigured. */
+        for (size_t i = 0; i < n->n_links; i++)
+                n->links[i]->network = network_find(n, n->links[i]->ifname);
 
         for (size_t i = 0; i < n->n_links; i++) {
                 int rr = link_reconfigure(n->links[i]);
