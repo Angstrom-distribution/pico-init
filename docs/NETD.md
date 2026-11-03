@@ -503,6 +503,7 @@ them:
 | `Number of Queues (Tx/Rx)` | rtnetlink. |
 | `Address` | `getifaddrs(3)`, without prefix length. |
 | `Gateway` | Default routes on that interface. |
+| `Connected To` | One line per LLDP neighbour in `lldp/<ifindex>`, see below. |
 | `Rx Packets` ... `Collisions` | With `-s`: ten counters from `statistics/` in sysfs. |
 
 Not shown, because netd computes none of it: `.link` and `.netdev` files,
@@ -521,8 +522,19 @@ WLAN access point, `r` router, `t` telephone, `d` DOCSIS, `a` station, `c`
 customer VLAN, `s` service VLAN, `m` TPMR. Rows are sorted by link index,
 then system name. At most 256 neighbours are listed. Columns are never
 ellipsized. Entries whose expiry has passed, such as those left by a netd
-that is no longer running, are skipped. Every string comes from the network
-and is reduced to printable ASCII before it is shown.
+that is no longer running, are skipped, and so is a file whose `IFNAME` is not
+what its ifindex is called now. Every string comes from the network and is
+reduced to printable ASCII before it is shown.
+
+`status` shows the neighbours of a link as `Connected To`, after `Gateway`
+and only for a link that has any, read from that link's `lldp/<ifindex>` alone:
+one line per neighbour, sorted like `lldp`, as `<system name> (<system description>) on port <port id> (<port
+description>)`. The parenthesised parts are left out when empty, and a
+neighbour without a system name is shown as `n/a`. The first line carries the
+label, the others are indented under it. Strings are reduced as above, and runs
+of spaces in them are squeezed to one, which the `lldp` columns do not do. A
+missing `/run/netd/lldp` or an unreadable file is not an error. At most 256
+neighbours are read.
 
 ### reload
 
@@ -553,6 +565,10 @@ has no IPv6.
   `MaximumMTU`, `HardwareAddress` (an array of bytes), `AdministrativeState`
   (the setup state), `OperationalState` and `NetworkFile`. Members netd has no
   data for, such as addresses, DNS and DHCP details, are not emitted.
+  An interface with LLDP neighbours also has `LLDPNeighbors`, an array of the
+  same objects as the `Neighbors` array of `lldp`. networkctl has no such
+  member: its `Neighbors` is the static neighbour table and its JSON output
+  carries no received neighbours, only the text `status` shows them.
 - `lldp` prints `{"Neighbors": [...]}`: one object per interface with
   `InterfaceIndex`, `InterfaceName` and a `Neighbors` array holding
   `ChassisID`, `PortID`, `PortDescription`, `SystemName`, `SystemDescription`,
