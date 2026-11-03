@@ -1018,7 +1018,8 @@ static int cmd_is_system_running(int argc, char *argv[]) {
  * systemctl-util.h in the real source): 0 running/ok, 1 dead, 3 not
  * running, 4 status unknown (unit never published == not-found here).
  */
-static int cmd_is_state_generic(int argc, char *argv[], const char *want_state, int not_this_state_code) {
+static int cmd_is_state_generic(
+                int argc, char *argv[], const char *want_state, const char *also_state, int not_this_state_code) {
         bool ok = false, not_found = true;
         int i;
 
@@ -1038,7 +1039,8 @@ static int cmd_is_state_generic(int argc, char *argv[], const char *want_state, 
 
                 if (st.found)
                         not_found = false;
-                if (strcmp(st.active_state, want_state) == 0)
+                if (strcmp(st.active_state, want_state) == 0 ||
+                    (also_state && strcmp(st.active_state, also_state) == 0))
                         ok = true;
         }
 
@@ -1047,8 +1049,9 @@ static int cmd_is_state_generic(int argc, char *argv[], const char *want_state, 
         return not_found ? 4 : not_this_state_code;
 }
 
+/* A reloading unit is still up: upstream's verb_is_active() accepts it. */
 static int cmd_is_active(int argc, char *argv[]) {
-        return cmd_is_state_generic(argc, argv, "active", 3); /* LSB 3: not running */
+        return cmd_is_state_generic(argc, argv, "active", "reloading", 3); /* LSB 3: not running */
 }
 
 /*
@@ -1062,7 +1065,7 @@ static int cmd_is_active(int argc, char *argv[]) {
  */
 static int cmd_is_failed(int argc, char *argv[]) {
         if (argc > 0)
-                return cmd_is_state_generic(argc, argv, "failed", 1); /* LSB 1: dead */
+                return cmd_is_state_generic(argc, argv, "failed", NULL, 1); /* LSB 1: dead */
 
         return is_system_running_compute(arg_quiet, NULL, 0);
 }
@@ -3046,16 +3049,89 @@ static void print_verb_failure(const char *verb, const char *unit, const char *r
 }
 
 /*
- * start/stop/restart share everything except the wire verb sent to
- * manager-ctrl.c; `display_verb` is upstream's job_type string
- * (systemctl-start-unit.c's unit_actions[] table) for the verb the person
- * typed, used in the error text. It differs from the plain verb for aliases
- * (try-restart's callers, below). reset-failed takes no --no-block and never
- * fails with a job result, so it stays separate.
- *
- * Silent on success, exit 0, like real start/stop/restart.
+ * What a reload verb does when PID 1 predates it and answers "err
+ * unknown-verb": what picoctl did before PID 1 had reloads. NOT_APPLICABLE
+ * is reload's old refusal, RESTART is reload-or-restart's old restart, TRY
+ * is try-reload-or-restart's old try-restart; TRY also keeps that verb's
+ * silence on a unit that does not exist (cmd_try_restart_as()'s gap).
  */
-static int cmd_verb_generic(int argc, char *argv[], const char *wire_verb, const char *display_verb) {
+typedef enum {
+        VERB_FALLBACK_NONE,
+        VERB_FALLBACK_NOT_APPLICABLE,
+        VERB_FALLBACK_RESTART,
+        VERB_FALLBACK_TRY,
+} VerbFallback;
+
+/* Active, activating or reloading: what try-restart acts on. */
+static bool unit_state_is_up(const char *unit) {
+        struct unit_state st;
+
+        read_unit_state(unit, &st);
+        return strcmp(st.active_state, "active") == 0 || strcmp(st.active_state, "activating") == 0 ||
+                        strcmp(st.active_state, "reloading") == 0;
+}
+
+/* One unit's round trip and its error text; 0 or 1, the exit status. */
+static int verb_one(const char *wire_verb, const char *display_verb, const char *unit, VerbFallback fallback) {
+        char reply[PICOCTL_CTRL_REPLY_MAX];
+        char *nl;
+        const char *reason;
+        int r;
+
+        r = ctrl_roundtrip(wire_verb, unit, arg_no_block, reply, sizeof(reply));
+        if (r < 0) {
+                /* A transport-level failure (no control socket at all, a
+                 * permission problem, ...): there is no bus call to have
+                 * failed, so this is picoctl's own wording, not an upstream
+                 * quote. */
+                picoctl_error("Failed to %s %s: %s", display_verb, unit, strerror(-r));
+                return 1;
+        }
+
+        if (strncmp(reply, "ok", 2) == 0)
+                return 0; /* silent success -- see cmd_verb_generic()'s header */
+
+        nl = strchr(reply, '\n');
+        if (nl)
+                *nl = '\0';
+        reason = strncmp(reply, "err ", 4) == 0 ? reply + 4 : reply;
+
+        if (strcmp(reason, "unknown-verb") == 0) {
+                if (fallback == VERB_FALLBACK_NOT_APPLICABLE)
+                        reason = "not-applicable";
+                else if (fallback == VERB_FALLBACK_RESTART)
+                        return verb_one("restart", display_verb, unit, VERB_FALLBACK_NONE);
+                else if (fallback == VERB_FALLBACK_TRY)
+                        return unit_state_is_up(unit) ?
+                                        verb_one("restart", display_verb, unit, VERB_FALLBACK_NONE) :
+                                        0;
+        }
+
+        if (fallback == VERB_FALLBACK_TRY && strcmp(reason, "no-such-unit") == 0)
+                return 0;
+
+        if (strcmp(reason, "canceled") == 0)
+                picoctl_error("Job for %s canceled.", unit);
+        else if (strcmp(reason, "timeout") == 0)
+                picoctl_error("Job for %s timed out.", unit);
+        else if (strcmp(reason, "failed") == 0)
+                print_job_failed(unit);
+        else if (strcmp(reason, "dependency") == 0)
+                picoctl_error("A dependency job for %s failed. See 'journalctl -xe' for details.", unit);
+        else if (strcmp(reason, "not-applicable") == 0)
+                /* BUS_ERROR_JOB_TYPE_NOT_APPLICABLE, src/core/transaction.c */
+                picoctl_error("Failed to reload %s: Job type reload is not applicable for unit %s.", unit, unit);
+        else if (strcmp(reason, "invalid") == 0)
+                /* bus-wait-for-jobs.c's text for a JOB_INVALID result */
+                picoctl_error("%s is not active, cannot reload.", unit);
+        else
+                print_verb_failure(display_verb, unit, reason);
+
+        return 1;
+}
+
+static int cmd_verb_generic_full(
+                int argc, char *argv[], const char *wire_verb, const char *display_verb, VerbFallback fallback) {
         int i, status = 0;
 
         /* --no-block is global (arg_no_block, from main()'s getopt_long()
@@ -3066,47 +3142,25 @@ static int cmd_verb_generic(int argc, char *argv[], const char *wire_verb, const
                 return 1;
         }
 
-        for (i = 0; i < argc; i++) {
-                char reply[PICOCTL_CTRL_REPLY_MAX];
-                char *nl;
-                const char *reason;
-                int r;
-
-                r = ctrl_roundtrip(wire_verb, argv[i], arg_no_block, reply, sizeof(reply));
-                if (r < 0) {
-                        /* A transport-level failure (no control socket at
-                         * all, a permission problem, ...): there is no bus
-                         * call to have failed, so this is picoctl's own
-                         * wording, not an upstream quote. */
-                        picoctl_error("Failed to %s %s: %s", display_verb, argv[i], strerror(-r));
+        for (i = 0; i < argc; i++)
+                if (verb_one(wire_verb, display_verb, argv[i], fallback) != 0)
                         status = 1;
-                        continue;
-                }
-
-                if (strncmp(reply, "ok", 2) == 0)
-                        continue; /* silent success -- see this function's own header */
-
-                nl = strchr(reply, '\n');
-                if (nl)
-                        *nl = '\0';
-                reason = strncmp(reply, "err ", 4) == 0 ? reply + 4 : reply;
-
-                if (strcmp(reason, "canceled") == 0)
-                        picoctl_error("Job for %s canceled.", argv[i]);
-                else if (strcmp(reason, "timeout") == 0)
-                        picoctl_error("Job for %s timed out.", argv[i]);
-                else if (strcmp(reason, "failed") == 0)
-                        print_job_failed(argv[i]);
-                else if (strcmp(reason, "dependency") == 0)
-                        picoctl_error("A dependency job for %s failed. See 'journalctl -xe' for details.",
-                                      argv[i]);
-                else
-                        print_verb_failure(display_verb, argv[i], reason);
-
-                status = 1;
-        }
 
         return status;
+}
+
+/*
+ * The job verbs share everything except the wire verb sent to
+ * manager-ctrl.c; `display_verb` is upstream's job_type string
+ * (systemctl-start-unit.c's unit_actions[] table) for the verb the person
+ * typed, used in the error text. It differs from the plain verb for aliases
+ * (try-restart's callers, below). reset-failed takes no --no-block and never
+ * fails with a job result, so it stays separate.
+ *
+ * Silent on success, exit 0, like real start/stop/restart.
+ */
+static int cmd_verb_generic(int argc, char *argv[], const char *wire_verb, const char *display_verb) {
+        return cmd_verb_generic_full(argc, argv, wire_verb, display_verb, VERB_FALLBACK_NONE);
 }
 
 static int cmd_start(int argc, char *argv[]) {
@@ -3154,14 +3208,9 @@ static int cmd_try_restart_as(int argc, char *argv[], const char *display_verb) 
         /* --no-block is global (arg_no_block) and never reaches this argv;
          * cmd_verb_generic() below reads it itself, so no passthrough is
          * needed here. */
-        for (i = 0; i < argc; i++) {
-                struct unit_state st;
-
-                read_unit_state(argv[i], &st);
-                if (strcmp(st.active_state, "active") == 0 || strcmp(st.active_state, "activating") == 0 ||
-                    strcmp(st.active_state, "reloading") == 0)
+        for (i = 0; i < argc; i++)
+                if (unit_state_is_up(argv[i]))
                         active[n_active++] = argv[i];
-        }
 
         rc = n_active > 0 ? cmd_verb_generic(n_active, active, "restart", display_verb) : 0;
         free(active);
@@ -3177,12 +3226,13 @@ static int cmd_condrestart(int argc, char *argv[]) {
 }
 
 /*
- * reload-or-restart (ReloadOrRestartUnit): reload if the unit supports it,
- * else restart. ExecReload= is not implemented (see cmd_reload()), so this
- * always restarts, which is upstream's own fallback.
+ * reload-or-restart (ReloadOrRestartUnit): reload an active unit that has
+ * ExecReload=, start an inactive one, restart one without ExecReload=. PID 1
+ * makes that choice (manager-ctrl.c); an older PID 1 only restarts.
  */
 static int cmd_reload_or_restart(int argc, char *argv[]) {
-        return cmd_verb_generic(argc, argv, "restart", "reload-or-restart");
+        return cmd_verb_generic_full(
+                        argc, argv, "reload-or-restart", "reload-or-restart", VERB_FALLBACK_RESTART);
 }
 
 /*
@@ -3190,35 +3240,22 @@ static int cmd_reload_or_restart(int argc, char *argv[]) {
  * spellings -- reload-or-try-restart, condreload, force-reload -- all share
  * one upstream job_type string ("reload-or-try-restart",
  * systemctl-start-unit.c's unit_actions[] table) and behaviour: reload if
- * supported, else try-restart. ExecReload= does not exist here, so this
- * always takes the try-restart branch.
+ * supported, else try-restart; a unit that is not up is left alone. PID 1
+ * decides; an older one gets cmd_try_restart_as()'s try-restart.
  */
 static int cmd_try_reload_or_restart(int argc, char *argv[]) {
-        return cmd_try_restart_as(argc, argv, "reload-or-try-restart");
+        return cmd_verb_generic_full(
+                        argc, argv, "try-reload-or-restart", "reload-or-try-restart", VERB_FALLBACK_TRY);
 }
 
 /*
- * reload (ReloadUnit): ExecReload= is not implemented in pico-init and job.h
- * has no JOB_RELOAD (only START/STOP/RESTART), so this fails like upstream
- * does for a unit with no ExecReload=: "Job type %s is not applicable for
- * unit %s." (BUS_ERROR_JOB_TYPE_NOT_APPLICABLE, src/core/transaction.c).
+ * reload (ReloadUnit): runs ExecReload= of an active unit as a job. A unit
+ * without ExecReload= is refused as upstream refuses it, "Job type %s is not
+ * applicable for unit %s." (BUS_ERROR_JOB_TYPE_NOT_APPLICABLE,
+ * src/core/transaction.c), which is also all an older PID 1 can do.
  */
 static int cmd_reload(int argc, char *argv[]) {
-        int i;
-
-        if (argc < 1) {
-                picoctl_error("picoctl reload: missing unit name");
-                return 1;
-        }
-
-        /* --no-block is global and never reaches this argv; every entry
-         * here is a real unit name. */
-        for (i = 0; i < argc; i++)
-                picoctl_error("Failed to reload %s: Job type reload is not applicable for unit %s.",
-                              argv[i],
-                              argv[i]);
-
-        return 1;
+        return cmd_verb_generic_full(argc, argv, "reload", "reload", VERB_FALLBACK_NOT_APPLICABLE);
 }
 
 static int cmd_reset_failed(int argc, char *argv[]) {
@@ -3519,7 +3556,7 @@ static void usage(void) {
               "  cat UNIT...                 Show the files of the specified units\n"
               "  start, stop, restart, try-restart, reload-or-restart,\n"
               "  try-reload-or-restart UNIT...  Queue a job for one or more units\n"
-              "  reload UNIT...              Always refused: there is no ExecReload=\n"
+              "  reload UNIT...              Run the ExecReload= commands of active units\n"
               "  kill UNIT...                Send a signal to the processes of a unit\n"
               "  reset-failed [UNIT...]      Reset failed state\n"
               "  whoami [PID...]             Show the unit a process belongs to\n"

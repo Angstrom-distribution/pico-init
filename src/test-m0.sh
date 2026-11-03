@@ -31,9 +31,10 @@ for sym in \
         manager_load_unit manager_add_job manager_dispatch_run_queue \
         manager_loop manager_dispatch_signal manager_shutdown \
         unit_new unit_free unit_active_state unit_start unit_stop \
+        unit_can_reload unit_run_reload \
         unit_load unit_parse_file unit_add_dependency \
         unit_dependency_detect_cycles \
-        service_start service_stop service_sigchld_event \
+        service_start service_stop service_reload service_sigchld_event \
         service_cgroup_empty_event service_spawn \
         job_new job_free job_run job_finish \
         transaction_new transaction_free transaction_add_job \
