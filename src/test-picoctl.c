@@ -23,7 +23,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -2062,6 +2064,181 @@ static void test_whoami(void) {
         ASSERT_EQ_INT(res.exit_code, 1);
 }
 
+/* --- reload verbs against a stand-in control socket --- */
+
+/*
+ * A stand-in for PID 1's control socket under --root: `restart` gets
+ * restart_reply, every other verb other_reply, and each request line is
+ * appended to <root>/requests. Bound before the fork, so picoctl never
+ * races its startup.
+ */
+static pid_t fake_ctrl_start(const char *root, const char *other_reply, const char *restart_reply) {
+        struct sockaddr_un addr;
+        char rtdir[PATH_MAX], log[PATH_MAX + 16];
+        pid_t pid;
+        int fd, n;
+
+        snprintf(rtdir, sizeof(rtdir), "%s%s", root, PICO_RUNTIME_DIR);
+        ASSERT_EQ_INT(fixture_mkdir_p(rtdir), 0);
+        snprintf(log, sizeof(log), "%s/requests", root);
+
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        n = snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/control", rtdir);
+        ASSERT_TRUE(n > 0 && (size_t) n < sizeof(addr.sun_path));
+        unlink(addr.sun_path);
+
+        fd = socket(AF_UNIX, SOCK_SEQPACKET, 0);
+        ASSERT_TRUE(fd >= 0);
+        ASSERT_EQ_INT(bind(fd, (struct sockaddr *) &addr, sizeof(addr)), 0);
+        ASSERT_EQ_INT(listen(fd, 4), 0);
+
+        pid = fork();
+        ASSERT_TRUE(pid >= 0);
+        if (pid == 0) {
+                for (;;) {
+                        char buf[600];
+                        const char *reply;
+                        ssize_t r;
+                        FILE *f;
+                        int c = accept(fd, NULL, NULL);
+
+                        if (c < 0)
+                                continue;
+                        r = recv(c, buf, sizeof(buf) - 1, 0);
+                        if (r > 0) {
+                                buf[r] = '\0';
+                                f = fopen(log, "ae");
+                                if (f) {
+                                        fprintf(f, "%s\n", buf);
+                                        fclose(f);
+                                }
+                                reply = strncmp(buf, "PICO1 restart ", 14) == 0 ? restart_reply : other_reply;
+                                (void) send(c, reply, strlen(reply), MSG_NOSIGNAL);
+                        }
+                        close(c);
+                }
+        }
+
+        close(fd);
+        return pid;
+}
+
+static void fake_ctrl_stop(pid_t pid) {
+        kill(pid, SIGKILL);
+        ASSERT_EQ_INT(waitpid(pid, NULL, 0), pid);
+}
+
+/* The requests the stand-in recorded since the last call, which clears them. */
+static void assert_requests(const char *root, const char *want) {
+        char path[PATH_MAX + 16], buf[1024];
+        size_t n = 0;
+        FILE *f;
+
+        snprintf(path, sizeof(path), "%s/requests", root);
+        f = fopen(path, "re");
+        if (f) {
+                n = fread(buf, 1, sizeof(buf) - 1, f);
+                fclose(f);
+        }
+        buf[n] = '\0';
+        ASSERT_STREQ(buf, want);
+        unlink(path);
+}
+
+/*
+ * A new picoctl against a PID 1 that predates the reload verbs ("err
+ * unknown-verb"): reload is refused as before, reload-or-restart restarts,
+ * try-reload-or-restart (and force-reload) restarts only a unit that is up.
+ */
+static void test_ctrl_compat_with_old_pid1(void) {
+        char *root = test_tmpdir_new();
+        struct run_result res;
+        pid_t server;
+
+        ASSERT_TRUE(root != NULL);
+        server = fake_ctrl_start(root, "err unknown-verb\n", "ok done\n");
+
+        RUN_PICOCTL(&res, "--root", root, "reload", "x.service");
+        ASSERT_EQ_INT(res.exit_code, 1);
+        assert_requests(root, "PICO1 reload x.service\n");
+
+        RUN_PICOCTL(&res, "--root", root, "reload-or-restart", "x.service");
+        ASSERT_EQ_INT(res.exit_code, 0);
+        assert_requests(root, "PICO1 reload-or-restart x.service\nPICO1 restart x.service\n");
+
+        fixture_unit_state(root, "x.service", "ActiveState=inactive\nSubState=dead\nLoadState=loaded\n");
+        RUN_PICOCTL(&res, "--root", root, "try-reload-or-restart", "x.service");
+        ASSERT_EQ_INT(res.exit_code, 0);
+        assert_requests(root, "PICO1 try-reload-or-restart x.service\n");
+
+        fixture_unit_state(root, "x.service", "ActiveState=active\nSubState=running\nLoadState=loaded\n");
+        RUN_PICOCTL(&res, "--root", root, "force-reload", "x.service");
+        ASSERT_EQ_INT(res.exit_code, 0);
+        assert_requests(root, "PICO1 try-reload-or-restart x.service\nPICO1 restart x.service\n");
+
+        fake_ctrl_stop(server);
+        test_rm_rf(root);
+        free(root);
+}
+
+/* The new PID 1's reload replies map to exit codes, and a try-* verb on a
+ * unit PID 1 does not know stays silent. */
+static void test_reload_replies_from_new_pid1(void) {
+        static const struct {
+                const char *reply, *verb, *wire;
+                int exit_code;
+        } cases[] = {
+                {        "err invalid\n",                "reload",                "reload", 1 },
+                { "err not-applicable\n",                "reload",                "reload", 1 },
+                {            "ok done\n",                "reload",                "reload", 0 },
+                {          "ok queued\n",     "reload-or-restart",     "reload-or-restart", 0 },
+                {         "err failed\n",     "reload-or-restart",     "reload-or-restart", 1 },
+                {   "err no-such-unit\n",                "reload",                "reload", 1 },
+                {   "err no-such-unit\n", "try-reload-or-restart", "try-reload-or-restart", 0 },
+                {   "err no-such-unit\n",            "condreload", "try-reload-or-restart", 0 },
+        };
+        size_t i;
+
+        for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+                char *root = test_tmpdir_new();
+                char want[128];
+                struct run_result res;
+                pid_t server;
+
+                ASSERT_TRUE(root != NULL);
+                server = fake_ctrl_start(root, cases[i].reply, "err unexpected-restart\n");
+
+                RUN_PICOCTL(&res, "--root", root, (char *) cases[i].verb, "x.service");
+                ASSERT_EQ_INT(res.exit_code, cases[i].exit_code);
+                snprintf(want, sizeof(want), "PICO1 %s x.service\n", cases[i].wire);
+                assert_requests(root, want);
+
+                fake_ctrl_stop(server);
+                test_rm_rf(root);
+                free(root);
+        }
+}
+
+/* is-active counts a reloading unit as active, as upstream's verb_is_active(). */
+static void test_is_active_accepts_reloading(void) {
+        char *root = test_tmpdir_new();
+        struct run_result res;
+
+        ASSERT_TRUE(root != NULL);
+        fixture_unit_state(root, "r.service", "ActiveState=reloading\nSubState=reload\nLoadState=loaded\n");
+
+        RUN_PICOCTL(&res, "--root", root, "is-active", "r.service");
+        ASSERT_STREQ(res.out, "reloading\n");
+        ASSERT_EQ_INT(res.exit_code, 0);
+
+        RUN_PICOCTL(&res, "--root", root, "is-failed", "r.service");
+        ASSERT_EQ_INT(res.exit_code, 1);
+
+        test_rm_rf(root);
+        free(root);
+}
+
 int main(void) {
         test_enable_disable_is_enabled();
         test_preset();
@@ -2092,6 +2269,9 @@ int main(void) {
         test_add_dependency_and_link();
         test_power_personalities();
         test_whoami();
+        test_ctrl_compat_with_old_pid1();
+        test_reload_replies_from_new_pid1();
+        test_is_active_accepts_reloading();
         /* Last: it exit(77)s on a host without systemctl, and a SKIP must not
          * hide the in-process checks above. */
         test_oracle_symlinks_byte_identical();
