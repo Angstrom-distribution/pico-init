@@ -5,9 +5,10 @@
  * The .network parser.
  *
  * Covers: the [DHCPv4] defaults (in particular UseTimezone=yes, netd's
- * divergence from networkd); usb0.network and usb0-server.network fixtures
- * for a USB gadget link; fixtures using directives outside netd's subset
- * ([IPv6AcceptRA], [Route], RouteMetric=); the three-directory search path
+ * divergence from networkd); RouteMetric= in [DHCPv4] and the legacy [DHCP]
+ * section; usb0.network and usb0-server.network fixtures for a USB gadget
+ * link; fixtures using sections outside netd's subset ([IPv6AcceptRA],
+ * [Route]); the three-directory search path
  * with basename shadowing and lexicographic union ordering; [Match] Name=
  * glob matching, including the "no [Match] Name= matches nothing" rule; and
  * unknown-section/directive tolerance. It also holds a regression for the
@@ -51,6 +52,7 @@ static void test_defaults(void) {
         ASSERT_TRUE(nw->dhcp_use_dns);
         ASSERT_TRUE(nw->dhcp_use_ntp);
         ASSERT_TRUE(nw->dhcp_use_timezone);
+        ASSERT_TRUE(!nw->dhcp_route_metric_set);
 
         ASSERT_TRUE(network_free(nw) == NULL);
 }
@@ -274,10 +276,10 @@ static void test_real_usb0_server_network_parses(void) {
 }
 
 /*
- * Typical console-image .network files, exercising directives well outside
- * netd's subset: RouteMetric=, and whole sections ([IPv6AcceptRA], [Route])
- * netd has no fields for at all. A parse failure would otherwise only be
- * found at boot.
+ * Typical console-image .network files: [DHCPv4] RouteMetric=, and whole
+ * sections ([IPv6AcceptRA], [Route]) netd has no fields for at all, whose
+ * RouteMetric=/Metric= must not leak into the DHCPv4 value. A parse failure
+ * would otherwise only be found at boot.
  */
 static const char *console_10_en_network =
                 "[Match]\n"
@@ -337,7 +339,11 @@ static const char *console_12_wlan_network =
                 "Metric=100\n";
 
 static void assert_console_fixture_parses(
-                const char *name, const char *content, const char *glob_hit, const char *glob_miss) {
+                const char *name,
+                const char *content,
+                const char *glob_hit,
+                const char *glob_miss,
+                uint32_t metric) {
         char *dir, *path;
         Network *nw = NULL;
 
@@ -359,6 +365,8 @@ static void assert_console_fixture_parses(
         ASSERT_TRUE(!nw->gateway_set);
         ASSERT_EQ_INT(nw->n_dns, 0);
         ASSERT_EQ_INT(nw->n_ntp, 0);
+        ASSERT_TRUE(nw->dhcp_route_metric_set);
+        ASSERT_EQ_INT(nw->dhcp_route_metric, metric);
 
         network_free(nw);
         free(path);
@@ -367,9 +375,9 @@ static void assert_console_fixture_parses(
 }
 
 static void test_console_base_image_fixtures_parse(void) {
-        assert_console_fixture_parses("10-en.network", console_10_en_network, "en0", "eth0");
-        assert_console_fixture_parses("11-eth.network", console_11_eth_network, "eth0", "wlan0");
-        assert_console_fixture_parses("12-wlan.network", console_12_wlan_network, "wlan0", "en0");
+        assert_console_fixture_parses("10-en.network", console_10_en_network, "en0", "eth0", 10);
+        assert_console_fixture_parses("11-eth.network", console_11_eth_network, "eth0", "wlan0", 10);
+        assert_console_fixture_parses("12-wlan.network", console_12_wlan_network, "wlan0", "en0", 100);
 }
 
 /* An unrecognized section and unrecognized directives inside a recognized
@@ -389,7 +397,7 @@ static const char *tolerant_fixture =
                 "\n"
                 "[DHCPv4]\n"
                 "UseDNS=no\n"
-                "RouteMetric=10\n"; /* not implemented */
+                "RouteMetric=10\n";
 
 static void test_lldp_directives(void) {
         static const struct {
@@ -460,9 +468,166 @@ static void test_unknown_directive_tolerance(void) {
         ASSERT_TRUE(!nw->dhcp_use_dns); /* explicit UseDNS=no honoured */
         ASSERT_TRUE(nw->dhcp_use_ntp);  /* untouched directive keeps its default */
         ASSERT_TRUE(nw->dhcp_use_timezone);
+        ASSERT_TRUE(nw->dhcp_route_metric_set);
+        ASSERT_EQ_INT(nw->dhcp_route_metric, 10);
 
         network_free(nw);
         free(path);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* Parses `body` as a whole file; the caller frees the result. */
+static Network *parse_body(const char *dir, const char *body) {
+        Network *nw = NULL;
+        char *path;
+
+        ASSERT_EQ_INT(test_write_file(dir, "metric.network", body), 0);
+        path = join_path(dir, "metric.network");
+        ASSERT_EQ_INT(network_parse_file(path, &nw), 0);
+        ASSERT_TRUE(nw != NULL);
+        free(path);
+        return nw;
+}
+
+/*
+ * Only plain decimal in uint32 range is accepted. networkd's safe_atou32()
+ * reads "010" as 8 and "0x10" as 16, so every spelling the two could read
+ * differently is rejected and the default stays.
+ */
+static void test_route_metric_values(void) {
+        static const struct {
+                const char *value;
+                uint32_t want;
+        } accepted[] = {
+                {          "0",           0 },
+                {         "10",          10 },
+                {        "300",         300 },
+                { "4294967295", 4294967295u },
+        };
+        static const char * const rejected[] = {
+                "",
+                "-1",
+                "-0",
+                "+5",
+                "0x10",
+                "010",
+                "0b1",
+                "0o7",
+                "abc",
+                "10abc",
+                "1 2",
+                "4294967296",
+                "99999999999999999999",
+        };
+        char *dir = test_tmpdir_new();
+        char body[160];
+        size_t i;
+
+        ASSERT_TRUE(dir != NULL);
+
+        for (i = 0; i < sizeof(accepted) / sizeof(accepted[0]); i++) {
+                Network *nw;
+
+                snprintf(body, sizeof(body), "[Match]\nName=x\n\n[DHCPv4]\nRouteMetric=%s\n", accepted[i].value);
+                nw = parse_body(dir, body);
+                ASSERT_TRUE(nw->dhcp_route_metric_set);
+                ASSERT_EQ_INT(nw->dhcp_route_metric, accepted[i].want);
+                network_free(nw);
+        }
+
+        for (i = 0; i < sizeof(rejected) / sizeof(rejected[0]); i++) {
+                Network *nw;
+
+                snprintf(body, sizeof(body), "[Match]\nName=x\n\n[DHCPv4]\nRouteMetric=%s\n", rejected[i]);
+                nw = parse_body(dir, body);
+                if (nw->dhcp_route_metric_set) {
+                        fprintf(stderr, "RouteMetric=%s was accepted\n", rejected[i]);
+                        exit(1);
+                }
+                network_free(nw);
+        }
+
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* The last valid line wins; a rejected or empty one keeps the earlier value. */
+static void test_route_metric_repeat_and_keep(void) {
+        static const struct {
+                const char *body;
+                uint32_t want;
+        } cases[] = {
+                {    "[DHCPv4]\nRouteMetric=10\nRouteMetric=20\n", 20 },
+                { "[DHCPv4]\nRouteMetric=10\nRouteMetric=bogus\n", 10 },
+                {      "[DHCPv4]\nRouteMetric=10\nRouteMetric=\n", 10 },
+        };
+        char *dir = test_tmpdir_new();
+        size_t i;
+
+        ASSERT_TRUE(dir != NULL);
+        for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+                Network *nw = parse_body(dir, cases[i].body);
+
+                ASSERT_TRUE(nw->dhcp_route_metric_set);
+                ASSERT_EQ_INT(nw->dhcp_route_metric, cases[i].want);
+                network_free(nw);
+        }
+
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* meta-angstrom's wireless.network shape, with Name= so netd can match it. */
+static const char *legacy_dhcp_wlan_fixture =
+                "[Match]\n"
+                "Name=wlan*\n"
+                "\n"
+                "[Network]\n"
+                "DHCP=yes\n"
+                "\n"
+                "[DHCP]\n"
+                "UseMTU=yes\n"
+                "RouteMetric=200\n"
+                "ClientIdentifier=mac\n";
+
+/*
+ * [DHCP] is networkd's legacy spelling: it applies only while no [DHCPv4]
+ * value has been seen, so [DHCPv4] wins in either order. [IPv6AcceptRA]
+ * RouteMetric= is a different route and never sets it.
+ */
+static void test_route_metric_dhcp_legacy_section(void) {
+        static const struct {
+                const char *body;
+                bool set;
+                uint32_t want;
+        } cases[] = {
+                {                           "[DHCP]\nRouteMetric=200\n",  true, 200 },
+                { "[DHCP]\nRouteMetric=200\n[DHCPv4]\nRouteMetric=10\n",  true,  10 },
+                { "[DHCPv4]\nRouteMetric=10\n[DHCP]\nRouteMetric=200\n",  true,  10 },
+                {  "[DHCP]\nRouteMetric=200\n[DHCP]\nRouteMetric=300\n",  true, 300 },
+                {                     "[IPv6AcceptRA]\nRouteMetric=5\n", false,   0 },
+        };
+        char *dir = test_tmpdir_new();
+        Network *nw;
+        size_t i;
+
+        ASSERT_TRUE(dir != NULL);
+        for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+                nw = parse_body(dir, cases[i].body);
+                ASSERT_EQ_INT(nw->dhcp_route_metric_set, cases[i].set);
+                if (cases[i].set)
+                        ASSERT_EQ_INT(nw->dhcp_route_metric, cases[i].want);
+                network_free(nw);
+        }
+
+        nw = parse_body(dir, legacy_dhcp_wlan_fixture);
+        ASSERT_TRUE(network_matches(nw, "wlan0"));
+        ASSERT_TRUE(network_dhcp4_enabled(nw));
+        ASSERT_TRUE(nw->dhcp_route_metric_set);
+        ASSERT_EQ_INT(nw->dhcp_route_metric, 200);
+        network_free(nw);
+
         test_rm_rf(dir);
         free(dir);
 }
@@ -619,6 +784,9 @@ int main(void) {
         test_console_base_image_fixtures_parse();
         test_lldp_directives();
         test_unknown_directive_tolerance();
+        test_route_metric_values();
+        test_route_metric_repeat_and_keep();
+        test_route_metric_dhcp_legacy_section();
         test_search_path_shadowing_and_order();
         test_missing_search_dir_is_not_an_error();
         test_huge_line_does_not_crash();

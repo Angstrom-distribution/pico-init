@@ -100,6 +100,9 @@ struct Link {
         struct in_addr address;
         unsigned char prefixlen;
         bool address_configured;
+        /* The prefix route's metric (IFA_RT_PRIORITY): a lease's RouteMetric=,
+         * 0 for Address=. A reload compares it to move the prefix route. */
+        uint32_t address_metric;
 
         struct in_addr gateway;
         bool gateway_configured;
@@ -110,6 +113,10 @@ struct Link {
         /* The default route came from a lease, so a lease without a router
          * takes it away again; a static Gateway= is never removed that way. */
         bool gateway_from_lease;
+        /* The metric both routes were added at. Stored, not recomputed: a
+         * delete must use the add's metric, and after a reload the Network
+         * that chose it is gone and RouteMetric= may have changed. */
+        uint32_t gateway_metric;
 
         /*
          * Reentrancy guard. Set for the duration of link_apply_lease(), which
@@ -223,12 +230,13 @@ int link_apply_lease(Link *l, DhcpLease *lease);
 
 /*
  * Lease expired, was NAKed, or was DECLINEd: remove what it configured
- * (address, route, lease file) and go back to LINK_CONFIGURING -- but leave
+ * (address, route, lease file), put back a static Address=/Gateway=, and go
+ * back to LINK_CONFIGURING -- but leave
  * l->dhcp_client running. The client is not netd-link.c's to restart: it
  * already returns itself to INIT and restarts its own DISCOVER cycle
  * internally after notifying this event (dhcp-client.c's
- * client_restart_full()/client_timeout_expire()), so there is nothing here
- * to do beyond clearing the state this lease put in the kernel. Unrelated to
+ * client_restart_full()/client_timeout_expire()), so the client needs
+ * nothing from here. Unrelated to
  * link_deconfigure(), which is the "stop DHCP outright" path. 0 or -errno.
  */
 int link_lose_lease(Link *l);

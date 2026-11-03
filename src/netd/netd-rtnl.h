@@ -180,6 +180,11 @@ int netd_rtnl_link_set_hwaddr(NetdRtnl *rtnl, int ifindex, const uint8_t *addr, 
  * `lifetime_sec` is the DHCP lease time, passed through as IFA_CACHEINFO so
  * the kernel expires the address if netd dies before the lease does;
  * UINT32_MAX means forever, which is what a static Address= gets.
+ *
+ * `route_metric` goes into IFA_RT_PRIORITY, the metric of the prefix route
+ * the kernel adds for the address (0 is the kernel's default), as
+ * systemd-networkd sends it. Re-sending the address with another metric
+ * moves the existing prefix route.
  */
 int netd_rtnl_address_add(
                 NetdRtnl *rtnl,
@@ -187,26 +192,29 @@ int netd_rtnl_address_add(
                 const struct in_addr *address,
                 unsigned char prefixlen,
                 const struct in_addr *broadcast,
-                uint32_t lifetime_sec);
+                uint32_t lifetime_sec,
+                uint32_t route_metric);
 
 int netd_rtnl_address_del(NetdRtnl *rtnl, int ifindex, const struct in_addr *address, unsigned char prefixlen);
 
 /*
  * RTM_NEWROUTE, RTN_UNICAST / RT_TABLE_MAIN / RT_SCOPE_UNIVERSE (or LINK when
- * there is no gateway), NLM_F_REQUEST|NLM_F_CREATE|NLM_F_REPLACE|NLM_F_ACK.
+ * there is no gateway), NLM_F_REQUEST|NLM_F_CREATE|NLM_F_APPEND|NLM_F_ACK.
  *
  * `destination` NULL with prefixlen 0 is the default route, which is the case
  * that actually matters and which netd_rtnl_route_add_default() exists to
  * make unmistakable at the call site. `gateway` NULL means an on-link route.
- * `metric` goes into RTA_PRIORITY, which is part of what the kernel matches a
- * route by (table+prefix+priority) -- and NLM_F_REPLACE means two default
- * routes offered at the same metric are one route that the second add
- * overwrites, not two. So coexistence is the caller's to arrange, not
- * something this call provides: a distinct metric per interface makes two
- * default routes genuinely distinct routes, individually replaceable and
- * individually deletable, with the kernel preferring the lowest metric. That
- * is exactly what netd-link.c's link_route_metric() derives from the ifindex;
- * a caller reusing one metric across interfaces gets silent replacement.
+ * `metric` goes into RTA_PRIORITY, and the kernel prefers the lowest.
+ *
+ * CREATE|APPEND is what systemd-networkd sends for every route: routes that
+ * differ only in output interface or gateway coexist at one metric, the one
+ * added first ahead of later ones, and an identical add returns -EEXIST
+ * rather than replacing anything.
+ *
+ * netd_rtnl_route_del() sends the same attributes, and the kernel matches a
+ * delete on the output interface, gateway, protocol and priority, so it
+ * removes only the caller's own route. A priority of 0 matches any priority
+ * on that interface and gateway, the lowest first.
  */
 int netd_rtnl_route_add(
                 NetdRtnl *rtnl,

@@ -29,31 +29,27 @@
 #include "netd.h"
 
 /*
- * Shared by static Gateway= and by a lease's default route: a link has one
- * "the route netd put in" slot (Link.gateway/gateway_configured), so
- * whichever source configured it, removing it later needs the same metric to
- * find the same kernel route again.
+ * Route metrics follow systemd-networkd. A lease's default route, its host
+ * route to an off-subnet router and the prefix route of the leased address
+ * use [DHCPv4] RouteMetric=, default 1024 (networkd's DHCP_ROUTE_METRIC). A
+ * Gateway= route has no metric of its own, so it gets the kernel's 0, as does
+ * the prefix route of Address=.
  *
- * The metric is per link. The kernel identifies a route by
- * table+prefix+priority and netd adds with NLM_F_CREATE|NLM_F_REPLACE, so two
- * managed uplinks (eth0 and usb0, say) at one shared metric are the *same*
- * route: the second add silently replaces the first link's default route
- * while both links' gateway_configured still say they have one, and the
- * first link's later delete no-ops on -ESRCH. A per-link metric keeps the
- * routes distinct and individually removable, and the kernel picks the
- * lowest metric as primary (see netd-rtnl.h).
- *
- * Derived from the ifindex because it is assigned once in link_new() and
- * never rewritten (link_update_snapshot() leaves it alone), so a teardown
- * always computes the same metric the add did, and a restarted netd that
- * re-enumerates the same interfaces derives the same metrics again.
+ * Links sharing a metric do not collide: routes are added with
+ * NLM_F_CREATE|NLM_F_APPEND and deleted by oif, gateway and priority (see
+ * netd-rtnl.h), so each link's route stays its own.
  */
-#define NETD_LINK_ROUTE_METRIC_BASE 100
+#define NETD_DHCP_ROUTE_METRIC 1024
 
-static uint32_t link_route_metric(const Link *l) {
-        /* ifindex is a small positive int from the kernel (netd_rtnl_route_
-         * add() itself rejects <= 0), so this cannot realistically wrap. */
-        return NETD_LINK_ROUTE_METRIC_BASE + (uint32_t) l->ifindex;
+static uint32_t link_lease_route_metric(const Link *l) {
+        if (l->network && l->network->dhcp_route_metric_set)
+                return l->network->dhcp_route_metric;
+
+        return NETD_DHCP_ROUTE_METRIC;
+}
+
+static uint32_t link_route_metric(const Link *l, bool from_lease) {
+        return from_lease ? link_lease_route_metric(l) : 0;
 }
 
 /* --- idempotent rtnl wrappers ---
@@ -66,8 +62,13 @@ static uint32_t link_route_metric(const Link *l) {
  */
 
 static int address_add_idempotent(
-                NetdRtnl *rtnl, int ifindex, const struct in_addr *addr, unsigned char prefixlen, uint32_t life) {
-        int r = netd_rtnl_address_add(rtnl, ifindex, addr, prefixlen, NULL, life);
+                NetdRtnl *rtnl,
+                int ifindex,
+                const struct in_addr *addr,
+                unsigned char prefixlen,
+                uint32_t life,
+                uint32_t metric) {
+        int r = netd_rtnl_address_add(rtnl, ifindex, addr, prefixlen, NULL, life, metric);
         return r == -EEXIST ? 0 : r;
 }
 
@@ -111,6 +112,30 @@ static bool same_subnet(struct in_addr a, unsigned char a_pfx, struct in_addr b,
         return a.s_addr == b.s_addr;
 }
 
+static int link_gateway_remove(Link *l);
+
+/*
+ * The kernel flushes a link's routes with its last IPv4 address, so the
+ * default route goes first and the caller adds it back; left in place, the
+ * slot would claim a route the kernel no longer has.
+ */
+static int link_address_del(Link *l) {
+        int r;
+
+        if (l->gateway_configured) {
+                r = link_gateway_remove(l);
+                if (r < 0)
+                        return r;
+        }
+
+        r = address_del_idempotent(l->netd->rtnl, l->ifindex, &l->address, l->prefixlen);
+        if (r < 0)
+                return r;
+
+        l->address_configured = false;
+        return 0;
+}
+
 /*
  * Converge Link's configured address to (want, want_pfx), choosing add/
  * delete ordering by the three cases the kernel's secondary-address
@@ -124,33 +149,39 @@ static bool same_subnet(struct in_addr a, unsigned char a_pfx, struct in_addr b,
  *      the new address first would make it "secondary" to the old one
  *      (net.ipv4.conf.*.promote_secondaries defaults to 0), and the
  *      following delete of the old (primary) address would then cascade
- *      into deleting the new (secondary) one too.
+ *      into deleting the new (secondary) one too. The default route goes
+ *      with the old address (link_address_del()).
  *   3. a genuine change to a DIFFERENT subnet -- add first, safely, for the
  *      shortest possible address-less window; the two addresses never share
  *      a connected route, so there is no secondary/cascade risk.
  *
  * `lifetime_sec` is UINT32_MAX for a static Address=, the lease time for a
- * DHCP one. Shared by apply_static_address() and link_apply_lease().
+ * DHCP one; `metric` is the prefix route's. Shared by apply_static_address()
+ * and link_apply_lease().
  */
-static int converge_address(Link *l, const struct in_addr *want, unsigned char want_pfx, uint32_t lifetime_sec) {
+static int converge_address(
+                Link *l,
+                const struct in_addr *want,
+                unsigned char want_pfx,
+                uint32_t lifetime_sec,
+                uint32_t metric) {
         Netd *n = l->netd;
         int r;
 
         if (l->address_configured && l->address.s_addr == want->s_addr && l->prefixlen == want_pfx) {
-                r = address_add_idempotent(n->rtnl, l->ifindex, want, want_pfx, lifetime_sec);
+                r = address_add_idempotent(n->rtnl, l->ifindex, want, want_pfx, lifetime_sec, metric);
                 if (r < 0)
                         return r;
         } else if (l->address_configured && same_subnet(l->address, l->prefixlen, *want, want_pfx)) {
-                r = address_del_idempotent(n->rtnl, l->ifindex, &l->address, l->prefixlen);
+                r = link_address_del(l);
                 if (r < 0)
                         return r;
-                l->address_configured = false;
 
-                r = address_add_idempotent(n->rtnl, l->ifindex, want, want_pfx, lifetime_sec);
+                r = address_add_idempotent(n->rtnl, l->ifindex, want, want_pfx, lifetime_sec, metric);
                 if (r < 0)
                         return r;
         } else {
-                r = address_add_idempotent(n->rtnl, l->ifindex, want, want_pfx, lifetime_sec);
+                r = address_add_idempotent(n->rtnl, l->ifindex, want, want_pfx, lifetime_sec, metric);
                 if (r < 0)
                         return r;
 
@@ -161,6 +192,7 @@ static int converge_address(Link *l, const struct in_addr *want, unsigned char w
         l->address = *want;
         l->prefixlen = want_pfx;
         l->address_configured = true;
+        l->address_metric = metric;
         return 0;
 }
 
@@ -346,9 +378,7 @@ int netd_link_rtnl_handler(void *userdata, NetdRtnlLinkEvent event, const NetdRt
 /* --- static Address=/Gateway= convergence --- */
 
 static int apply_static_address(Link *l, const Network *nw) {
-        Netd *n = l->netd;
         const NetworkAddress *want;
-        int r;
 
         if (nw->n_addresses == 0) {
                 if (!l->address_configured)
@@ -364,12 +394,7 @@ static int apply_static_address(Link *l, const Network *nw) {
                 if (l->lease && network_dhcp4_enabled(nw))
                         return 0;
 
-                r = address_del_idempotent(n->rtnl, l->ifindex, &l->address, l->prefixlen);
-                if (r < 0)
-                        return r;
-
-                l->address_configured = false;
-                return 0;
+                return link_address_del(l);
         }
 
         if (nw->n_addresses > 1)
@@ -382,12 +407,15 @@ static int apply_static_address(Link *l, const Network *nw) {
         want = &nw->addresses[0];
 
         /* Already exactly right: leave it strictly alone. Reloading must not
-         * bounce a working interface (netd-link.h on link_reconfigure()). */
+         * bounce a working interface (netd-link.h on link_reconfigure()). A
+         * held lease's address keeps its metric; once DHCP= is off it is
+         * Address='s, at 0. */
         if (l->address_configured && l->address.s_addr == want->address.s_addr &&
-            l->prefixlen == want->prefixlen)
+            l->prefixlen == want->prefixlen &&
+            (l->address_metric == 0 || (l->lease && network_dhcp4_enabled(nw))))
                 return 0;
 
-        return converge_address(l, &want->address, want->prefixlen, UINT32_MAX);
+        return converge_address(l, &want->address, want->prefixlen, UINT32_MAX, 0);
 }
 
 /* Removes the default route and, if there is one, its host route. */
@@ -395,12 +423,12 @@ static int link_gateway_remove(Link *l) {
         Netd *n = l->netd;
         int r;
 
-        r = route_del_default_idempotent(n->rtnl, l->ifindex, &l->gateway, link_route_metric(l));
+        r = route_del_default_idempotent(n->rtnl, l->ifindex, &l->gateway, l->gateway_metric);
         if (r < 0)
                 return r;
 
         if (l->gateway_host_route) {
-                r = route_del_host_idempotent(n->rtnl, l->ifindex, &l->gateway, link_route_metric(l));
+                r = route_del_host_idempotent(n->rtnl, l->ifindex, &l->gateway, l->gateway_metric);
                 if (r < 0)
                         pico_log(PICO_LOG_WARNING,
                                  "netd: %s: failed to remove gateway host route: %s",
@@ -419,59 +447,188 @@ static int link_gateway_remove(Link *l) {
  * outside the interface's subnet needs a link-scope host route first, or the
  * kernel refuses the default route with ENETUNREACH (systemd c9ee0d2eeb,
  * 863293dbd3: the netmask may mask out the gateway).
+ *
+ * Adding first keeps a default route in place throughout; APPEND never
+ * collides with the old route, which is then deleted at the metric it was
+ * added with. A delete at metric 0 matches any metric at that router, so an
+ * old route at 0 to the same router goes first instead.
  */
 static int link_gateway_replace(Link *l, const struct in_addr *gw, bool host_route, bool from_lease) {
         Netd *n = l->netd;
-        uint32_t metric = link_route_metric(l);
+        uint32_t new_metric = link_route_metric(l, from_lease), old_metric = l->gateway_metric;
         struct in_addr old_gw = l->gateway;
         bool had_gateway = l->gateway_configured, had_host_route = l->gateway_host_route;
         int r;
 
+        if (had_gateway && old_metric == 0 && new_metric != 0 && old_gw.s_addr == gw->s_addr) {
+                r = link_gateway_remove(l);
+                if (r < 0)
+                        return r;
+                had_gateway = had_host_route = false;
+        }
+
         if (host_route) {
-                r = route_add_host_idempotent(n->rtnl, l->ifindex, gw, metric);
+                r = route_add_host_idempotent(n->rtnl, l->ifindex, gw, new_metric);
                 if (r < 0)
                         return r;
         }
 
-        r = route_add_default_idempotent(n->rtnl, l->ifindex, gw, metric);
+        r = route_add_default_idempotent(n->rtnl, l->ifindex, gw, new_metric);
         if (r < 0) {
                 if (host_route)
-                        (void) route_del_host_idempotent(n->rtnl, l->ifindex, gw, metric);
+                        (void) route_del_host_idempotent(n->rtnl, l->ifindex, gw, new_metric);
                 return r;
         }
 
         if (had_gateway) {
-                bool same = old_gw.s_addr == gw->s_addr;
+                bool same = old_gw.s_addr == gw->s_addr && old_metric == new_metric;
 
                 if (!same)
-                        (void) route_del_default_idempotent(n->rtnl, l->ifindex, &old_gw, metric);
+                        (void) route_del_default_idempotent(n->rtnl, l->ifindex, &old_gw, old_metric);
                 if (had_host_route && (!same || !host_route))
-                        (void) route_del_host_idempotent(n->rtnl, l->ifindex, &old_gw, metric);
+                        (void) route_del_host_idempotent(n->rtnl, l->ifindex, &old_gw, old_metric);
         }
 
         l->gateway = *gw;
         l->gateway_configured = true;
         l->gateway_host_route = host_route;
         l->gateway_from_lease = from_lease;
+        l->gateway_metric = new_metric;
         return 0;
 }
 
-static int apply_static_gateway(Link *l, const Network *nw) {
-        if (!nw->gateway_set) {
-                if (!l->gateway_configured)
-                        return 0;
+static int link_converge_static_gateway(Link *l, const Network *nw) {
+        if (!nw->gateway_set)
+                return l->gateway_configured ? link_gateway_remove(l) : 0;
 
-                /* Same as the address: with a lease held, this is its router. */
-                if (l->lease && network_dhcp4_enabled(nw))
-                        return 0;
-
-                return link_gateway_remove(l);
-        }
-
-        if (l->gateway_configured && l->gateway.s_addr == nw->gateway.s_addr)
+        /* A lease's route at this address becomes Gateway='s, as at startup. */
+        if (l->gateway_configured && l->gateway.s_addr == nw->gateway.s_addr && !l->gateway_from_lease &&
+            l->gateway_metric == link_route_metric(l, false))
                 return 0;
 
         return link_gateway_replace(l, &nw->gateway, false, false);
+}
+
+static int apply_static_gateway(Link *l, const Network *nw) {
+        /* With a lease held, its router decides, Gateway= being the fallback:
+         * link_reapply_lease_routes() settles the route. */
+        if (l->lease && network_dhcp4_enabled(nw))
+                return 0;
+
+        return link_converge_static_gateway(l, nw);
+}
+
+static int lease_get_address_prefix(DhcpLease *lease, struct in_addr *addr, unsigned char *prefixlen) {
+        int r;
+
+        r = dhcp_lease_get_address(lease, addr);
+        if (r < 0)
+                return r;
+
+        r = dhcp_lease_get_prefix(lease, NULL, prefixlen);
+        if (r < 0)
+                /* No subnet mask option in the lease: fall back to the
+                 * classful default the way a bare BOOTP reply would need to. */
+                return in4_addr_default_prefixlen(addr, prefixlen);
+
+        return 0;
+}
+
+/*
+ * A router that is also Gateway= stays static at metric 0, as it is at
+ * startup, so a lease without a router never removes it. Such a lease removes
+ * a lease's route and puts Gateway= back. Failures are only warnings.
+ */
+static void link_apply_lease_router(Link *l, DhcpLease *lease, struct in_addr addr, unsigned char prefixlen) {
+        const Network *nw = l->network;
+        const struct in_addr *routers, *router = NULL;
+        int nrouters = dhcp_lease_get_router(lease, &routers);
+        int r = 0;
+
+        for (int i = 0; i < nrouters; i++)
+                if (routers[i].s_addr != 0) {
+                        router = &routers[i];
+                        break;
+                }
+
+        if (router) {
+                bool host_route = !same_subnet(addr, prefixlen, *router, prefixlen);
+                bool from_lease = !(nw && nw->gateway_set && nw->gateway.s_addr == router->s_addr);
+
+                if (l->gateway_configured && l->gateway.s_addr == router->s_addr &&
+                    l->gateway_host_route == host_route && l->gateway_from_lease == from_lease &&
+                    l->gateway_metric == link_route_metric(l, from_lease))
+                        return;
+
+                r = link_gateway_replace(l, router, host_route, from_lease);
+                if (r < 0)
+                        pico_log(PICO_LOG_WARNING,
+                                 "netd: %s: failed to apply lease default route: %s",
+                                 l->ifname,
+                                 strerror(-r));
+                return;
+        }
+
+        if (nw)
+                r = link_converge_static_gateway(l, nw);
+        else if (l->gateway_configured)
+                r = link_gateway_remove(l);
+        if (r < 0)
+                pico_log(PICO_LOG_WARNING,
+                         "netd: %s: failed to remove lease default route: %s",
+                         l->ifname,
+                         strerror(-r));
+}
+
+/* What is left of the lease, so re-sending its address does not extend it.
+ * 0 once it has run out. */
+static uint32_t lease_remaining_sec(DhcpLease *lease) {
+        usec_t lifetime, deadline, now;
+
+        if (dhcp_lease_get_lifetime(lease, &lifetime) < 0 || lifetime == USEC_INFINITY)
+                return UINT32_MAX;
+
+        now = now_monotonic();
+        if (dhcp_lease_get_lifetime_timestamp(lease, &deadline) >= 0 && now != USEC_INFINITY)
+                lifetime = deadline > now ? deadline - now : 0;
+
+        return (uint32_t) (lifetime / USEC_PER_SEC);
+}
+
+/*
+ * A reload re-derives the held lease's routes at once, as a lease event would:
+ * a changed RouteMetric= moves them, the prefix route included (bt-pan-
+ * client.sh rewrites its file and runs `networkctl reload` for exactly that),
+ * a changed Gateway= is weighed against the lease's router, and an unchanged
+ * file changes nothing.
+ */
+static void link_reapply_lease_routes(Link *l, const Network *nw) {
+        struct in_addr addr;
+        unsigned char prefixlen;
+        uint32_t metric, life;
+        int r;
+
+        if (!l->lease || !network_dhcp4_enabled(nw))
+                return;
+
+        if (lease_get_address_prefix(l->lease, &addr, &prefixlen) < 0)
+                return;
+
+        metric = link_lease_route_metric(l);
+        life = lease_remaining_sec(l->lease);
+        if (l->address_configured && l->address.s_addr == addr.s_addr && l->prefixlen == prefixlen &&
+            l->address_metric != metric && life > 0) {
+                r = address_add_idempotent(l->netd->rtnl, l->ifindex, &addr, prefixlen, life, metric);
+                if (r < 0)
+                        pico_log(PICO_LOG_WARNING,
+                                 "netd: %s: failed to move the prefix route: %s",
+                                 l->ifname,
+                                 strerror(-r));
+                else
+                        l->address_metric = metric;
+        }
+
+        link_apply_lease_router(l, l->lease, addr, prefixlen);
 }
 
 /* Defined near link_deconfigure() below. */
@@ -928,12 +1085,18 @@ static int link_configure_impl(Link *l) {
                 return r;
         }
 
+        /* With DHCP on, a Gateway= not reachable yet (no Address= in its
+         * subnet) must not stop the client: the next lease retries it. */
         r = apply_static_gateway(l, nw);
         if (r < 0) {
                 pico_log(PICO_LOG_WARNING, "netd: %s: failed to apply Gateway=: %s", l->ifname, strerror(-r));
-                l->state = LINK_FAILED;
-                return r;
+                if (!network_dhcp4_enabled(nw)) {
+                        l->state = LINK_FAILED;
+                        return r;
+                }
         }
+
+        link_reapply_lease_routes(l, nw);
 
         /*
          * DHCPv4 client. Starting it is not itself convergence: nothing is
@@ -955,9 +1118,15 @@ static int link_configure_impl(Link *l) {
                 }
                 if (!l->lease)
                         converged = false;
-        } else if (l->dhcp_client)
-                /* DHCP= was removed by a reload: stop asking. */
+        } else {
+                /* DHCP= was removed by a reload: stop asking, and forget the
+                 * lease so turning DHCP= back on does not route through it. */
                 link_stop_dhcp_client(l);
+                if (l->lease) {
+                        (void) link_remove_lease_file(l);
+                        l->lease = dhcp_lease_unref(l->lease);
+                }
+        }
 
         /*
          * DHCPv4 server. Unlike the client, starting it *is* full convergence
@@ -1246,18 +1415,9 @@ int link_apply_lease(Link *l, DhcpLease *lease) {
 
         l->applying_lease = true;
 
-        r = dhcp_lease_get_address(lease, &addr);
+        r = lease_get_address_prefix(lease, &addr, &prefixlen);
         if (r < 0)
                 goto fail;
-
-        r = dhcp_lease_get_prefix(lease, NULL, &prefixlen);
-        if (r < 0) {
-                /* No subnet mask option in the lease: fall back to the
-                 * classful default the way a bare BOOTP reply would need to. */
-                r = in4_addr_default_prefixlen(&addr, &prefixlen);
-                if (r < 0)
-                        goto fail;
-        }
 
         if (dhcp_lease_get_lifetime(lease, &lifetime) >= 0 && lifetime != USEC_INFINITY)
                 lifetime_sec = (uint32_t) (lifetime / USEC_PER_SEC);
@@ -1270,45 +1430,11 @@ int link_apply_lease(Link *l, DhcpLease *lease) {
          * converge_address() decides from the addresses themselves, so the
          * event is not needed here.
          */
-        r = converge_address(l, &addr, prefixlen, lifetime_sec);
+        r = converge_address(l, &addr, prefixlen, lifetime_sec, link_lease_route_metric(l));
         if (r < 0)
                 goto fail;
 
-        {
-                const struct in_addr *routers;
-                const struct in_addr *router = NULL;
-                int nrouters = dhcp_lease_get_router(lease, &routers);
-
-                for (int i = 0; i < nrouters; i++)
-                        if (routers[i].s_addr != 0) {
-                                router = &routers[i];
-                                break;
-                        }
-
-                if (router) {
-                        bool host_route = !same_subnet(addr, prefixlen, *router, prefixlen);
-
-                        if (!l->gateway_configured || l->gateway.s_addr != router->s_addr ||
-                            l->gateway_host_route != host_route) {
-                                int rr = link_gateway_replace(l, router, host_route, true);
-
-                                if (rr < 0)
-                                        pico_log(PICO_LOG_WARNING,
-                                                 "netd: %s: failed to apply lease default route: %s",
-                                                 l->ifname,
-                                                 strerror(-rr));
-                        }
-                } else if (l->gateway_configured && l->gateway_from_lease) {
-                        /* The renewed lease dropped the router. */
-                        int rr = link_gateway_remove(l);
-
-                        if (rr < 0)
-                                pico_log(PICO_LOG_WARNING,
-                                         "netd: %s: failed to remove lease default route: %s",
-                                         l->ifname,
-                                         strerror(-rr));
-                }
-        }
+        link_apply_lease_router(l, lease, addr, prefixlen);
 
         old = l->lease;
         l->lease = lease; /* takes ownership, per netd-link.h */
@@ -1386,6 +1512,24 @@ int link_lose_lease(Link *l) {
 
         l->applying_lease = true;
         r = link_teardown_kernel_state(l);
+
+        /* The teardown took the one address and route slot, static or not. */
+        if (l->network) {
+                int rr = apply_static_address(l, l->network);
+
+                if (rr < 0)
+                        pico_log(PICO_LOG_WARNING,
+                                 "netd: %s: failed to apply Address=: %s",
+                                 l->ifname,
+                                 strerror(-rr));
+                rr = apply_static_gateway(l, l->network);
+                if (rr < 0)
+                        pico_log(PICO_LOG_WARNING,
+                                 "netd: %s: failed to apply Gateway=: %s",
+                                 l->ifname,
+                                 strerror(-rr));
+        }
+
         l->state = LINK_CONFIGURING;
         l->applying_lease = false;
         link_lldp_update_address(l);

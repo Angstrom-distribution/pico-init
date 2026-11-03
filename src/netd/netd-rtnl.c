@@ -532,7 +532,8 @@ int netd_rtnl_address_add(
                 const struct in_addr *address,
                 unsigned char prefixlen,
                 const struct in_addr *broadcast,
-                uint32_t lifetime_sec) {
+                uint32_t lifetime_sec,
+                uint32_t route_metric) {
 
         struct nl_request req;
         struct nlmsghdr *nlh;
@@ -583,6 +584,10 @@ int netd_rtnl_address_add(
         ci.ifa_valid = lifetime_sec;
 
         r = nl_add_attr(&req, IFA_CACHEINFO, &ci, sizeof(ci));
+        if (r < 0)
+                return r;
+
+        r = nl_add_attr(&req, IFA_RT_PRIORITY, &route_metric, sizeof(route_metric));
         if (r < 0)
                 return r;
 
@@ -690,7 +695,7 @@ int netd_rtnl_route_add(
 
         r = build_route(&req,
                         RTM_NEWROUTE,
-                        NLM_F_REQUEST | NLM_F_CREATE | NLM_F_REPLACE | NLM_F_ACK,
+                        NLM_F_REQUEST | NLM_F_CREATE | NLM_F_APPEND | NLM_F_ACK,
                         ifindex,
                         destination,
                         prefixlen,
