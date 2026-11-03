@@ -91,8 +91,15 @@
  *    Restart=. 255, a signal or one of pico-init's own setup exit codes
  *    fails it as ExecStartPre= would.
  *
- * Not backported: running ExecReload= (it is parsed and stored, but
- * nothing asks a single unit to reload yet), Type=dbus/idle, the watchdog,
+ *  - ExecReload=, modern upstream's SERVICE_RELOAD without the reload
+ *    signal, RELOADING=1 or PIDFile= re-read: from RUNNING or EXITED every
+ *    line runs in turn as the control process with $MAINPID set, the main
+ *    process untouched. The outcome goes to reload_result, never to result,
+ *    so a failed reload fails its job but leaves the unit up and Restart=
+ *    out of it (upstream's service_reload_finish()). TimeoutStartSec=
+ *    bounds the whole chain, and its expiry kills the running line only.
+ *
+ * Not backported: Type=dbus/idle, the watchdog,
  * cgroup accounting/resource-control directives, D-Bus property change
  * signals -- none of it has a field in service.h.
  *
@@ -226,6 +233,7 @@ static void service_timer_start_timeout(void *userdata, usec_t now);
 static void service_timer_exec_stop_timeout(void *userdata, usec_t now);
 static void service_timer_stop_timeout(void *userdata, usec_t now);
 static void service_timer_stop_post_timeout(void *userdata, usec_t now);
+static void service_timer_reload_timeout(void *userdata, usec_t now);
 static void service_timer_restart(void *userdata, usec_t now);
 
 /* timer.h's rule: a caller with an infinite timeout skips
@@ -720,7 +728,7 @@ static void service_set_state(Service *s, ServiceState state) {
         /* Sampled before unit_notify(), which may complete and clear the job. */
         had_job = UNIT(s)->job != NULL;
 
-        unit_notify(UNIT(s), old_active, new_active);
+        unit_notify(UNIT(s), old_active, new_active, s->reload_result == SERVICE_SUCCESS);
 
         /*
          * Upstream's retroactive Conflicts= stop (unit.c, on an "unexpected"
@@ -1001,6 +1009,53 @@ static void service_enter_running(Service *s) {
         service_enter_exec_stop(s);
 }
 
+/* Upstream's service_reload_finish(): the first failure is the reload's
+ * result, and the unit goes back to wherever service_enter_running() puts
+ * it -- RUNNING or EXITED, or down if the main process left meanwhile. */
+static void service_reload_finish(Service *s, ServiceResult f) {
+        if (s->reload_result == SERVICE_SUCCESS)
+                s->reload_result = f;
+
+        /* The main process left during the reload: reap the cgroup as the
+         * RUNNING exit path does, before ExecStop= runs. */
+        if (s->main_pid == 0)
+                service_reap_cgroup_remainder(s);
+
+        service_enter_running(s);
+}
+
+/* Spawns ExecReload= line exec_reload_idx as the control process. */
+static void service_run_exec_reload(Service *s) {
+        int r;
+
+        r = service_spawn(s, s->exec_reload[s->exec_reload_idx].argv, &s->control_pid);
+        if (r < 0) {
+                pico_log(PICO_LOG_ERR, "%s: failed to spawn ExecReload=: %s", UNIT(s)->id, strerror(-r));
+                service_reload_finish(s, SERVICE_FAILURE_RESOURCES);
+        }
+}
+
+int service_reload(Service *s) {
+        if (!s)
+                return -EINVAL;
+
+        if (s->n_exec_reload == 0)
+                return -EALREADY;
+
+        if ((s->state != SERVICE_RUNNING && s->state != SERVICE_EXITED) || s->control_pid != 0)
+                return -EAGAIN;
+
+        service_timer_reset(s);
+
+        s->reload_result = SERVICE_SUCCESS;
+        s->reload_stopped = false;
+        s->exec_reload_idx = 0;
+        service_set_state(s, SERVICE_RELOAD);
+        service_arm_timeout(s, s->timeout_start_usec, service_timer_reload_timeout);
+        service_run_exec_reload(s);
+        return 0;
+}
+
 static void service_enter_start(Service *s) {
         int r;
 
@@ -1154,6 +1209,8 @@ static int service_do_start(Service *s) {
         }
 
         s->result = SERVICE_SUCCESS;
+        s->reload_result = SERVICE_SUCCESS;
+        s->reload_stopped = false;
 
         /* A fresh start must not carry READY/STATUS over from a previous
          * run (see service.h). */
@@ -1187,6 +1244,7 @@ int service_start(Service *s) {
         case SERVICE_EXEC_START:
         case SERVICE_RUNNING:
         case SERVICE_EXITED:
+        case SERVICE_RELOAD:
                 return 0; /* already starting or started */
 
         case SERVICE_EXEC_STOP:
@@ -1237,9 +1295,12 @@ int service_stop(Service *s) {
         case SERVICE_CONDITION:
         case SERVICE_START_PRE:
         case SERVICE_EXEC_START:
-                /* Something is still starting: signal it at once, no
-                 * ExecStop= for a run that never completed (upstream's
-                 * service_stop() does the same). */
+        case SERVICE_RELOAD:
+                /* Something is still starting or reloading: signal it at
+                 * once, no ExecStop= (upstream's service_stop() does the
+                 * same for both). */
+                if (s->state == SERVICE_RELOAD)
+                        s->reload_stopped = true;
                 s->forbid_restart = true;
                 service_enter_stop(s);
                 return 0;
@@ -1284,6 +1345,8 @@ static const char *service_command_name(Service *s, bool is_control) {
                 return "ExecCondition";
         if (s->state == SERVICE_START_PRE)
                 return "ExecStartPre";
+        if (s->state == SERVICE_RELOAD)
+                return "ExecReload";
         if (s->state == SERVICE_EXEC_STOP)
                 return "ExecStop";
         if (s->state == SERVICE_STOP_POST)
@@ -1291,13 +1354,15 @@ static const char *service_command_name(Service *s, bool is_control) {
         return "ExecStart"; /* Type=forking's parent */
 }
 
-/* The "-" flag of the ExecCondition=/ExecStartPre=/ExecStopPost= line now
- * running as the control process. */
+/* The "-" flag of the ExecCondition=/ExecStartPre=/ExecReload=/ExecStopPost=
+ * line now running as the control process. */
 static bool service_list_command_ignore(Service *s) {
         if (s->state == SERVICE_CONDITION)
                 return s->exec_condition[s->exec_condition_idx].ignore;
         if (s->state == SERVICE_START_PRE && s->exec_start_pre_idx < s->n_exec_start_pre)
                 return s->exec_start_pre[s->exec_start_pre_idx].ignore;
+        if (s->state == SERVICE_RELOAD && s->exec_reload_idx < s->n_exec_reload)
+                return s->exec_reload[s->exec_reload_idx].ignore;
         if (s->state == SERVICE_STOP_POST && s->exec_stop_post_idx < s->n_exec_stop_post)
                 return s->exec_stop_post[s->exec_stop_post_idx].ignore;
         return false;
@@ -1331,9 +1396,9 @@ static void format_exit_status(char *buf, size_t size, int code, int status) {
  */
 void service_sigchld_event(Service *s, pid_t pid, int code, int status) {
         char statusbuf[64];
-        bool is_main, is_control;
+        bool is_main, is_control, reload;
         PicoExitClean clean;
-        ServiceResult f;
+        ServiceResult f, *shown;
 
         if (!s)
                 return;
@@ -1354,6 +1419,10 @@ void service_sigchld_event(Service *s, pid_t pid, int code, int status) {
                  (is_control && !(s->state == SERVICE_EXEC_START && s->type == SERVICE_TYPE_FORKING))) ?
                         PICO_EXIT_CLEAN_COMMAND :
                         PICO_EXIT_CLEAN_DAEMON;
+
+        /* The stop killed this reload command; its SIGTERM is not a failure. */
+        if (is_control && s->reload_stopped && s->state == SERVICE_STOP)
+                clean = PICO_EXIT_CLEAN_DAEMON;
 
         if (pico_is_clean_exit(code, status, clean))
                 f = SERVICE_SUCCESS;
@@ -1405,23 +1474,27 @@ void service_sigchld_event(Service *s, pid_t pid, int code, int status) {
 
         /* a0fef983ab: write-once -- the *first* failure wins, not the
          * last. A watchdog-style timeout that goes on to SIGABRT the
-         * service must report the timeout, not the coredump it caused. */
-        if (s->result == SERVICE_SUCCESS)
-                s->result = f;
+         * service must report the timeout, not the coredump it caused.
+         * A reload command's outcome is the reload's alone (upstream skips
+         * this write in SERVICE_RELOAD), so it can never fail the unit. */
+        reload = is_control && s->state == SERVICE_RELOAD;
+        shown = reload ? &s->reload_result : &s->result;
+        if (*shown == SERVICE_SUCCESS)
+                *shown = f;
 
         /* v30 logs through log_full() at NOTICE when the unit failed and DEBUG
          * otherwise, so a failure is visible on a serial console. The level
-         * follows s->result rather than the local f, to agree with the
-         * result= this line prints: under the write-once rule an earlier
+         * follows the stored result rather than the local f, to agree with
+         * the result= this line prints: under the write-once rule an earlier
          * failure survives a later clean exit. */
         format_exit_status(statusbuf, sizeof statusbuf, code, status);
-        pico_log(service_result_is_failure(s->result) ? PICO_LOG_WARNING : PICO_LOG_DEBUG,
+        pico_log(service_result_is_failure(*shown) ? PICO_LOG_WARNING : PICO_LOG_DEBUG,
                  "%s: %s process exited, code=%s, status=%s, result=%s",
                  UNIT(s)->id,
                  is_control ? "control" : "main",
                  sigchld_code_to_string(code),
                  statusbuf,
-                 service_result_to_string(s->result));
+                 service_result_to_string(*shown));
 
         if (is_control) {
                 if (s->state == SERVICE_CONDITION) {
@@ -1478,6 +1551,22 @@ void service_sigchld_event(Service *s, pid_t pid, int code, int status) {
                                 service_forking_locate_main_pid(s);
                         s->control_pid = 0;
                         service_enter_running(s); /* s->result routes the failure case */
+                } else if (reload) {
+                        /* ExecStop='s chain rule, but a failure only ends
+                         * the reload: the unit goes back up either way. */
+                        s->control_pid = 0;
+                        if (f == SERVICE_SUCCESS && s->exec_reload_idx + 1 < s->n_exec_reload) {
+                                s->exec_reload_idx++;
+                                service_run_exec_reload(s);
+                                return;
+                        }
+
+                        if (f != SERVICE_SUCCESS && s->exec_reload_idx < s->n_exec_reload)
+                                pico_log(PICO_LOG_WARNING,
+                                         "%s: ExecReload= command %s failed",
+                                         UNIT(s)->id,
+                                         s->exec_reload[s->exec_reload_idx].argv[0]);
+                        service_reload_finish(s, f);
                 } else if (s->state == SERVICE_EXEC_STOP) {
                         /* The next line only after a success, as with v30's
                          * control_command_next; a failure (already logged
@@ -1572,6 +1661,10 @@ void service_sigchld_event(Service *s, pid_t pid, int code, int status) {
                 break;
 
         default:
+                /* SERVICE_RELOAD lands here on purpose: the exit is
+                 * recorded above, and the reload command's own SIGCHLD
+                 * ends the reload through service_enter_running(), which
+                 * then sees main_pid gone, as upstream waits for it. */
                 break;
         }
 }
@@ -1757,6 +1850,31 @@ static void service_timer_stop_post_timeout(void *userdata, usec_t now) {
                 service_enter_dead(s);
 }
 
+/*
+ * TimeoutStartSec= over the ExecReload= chain, as systemd.service(5) has it.
+ * Only the running line is killed, never the cgroup: that is the daemon the
+ * reload was meant to keep running. KillMode= and SendSIGKILL= do not apply,
+ * as for upstream's service_kill_control_process(). The SIGCHLD of the
+ * killed line ends the reload.
+ */
+static void service_timer_reload_timeout(void *userdata, usec_t now) {
+        Service *s = userdata;
+        (void) now;
+
+        pico_log(PICO_LOG_WARNING, "%s: reload operation timed out, killing the reload command", UNIT(s)->id);
+
+        if (s->reload_result == SERVICE_SUCCESS)
+                s->reload_result = SERVICE_FAILURE_TIMEOUT;
+
+        /* One past the last line, as for ExecStopPost='s timeout. */
+        s->exec_reload_idx = s->n_exec_reload;
+
+        if (control_pid_good(s) > 0)
+                (void) kill(s->control_pid, SIGKILL);
+        else
+                service_reload_finish(s, SERVICE_FAILURE_TIMEOUT);
+}
+
 static void service_timer_restart(void *userdata, usec_t now) {
         Service *s = userdata;
         (void) now;
@@ -1863,11 +1981,17 @@ const char *service_type_to_string(ServiceType t) {
  * here; a missing one would leave service_state_to_string() returning NULL
  * for a state main.c's own logging paths can reach. */
 static const char * const service_state_table[_SERVICE_STATE_MAX] = {
-        [SERVICE_DEAD] = "dead",           [SERVICE_CONDITION] = "condition",
-        [SERVICE_START_PRE] = "start-pre", [SERVICE_EXEC_START] = "exec-start",
-        [SERVICE_RUNNING] = "running",     [SERVICE_EXITED] = "exited",
-        [SERVICE_EXEC_STOP] = "exec-stop", [SERVICE_STOP] = "stop",
-        [SERVICE_STOP_POST] = "stop-post", [SERVICE_AUTO_RESTART] = "auto-restart",
+        [SERVICE_DEAD] = "dead",
+        [SERVICE_CONDITION] = "condition",
+        [SERVICE_START_PRE] = "start-pre",
+        [SERVICE_EXEC_START] = "exec-start",
+        [SERVICE_RUNNING] = "running",
+        [SERVICE_EXITED] = "exited",
+        [SERVICE_RELOAD] = "reload",
+        [SERVICE_EXEC_STOP] = "exec-stop",
+        [SERVICE_STOP] = "stop",
+        [SERVICE_STOP_POST] = "stop-post",
+        [SERVICE_AUTO_RESTART] = "auto-restart",
         [SERVICE_FAILED] = "failed",
 };
 
@@ -1994,6 +2118,7 @@ static void service_init(Unit *u) {
         s->type = SERVICE_TYPE_SIMPLE;
         s->state = SERVICE_DEAD;
         s->result = SERVICE_SUCCESS;
+        s->reload_result = SERVICE_SUCCESS;
         s->restart = SERVICE_RESTART_NO;
         s->restart_usec = PICO_DEFAULT_RESTART_USEC;
         s->timeout_start_usec = PICO_DEFAULT_TIMEOUT_USEC;
@@ -2065,6 +2190,15 @@ static int service_stop_thunk(Unit *u) {
         return service_stop(SERVICE(u));
 }
 
+static int service_reload_thunk(Unit *u) {
+        return service_reload(SERVICE(u));
+}
+
+/* Upstream's service_can_reload(), minus Type=notify-reload's signal. */
+static bool service_can_reload_thunk(Unit *u) {
+        return SERVICE(u)->n_exec_reload > 0;
+}
+
 static UnitActiveState service_active_state_of(ServiceState state, bool remain_after_exit) {
         switch (state) {
         case SERVICE_DEAD:
@@ -2078,6 +2212,9 @@ static UnitActiveState service_active_state_of(ServiceState state, bool remain_a
 
         case SERVICE_RUNNING:
                 return UNIT_ACTIVE;
+
+        case SERVICE_RELOAD:
+                return UNIT_RELOADING;
 
         case SERVICE_EXITED:
                 /* Active only with RemainAfterExit=, which is how a
@@ -2112,4 +2249,6 @@ const UnitVTable service_vtable = {
         .start = service_start_thunk,
         .stop = service_stop_thunk,
         .active_state = service_active_state_thunk,
+        .reload = service_reload_thunk,
+        .can_reload = service_can_reload_thunk,
 };

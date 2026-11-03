@@ -322,6 +322,7 @@ static void publish_unit_file(Unit *u) {
                 "UnitFileState=%s\n"
                 "MainPID=%d\n"
                 "Result=%s\n"
+                "ReloadResult=%s\n"
                 "ExecMainCode=%s\n"
                 "ExecMainStatus=%d\n"
                 "NRestarts=%u\n"
@@ -344,6 +345,7 @@ static void publish_unit_file(Unit *u) {
                  * ExecMainCode/Status for a unit that has since failed. */
                 s ? (int) s->exec_main_pid : 0,
                 s ? service_result_to_string(s->result) : "success",
+                s ? service_result_to_string(s->reload_result) : "success",
                 s ? exec_main_code_to_string(s->main_exit_code) : "",
                 s ? s->main_exit_status : 0,
                 s ? s->n_restarts : 0u,

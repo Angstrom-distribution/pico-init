@@ -329,7 +329,36 @@ int unit_stop(Unit *u) {
         return u->vtable->stop(u);
 }
 
-void unit_notify(Unit *u, UnitActiveState old_state, UnitActiveState new_state) {
+bool unit_can_reload(Unit *u) {
+        if (!u || !u->vtable || !u->vtable->reload || !u->vtable->can_reload)
+                return false;
+
+        return u->load_state == UNIT_LOADED && u->vtable->can_reload(u);
+}
+
+int unit_run_reload(Unit *u) {
+        UnitActiveState st;
+
+        if (!u)
+                return -EINVAL;
+
+        /* Upstream's -EBADR, which ends the job as skipped: done here. */
+        if (!unit_can_reload(u))
+                return -EALREADY;
+
+        st = unit_active_state(u);
+        if (st == UNIT_RELOADING)
+                return -EAGAIN;
+
+        if (st != UNIT_ACTIVE) {
+                pico_log(PICO_LOG_WARNING, "%s: cannot be reloaded because it is inactive", u->id);
+                return -ENOEXEC;
+        }
+
+        return u->vtable->reload(u);
+}
+
+void unit_notify(Unit *u, UnitActiveState old_state, UnitActiveState new_state, bool reload_success) {
         Job *j;
 
         if (!u || old_state == new_state)
@@ -404,6 +433,26 @@ void unit_notify(Unit *u, UnitActiveState old_state, UnitActiveState new_state) 
                         job_finish(j, JOB_DONE);
                 break;
 
+        case JOB_RELOAD:
+                /*
+                 * Upstream's JOB_RELOAD arm. Back to ACTIVE is the reload
+                 * ending, unless a second request merged in while it ran
+                 * (job_install()): then the same job runs the reload again,
+                 * so that request sees a reload that started after it. Any
+                 * other way out means the unit went down under the reload.
+                 */
+                if (new_state == UNIT_ACTIVE) {
+                        if (j->reload_again) {
+                                j->reload_again = false;
+                                j->state = JOB_WAITING;
+                                job_add_to_run_queue(j);
+                                break;
+                        }
+                        job_finish(j, reload_success ? JOB_DONE : JOB_FAILED);
+                } else if (new_state != UNIT_ACTIVATING && new_state != UNIT_RELOADING)
+                        job_finish(j, reload_success ? JOB_CANCELED : JOB_FAILED);
+                break;
+
         default:
                 break;
         }
@@ -437,8 +486,8 @@ const char *unit_load_state_to_string(UnitLoadState s) {
 }
 
 static const char * const unit_active_state_table[_UNIT_ACTIVE_STATE_MAX] = {
-        [UNIT_INACTIVE] = "inactive",         [UNIT_ACTIVATING] = "activating", [UNIT_ACTIVE] = "active",
-        [UNIT_DEACTIVATING] = "deactivating", [UNIT_FAILED] = "failed",
+        [UNIT_INACTIVE] = "inactive",   [UNIT_ACTIVATING] = "activating",     [UNIT_ACTIVE] = "active",
+        [UNIT_RELOADING] = "reloading", [UNIT_DEACTIVATING] = "deactivating", [UNIT_FAILED] = "failed",
 };
 
 const char *unit_active_state_to_string(UnitActiveState s) {

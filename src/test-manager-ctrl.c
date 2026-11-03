@@ -755,6 +755,8 @@ static void test_malformed_requests_rejected_without_allocating(void) {
                         f.m, f.rtdir, "PICO1 start demo.service --no-block extra", "err malformed\n", 100);
         ctrl_roundtrip_assert(
                         f.m, f.rtdir, "PICO1 reset-failed demo.service --no-block", "err malformed\n", 100);
+        ctrl_roundtrip_assert(
+                        f.m, f.rtdir, "PICO1 reload demo.service --no-block extra", "err malformed\n", 100);
         ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 start typo.service", "err no-such-unit\n", 100);
 
         /* oversized: a single message whose real length (reported via
@@ -1026,6 +1028,407 @@ static void test_start_template_is_refused(void) {
         ctrl_fixture_teardown(&f);
 }
 
+/* --- reload verbs --- */
+
+/* Lines in <dir>/<name>; 0 when the file is not there. */
+static int count_lines(const char *dir, const char *name) {
+        char path[PATH_MAX];
+        int c, n = 0;
+        FILE *fp;
+
+        snprintf(path, sizeof(path), "%s/%s", dir, name);
+        fp = fopen(path, "re");
+        if (!fp)
+                return 0;
+        while ((c = fgetc(fp)) != EOF)
+                if (c == '\n')
+                        n++;
+        fclose(fp);
+        return n;
+}
+
+/* A unit that runs a reload counted in <unitdir>/<counter>. */
+static void write_reloadable(struct ctrl_fixture *f, const char *name, const char *counter, const char *pre) {
+        char unit[2 * PATH_MAX];
+
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Service]\nType=simple\nExecStart=/bin/sleep 300\n"
+                 "ExecReload=/bin/sh -c \"%secho r >> %s/%s\"\n",
+                 pre,
+                 f->unitdir,
+                 counter);
+        ASSERT_EQ_INT(test_write_file(f->unitdir, name, unit), 0);
+}
+
+static bool ctrl_unit_settled_done(void *userdata) {
+        Unit *u = userdata;
+
+        return u->job == NULL;
+}
+
+static bool ctrl_unit_reloading_done(void *userdata) {
+        return unit_active_state(userdata) == UNIT_RELOADING;
+}
+
+static bool ctrl_unit_down_done(void *userdata) {
+        Unit *u = userdata;
+        UnitActiveState st = unit_active_state(u);
+
+        return u->job == NULL && (st == UNIT_INACTIVE || st == UNIT_FAILED);
+}
+
+/* The state file holds `line`, a whole "Name=value\n" line. */
+static bool state_file_has(struct ctrl_fixture *f, const char *unit, const char *line) {
+        char path[PATH_MAX], buf[4096];
+        size_t n;
+        FILE *fp;
+
+        snprintf(path, sizeof(path), "%s/units/%s", f->rtdir, unit);
+        fp = fopen(path, "re");
+        if (!fp)
+                return false;
+        n = fread(buf, 1, sizeof(buf) - 1, fp);
+        buf[n] = '\0';
+        fclose(fp);
+        return strstr(buf, line) != NULL;
+}
+
+/*
+ * reload end to end: refused as "invalid" on an inactive unit, done on an
+ * active one with the daemon untouched, "ok queued" with --no-block,
+ * "not-applicable" without ExecReload= or on a target, "no-such-unit"
+ * without loading anything, and "failed" when ExecReload= fails -- with the
+ * unit still active and only ReloadResult= saying so.
+ */
+static void test_reload_verbs(void) {
+        struct ctrl_fixture f;
+        Unit *u, *bad;
+        pid_t main_pid;
+        size_t n_before;
+
+        ctrl_fixture_setup(&f);
+        write_reloadable(&f, "demo.service", "reloads", "");
+        ASSERT_EQ_INT(test_write_file(f.unitdir, "plain.service", "[Service]\nExecStart=/bin/sleep 300\n"), 0);
+        ASSERT_EQ_INT(test_write_file(f.unitdir,
+                                      "bad.service",
+                                      "[Service]\nExecStart=/bin/sleep 300\nExecReload=/bin/false\n"),
+                      0);
+        ctrl_fixture_boot(&f);
+
+        u = manager_get_unit(f.m, "demo.service");
+        bad = manager_get_unit(f.m, "bad.service");
+        ASSERT_TRUE(u != NULL && bad != NULL);
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 reload demo.service", "err invalid\n", 400);
+        ASSERT_EQ_INT(unit_active_state(u), UNIT_INACTIVE);
+        ASSERT_TRUE(u->job == NULL);
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 start demo.service", "ok done\n", 400);
+        main_pid = SERVICE(u)->main_pid;
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 reload demo.service", "ok done\n", 400);
+        ASSERT_EQ_INT(count_lines(f.unitdir, "reloads"), 1);
+        ASSERT_EQ_INT(SERVICE(u)->main_pid, main_pid);
+        ASSERT_EQ_INT(unit_active_state(u), UNIT_ACTIVE);
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 reload demo.service --no-block", "ok queued\n", 100);
+        ASSERT_TRUE(drive_until(f.m, ctrl_unit_settled_done, u, 400));
+        ASSERT_EQ_INT(count_lines(f.unitdir, "reloads"), 2);
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 reload plain.service", "err not-applicable\n", 100);
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 reload default.target", "err not-applicable\n", 100);
+
+        n_before = f.m->n_units;
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 reload nosuch.service", "err no-such-unit\n", 100);
+        ASSERT_EQ_INT((long long) f.m->n_units, (long long) n_before);
+        ASSERT_TRUE(manager_get_unit(f.m, "nosuch.service") == NULL);
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 start bad.service", "ok done\n", 400);
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 reload bad.service", "err failed\n", 400);
+        ASSERT_EQ_INT(unit_active_state(bad), UNIT_ACTIVE);
+        ASSERT_TRUE(state_file_has(&f, "bad.service", "\nResult=success\n"));
+        ASSERT_TRUE(state_file_has(&f, "bad.service", "\nReloadResult=exit-code\n"));
+        ASSERT_TRUE(state_file_has(&f, "demo.service", "\nReloadResult=success\n"));
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 stop demo.service", "ok done\n", 800);
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 stop bad.service", "ok done\n", 800);
+        ctrl_fixture_teardown(&f);
+}
+
+/*
+ * reload-or-restart reloads an active reloadable unit, restarts one without
+ * ExecReload=, starts an inactive one, and loads a template instance to do
+ * it. try-reload-or-restart does the same to a unit that is up and nothing
+ * to one that is not.
+ */
+static void test_reload_or_restart_variants(void) {
+        struct ctrl_fixture f;
+        Unit *u, *plain, *inst;
+        pid_t pid;
+
+        ctrl_fixture_setup(&f);
+        write_reloadable(&f, "demo.service", "reloads", "");
+        write_reloadable(&f, "rl@.service", "rl-reloads", "");
+        ASSERT_EQ_INT(test_write_file(f.unitdir, "plain.service", "[Service]\nExecStart=/bin/sleep 300\n"), 0);
+        ctrl_fixture_boot(&f);
+
+        u = manager_get_unit(f.m, "demo.service");
+        plain = manager_get_unit(f.m, "plain.service");
+        ASSERT_TRUE(u != NULL && plain != NULL);
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 reload-or-restart demo.service", "ok done\n", 400);
+        ASSERT_EQ_INT(unit_active_state(u), UNIT_ACTIVE);
+        ASSERT_EQ_INT(count_lines(f.unitdir, "reloads"), 0);
+
+        pid = SERVICE(u)->main_pid;
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 reload-or-restart demo.service", "ok done\n", 400);
+        ASSERT_EQ_INT(SERVICE(u)->main_pid, pid);
+        ASSERT_EQ_INT(count_lines(f.unitdir, "reloads"), 1);
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 start plain.service", "ok done\n", 400);
+        pid = SERVICE(plain)->main_pid;
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 reload-or-restart plain.service", "ok done\n", 800);
+        ASSERT_EQ_INT(unit_active_state(plain), UNIT_ACTIVE);
+        ASSERT_TRUE(SERVICE(plain)->main_pid > 0 && SERVICE(plain)->main_pid != pid);
+
+        ASSERT_TRUE(manager_get_unit(f.m, "rl@a.service") == NULL);
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 reload-or-restart rl@a.service", "ok done\n", 400);
+        inst = manager_get_unit(f.m, "rl@a.service");
+        ASSERT_TRUE(inst != NULL);
+        ASSERT_EQ_INT(unit_active_state(inst), UNIT_ACTIVE);
+        ASSERT_EQ_INT(count_lines(f.unitdir, "rl-reloads"), 0);
+
+        /* try-reload-or-restart: active reloadable reloads, active plain
+         * restarts, anything down is left alone. */
+        pid = SERVICE(u)->main_pid;
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 try-reload-or-restart demo.service", "ok done\n", 400);
+        ASSERT_EQ_INT(SERVICE(u)->main_pid, pid);
+        ASSERT_EQ_INT(count_lines(f.unitdir, "reloads"), 2);
+
+        pid = SERVICE(plain)->main_pid;
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 try-reload-or-restart plain.service", "ok done\n", 800);
+        ASSERT_TRUE(SERVICE(plain)->main_pid > 0 && SERVICE(plain)->main_pid != pid);
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 stop demo.service", "ok done\n", 800);
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 stop plain.service", "ok done\n", 800);
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 try-reload-or-restart demo.service", "ok done\n", 100);
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 try-reload-or-restart plain.service", "ok done\n", 100);
+        ASSERT_EQ_INT(unit_active_state(u), UNIT_INACTIVE);
+        ASSERT_EQ_INT(unit_active_state(plain), UNIT_INACTIVE);
+        ASSERT_TRUE(u->job == NULL && plain->job == NULL);
+        ASSERT_EQ_INT(count_lines(f.unitdir, "reloads"), 2);
+
+        ctrl_roundtrip_assert(
+                        f.m, f.rtdir, "PICO1 try-reload-or-restart rl@b.service", "err no-such-unit\n", 100);
+        ASSERT_TRUE(manager_get_unit(f.m, "rl@b.service") == NULL);
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 stop rl@a.service", "ok done\n", 800);
+        ctrl_fixture_teardown(&f);
+}
+
+/* test_start_refused_while_shutting_down()'s shape for the reload verbs. */
+static void test_reload_refused_while_shutting_down(void) {
+        struct ctrl_fixture f;
+        Unit *u, *hold;
+
+        ctrl_fixture_setup(&f);
+        write_reloadable(&f, "demo.service", "reloads", "");
+        ASSERT_EQ_INT(test_write_file(f.unitdir,
+                                      "hold.service",
+                                      "[Unit]\n[Service]\nType=oneshot\nExecStart=/bin/sleep 30\n"),
+                      0);
+        ctrl_fixture_boot(&f);
+
+        u = manager_get_unit(f.m, "demo.service");
+        hold = manager_get_unit(f.m, "hold.service");
+        ASSERT_TRUE(u != NULL && hold != NULL);
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 start demo.service", "ok done\n", 400);
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 start hold.service --no-block", "ok queued\n", 100);
+        drive_until_service_state(f.m, hold, SERVICE_EXEC_START);
+        f.m->pending_objective = MANAGER_POWEROFF;
+        f.m->shutdown_deadline = now_monotonic() + 60 * USEC_PER_SEC;
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 reload demo.service", "err shutting-down\n", 100);
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 reload-or-restart demo.service", "err shutting-down\n", 100);
+        ctrl_roundtrip_assert(
+                        f.m, f.rtdir, "PICO1 try-reload-or-restart demo.service", "err shutting-down\n", 100);
+        ASSERT_TRUE(u->job == NULL);
+        ASSERT_EQ_INT(count_lines(f.unitdir, "reloads"), 0);
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 stop demo.service", "ok done\n", 400);
+
+        f.m->pending_objective = MANAGER_RUNNING;
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 stop hold.service", "ok done\n", 400);
+        ctrl_fixture_teardown(&f);
+}
+
+/* A reload never displaces a pending stop: refused, and the stop goes on. */
+static void test_reload_while_stopping_is_invalid(void) {
+        struct ctrl_fixture f;
+        char unit[2 * PATH_MAX];
+        Unit *u;
+
+        ctrl_fixture_setup(&f);
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Service]\nExecStart=/bin/sleep 300\nExecStop=/bin/sleep 1\n"
+                 "ExecReload=/bin/sh -c \"echo r >> %s/reloads\"\n",
+                 f.unitdir);
+        ASSERT_EQ_INT(test_write_file(f.unitdir, "demo.service", unit), 0);
+        ctrl_fixture_boot(&f);
+
+        u = manager_get_unit(f.m, "demo.service");
+        ASSERT_TRUE(u != NULL);
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 start demo.service", "ok done\n", 400);
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 stop demo.service --no-block", "ok queued\n", 100);
+        drive_until_service_state(f.m, u, SERVICE_EXEC_STOP);
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 reload demo.service", "err invalid\n", 100);
+        ASSERT_TRUE(u->job != NULL && u->job->type == JOB_STOP);
+
+        ASSERT_TRUE(drive_until(f.m, ctrl_unit_down_done, u, 600));
+        ASSERT_EQ_INT(unit_active_state(u), UNIT_INACTIVE);
+        ASSERT_EQ_INT(count_lines(f.unitdir, "reloads"), 0);
+        ctrl_fixture_teardown(&f);
+}
+
+/*
+ * Two clients on one job. A reload sent while another runs merges into it
+ * and runs the reload again, and both clients get "ok done". A reload sent
+ * while the unit is still starting waits for the start, and gets its result
+ * without ExecReload= ever running.
+ */
+static void test_reload_merge_two_clients(void) {
+        struct ctrl_fixture f;
+        struct ctrl_client c1, c2;
+        struct ctrl_two_clients tc;
+        char unit[2 * PATH_MAX];
+        Unit *u, *o;
+
+        ctrl_fixture_setup(&f);
+        write_reloadable(&f, "demo.service", "reloads", "sleep 0.3; ");
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/sleep 0.3\n"
+                 "ExecReload=/bin/sh -c \"echo r >> %s/oneshot-reloads\"\n",
+                 f.unitdir);
+        ASSERT_EQ_INT(test_write_file(f.unitdir, "slow-start.service", unit), 0);
+        ctrl_fixture_boot(&f);
+
+        u = manager_get_unit(f.m, "demo.service");
+        o = manager_get_unit(f.m, "slow-start.service");
+        ASSERT_TRUE(u != NULL && o != NULL);
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 start demo.service", "ok done\n", 400);
+
+        ctrl_client_connect(&c1, f.rtdir);
+        ctrl_client_send_str(&c1, "PICO1 reload demo.service");
+        ASSERT_TRUE(drive_until(f.m, ctrl_unit_reloading_done, u, 400));
+        ctrl_client_connect(&c2, f.rtdir);
+        ctrl_client_send_str(&c2, "PICO1 reload demo.service");
+
+        tc.a = &c1;
+        tc.b = &c2;
+        ASSERT_TRUE(drive_until(f.m, ctrl_two_clients_done, &tc, 800));
+        ASSERT_STREQ(c1.reply, "ok done\n");
+        ASSERT_STREQ(c2.reply, "ok done\n");
+        ASSERT_EQ_INT(count_lines(f.unitdir, "reloads"), 2);
+        ctrl_client_close(&c1);
+        ctrl_client_close(&c2);
+        ASSERT_TRUE(drive_until(f.m, ctrl_no_leaks_done, f.m, 100));
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 start slow-start.service --no-block", "ok queued\n", 100);
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 reload slow-start.service", "ok done\n", 400);
+        ASSERT_EQ_INT(SERVICE(o)->state, SERVICE_EXITED);
+        ASSERT_EQ_INT(count_lines(f.unitdir, "oneshot-reloads"), 0);
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 stop demo.service", "ok done\n", 800);
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 stop slow-start.service", "ok done\n", 400);
+        ctrl_fixture_teardown(&f);
+}
+
+/*
+ * A start sent while the unit reloads, directly or through a Wants=, merges
+ * into the reload job: the reload's client gets "ok done", so does the
+ * start's, and the reload runs once.
+ */
+static void test_start_merges_into_reload(void) {
+        struct ctrl_fixture f;
+        struct ctrl_client c1, c2;
+        struct ctrl_two_clients tc;
+        Unit *u;
+
+        ctrl_fixture_setup(&f);
+        write_reloadable(&f, "demo.service", "reloads", "sleep 0.3; ");
+        ASSERT_EQ_INT(test_write_file(f.unitdir, "want.target", "[Unit]\nWants=demo.service\n"), 0);
+        ctrl_fixture_boot(&f);
+
+        u = manager_get_unit(f.m, "demo.service");
+        ASSERT_TRUE(u != NULL);
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 start demo.service", "ok done\n", 400);
+
+        ctrl_client_connect(&c1, f.rtdir);
+        ctrl_client_send_str(&c1, "PICO1 reload demo.service");
+        ASSERT_TRUE(drive_until(f.m, ctrl_unit_reloading_done, u, 400));
+        ctrl_client_connect(&c2, f.rtdir);
+        ctrl_client_send_str(&c2, "PICO1 start demo.service");
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 start want.target", "ok done\n", 400);
+
+        tc.a = &c1;
+        tc.b = &c2;
+        ASSERT_TRUE(drive_until(f.m, ctrl_two_clients_done, &tc, 800));
+        ASSERT_STREQ(c1.reply, "ok done\n");
+        ASSERT_STREQ(c2.reply, "ok done\n");
+        ASSERT_EQ_INT(count_lines(f.unitdir, "reloads"), 1);
+        ASSERT_EQ_INT(unit_active_state(u), UNIT_ACTIVE);
+        ctrl_client_close(&c1);
+        ctrl_client_close(&c2);
+        ASSERT_TRUE(drive_until(f.m, ctrl_no_leaks_done, f.m, 100));
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 stop demo.service", "ok done\n", 800);
+        ctrl_fixture_teardown(&f);
+}
+
+static bool ctrl_file_exists_done(void *userdata) {
+        return access(userdata, F_OK) == 0;
+}
+
+/* dropbear@.service's shape: an instance's ExecReload=kill -HUP $MAINPID
+ * reaches that instance's own daemon. */
+static void test_reload_template_instance_end_to_end(void) {
+        struct ctrl_fixture f;
+        char unit[2 * PATH_MAX], path[PATH_MAX];
+        Unit *u;
+        pid_t pid;
+
+        ctrl_fixture_setup(&f);
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Service]\nKillMode=process\n"
+                 "ExecStart=/bin/sh -c \"trap 'echo hup >> %s/%%i.hup' HUP; while :; do sleep 0.05; done\"\n"
+                 "ExecReload=/bin/kill -HUP $MAINPID\n",
+                 f.unitdir);
+        ASSERT_EQ_INT(test_write_file(f.unitdir, "rl@.service", unit), 0);
+        ctrl_fixture_boot(&f);
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 start rl@a.service", "ok done\n", 400);
+        u = manager_get_unit(f.m, "rl@a.service");
+        ASSERT_TRUE(u != NULL);
+        pid = SERVICE(u)->main_pid;
+        usleep(200 * 1000); /* let the shell install its trap */
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 reload rl@a.service", "ok done\n", 400);
+        snprintf(path, sizeof(path), "%s/a.hup", f.unitdir);
+        ASSERT_TRUE(drive_until(f.m, ctrl_file_exists_done, path, 400));
+        ASSERT_EQ_INT(SERVICE(u)->main_pid, pid);
+        ASSERT_EQ_INT(unit_active_state(u), UNIT_ACTIVE);
+
+        ctrl_roundtrip_assert(f.m, f.rtdir, "PICO1 stop rl@a.service", "ok done\n", 800);
+        ctrl_fixture_teardown(&f);
+}
+
 int main(void) {
         test_start_stop_restart_active_and_inactive();
         test_start_failing_unit_replies_with_real_result();
@@ -1049,6 +1452,14 @@ int main(void) {
         test_start_invalid_unit_leaves_no_dangling_edge();
         test_start_alias_to_referenced_error_unit_leaves_no_dangling_edge();
         test_start_template_is_refused();
+
+        test_reload_verbs();
+        test_reload_or_restart_variants();
+        test_reload_refused_while_shutting_down();
+        test_reload_while_stopping_is_invalid();
+        test_reload_merge_two_clients();
+        test_start_merges_into_reload();
+        test_reload_template_instance_end_to_end();
 
         printf("test-manager-ctrl: all checks passed\n");
         return 0;

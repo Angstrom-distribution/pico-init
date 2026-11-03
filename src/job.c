@@ -61,8 +61,15 @@
  *    redundancy test was reverted by every major distro and then by upstream
  *    itself. v30's naive state test is what it returned to.
  *
- * Not taken: JOB_NOP and job-type collapsing (e0209d83e7), try-restart and
- * reload types, job modes and the destructiveness check, isolate, job
+ * JOB_RELOAD is modern upstream's, reduced: it pulls in nothing (no
+ * PropagatesReloadTo=), is ordered like a start, is never redundant, and a
+ * reload request merges into the job its unit already has rather than
+ * cancelling it, as a start on a unit that is up merges into its reload job
+ * (job_install()). JOB_INVALID is its result on a unit that is not up.
+ *
+ * Not taken: JOB_NOP and job-type collapsing (e0209d83e7) and the try-* and
+ * reload-or-start types (manager-ctrl.c picks a plain type from the unit's
+ * state instead), job modes and the destructiveness check, isolate, job
  * timeouts, job garbage collection (only device units are collectable), the
  * Requisite=/BindsTo=/OnFailure= dependency families, every
  * D-Bus/Varlink job object, and serialization across daemon-reload.
@@ -147,15 +154,21 @@ void job_add_to_run_queue(Job *j) {
 /*
  * Lower triangle of the merge table: what a job of type `a` becomes when a
  * request of type `b` arrives for the same unit. _JOB_TYPE_INVALID means the
- * two conflict and cannot be merged. Three types make this small, but keeping
- * it a table rather than three hand-written predicates is the point -- the
+ * two conflict and cannot be merged. Four types make this small, but keeping
+ * it a table rather than hand-written predicates is the point -- the
  * predicates below are all derived from this one place.
+ *
+ * Every entry is spelled out: one left out would be 0, which is JOB_START.
+ * START with RELOAD is a conflict because upstream's answer, RELOAD_OR_START,
+ * has no type here; a reload transaction holds only its anchor, so the pair
+ * never meets inside one.
  */
 static JobType job_type_merge_table[_JOB_TYPE_MAX][_JOB_TYPE_MAX] = {
-        /*                 START               STOP                RESTART      */
-        [JOB_START] = {         JOB_START, _JOB_TYPE_INVALID,       JOB_RESTART },
-        [JOB_STOP] = { _JOB_TYPE_INVALID,          JOB_STOP, _JOB_TYPE_INVALID },
-        [JOB_RESTART] = {       JOB_RESTART, _JOB_TYPE_INVALID,       JOB_RESTART },
+        /*                 START               STOP                RESTART            RELOAD      */
+        [JOB_START] = {         JOB_START, _JOB_TYPE_INVALID,       JOB_RESTART, _JOB_TYPE_INVALID },
+        [JOB_STOP] = { _JOB_TYPE_INVALID,          JOB_STOP, _JOB_TYPE_INVALID, _JOB_TYPE_INVALID },
+        [JOB_RESTART] = {       JOB_RESTART, _JOB_TYPE_INVALID,       JOB_RESTART,       JOB_RESTART },
+        [JOB_RELOAD] = { _JOB_TYPE_INVALID, _JOB_TYPE_INVALID,       JOB_RESTART,        JOB_RELOAD },
 };
 
 static JobType job_type_lookup_merge(JobType a, JobType b) {
@@ -182,7 +195,7 @@ static bool job_type_is_superset(JobType a, JobType b) {
 static bool job_type_is_redundant(JobType t, UnitActiveState s) {
         switch (t) {
         case JOB_START:
-                return s == UNIT_ACTIVE;
+                return s == UNIT_ACTIVE || s == UNIT_RELOADING;
 
         case JOB_STOP:
                 return s == UNIT_INACTIVE || s == UNIT_FAILED;
@@ -194,6 +207,11 @@ static bool job_type_is_redundant(JobType t, UnitActiveState s) {
                  * captured stale state from the dependency that just
                  * restarted, so the restart still has to happen (dc06321fe3).
                  */
+                return false;
+
+        case JOB_RELOAD:
+                /* Upstream's answer too: the unit's state never makes a
+                 * reload unnecessary. */
                 return false;
 
         default:
@@ -311,27 +329,92 @@ int job_new(Manager *m, JobType type, Unit *u, Job **ret) {
         return 0;
 }
 
-/* Hand the job to the manager: attach to the unit and queue it. */
+/*
+ * A reload request meeting the job its unit already has. True when `old`
+ * takes it over, and the new job is then never installed. A start that has
+ * not run yet on a unit that is already up becomes the reload (upstream's
+ * START + RELOAD = RELOAD_OR_START, collapsed on an active unit); any other
+ * start is kept, since the unit is not up to reload yet; a restart is a
+ * superset; a waiting reload already covers it. A running reload runs again
+ * once it ends: the request came after the current run read its config, as
+ * upstream's refusal to late-merge into a running reload.
+ */
+static bool job_merge_reload(Job *old) {
+        UnitActiveState st = unit_active_state(old->unit);
+
+        switch (old->type) {
+        case JOB_START:
+                if (old->state == JOB_WAITING && (st == UNIT_ACTIVE || st == UNIT_RELOADING)) {
+                        old->type = JOB_RELOAD;
+                        manager_state_notify_job(old);
+                }
+                return true;
+
+        case JOB_RESTART:
+                return true;
+
+        case JOB_RELOAD:
+                if (old->state == JOB_RUNNING)
+                        old->reload_again = true;
+                return true;
+
+        default:
+                return false;
+        }
+}
+
+/*
+ * A start meeting a reload job on a unit that is up: the reload keeps the unit
+ * up, so it covers the start (upstream's START + RELOAD = RELOAD_OR_START,
+ * collapsed on an active unit). The merge table still calls the pair a
+ * conflict, which is only right inside one transaction.
+ */
+static bool job_reload_covers_start(Job *old, JobType t) {
+        UnitActiveState st;
+
+        if (!old || old->type != JOB_RELOAD || t != JOB_START)
+                return false;
+
+        st = unit_active_state(old->unit);
+        return st == UNIT_ACTIVE || st == UNIT_RELOADING;
+}
+
+/* Hand the job to the manager: attach to the unit and queue it. A reload
+ * that merges into the unit's job, or a start its reload job covers, is left
+ * uninstalled, for the transaction to free; manager_add_job() hands back
+ * u->job, so callers see the merge. */
 static void job_install(Job *j) {
         Job *old;
 
         if (!j || j->installed)
                 return;
 
+        old = j->unit->job;
+        if (old && old != j &&
+            ((j->type == JOB_RELOAD && job_merge_reload(old)) || job_reload_covers_start(old, j->type))) {
+                pico_log(PICO_LOG_DEBUG,
+                         "%s: %s merged into its %s job %u",
+                         j->unit->id,
+                         job_type_to_string(j->type),
+                         job_type_to_string(old->type),
+                         (unsigned) old->id);
+                return;
+        }
+
         /*
-         * A job already installed on this unit is superseded, not silently
-         * discarded. Overwriting unit->job left the old one installed, still
-         * on the run queue and unreachable: it never finished, never freed,
-         * and anything waiting on its result waited forever. Three real
-         * callers reach it -- a second control-socket request for one unit,
-         * manager_shutdown()'s stop sweep landing on a unit with a start job
-         * in flight, and any transaction pulling the unit in as a dependency.
+         * Otherwise a job already installed on this unit is superseded, not
+         * silently discarded. Overwriting unit->job left the old one
+         * installed, still on the run queue and unreachable: it never
+         * finished, never freed, and anything waiting on its result waited
+         * forever. Real callers reach it -- a second control-socket request
+         * for one unit, manager_shutdown()'s stop sweep landing on a unit
+         * with a start or reload job in flight, and any transaction pulling
+         * the unit in as a dependency.
          *
          * recursive = false: this runs inside transaction_activate(), which is
          * still iterating the transaction -- the same reason
          * job_propagate_failure() passes false (563ba9ea6e, 1abc85b8d0).
          */
-        old = j->unit->job;
         if (old && old != j)
                 job_finish_full(old, JOB_CANCELED, false);
 
@@ -425,6 +508,10 @@ int job_run(Job *j) {
                 r = unit_stop(u);
                 break;
 
+        case JOB_RELOAD:
+                r = unit_run_reload(u);
+                break;
+
         default:
                 r = -EINVAL;
                 break;
@@ -455,6 +542,12 @@ int job_run(Job *j) {
          * change (v30 job_run_and_invalidate()). */
         if (r == -EAGAIN) {
                 j->state = JOB_WAITING;
+                return 0;
+        }
+
+        /* A reload of a unit that is not up (upstream job.c's -ENOEXEC). */
+        if (j->type == JOB_RELOAD && r == -ENOEXEC) {
+                job_finish_full(j, JOB_INVALID, true);
                 return 0;
         }
 
@@ -584,7 +677,7 @@ int job_finish_full(Job *j, JobResult result, bool recursive) {
          * other combination, which is what upstream does for JOB_CANCELED
          * (no word in that table) and is also all there is to do for a
          * JobResult this project's smaller enum has no counterpart for
-         * (upstream's JOB_SKIPPED/JOB_COLLECTED/JOB_INVALID/...). A restart
+         * (upstream's JOB_SKIPPED/JOB_COLLECTED/...). A restart
          * reaches this function twice, but its first pass was converted into
          * a start above and left through `finish`, so only the second pass
          * -- JOB_START or, if the stop half itself failed, JOB_STOP's table
@@ -677,6 +770,15 @@ int job_finish_full(Job *j, JobResult result, bool recursive) {
                 default:
                         break;
                 }
+        } else if (j->type == JOB_RELOAD) {
+                /* Upstream's generic_finished_reload_job[] words, log only:
+                 * job_emit_done_message() gives a reload no console line. */
+                const char *name = u->description ? u->description : u->id;
+
+                if (result == JOB_DONE)
+                        pico_log(PICO_LOG_INFO, "Reloaded %s.", name);
+                else if (result == JOB_FAILED)
+                        pico_log(PICO_LOG_WARNING, "Reload failed for %s.", name);
         }
 
         /* The default target's start job ending, either way, is when the boot
@@ -748,6 +850,7 @@ static const char * const job_type_table[_JOB_TYPE_MAX] = {
         [JOB_START] = "start",
         [JOB_STOP] = "stop",
         [JOB_RESTART] = "restart",
+        [JOB_RELOAD] = "reload",
 };
 
 const char *job_type_to_string(JobType t) {
@@ -771,7 +874,7 @@ const char *job_state_to_string(JobState s) {
 
 static const char * const job_result_table[_JOB_RESULT_MAX] = {
         [JOB_DONE] = "done",       [JOB_FAILED] = "failed",         [JOB_CANCELED] = "canceled",
-        [JOB_TIMEOUT] = "timeout", [JOB_DEPENDENCY] = "dependency",
+        [JOB_TIMEOUT] = "timeout", [JOB_DEPENDENCY] = "dependency", [JOB_INVALID] = "invalid",
 };
 
 const char *job_result_to_string(JobResult r) {
@@ -1008,6 +1111,11 @@ static int transaction_add_job_full(Transaction *tx, JobType type, Unit *u, bool
         if (type < 0 || type >= _JOB_TYPE_MAX)
                 return -EINVAL;
 
+        /* manager-ctrl.c refuses this before it gets here; upstream's
+         * "job type not applicable" check in transaction.c. */
+        if (type == JOB_RELOAD && !unit_can_reload(u))
+                return -EOPNOTSUPP;
+
         is_anchor = tx->n_jobs == 0;
 
         /*
@@ -1119,9 +1227,11 @@ static void transaction_drop_redundant(Transaction *tx) {
 
                 /* Not redundant while a conflicting job is installed: a unit
                  * that is active now but has a stop queued is about to go
-                 * down (v30 transaction_drop_redundant()). */
+                 * down (v30 transaction_drop_redundant()). A reload job does
+                 * not take it down. */
                 if (j != tx->anchor_job && job_type_is_redundant(j->type, unit_active_state(j->unit)) &&
-                    !(j->unit->job && job_type_is_conflicting(j->type, j->unit->job->type))) {
+                    !(j->unit->job && job_type_is_conflicting(j->type, j->unit->job->type) &&
+                      !job_reload_covers_start(j->unit->job, j->type))) {
                         pico_log(PICO_LOG_DEBUG,
                                  "%s: %s job is redundant, dropping",
                                  j->unit->id,

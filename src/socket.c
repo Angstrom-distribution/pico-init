@@ -543,7 +543,7 @@ static void socket_set_state(Socket *s, SocketState state) {
         s->state = state;
         new_active = socket_active_state_of(s->state);
 
-        unit_notify(SOCKET_UNIT(s), old_active, new_active);
+        unit_notify(SOCKET_UNIT(s), old_active, new_active, true);
 }
 
 /* Used both for a fresh start (fds just opened) and for re-arming after a
@@ -714,7 +714,8 @@ static void socket_drain_port(SocketPort *p) {
  * installed would silently overwrite unit->job and leak the first Job
  * object (see job.c's job_install()). So: if the service already has any
  * job in flight, or is already active/activating, there is nothing new to
- * queue -- just note that we are (still) RUNNING and return.
+ * queue -- just note that we are (still) RUNNING and return. A reloading
+ * service is up too.
  */
 static int socket_trigger(Socket *s) {
         Unit *svc = s->service;
@@ -731,7 +732,7 @@ static int socket_trigger(Socket *s) {
         }
 
         st = unit_active_state(svc);
-        if (svc->job || st == UNIT_ACTIVE || st == UNIT_ACTIVATING) {
+        if (svc->job || st == UNIT_ACTIVE || st == UNIT_ACTIVATING || st == UNIT_RELOADING) {
                 socket_enter_running_state(s);
                 return 0;
         }

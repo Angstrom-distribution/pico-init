@@ -113,6 +113,7 @@ typedef enum ServiceState {
                                * forking: the parent (control_pid) has not exited yet */
         SERVICE_RUNNING,      /* simple: main process up */
         SERVICE_EXITED,       /* main process gone, cgroup empty, clean exit */
+        SERVICE_RELOAD,       /* ExecReload= running as the control process, main process untouched */
         SERVICE_EXEC_STOP,    /* ExecStop= running as the control process, nothing signalled yet */
         SERVICE_STOP,         /* SIGTERM sent, waiting for exit or TimeoutStopSec */
         SERVICE_STOP_POST,    /* ExecStopPost= running, every other process already gone */
@@ -169,6 +170,8 @@ typedef struct Service {
         ServiceType type;
         ServiceState state;
         ServiceResult result;
+        ServiceResult reload_result;         /* the last reload's; never touches result, so never Restart= */
+        bool reload_stopped;                 /* a stop interrupted the running reload command */
         ServiceStandardInput standard_input; /* StandardInput=, default SERVICE_STANDARD_INPUT_NULL */
         ServiceStdioOutput standard_output;  /* StandardOutput=, default inherit */
         ServiceStdioOutput standard_error;   /* StandardError=, default inherit (follows stdout) */
@@ -197,8 +200,9 @@ typedef struct Service {
          * ExecCondition= runs before ExecStartPre=, and an exit of 1-254
          * skips the start instead of failing it. ExecStopPost= runs once
          * every other process of the unit is gone, after a stop and after a
-         * failed start alike. ExecReload= is parsed and kept, but nothing
-         * runs it: pico-init has no per-unit reload request yet.
+         * failed start alike. ExecReload= runs on a reload job while the
+         * unit is active (SERVICE_RELOAD); exec_reload_idx is the line
+         * running.
          */
         ServiceExecCommand *exec_condition;
         unsigned n_exec_condition;
@@ -217,6 +221,7 @@ typedef struct Service {
         unsigned exec_stop_post_idx;
         ServiceExecCommand *exec_reload;
         unsigned n_exec_reload;
+        unsigned exec_reload_idx;
 
         /*
          * Environment=/EnvironmentFile=: a "NAME=value" strv and a strv of
@@ -252,8 +257,8 @@ typedef struct Service {
         char **supplementary_groups;
 
         pid_t main_pid;    /* ExecStart= process, 0 when none; forking: the daemon left behind */
-        pid_t control_pid; /* ExecCondition=/ExecStartPre=/ExecStop=/ExecStopPost= process, or
-                            * forking's ExecStart= parent; 0 when none */
+        pid_t control_pid; /* ExecCondition=/ExecStartPre=/ExecReload=/ExecStop=/ExecStopPost=
+                            * process, or forking's ExecStart= parent; 0 when none */
 
         /*
          * Type=forking's main-pid discovery. pid_file is PIDFile= as
@@ -370,6 +375,11 @@ typedef struct Service {
 /* --- service.c --- */
 int service_start(Service *s); /* DEAD -> CONDITION/START_PRE/EXEC_START */
 int service_stop(Service *s);  /* ExecStop= if any, SIGTERM, cgroup_v2_kill on timeout, ExecStopPost= */
+
+/* RUNNING/EXITED -> RELOAD: the ExecReload= chain, bounded by
+ * TimeoutStartSec=. -EAGAIN from any other state, -EALREADY without
+ * ExecReload=. */
+int service_reload(Service *s);
 
 /* Frees every ExecStop= line; unit-parse.c's reset on an empty ExecStop=. */
 void service_exec_stop_clear(Service *s);

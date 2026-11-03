@@ -3665,6 +3665,502 @@ static void test_orphaned_cgroup_is_reaped(void) {
         free(dir);
 }
 
+/* Waits for `path` to exist and read as non-empty, as a daemon's trap
+ * writes it on its own schedule. */
+static bool file_appears_within(const char *path, int timeout_ms) {
+        struct stat st;
+        int waited;
+
+        for (waited = 0; waited < timeout_ms; waited += 10) {
+                if (stat(path, &st) == 0 && st.st_size > 0)
+                        return true;
+                test_sleep_ms(10);
+        }
+
+        return stat(path, &st) == 0 && st.st_size > 0;
+}
+
+/*
+ * ExecReload=: every line runs in order as the control process while the
+ * main process stays up, and $MAINPID reaches each line as a whole word, as
+ * ${MAINPID} inside a word, and through kill -HUP to the daemon's trap.
+ */
+static void test_exec_reload_runs_while_active(void) {
+        Manager *m;
+        Service *s;
+        char *dir;
+        char unit[4 * PATH_MAX], path[PATH_MAX], v[64], want[32];
+        pid_t main_pid;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Service]\nType=simple\n"
+                 "ExecStart=/bin/sh -c \"trap 'echo hup >> %s/hup' HUP; while :; do sleep 0.05; done\"\n"
+                 "ExecReload=/bin/kill -HUP $MAINPID\n"
+                 "ExecReload=/bin/sh -c \"echo $1 > %s/whole\" sh $MAINPID\n"
+                 "ExecReload=/bin/sh -c \"echo ${MAINPID} > %s/braced\"\n",
+                 dir,
+                 dir,
+                 dir);
+        s = load_service(m, dir, "reload.service", unit);
+        ASSERT_TRUE(unit_can_reload(UNIT(s)));
+
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        ASSERT_EQ_INT(s->state, SERVICE_RUNNING);
+        main_pid = s->main_pid;
+        test_sleep_ms(100); /* past the shell's trap */
+
+        ASSERT_EQ_INT(unit_run_reload(UNIT(s)), 0);
+        ASSERT_EQ_INT(s->state, SERVICE_RELOAD);
+        ASSERT_EQ_INT(unit_active_state(UNIT(s)), UNIT_RELOADING);
+        ASSERT_STREQ(unit_active_state_to_string(UNIT_RELOADING), "reloading");
+        ASSERT_STREQ(service_state_to_string(SERVICE_RELOAD), "reload");
+        ASSERT_TRUE(s->control_pid > 0);
+        ASSERT_EQ_INT(s->main_pid, main_pid);
+
+        ASSERT_TRUE(drive_until(m, service_running_done, s, 600));
+        ASSERT_EQ_INT(s->reload_result, SERVICE_SUCCESS);
+        ASSERT_EQ_INT(s->result, SERVICE_SUCCESS);
+        ASSERT_EQ_INT(s->control_pid, 0);
+        ASSERT_EQ_INT(s->main_pid, main_pid);
+        ASSERT_TRUE(pid_is_running(main_pid));
+        ASSERT_TRUE(s->timer_event == NULL);
+
+        snprintf(want, sizeof(want), "%d\n", (int) main_pid);
+        snprintf(path, sizeof(path), "%s/whole", dir);
+        read_file(path, v, sizeof(v));
+        ASSERT_STREQ(v, want);
+        snprintf(path, sizeof(path), "%s/braced", dir);
+        read_file(path, v, sizeof(v));
+        ASSERT_STREQ(v, want);
+        snprintf(path, sizeof(path), "%s/hup", dir);
+        ASSERT_TRUE(file_appears_within(path, 2000));
+        read_file(path, v, sizeof(v));
+        ASSERT_STREQ(v, "hup\n");
+
+        ASSERT_EQ_INT(unit_stop(UNIT(s)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, s, 600));
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * A failed reload is the reload's result alone: the chain stops at the
+ * failing line, the unit stays RUNNING with result success, the daemon is
+ * untouched and Restart=on-failure does not fire. A '-' line is a success.
+ */
+static void test_exec_reload_failure_keeps_unit_active(void) {
+        Manager *m;
+        Service *s, *d;
+        char *dir;
+        char unit[2 * PATH_MAX], path[PATH_MAX];
+        pid_t main_pid;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Service]\nType=simple\nRestart=on-failure\nExecStart=/bin/sleep 100\n"
+                 "ExecReload=/bin/false\nExecReload=/bin/sh -c \"echo x > %s/second\"\n",
+                 dir);
+        s = load_service(m, dir, "reload-fails.service", unit);
+
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Service]\nType=simple\nExecStart=/bin/sleep 100\n"
+                 "ExecReload=-/bin/false\nExecReload=/bin/sh -c \"echo x > %s/after-dash\"\n",
+                 dir);
+        d = load_service(m, dir, "reload-dash.service", unit);
+
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        main_pid = s->main_pid;
+        ASSERT_EQ_INT(unit_run_reload(UNIT(s)), 0);
+        ASSERT_TRUE(drive_until(m, service_running_done, s, 600));
+        ASSERT_EQ_INT(s->result, SERVICE_SUCCESS);
+        ASSERT_EQ_INT(s->reload_result, SERVICE_FAILURE_EXIT_CODE);
+        ASSERT_EQ_INT(unit_active_state(UNIT(s)), UNIT_ACTIVE);
+        ASSERT_EQ_INT(s->n_restarts, 0);
+        ASSERT_EQ_INT(s->main_pid, main_pid);
+        ASSERT_TRUE(pid_is_running(main_pid));
+        snprintf(path, sizeof(path), "%s/second", dir);
+        ASSERT_TRUE(access(path, F_OK) < 0);
+
+        /* The next start begins with a clean reload result. */
+        ASSERT_EQ_INT(unit_stop(UNIT(s)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, s, 600));
+        ASSERT_EQ_INT(s->state, SERVICE_DEAD);
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        ASSERT_EQ_INT(s->reload_result, SERVICE_SUCCESS);
+        ASSERT_EQ_INT(unit_stop(UNIT(s)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, s, 600));
+
+        ASSERT_EQ_INT(unit_start(UNIT(d)), 0);
+        ASSERT_EQ_INT(unit_run_reload(UNIT(d)), 0);
+        ASSERT_TRUE(drive_until(m, service_running_done, d, 600));
+        ASSERT_EQ_INT(d->reload_result, SERVICE_SUCCESS);
+        snprintf(path, sizeof(path), "%s/after-dash", dir);
+        ASSERT_EQ_INT(access(path, F_OK), 0);
+        ASSERT_EQ_INT(unit_stop(UNIT(d)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, d, 600));
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+static bool service_not_reloading_done(void *userdata) {
+        return ((Service *) userdata)->state != SERVICE_RELOAD;
+}
+
+/*
+ * When a reload does not run: no ExecReload= (nothing to do, -EALREADY), a
+ * unit that is not up (-ENOEXEC), a reload already running (-EAGAIN). A
+ * oneshot kept up by RemainAfterExit= is up and reloads back to EXITED,
+ * with $MAINPID unset because there is no main process.
+ */
+static void test_exec_reload_refused_states(void) {
+        Manager *m;
+        Service *plain, *r, *o;
+        char *dir;
+        char unit[2 * PATH_MAX], path[PATH_MAX], v[64];
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        plain = load_service(m, dir, "no-reload.service", "[Service]\nType=simple\nExecStart=/bin/sleep 100\n");
+        r = load_service(
+                        m,
+                        dir,
+                        "slow-reload.service",
+                        "[Service]\nType=simple\nExecStart=/bin/sleep 100\nExecReload=/bin/sleep 0.3\n");
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n"
+                 "ExecReload=/bin/sh -c \"echo [$1] > %s/f\" sh $MAINPID\n",
+                 dir);
+        o = load_service(m, dir, "oneshot-reload.service", unit);
+
+        ASSERT_TRUE(!unit_can_reload(UNIT(plain)));
+        ASSERT_EQ_INT(unit_start(UNIT(plain)), 0);
+        ASSERT_EQ_INT(unit_run_reload(UNIT(plain)), -EALREADY);
+        ASSERT_EQ_INT(plain->state, SERVICE_RUNNING);
+        ASSERT_EQ_INT(plain->control_pid, 0);
+
+        ASSERT_TRUE(unit_can_reload(UNIT(r)));
+        ASSERT_EQ_INT(unit_run_reload(UNIT(r)), -ENOEXEC);
+        ASSERT_EQ_INT(r->state, SERVICE_DEAD);
+        ASSERT_EQ_INT(r->control_pid, 0);
+
+        ASSERT_EQ_INT(unit_start(UNIT(r)), 0);
+        ASSERT_EQ_INT(unit_run_reload(UNIT(r)), 0);
+        ASSERT_EQ_INT(unit_run_reload(UNIT(r)), -EAGAIN);
+        ASSERT_EQ_INT(unit_start(UNIT(r)), 0); /* already up */
+        ASSERT_EQ_INT(r->state, SERVICE_RELOAD);
+        ASSERT_TRUE(drive_until(m, service_running_done, r, 600));
+        ASSERT_EQ_INT(r->reload_result, SERVICE_SUCCESS);
+
+        ASSERT_EQ_INT(unit_start(UNIT(o)), 0);
+        ASSERT_TRUE(drive_until(m, service_exited_done, o, 600));
+        ASSERT_EQ_INT(unit_active_state(UNIT(o)), UNIT_ACTIVE);
+        ASSERT_EQ_INT(unit_run_reload(UNIT(o)), 0);
+        ASSERT_EQ_INT(o->state, SERVICE_RELOAD);
+        ASSERT_TRUE(drive_until(m, service_not_reloading_done, o, 600));
+        ASSERT_EQ_INT(o->state, SERVICE_EXITED);
+        ASSERT_EQ_INT(o->reload_result, SERVICE_SUCCESS);
+        snprintf(path, sizeof(path), "%s/f", dir);
+        read_file(path, v, sizeof(v));
+        ASSERT_STREQ(v, "[]\n");
+
+        ASSERT_EQ_INT(unit_stop(UNIT(plain)), 0);
+        ASSERT_EQ_INT(unit_stop(UNIT(r)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, plain, 600));
+        ASSERT_TRUE(drive_until(m, service_settled_done, r, 600));
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * TimeoutStartSec= bounds the reload, and its expiry kills only the reload
+ * command: the daemon it was meant to keep running survives.
+ */
+static void test_exec_reload_timeout_kills_only_the_command(void) {
+        Manager *m;
+        Service *s;
+        char *dir;
+        pid_t main_pid, reload_pid;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        s = load_service(
+                        m,
+                        dir,
+                        "reload-wedged.service",
+                        "[Service]\nType=simple\nTimeoutStartSec=300ms\nExecStart=/bin/sleep 100\n"
+                        "ExecReload=/bin/sleep 30\n");
+
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        main_pid = s->main_pid;
+        ASSERT_EQ_INT(unit_run_reload(UNIT(s)), 0);
+        reload_pid = s->control_pid;
+        ASSERT_TRUE(reload_pid > 0);
+        ASSERT_TRUE(s->timer_event != NULL);
+
+        ASSERT_TRUE(drive_until(m, service_running_done, s, 400));
+        ASSERT_EQ_INT(s->reload_result, SERVICE_FAILURE_TIMEOUT);
+        ASSERT_EQ_INT(s->result, SERVICE_SUCCESS);
+        ASSERT_EQ_INT(s->control_pid, 0);
+        ASSERT_TRUE(!pid_is_running(reload_pid));
+        ASSERT_EQ_INT(s->main_pid, main_pid);
+        ASSERT_TRUE(pid_is_running(main_pid));
+        ASSERT_TRUE(s->timer_event == NULL);
+
+        ASSERT_EQ_INT(unit_stop(UNIT(s)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, s, 600));
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * A stop during a reload signals the daemon and the reload command at once
+ * and runs no ExecStop=. The reload command the stop killed is not a
+ * failure: the unit ends inactive with result success.
+ */
+static void test_stop_during_reload(void) {
+        Manager *m;
+        Service *s;
+        char *dir;
+        char unit[2 * PATH_MAX], path[PATH_MAX];
+        pid_t main_pid, reload_pid;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Service]\nType=simple\nExecStart=/bin/sleep 100\nExecReload=/bin/sleep 30\n"
+                 "ExecStop=/bin/sh -c \"echo x > %s/stopped\"\n",
+                 dir);
+        s = load_service(m, dir, "reload-stop.service", unit);
+
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        main_pid = s->main_pid;
+        ASSERT_EQ_INT(unit_run_reload(UNIT(s)), 0);
+        reload_pid = s->control_pid;
+
+        ASSERT_EQ_INT(unit_stop(UNIT(s)), 0);
+        ASSERT_EQ_INT(s->state, SERVICE_STOP);
+        ASSERT_TRUE(s->forbid_restart);
+        ASSERT_TRUE(drive_until(m, service_settled_done, s, 600));
+        ASSERT_EQ_INT(s->state, SERVICE_DEAD);
+        ASSERT_EQ_INT(s->result, SERVICE_SUCCESS);
+        ASSERT_TRUE(!pid_is_running(main_pid));
+        ASSERT_TRUE(!pid_is_running(reload_pid));
+        snprintf(path, sizeof(path), "%s/stopped", dir);
+        ASSERT_TRUE(access(path, F_OK) < 0);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * The main process exiting mid-reload is recorded, and the unit goes down
+ * only once the reload command has finished, whichever SIGCHLD comes first.
+ */
+static void test_main_exit_during_reload(void) {
+        Manager *m;
+        Service *s;
+        char *dir;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        s = load_service(
+                        m,
+                        dir,
+                        "reload-kills-main.service",
+                        "[Service]\nType=simple\nExecStart=/bin/sleep 100\n"
+                        "ExecReload=/bin/sh -c \"kill -TERM $1; sleep 0.2\" sh $MAINPID\n");
+
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        ASSERT_EQ_INT(unit_run_reload(UNIT(s)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, s, 600));
+        ASSERT_EQ_INT(s->state, SERVICE_DEAD);
+        ASSERT_EQ_INT(s->result, SERVICE_SUCCESS);
+        ASSERT_EQ_INT(s->reload_result, SERVICE_SUCCESS);
+        ASSERT_EQ_INT(s->main_pid, 0);
+        ASSERT_EQ_INT(s->control_pid, 0);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
+ * The main process exiting mid-reload leaves no helper behind: when the
+ * reload ends, the rest of the cgroup is killed before ExecStop= runs, as on
+ * the RUNNING exit path. ExecStop= records the helper's state letter, which
+ * must not be a live one. Without a usable cgroup in the test environment
+ * there is nothing to reap, and the check is skipped.
+ */
+static void test_main_exit_during_reload_reaps_cgroup(void) {
+        Manager *m;
+        Service *s;
+        char *dir;
+        char unit[2 * PATH_MAX], path[PATH_MAX], buf[32];
+        pid_t helper;
+        FILE *f;
+        bool had_cgroup;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        snprintf(path, sizeof(path), "%s/check.sh", dir);
+        f = fopen(path, "w");
+        ASSERT_TRUE(f != NULL);
+        fputs("pid=$(cat \"$1/helper\")\n"
+              "st=gone\n"
+              "[ -r /proc/$pid/stat ] && st=$(sed 's/^[0-9]* (.*) //; s/ .*//' /proc/$pid/stat)\n"
+              "echo \"$st\" > \"$1/seen\"\n",
+              f);
+        fclose(f);
+
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Service]\nType=simple\n"
+                 "ExecStart=/bin/sh -c \"sleep 100 & echo $! > %s/helper; exec sleep 100\"\n"
+                 "ExecReload=/bin/sh -c \"kill -TERM $1; sleep 0.2\" sh $MAINPID\n"
+                 "ExecStop=/bin/sh %s/check.sh %s\n",
+                 dir,
+                 dir,
+                 dir);
+        s = load_service(m, dir, "reload-kills-main-helper.service", unit);
+
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        snprintf(path, sizeof(path), "%s/helper", dir);
+        for (int i = 0; i < 100 && access(path, F_OK) < 0; i++)
+                usleep(20000);
+        f = fopen(path, "r");
+        ASSERT_TRUE(f != NULL);
+        ASSERT_TRUE(fgets(buf, sizeof(buf), f) != NULL);
+        fclose(f);
+        helper = (pid_t) atoi(buf);
+        ASSERT_TRUE(helper > 1);
+        had_cgroup = s->cgroup != NULL;
+
+        ASSERT_EQ_INT(unit_run_reload(UNIT(s)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, s, 600));
+        ASSERT_EQ_INT(s->state, SERVICE_DEAD);
+        if (had_cgroup) {
+                snprintf(path, sizeof(path), "%s/seen", dir);
+                f = fopen(path, "r");
+                ASSERT_TRUE(f != NULL);
+                ASSERT_TRUE(fgets(buf, sizeof(buf), f) != NULL);
+                fclose(f);
+                /* gone, a zombie or dead: not sleeping, running or stopped */
+                ASSERT_TRUE(strncmp(buf, "gone", 4) == 0 || buf[0] == 'Z' || buf[0] == 'X');
+        }
+        kill(helper, SIGKILL);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* $MAINPID reaches every control process while a main pid is known,
+ * ExecStop= included, as upstream. */
+static void test_exec_stop_gets_mainpid(void) {
+        Manager *m;
+        Service *s;
+        char *dir;
+        char unit[2 * PATH_MAX], path[PATH_MAX], v[64], want[32];
+        pid_t main_pid;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Service]\nType=simple\nExecStart=/bin/sleep 100\n"
+                 "ExecStop=/bin/sh -c \"echo $1 > %s/f\" sh $MAINPID\n",
+                 dir);
+        s = load_service(m, dir, "stop-mainpid.service", unit);
+
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        main_pid = s->main_pid;
+        ASSERT_EQ_INT(unit_stop(UNIT(s)), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, s, 600));
+        ASSERT_EQ_INT(s->state, SERVICE_DEAD);
+
+        snprintf(want, sizeof(want), "%d\n", (int) main_pid);
+        snprintf(path, sizeof(path), "%s/f", dir);
+        read_file(path, v, sizeof(v));
+        ASSERT_STREQ(v, want);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* Specifiers in ExecReload= are expanded per instance at load. */
+static void test_exec_reload_template_instance(void) {
+        Manager *m;
+        Service *s;
+        Unit *u = NULL;
+        char *dir;
+        char unit[2 * PATH_MAX], path[PATH_MAX], v[64];
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        snprintf(unit,
+                 sizeof(unit),
+                 "[Service]\nType=simple\nExecStart=/bin/sleep 100\n"
+                 "ExecReload=/bin/sh -c \"echo %%i > %s/inst\"\n",
+                 dir);
+        ASSERT_EQ_INT(test_write_file(dir, "rl@.service", unit), 0);
+        ASSERT_EQ_INT(manager_load_unit(m, "rl@x.service", &u), 0);
+        ASSERT_TRUE(u != NULL);
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        s = SERVICE(u);
+
+        ASSERT_EQ_INT(unit_start(u), 0);
+        ASSERT_EQ_INT(unit_run_reload(u), 0);
+        ASSERT_TRUE(drive_until(m, service_running_done, s, 600));
+        ASSERT_EQ_INT(s->reload_result, SERVICE_SUCCESS);
+
+        snprintf(path, sizeof(path), "%s/inst", dir);
+        read_file(path, v, sizeof(v));
+        ASSERT_STREQ(v, "x\n");
+
+        ASSERT_EQ_INT(unit_stop(u), 0);
+        ASSERT_TRUE(drive_until(m, service_settled_done, s, 600));
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
         test_close_all_except_keeps_every_fd();
         test_lifecycle_simple();
@@ -3725,6 +4221,15 @@ int main(void) {
         test_exec_stop_post_failure_and_timeout();
         test_exec_condition_skips_start();
         test_exec_condition_exit_space();
+        test_exec_reload_runs_while_active();
+        test_exec_reload_failure_keeps_unit_active();
+        test_exec_reload_refused_states();
+        test_exec_reload_timeout_kills_only_the_command();
+        test_stop_during_reload();
+        test_main_exit_during_reload();
+        test_main_exit_during_reload_reaps_cgroup();
+        test_exec_stop_gets_mainpid();
+        test_exec_reload_template_instance();
 
         printf("test-service: all checks passed\n");
         return 0;

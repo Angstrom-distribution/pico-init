@@ -40,6 +40,7 @@ typedef enum UnitActiveState {
         UNIT_INACTIVE,
         UNIT_ACTIVATING,
         UNIT_ACTIVE,
+        UNIT_RELOADING, /* ExecReload= running; still up, as upstream's UNIT_IS_ACTIVE_OR_RELOADING() */
         UNIT_DEACTIVATING,
         UNIT_FAILED,
         _UNIT_ACTIVE_STATE_MAX,
@@ -90,6 +91,11 @@ typedef struct UnitVTable {
         int (*start)(Unit *u);
         int (*stop)(Unit *u);
         UnitActiveState (*active_state)(Unit *u);
+
+        /* A reload job's work, and whether this unit has any; both may be
+         * NULL, which makes the type not reloadable. */
+        int (*reload)(Unit *u);
+        bool (*can_reload)(Unit *u);
 } UnitVTable;
 
 extern const UnitVTable service_vtable; /* service.c */
@@ -191,12 +197,25 @@ UnitActiveState unit_active_state(Unit *u);
 int unit_start(Unit *u); /* dispatches through vtable->start */
 int unit_stop(Unit *u);  /* dispatches through vtable->stop */
 
+/* Loaded, and its type has reload work for it (a service: ExecReload=). */
+bool unit_can_reload(Unit *u);
+
+/*
+ * A reload job's dispatch, upstream's unit_reload() under a name that keeps
+ * clear of unit-reload.c's per-unit daemon-reload. -EALREADY when there is
+ * nothing to run, -EAGAIN while a reload is already running, -ENOEXEC when
+ * the unit is not active; else vtable->reload().
+ */
+int unit_run_reload(Unit *u);
+
 /*
  * Called by a concrete unit type after its own state machine moved. Completes
  * or fails u->job when the unit reaches a state the in-flight job was waiting
  * for, so job bookkeeping lives in one place instead of in every unit type.
+ * reload_success is how the reload that just ended went; only a reload job
+ * reads it, and every type without reloads passes true.
  */
-void unit_notify(Unit *u, UnitActiveState old_state, UnitActiveState new_state);
+void unit_notify(Unit *u, UnitActiveState old_state, UnitActiveState new_state, bool reload_success);
 
 const char *unit_type_to_string(UnitType t);
 const char *unit_load_state_to_string(UnitLoadState s);
@@ -272,6 +291,7 @@ int unit_parse_file(Unit *u, const char *path);
 
 /* --- unit-reload.c --- */
 /*
+ * daemon-reload for one unit, not a reload job (that is unit_run_reload()).
  * Re-parse a loaded unit's fragment and replace its directive values in
  * place, all or nothing; nothing is started, stopped or signalled. 1 when
  * reloaded, 0 when not applicable (not loaded, or a socket unit), -EBUSY
