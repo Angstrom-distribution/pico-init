@@ -177,7 +177,7 @@ of units that carry a degradation record.
 
 ## Jobs and transactions
 
-A job is a start, stop or restart request for one unit. A request first
+A job is a start, stop, restart or reload request for one unit. A request first
 becomes a transaction: the requested job is the anchor, and
 `Requires=` and `Wants=` pull in start jobs for dependencies,
 `Requires=` in reverse pulls in stop jobs, and `Conflicts=` pulls in stops.
@@ -194,12 +194,26 @@ responsibility. A job runs when every job that must precede it has finished;
 a stop job always precedes, whatever direction the ordering edge points.
 Unit state changes call `unit_notify()`, which completes or fails the job
 the unit was waiting for. A job result is one of `done`, `failed`,
-`canceled`, `timeout` or `dependency`.
+`canceled`, `timeout`, `dependency` or `invalid`.
 
 A restart job runs as a stop and is converted to a start only when the stop
 finishes, so ordering is preserved. A start job whose unit has an unmet
 `ConditionPathExists=` or `ConditionPathIsDirectory=` finishes as done and
 leaves the unit inactive.
+
+A reload job runs the `ExecReload=` lines of an active service (see
+`service_reload()`): the unit is `reloading` while they run and goes back
+to `active` afterwards, whether they succeeded or not. The outcome goes to
+the service's `reload_result`, never to `result`, so a failed reload fails
+its job and leaves the unit up with `Restart=` out of it. A reload job
+pulls in no dependencies, is ordered like a start and is never redundant.
+Requested for a unit that is not active it finishes as `invalid`. It
+merges into the job its unit already has instead of replacing it: a start
+that has not run yet on an active unit becomes the reload, any other start
+and a restart are kept, and a reload arriving while one runs makes the
+same job run again once it ends. A stop or restart request replaces a
+reload job, which finishes as `canceled`. A start for a reloading unit is
+redundant, and a socket does not queue one for it.
 
 Not implemented: job modes, `isolate`, job timeouts, `Requisite=`,
 `BindsTo=`, `OnFailure=`, and carrying jobs across a reload.
@@ -282,7 +296,7 @@ Unit file properties:
 | `LoadState`                 | `stub`, `loaded`, `error` or `masked`         |
 | `FragmentPath`, `Description` | From the unit file                          |
 | `UnitFileState`             | `static`, `enabled` or `disabled`             |
-| `MainPID`, `Result`, `ExecMainCode`, `ExecMainStatus`, `NRestarts` | Service process and result |
+| `MainPID`, `Result`, `ReloadResult`, `ExecMainCode`, `ExecMainStatus`, `NRestarts` | Service process and results; `ReloadResult` is the last reload's |
 | `Job`                       | Installed job as `<id> <type>`, empty if none |
 | `Delegate`, `DelegateControllers`, `DelegateSubgroup` | Cgroup delegation   |
 | `KillMode`, `KillSignal`, `SendSIGKILL`, `SendSIGHUP` | Services only      |
@@ -303,22 +317,27 @@ connection carries one request line and receives one reply line:
 ```
 PICO1 start dropbear.service
 PICO1 restart dropbear.service --no-block
+PICO1 reload dropbear@x.service
 PICO1 daemon-reload
 ```
 
 | Verb            | Action                                                   |
 |-----------------|----------------------------------------------------------|
-| `start`, `stop`, `restart` | Queue a job through `manager_add_job()`       |
+| `start`, `stop`, `restart`, `reload` | Queue a job through `manager_add_job()` |
+| `reload-or-restart`, `try-reload-or-restart` | Choose reload, start or restart from the unit's state when the request arrives, or reply `ok done` at once when `try-` finds nothing to do |
 | `reset-failed`  | Clear a failed unit directly, no job                     |
 | `daemon-reload` | Call `manager_reload()`, the same as SIGHUP              |
 
 Replies are `ok ...` or `err <reason>`. For job verbs the reply is held
 until the job finishes, so `picoctl`'s exit status is the job's result;
-`--no-block` replies `ok queued` at once. Pending replies are keyed by job
-id, never by job pointer. PID 1 never blocks on a client: connections are
+`--no-block` replies `ok queued` at once. A reload can merge into a job the
+unit already has, so several clients can wait on one job; each gets the
+reply. A reload of a unit without `ExecReload=` is answered
+`err not-applicable` and one of a unit that is not active `err invalid`.
+Pending replies are keyed by job id, never by job pointer. PID 1 never blocks on a client: connections are
 non-blocking, at most 16 are tracked and further ones are rejected, and
 requests are parsed out of a fixed 512-byte buffer. During a pending
-shutdown, `start` and `restart` are refused.
+shutdown, `start`, `restart` and the three reload verbs are refused.
 
 Reboot and poweroff do not use the socket. `picoctl reboot` sends SIGINT to
 PID 1, `poweroff` and `halt` send SIGRTMIN+4 and SIGRTMIN+3. When invoked
@@ -336,10 +355,9 @@ of these sources:
 | `status`, `show`, `list-units`, `list-jobs`, `is-active`, `is-failed`, `is-system-running`, `get-default`, `cat`, `list-unit-files` | State files and unit files; no IPC |
 | `whoami` | `/proc/<pid>/cgroup` |
 | `enable`, `disable`, `reenable`, `is-enabled`, `preset`, `preset-all`, `mask`, `unmask`, `link`, `add-wants`, `add-requires` | The `.wants`/`.requires` symlinks and preset files, using the same code as boot |
-| `start`, `stop`, `restart`, `try-restart`, `reload-or-restart`, `reset-failed`, `daemon-reload` | Control socket |
+| `start`, `stop`, `restart`, `try-restart`, `reload`, `reload-or-restart`, `try-reload-or-restart`, `reset-failed`, `daemon-reload` | Control socket |
 | `kill` | `kill(2)` or `sigqueue(3)` on `MainPID` from the state file, or on every pid in the unit's `cgroup.procs` |
 | `reboot`, `poweroff`, `halt` | Signal to PID 1, see above |
-| `reload` | Always fails: `ExecReload=` and reload jobs do not exist |
 
 `picoctl status` also prints the last log lines of the unit by reading
 `logd`'s ring directly. `--root DIR` prefixes every path it touches, which

@@ -130,7 +130,7 @@ logged and skipped.
 | `ExecCondition=`        | List.                                           |
 | `ExecStop=`             | List.                                           |
 | `ExecStopPost=`         | List.                                           |
-| `ExecReload=`           | Stored, recorded as degraded, never run.        |
+| `ExecReload=`           | List. Runs on `picoctl reload` while the unit is active; `$MAINPID` is set; `TimeoutStartSec=` bounds the whole list. |
 | `Environment=`          | Quoting and C escapes as in `ExecStart=`; accumulates. |
 | `EnvironmentFile=`      | Absolute path, optional leading `-`; accumulates. Values are unquoted as by the shell; a file over 4 MiB is refused. |
 | `User=`, `Group=`       | Name or numeric id, resolved at each start.     |
@@ -190,8 +190,7 @@ degradation record.
 |----------------------------|-------------------------------------------------|--------|
 | `Type=dbus`                | Runs as `simple`. There is no bus, so readiness is never waited for. | `Type=dbus` |
 | `Type=idle`                | Runs as `simple`; the start delay is not implemented. | `Type=idle` |
-| `Type=notify-reload`       | Runs as `notify`; there is no reload protocol.  | `Type=notify-reload` |
-| `ExecReload=`              | Parsed and stored; nothing runs it.             | `ExecReload` |
+| `Type=notify-reload`       | Runs as `notify`. `ExecReload=` runs, but the reload signal and the `RELOADING=1`/`READY=1` handshake do not; `RELOADING=1` is logged and otherwise ignored. | `Type=notify-reload` |
 | `StandardInput=` other than the four above (`null`, `file:`, `data`, ...) | Ignored. | `StandardInput` |
 | `StandardOutput=`, `StandardError=` with another value (`console`, `tty`, `kmsg`, `file:`, `socket`, ...) | Ignored. | the directive name |
 | `TTYPath=` not absolute    | Ignored.                                        | `TTYPath` |
@@ -288,7 +287,7 @@ state; `pico-unit-lint` reports them as `FAILED TO LOAD`.
   suffix swap, or `Service=`.
 - `Accept=yes` combined with `Service=`, or with any `ListenDatagram=`.
 
-### Reload
+### Reload of the manager
 
 `picoctl daemon-reload` and `SIGHUP` re-read the fragments of loaded units
 and find new unit files and new `.wants`/`.requires` symlinks. They do not
@@ -303,6 +302,48 @@ start anything, and they skip:
   configuration and logs a warning.
 
 Presets are not re-evaluated by a reload.
+
+### Reloading a service
+
+`picoctl reload` runs the `ExecReload=` lines of an active service as a
+reload job. The main process is not touched. Each line runs as a control
+process with the service's `User=`, `Group=`, environment and cgroup, and
+`$MAINPID` and `${MAINPID}` expand to the main pid while one is known. A
+service held up by `RemainAfterExit=` can be reloaded too.
+
+- A service without `ExecReload=` is refused with `Job type reload is not
+  applicable for unit X.`, as systemd does. A service that is not active
+  ends the job as `invalid`, and picoctl prints `X is not active, cannot
+  reload.`
+- The lines run in order and the first failure ends the list; a line
+  prefixed with `-` counts as a success. A failed reload fails the job and
+  nothing else: the unit stays active, `Result=` is untouched and `Restart=`
+  does not fire. The outcome is in `ReloadResult=` of `picoctl show`.
+- `TimeoutStartSec=` bounds the whole list, where systemd arms it again for
+  every line. On expiry only the running line is killed, with `SIGKILL`,
+  whatever `KillMode=` says.
+- A stop during a reload signals the main and control processes at once and
+  does not run `ExecStop=`.
+- A reload is merged into the job the unit already has instead of replacing
+  it. A start that has not run yet on an active unit becomes the reload, any
+  other start and a restart are kept, and a reload that arrives while one is
+  running makes it run once more. Every waiting client gets the result. A
+  reload job that a stop or restart request replaces reports `canceled`,
+  where systemd merges a restart into it.
+- A reload is refused with `invalid` while a stop job is pending, where
+  systemd cancels the stop. During a pending shutdown it is refused as
+  `shutting-down`.
+- `reload-or-restart` reloads an active service that has `ExecReload=`,
+  starts one that is not active and restarts one without `ExecReload=`.
+  `try-reload-or-restart` and its aliases reload an active service that has
+  `ExecReload=`, restart one without it that is active or activating, and
+  leave any other alone. Both are decided by PID 1 when the request arrives.
+- `is-active` accepts `reloading` as well as `active`, and `list-jobs` shows
+  the reload job as `running`.
+- A reload does not re-read `PIDFile=`. `ExecReloadPost=`,
+  `PropagatesReloadTo=` and `ReloadPropagatedFrom=` are not supported.
+- `$MAINPID` is also set for `ExecStop=` and `ExecStopPost=` while the main
+  process is alive; before it was unset there.
 
 ### Presets
 

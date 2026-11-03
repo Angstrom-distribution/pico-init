@@ -36,19 +36,18 @@ A verb that systemctl does not have either is `Unknown command verb`.
 |------|--------|-------|
 | `list-units [PATTERN...]` | state files | Hides inactive units without a job unless `--all` or `--state=` is given, as `systemctl` does |
 | `list-unit-files [PATTERN...]` | unit files | |
-| `list-jobs [PATTERN...]` | state files | A job is `running` once its unit is activating or deactivating, `waiting` before that |
+| `list-jobs [PATTERN...]` | state files | A job is `running` once its unit is activating, deactivating or reloading, `waiting` before that |
 | `list-timers`, `list-paths`, `list-automounts` | none | Always empty: those unit types do not exist |
 | `status`, `show`, `cat` | state files, unit files | `show` without a unit prints the manager's properties |
-| `is-active`, `is-failed`, `is-enabled`, `is-system-running` | state files, symlinks | `is-system-running --wait` polls while the state is `starting` |
+| `is-active`, `is-failed`, `is-enabled`, `is-system-running` | state files, symlinks | `is-active` accepts `reloading` as well as `active`; `is-system-running --wait` polls while the state is `starting` |
 | `get-default` | state files | The default target is fixed at boot |
 | `whoami [PID...]` | `/proc/PID/cgroup` | The unit a process belongs to |
 | `enable`, `disable`, `reenable`, `preset`, `mask`, `unmask` | symlinks | `--now` also starts or stops the unit |
 | `preset-all` | symlinks, preset files | Every unit file through the preset rules |
 | `link PATH...`, `add-wants TARGET UNIT...`, `add-requires TARGET UNIT...` | symlinks | |
-| `start`, `stop`, `restart`, `try-restart`, `reload-or-restart`, `try-reload-or-restart`, `reset-failed`, `daemon-reload` | control socket | |
+| `start`, `stop`, `restart`, `try-restart`, `reload`, `reload-or-restart`, `try-reload-or-restart`, `reset-failed`, `daemon-reload` | control socket | `reload` runs the `ExecReload=` lines of an active unit; a unit without them is refused. `reload-or-restart` reloads an active unit that has them, starts one that is not active and restarts one without them; `try-reload-or-restart` leaves a unit that is not up alone. Against an older PID 1 they fall back to restart, try-restart and a refusal |
 | `kill` | `kill(2)` or `sigqueue(3)` | |
 | `reboot`, `poweroff`, `halt` | signal to PID 1 | |
-| `reload` | | Refused: there is no `ExecReload=` |
 
 The legacy spellings `check`, `condstop`, `condrestart`, `condreload`,
 `force-reload` and `reload-or-try-restart` work as they do in `systemctl`.
