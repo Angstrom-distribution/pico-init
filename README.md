@@ -25,12 +25,13 @@ the DHCP and SNTP code in `netd` is lifted from current systemd.
   `is-enabled`, `is-system-running`, `get-default`, `whoami`, `enable`,
   `disable`, `reenable`, `preset`, `preset-all`, `mask`, `unmask`, `link`,
   `add-wants`, `add-requires`, `start`, `stop`, `restart`, `try-restart`,
-  `reload-or-restart`, `kill`, `reset-failed`, `daemon-reload`, `reboot`,
-  `poweroff`, `halt`. Options, JSON output and colours follow systemd 262's
-  `systemctl`; what it cannot do it refuses by name. The read verbs work
-  from state files under `/run/pico-init` and keep working when PID 1 is
-  wedged; `--root` works for the file verbs. Invoked as `reboot`,
-  `poweroff`, `halt` or `shutdown` it takes those commands' options.
+  `reload`, `reload-or-restart`, `try-reload-or-restart`, `kill`,
+  `reset-failed`, `daemon-reload`, `reboot`, `poweroff`, `halt`. Options,
+  JSON output and colours follow systemd 262's `systemctl`; what it cannot
+  do it refuses by name. The read verbs work from state files under
+  `/run/pico-init` and keep working when PID 1 is wedged; `--root` works
+  for the file verbs. Invoked as `reboot`, `poweroff`, `halt` or `shutdown`
+  it takes those commands' options.
 - **`netd`**, a network daemon reading `.network` files from the
   `systemd-networkd` directories: static addresses, a DHCPv4 client and
   server, DNS into `/etc/resolv.conf`, an SNTP client, the time zone from
@@ -146,8 +147,9 @@ rest.
 
 - Mount, swap, timer, path, device, scope and slice units. `/etc/fstab` is
   handled by PID 1 at boot instead.
-- Running `ExecReload=`: it is parsed and recorded as degraded, and
-  `picoctl reload` refuses. `isolate` and `set-default` are not available.
+- `isolate` and `set-default`.
+- The `Type=notify-reload` reload signal and the `RELOADING=1` handshake,
+  `ExecReloadPost=`, `PropagatesReloadTo=` and `ReloadPropagatedFrom=`.
 - Resource-control directives (`CPUWeight=`, `MemoryHigh=`, `MemoryMax=`,
   `TasksMax=`, ...) and sandboxing directives (`ProtectSystem=`,
   `PrivateTmp=`, `NoNewPrivileges=`, ...).
