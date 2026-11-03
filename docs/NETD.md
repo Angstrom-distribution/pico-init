@@ -103,7 +103,7 @@ matches on `Name=` alone, or not at all if it has none.
 | --- | --- | --- |
 | `DHCP=` | `no`, `ipv4`, `ipv6`, `yes` (also any other boolean spelling, case-insensitive) | `yes` and `ipv4` start the DHCPv4 client. `ipv6` parses and does nothing. `yes` is IPv4 only in practice. Default `no`. |
 | `Address=` | `a.b.c.d/nn` | Static IPv4 address. Only the first valid line is applied; later ones are parsed and ignored. A value without a prefix length is rejected. |
-| `Gateway=` | IPv4 address | Static default route. |
+| `Gateway=` | IPv4 address | Static default route, at the kernel's metric 0. |
 | `DNS=` | IPv4 address literals, space-separated | Written to `/etc/resolv.conf`. A host name is rejected: netd has no resolver. |
 | `NTP=` | IPv4 address literals, space-separated | SNTP servers. A host name is rejected. |
 | `DHCPServer=` | boolean | Run a DHCPv4 server on the link. Default no. |
@@ -120,10 +120,47 @@ outside the leased address and netmask, netd first adds a link-scope host
 route to it, and removes that route together with the default route. A
 renewed lease without a router removes the default route a lease installed.
 
-Each link has one default route, whether from `Gateway=` or from a lease. It
-is installed with a metric of 100 plus the interface index, so two managed
-uplinks keep separate, individually removable routes and the kernel prefers
-the lower metric.
+On a link with both `Gateway=` and DHCP, a lease's router replaces the
+`Gateway=` route, and a reload keeps it. A router at the `Gateway=` address
+leaves that route as it is, at metric 0, and a renewed lease without a
+router, or a lost lease, puts the `Gateway=` route back. A `Gateway=` that
+cannot be added yet, such as one with no `Address=` in its subnet, is logged
+and does not stop the DHCP client; a lease adds it once the leased address
+puts it in reach, unless the lease names a different router.
+
+A new address in the same subnet as the old one, from a lease or a changed
+`Address=`, is put in after the old one is deleted. Deleting a link's last
+address makes the kernel drop its routes, so netd removes the default route
+first and adds it again for the new address.
+
+Each link has one default route, whether from `Gateway=` or from a lease,
+and the kernel prefers the lowest metric. Metrics follow `systemd-networkd`.
+A lease's default route uses `[DHCPv4] RouteMetric=`, 1024 when it is unset,
+the same on every link. `Gateway=` ignores `RouteMetric=` and has no metric
+of its own, so its route gets the kernel's 0, as a `systemd-networkd`
+`Gateway=` without `Metric=` does.
+
+Routes at the same metric on different links coexist, and each is removed on
+its own; no preference between them is documented. A host route to an
+off-subnet router uses the same metric as its default route. The kernel's
+prefix route for the leased address gets the lease's metric too: netd sends
+it with the address as `IFA_RT_PRIORITY`, as `systemd-networkd` does. The
+prefix route of `Address=` stays at the kernel's 0, the `systemd-networkd`
+default for `[Address] RouteMetric=`, which netd does not read.
+
+Two differences from `systemd-networkd` remain. It adds the host route to a
+lease's router even when the router is inside the leased subnet, where netd
+adds it only for a router outside. It also keeps a `Gateway=` route at 0
+beside a lease's default route at `RouteMetric=`, where netd keeps the one
+default route per link described above.
+
+A route is added next to existing ones, never over them, and netd removes
+only the routes it recorded adding. A netd that exits without its teardown,
+killed by `SIGKILL` or the OOM killer, leaves its default and host routes in
+the kernel, and the next netd does not know about them. A stale route at the
+same router and metric is taken over as the new netd's own. One at another
+router or metric stays beside the new route, and is preferred to it when its
+metric is lower, until it is deleted by hand or the link goes away.
 
 ### [DHCPv4]
 
@@ -132,10 +169,23 @@ the lower metric.
 | `UseDNS=` | yes | Use option 6 for `/etc/resolv.conf`. |
 | `UseNTP=` | yes | Use option 42 as SNTP servers. |
 | `UseTimezone=` | yes | Apply option 101 as the system time zone. |
+| `RouteMetric=` | 1024 | Metric of the lease's default route, of its router's host route and of the leased address's prefix route. Unsigned decimal, 0 to 4294967295. |
 
 `UseTimezone=` defaults to yes, where `systemd-networkd` defaults to no. An
 explicit `UseTimezone=no` is honoured. See
 [INCOMPATIBILITIES.md](INCOMPATIBILITIES.md) for the other differences.
+
+`RouteMetric=` accepts plain decimal only. A sign, a `0x`, `0b` or `0o`
+prefix, a leading zero, trailing text, an empty value or a value above
+4294967295 is rejected with a warning and the earlier value, if any, stays;
+`systemd-networkd` would read some of these in another base. A changed
+`RouteMetric=` moves the lease's routes, the prefix route included, on the
+next reload; the address is sent again with what is left of the lease.
+
+`[DHCP] RouteMetric=` is read as the legacy spelling of the same key. A
+`[DHCPv4]` value wins over it in whichever order the two appear. `[DHCP]` is
+read for this key only; its other keys are dropped. `RouteMetric=` in
+`[IPv6AcceptRA]` is dropped with the rest of that section.
 
 ### Example
 
@@ -170,8 +220,8 @@ Everything not listed above. Notably:
   DHCP server's pool, lease times and options cannot be configured, and
   `Domains=`, `Hostname=`, `MTUBytes=`, `Bridge=` and `RequiredForOnline=`
   have no effect.
-- DHCPv4 client keys such as `UseRoutes=`, `UseHostname=`, `ClientIdentifier=`
-  and `RouteMetric=`.
+- DHCPv4 client keys such as `UseRoutes=`, `UseHostname=` and
+  `ClientIdentifier=`.
 - DHCP server static leases, lease persistence across a netd restart, relay
   and DHCPINFORM.
 - Link-local addressing, `ConfigureWithoutCarrier=`, `ActivationPolicy=`.
@@ -199,8 +249,11 @@ order:
 - SNTP servers from option 42, when `UseNTP=` allows.
 - The time zone from option 101, when `UseTimezone=` allows.
 
-When a lease expires, is NAKed or is declined, netd removes the address and
-route it added, and the client starts a new DISCOVER cycle by itself. When
+When a lease expires, is NAKed or is declined, netd removes the link's address
+and default route, puts back a static `Address=` and `Gateway=` if the file
+has them, and the client starts a new DISCOVER cycle by itself. A reload that
+turns `DHCP=` off stops the client and forgets the lease, removing
+`/run/netd/leases/<ifindex>`; turning it back on starts without a lease. When
 netd starts and finds `/run/netd/leases/<ifindex>`, the client first asks for
 that address by name (INIT-REBOOT).
 

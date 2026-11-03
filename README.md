@@ -125,7 +125,8 @@ gets SIGTERM, then SIGKILL.
 `/run/systemd/network` and `/usr/lib/systemd/network`. It implements
 `[Match] Name=`, `[Network] DHCP=` (IPv4; `ipv6` is accepted and ignored),
 `Address=`, `Gateway=`, `DNS=`, `NTP=`, `DHCPServer=`, `LLDP=`,
-`EmitLLDP=`, and `[DHCPv4] UseDNS=`, `UseNTP=`, `UseTimezone=`; other
+`EmitLLDP=`, and `[DHCPv4] UseDNS=`, `UseNTP=`, `UseTimezone=` and
+`RouteMetric=`, reading `[DHCP] RouteMetric=` as its legacy spelling; other
 directives are ignored. NTP servers come from `NTP=` or DHCP option 42, the
 time zone from DHCP option 101. A link with a random kernel MAC address is
 given a stable one, and `netd` sets a modern default qdisc and TCP
