@@ -1,3 +1,72 @@
+# CHANGES WITH 0.3.2:
+
+        A service can be reloaded: pico-init runs ExecReload= and picoctl has
+        the reload verbs. netctl status shows LLDP neighbours.
+
+##        PID 1 and unit files:
+
+        * ExecReload= is run. The lines run in order as the control process
+          with $MAINPID set, under the service's user, environment and cgroup,
+          and the unit shows reloading in ActiveState meanwhile.
+          TimeoutStartSec= bounds the whole chain. A failing reload fails its
+          job, but the unit stays up and Restart= does not fire: the outcome
+          is kept apart from the result of the service and shown as
+          ReloadResult=.
+
+        * A reload merges into the start, restart or reload job the unit
+          already has, and a start pulled in through Wants= no longer cancels
+          a waiting reload.
+
+        * A stop during a reload leaves the unit inactive with result success.
+          A main process that exits during a reload has the rest of its cgroup
+          killed, as on the normal exit path.
+
+        * Not implemented: the Type=notify-reload RELOADING=1 handshake (it is
+          logged and ignored), ExecReloadPost=, PropagatesReloadTo= and
+          ReloadPropagatedFrom=.
+
+##        picoctl:
+
+        * New verbs reload, reload-or-restart and try-reload-or-restart.
+          reload-or-restart reloads a unit that has ExecReload= and restarts
+          any other. Errors use systemctl's wording, for example "Job type
+          reload is not applicable for unit X." and "X is not active, cannot
+          reload." An old PID 1 answers err unknown-verb, and picoctl then
+          does what it did before: refuse reload, restart, try-restart. The
+          control protocol keeps its version. is-active and try-restart count
+          a reloading unit as up.
+
+##        netd:
+
+        * netctl status prints a "Connected To:" line for each LLDP neighbour
+          of the links it shows, after the Gateway row, as networkctl does:
+          the system name and port, with the descriptions when they are not
+          empty, and n/a for an empty name. Neighbours are sorted by name and
+          chassis. Control characters are replaced and runs of spaces
+          squeezed. status --json and list --json get an LLDPNeighbors array
+          that holds the objects netctl lldp --json prints; networkctl's own
+          JSON has nothing like it.
+
+        * The neighbours of a link are read only from
+          /run/netd/lldp/<ifindex>, and a file whose IFNAME is not the link's
+          name is skipped, in netctl lldp as well. A stale file left by a
+          killed netd no longer lists a neighbour twice.
+
+        * The LLDP table is read with getline(). A neighbour line can be
+          longer than 2048 bytes and was split, so the fields after the split
+          were lost.
+
+##        Build and tests:
+
+        * test-job covers the job merge table. test-service,
+          test-manager-ctrl and test-picoctl cover the reload itself, the
+          control verbs and the picoctl output. test-netctl-opts runs netctl
+          status against fixture neighbours.
+
+##        Contributions from:
+
+        Koen Kooi
+
 # CHANGES WITH 0.3.1:
 
         Stopping a service now signals every process of it, including the
