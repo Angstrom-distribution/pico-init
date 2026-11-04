@@ -6,6 +6,9 @@ Description=pico log daemon
 
 [Service]
 ExecStart=/usr/sbin/logd
+# logd must never write into its own input queue: a full queue would block it
+# on its own log line.
+StandardOutput=null
 Restart=on-failure
 RestartSec=2
 
