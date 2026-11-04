@@ -242,6 +242,30 @@ static int add_v4(NetdRtnl *rtnl, int ifindex, const struct in_addr *addr, unsig
         return netd_rtnl_address_add(rtnl, &a);
 }
 
+/* A default route through `gw`, as the link layer sends it. */
+static void default_v4(NetdRtnlRoute *rt, int ifindex, const struct in_addr *gw, uint32_t metric) {
+        memset(rt, 0, sizeof(*rt));
+        rt->ifindex = ifindex;
+        rt->family = AF_INET;
+        rt->gw.in = *gw;
+        rt->has_gw = true;
+        rt->metric = metric;
+}
+
+static int add_default_v4(NetdRtnl *rtnl, int ifindex, const struct in_addr *gw, uint32_t metric) {
+        NetdRtnlRoute rt;
+
+        default_v4(&rt, ifindex, gw, metric);
+        return netd_rtnl_route_add(rtnl, &rt);
+}
+
+static int del_default_v4(NetdRtnl *rtnl, int ifindex, const struct in_addr *gw, uint32_t metric) {
+        NetdRtnlRoute rt;
+
+        default_v4(&rt, ifindex, gw, metric);
+        return netd_rtnl_route_del(rtnl, &rt);
+}
+
 static void test_netns_rtnl(void) {
         NetdRtnl *rtnl = NULL;
         EventLog log;
@@ -298,7 +322,7 @@ static void test_netns_rtnl(void) {
         ASSERT_TRUE(r == 0);
 
         gw.s_addr = htonl(0x0AFA00FE); /* 10.250.0.254, on-link via the /24 just added */
-        r = netd_rtnl_route_add_default(rtnl, veth->ifindex, &gw, 100);
+        r = add_default_v4(rtnl, veth->ifindex, &gw, 100);
         ASSERT_TRUE(r == 0);
 
         /* The up-flag change above generated a live RTM_NEWLINK; the
@@ -776,24 +800,24 @@ static void test_netns_route_same_metric(void) {
         ASSERT_EQ_INT(inet_pton(AF_INET, "10.70.0.1", &gwa), 1);
         ASSERT_EQ_INT(inet_pton(AF_INET, "10.71.0.1", &gwb), 1);
 
-        ASSERT_EQ_INT(netd_rtnl_route_add_default(rtnl, ia, &gwa, 100), 0);
-        ASSERT_EQ_INT(netd_rtnl_route_add_default(rtnl, ib, &gwb, 100), 0);
+        ASSERT_EQ_INT(add_default_v4(rtnl, ia, &gwa, 100), 0);
+        ASSERT_EQ_INT(add_default_v4(rtnl, ib, &gwb, 100), 0);
         run_shell("ip -4 route show default metric 100 | grep -q 'dev rma0'");
         run_shell("ip -4 route show default metric 100 | grep -q 'dev rmb0'");
 
-        ASSERT_EQ_INT(netd_rtnl_route_add_default(rtnl, ia, &gwa, 100), -EEXIST);
+        ASSERT_EQ_INT(add_default_v4(rtnl, ia, &gwa, 100), -EEXIST);
 
         /* rmb0's gateway on rma0 is nobody's route. */
-        ASSERT_EQ_INT(netd_rtnl_route_del(rtnl, ia, NULL, 0, &gwb, 100), -ESRCH);
+        ASSERT_EQ_INT(del_default_v4(rtnl, ia, &gwb, 100), -ESRCH);
         run_shell("ip -4 route show default metric 100 | grep -q 'dev rma0'");
         run_shell("ip -4 route show default metric 100 | grep -q 'dev rmb0'");
 
-        ASSERT_EQ_INT(netd_rtnl_route_del(rtnl, ia, NULL, 0, &gwa, 100), 0);
+        ASSERT_EQ_INT(del_default_v4(rtnl, ia, &gwa, 100), 0);
         run_shell("test -z \"$(ip -4 route show default dev rma0)\"");
         run_shell("ip -4 route show default metric 100 | grep -q 'dev rmb0'");
 
-        ASSERT_EQ_INT(netd_rtnl_route_add_default(rtnl, ia, &gwa, 100), 0);
-        ASSERT_EQ_INT(netd_rtnl_route_del(rtnl, ib, NULL, 0, &gwb, 100), 0);
+        ASSERT_EQ_INT(add_default_v4(rtnl, ia, &gwa, 100), 0);
+        ASSERT_EQ_INT(del_default_v4(rtnl, ib, &gwb, 100), 0);
         run_shell("ip -4 route show default metric 100 | grep -q 'dev rma0'");
         run_shell("test -z \"$(ip -4 route show default dev rmb0)\"");
 
@@ -1113,6 +1137,113 @@ static void test_netns_address_struct(void) {
         netd_rtnl_free(rtnl);
 
         printf("test-netd-rtnl: address struct subtest ok\n");
+}
+
+/* The route request carries destination, gateway, scope, onlink and preferred
+ * source for IPv4 and the same for IPv6; delete removes each by the fields the
+ * kernel matches. */
+static void test_netns_route_struct(void) {
+        NetdRtnl *rtnl = NULL;
+        NetdRtnlRoute rt;
+        NetdRtnlAddress a;
+        int i, f;
+
+        enter_test_netns();
+
+        ASSERT_TRUE(netd_rtnl_new(&rtnl) == 0);
+        run_ip("link add name rs0 type veth peer name rs1");
+        run_ip("link set rs0 up");
+        i = (int) ifindex_of("rs0");
+
+        memset(&a, 0, sizeof(a));
+        a.ifindex = i;
+        a.family = AF_INET;
+        a.prefixlen = 24;
+        a.valid_sec = UINT32_MAX;
+        a.preferred_sec = UINT32_MAX;
+        ASSERT_EQ_INT(netd_addr_parse("10.80.0.2", &f, &a.address), 0);
+        ASSERT_EQ_INT(netd_rtnl_address_add(rtnl, &a), 0);
+
+        memset(&rt, 0, sizeof(rt));
+        rt.ifindex = i;
+        rt.family = AF_INET;
+        rt.dst_len = 24;
+        rt.metric = 50;
+        rt.has_gw = true;
+        rt.has_prefsrc = true;
+        ASSERT_EQ_INT(netd_addr_parse("10.81.0.0", &f, &rt.dst), 0);
+        ASSERT_EQ_INT(netd_addr_parse("10.80.0.1", &f, &rt.gw), 0);
+        ASSERT_EQ_INT(netd_addr_parse("10.80.0.2", &f, &rt.prefsrc), 0);
+        ASSERT_EQ_INT(netd_rtnl_route_add(rtnl, &rt), 0);
+        run_shell("ip -4 route show dev rs0 | grep -q '^10\\.81\\.0\\.0/24 via 10\\.80\\.0\\.1 proto static src 10\\.80\\.0\\.2 metric 50'");
+        ASSERT_EQ_INT(netd_rtnl_route_add(rtnl, &rt), -EEXIST);
+        ASSERT_EQ_INT(netd_rtnl_route_del(rtnl, &rt), 0);
+        ASSERT_EQ_INT(netd_rtnl_route_del(rtnl, &rt), -ESRCH);
+        run_shell("test -z \"$(ip -4 route show dev rs0 | grep '^10\\.81\\.')\"");
+
+        /* a gateway outside every subnet is refused unless the route is onlink */
+        memset(&rt, 0, sizeof(rt));
+        rt.ifindex = i;
+        rt.family = AF_INET;
+        rt.has_gw = true;
+        ASSERT_EQ_INT(netd_addr_parse("10.82.0.1", &f, &rt.gw), 0);
+        ASSERT_TRUE(netd_rtnl_route_add(rtnl, &rt) < 0);
+        rt.flags = RTNH_F_ONLINK;
+        ASSERT_EQ_INT(netd_rtnl_route_add(rtnl, &rt), 0);
+        run_shell("ip -4 route show default dev rs0 | grep -q '^default via 10\\.82\\.0\\.1 proto static onlink'");
+        ASSERT_EQ_INT(netd_rtnl_route_del(rtnl, &rt), 0);
+
+        if (!netd_ipv6_supported())
+                fprintf(stderr, "test-netd-rtnl: kernel without IPv6, skipping the IPv6 route assertions\n");
+        else {
+                memset(&a, 0, sizeof(a));
+                a.ifindex = i;
+                a.family = AF_INET6;
+                a.prefixlen = 64;
+                a.valid_sec = UINT32_MAX;
+                a.preferred_sec = UINT32_MAX;
+                a.flags = IFA_F_NODAD;
+                ASSERT_EQ_INT(netd_addr_parse("fd80::2", &f, &a.address), 0);
+                ASSERT_EQ_INT(netd_rtnl_address_add(rtnl, &a), 0);
+
+                memset(&rt, 0, sizeof(rt));
+                rt.ifindex = i;
+                rt.family = AF_INET6;
+                rt.dst_len = 64;
+                rt.metric = 1024;
+                rt.has_gw = true;
+                ASSERT_EQ_INT(netd_addr_parse("fd81::", &f, &rt.dst), 0);
+                ASSERT_EQ_INT(netd_addr_parse("fe80::1", &f, &rt.gw), 0);
+                ASSERT_EQ_INT(netd_rtnl_route_add(rtnl, &rt), 0);
+                run_shell("ip -6 route show dev rs0 | grep -q '^fd81::/64 via fe80::1 proto static metric 1024'");
+                ASSERT_EQ_INT(netd_rtnl_route_add(rtnl, &rt), -EEXIST);
+
+                /* a global gateway inside the connected prefix, and a default route */
+                rt.dst_len = 0;
+                memset(&rt.dst, 0, sizeof(rt.dst));
+                rt.metric = 200;
+                ASSERT_EQ_INT(netd_addr_parse("fd80::1", &f, &rt.gw), 0);
+                ASSERT_EQ_INT(netd_rtnl_route_add(rtnl, &rt), 0);
+                run_shell("ip -6 route show default dev rs0 metric 200 | grep -q '^default via fd80::1 '");
+                ASSERT_EQ_INT(netd_rtnl_route_del(rtnl, &rt), 0);
+                run_shell("test -z \"$(ip -6 route show default dev rs0)\"");
+
+                ASSERT_EQ_INT(netd_addr_parse("fd81::", &f, &rt.dst), 0);
+                rt.dst_len = 64;
+                rt.metric = 1024;
+                ASSERT_EQ_INT(netd_addr_parse("fe80::1", &f, &rt.gw), 0);
+                ASSERT_EQ_INT(netd_rtnl_route_del(rtnl, &rt), 0);
+                run_shell("test -z \"$(ip -6 route show dev rs0 | grep '^fd81::')\"");
+        }
+
+        rt.family = AF_UNSPEC;
+        ASSERT_EQ_INT(netd_rtnl_route_add(rtnl, &rt), -EINVAL);
+        ASSERT_EQ_INT(netd_rtnl_route_del(rtnl, &rt), -EINVAL);
+
+        run_ip("link del rs0");
+        netd_rtnl_free(rtnl);
+
+        printf("test-netd-rtnl: route struct subtest ok\n");
 }
 
 /* A lease without RouteMetric= puts its default route, its host route to an
@@ -2007,6 +2138,7 @@ int main(void) {
         test_netns_route_metric_reload();
         test_netns_address_prefix_metric();
         test_netns_address_struct();
+        test_netns_route_struct();
         test_netns_lease_default_metric_routes();
         test_netns_default_metric_two_links();
         test_netns_static_gateway_two_links();
