@@ -106,7 +106,7 @@ matches on `Name=` alone, or not at all if it has none.
 | `Address=` | `a.b.c.d/nn` or an IPv6 address with `/nn` | Static address, shorthand for an [`[Address]`](#address) section. Each line is its own address, and an empty assignment clears the addresses collected so far. A value without a prefix length is rejected. |
 | `Gateway=` | IPv4 address | Static default route, at the kernel's metric 0. A default route with another metric, or through an IPv6 gateway, is a [`[Route]`](#route). |
 | `DNS=` | IPv4 and IPv6 address literals, space-separated | Written to `/etc/resolv.conf` in file order; a link-local IPv6 server is written with the link's interface. A host name or a `%scope` is rejected: netd has no resolver. |
-| `NTP=` | IPv4 address literals, space-separated | SNTP servers. A host name is rejected, and an IPv6 address is ignored with a warning: the SNTP client speaks IPv4 only. |
+| `NTP=` | IPv4 and IPv6 address literals, space-separated | SNTP servers. A link-local IPv6 server takes its interface by name or index, as `fe80::1%eth0` or `fe80::1%2`; without one it is asked on each link the file is applied to. A host name, `::`, a multicast or an IPv4-mapped address, and a `%ifname` on any other address are rejected. |
 | `IPv6AcceptRA=` | boolean | Take addresses and routes from IPv6 router advertisements; see [IPv6 router advertisements](#ipv6-router-advertisements). Unset, it is on unless the link forwards IPv6. |
 | `IPv6Token=` | as `[IPv6AcceptRA] Token=` | Legacy spelling of `Token=`. |
 | `DHCPServer=` | boolean | Run a DHCPv4 server on the link. Default no. |
@@ -360,7 +360,6 @@ Everything not listed above. Notably:
   allow and deny lists, `RouteTable=`, `QuickAck=`, `NetLabel=`, `NFTSet=`,
   temporary (privacy) addresses and `IPv6PrivacyExtensions=`, more than one
   token per link, and `DHCPv6Client=`.
-- IPv6 servers in `NTP=`.
 - `[Address]` keys `Broadcast=` (it is derived from the prefix), `HomeAddress=`,
   `ManageTemporaryAddress=`, `AutoJoin=`, `NetLabel=` and `NFTSet=`, null
   addresses taken from an address pool, and IPv4 address conflict detection.
@@ -423,8 +422,8 @@ address.
 first one is the server address and the advertised router, and the pool is the
 rest of that subnet, excluding the network and broadcast addresses and the
 server address. The default lease time is one hour and the maximum is twelve
-hours. `DNS=` and `NTP=` of the same file are offered to clients as options 6
-and 42.
+hours. The IPv4 entries of `DNS=` and `NTP=` of the same file are offered to
+clients as options 6 and 42.
 
 Leases live in memory and are forgotten when netd restarts; a client
 asks again. A request with a non-zero `giaddr` is rejected. Offering the same
@@ -536,6 +535,25 @@ option 42 and `UseNTP=` allows, the servers from that lease; each source
 replaces the list, so stale entries do not accumulate. At most eight servers
 are kept. The client asks one server at a time, round-robin.
 
+A server is an IPv4 or an IPv6 address. Each family has its own UDP socket;
+the IPv6 one is opened when the first IPv6 server is asked, and a failure to
+open it is reported once. A link-local server in `NTP=` is reached through
+the interface its `%ifname` or index names or, without one, through each
+link the file is applied to; each of those links is one of the eight
+servers. A server whose interface is not there is left out. When a link
+appears, is renamed, comes to match another file or goes away, and that
+changes the servers `NTP=` gives, the list is rebuilt from `NTP=`; like a
+reload, that replaces servers a DHCP lease put there until the lease is
+applied again.
+
+With `systemd-networkd`, `NTP=` and the lease servers of every link are
+handed together to `systemd-timesyncd`, which resolves each one, so host
+names work. netd takes address literals only, lets the last source replace
+the list instead of joining them, and asks a link-local server without an
+interface on each link of its file. It also checks the port of an IPv6 reply
+and the interface of a link-local one, where `systemd-timesyncd` compares
+the address only, as netd does for IPv4.
+
 | Parameter | Value |
 | --- | --- |
 | Resync interval | 2048 s, fixed |
@@ -543,11 +561,12 @@ are kept. The client asks one server at a time, round-robin.
 | Maximum root distance | 5 s |
 
 A reply is discarded when any of these hold: shorter than the NTP header; no
-request outstanding; not from the server asked; origin timestamp not equal to
-the transmitted nonce; zero transmit timestamp; receive or transmit time
-before 2026-01-01T00:00:00Z; leap indicator 3; stratum 0 or 16 and above;
-version other than 3 or 4; mode other than server; root distance above the
-maximum.
+request outstanding; not from the address asked (for an IPv6 server, also
+port 123 and, for a link-local one, the interface); origin timestamp not
+equal to the transmitted nonce; zero transmit timestamp; receive or transmit
+time before 2026-01-01T00:00:00Z; leap indicator 3; stratum 0 or 16 and
+above; version other than 3 or 4; mode other than server; root distance
+above the maximum.
 
 An accepted reply gives an offset by RFC 5905. An offset of 0.4 s or more
 steps the clock with `clock_adjtime(ADJ_SETOFFSET)`; a smaller one is slewed.
