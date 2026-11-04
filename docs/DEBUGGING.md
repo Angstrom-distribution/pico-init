@@ -18,12 +18,18 @@ PID 1 has two output channels.
 Log records carry a prefix of the form `pico-init[LEVEL]: `, where LEVEL is
 one of `err`, `warning`, `info`, `debug`. On `/dev/kmsg` the record also
 carries the matching syslog priority (3, 4, 6, 7), so the kernel ring keeps
-the level. The first record PID 1 logs after switching to `/dev/kmsg` is the
-version line:
+the level. The first records PID 1 logs after switching to `/dev/kmsg` are
+the version line, then the architecture and hostname lines in systemd's
+wording:
 
 ```
 pico-init[info]: pico-init <version> (<git description>) running as PID 1
+pico-init[info]: Detected architecture arm.
+pico-init[info]: Hostname set to <hostname>.
 ```
+
+The hardware watchdog, when PID 1 opens one, adds `Using hardware watchdog`
+and `Watchdog running with a hardware timeout of` lines a little later.
 
 There is no log-level setting. `pico_log()` has no runtime filter:
 `--log-level=`, `systemd.log_level=` and `debug` are accepted and change
