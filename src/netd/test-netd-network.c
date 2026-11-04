@@ -1582,9 +1582,8 @@ static void test_route_cap(void) {
         free(dir);
 }
 
-/* DNS= takes both families in file order; NTP= takes IPv4 only and says why
- * it drops an IPv6 server. */
-static void test_dns_ipv6_and_ntp_ipv6_ignored(void) {
+/* DNS= and NTP= take both families in file order. */
+static void test_dns_and_ntp_ipv6(void) {
         char *dir = test_tmpdir_new();
         char buf[INET6_ADDRSTRLEN];
         Capture c;
@@ -1594,8 +1593,8 @@ static void test_dns_ipv6_and_ntp_ipv6_ignored(void) {
         capture_begin(&c, dir);
         nw = parse_body(dir,
                         "[Network]\nDNS=2001:db8::53 10.0.0.53\nDNS=fe80::1 ::\n"
-                        "NTP=2001:db8::123 10.0.0.123\n");
-        ASSERT_EQ_INT(capture_end(&c, "is IPv6, which the SNTP client does not speak"), 1);
+                        "NTP=2001:db8::123 10.0.0.123\nNTP=fd00::7b fe80::1 fe80::2%eth1\n");
+        ASSERT_EQ_INT(capture_end(&c, "NTP= value"), 0);
 
         ASSERT_EQ_INT(nw->n_dns, 3);
         ASSERT_EQ_INT(nw->dns[0].family, AF_INET6);
@@ -1604,8 +1603,72 @@ static void test_dns_ipv6_and_ntp_ipv6_ignored(void) {
         ASSERT_STREQ(netd_addr_to_string(AF_INET, &nw->dns[1].address, buf), "10.0.0.53");
         ASSERT_EQ_INT(nw->dns[2].family, AF_INET6);
         ASSERT_STREQ(netd_addr_to_string(AF_INET6, &nw->dns[2].address, buf), "fe80::1");
+        ASSERT_EQ_INT(nw->n_ntp, 5);
+        ASSERT_EQ_INT(nw->ntp[0].family, AF_INET6);
+        ASSERT_STREQ(netd_addr_to_string(AF_INET6, &nw->ntp[0].address, buf), "2001:db8::123");
+        ASSERT_STREQ(nw->ntp[0].zone, "");
+        ASSERT_EQ_INT(nw->ntp[1].family, AF_INET);
+        ASSERT_EQ_INT(nw->ntp[1].address.in.s_addr, htonl(0x0a00007b));
+        ASSERT_EQ_INT(nw->ntp[2].family, AF_INET6);
+        ASSERT_STREQ(netd_addr_to_string(AF_INET6, &nw->ntp[2].address, buf), "fd00::7b");
+        ASSERT_STREQ(netd_addr_to_string(AF_INET6, &nw->ntp[3].address, buf), "fe80::1");
+        ASSERT_STREQ(nw->ntp[3].zone, "");
+        ASSERT_STREQ(netd_addr_to_string(AF_INET6, &nw->ntp[4].address, buf), "fe80::2");
+        ASSERT_STREQ(nw->ntp[4].zone, "eth1");
+        network_free(nw);
+
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* What NTP= refuses, one warning per token, the rest of the line kept. */
+static void test_ntp_ipv6_refused(void) {
+        char *dir = test_tmpdir_new();
+        char buf[INET6_ADDRSTRLEN];
+        Capture c;
+        Network *nw;
+
+        ASSERT_TRUE(dir != NULL);
+
+        capture_begin(&c, dir);
+        nw = parse_body(dir, "[Network]\nNTP=:: ff02::101 ::ffff:10.0.0.1 2001:db8::7\n");
+        ASSERT_EQ_INT(capture_end(&c, "cannot be a server address"), 3);
         ASSERT_EQ_INT(nw->n_ntp, 1);
-        ASSERT_EQ_INT(nw->ntp[0].s_addr, htonl(0x0a00007b));
+        ASSERT_STREQ(netd_addr_to_string(AF_INET6, &nw->ntp[0].address, buf), "2001:db8::7");
+        network_free(nw);
+
+        capture_begin(&c, dir);
+        nw = parse_body(dir, "[Network]\nNTP=2001:db8::1%eth0 fd00::1%eth0 fe80::6%eth0\n");
+        ASSERT_EQ_INT(capture_end(&c, "takes an interface name only on a link-local address"), 2);
+        ASSERT_EQ_INT(nw->n_ntp, 1);
+        ASSERT_STREQ(netd_addr_to_string(AF_INET6, &nw->ntp[0].address, buf), "fe80::6");
+        ASSERT_STREQ(nw->ntp[0].zone, "eth0");
+        network_free(nw);
+
+        capture_begin(&c, dir);
+        nw = parse_body(dir,
+                        "[Network]\nNTP=fe80::3% fe80::4%interfacename167 fe80::5%a/b fe80::7%interfacename1\n");
+        ASSERT_EQ_INT(capture_end(&c, "has an invalid interface name"), 3);
+        ASSERT_EQ_INT(nw->n_ntp, 1);
+        ASSERT_STREQ(nw->ntp[0].zone, "interfacename1");
+        ASSERT_EQ_INT(nw->ntp[0].zone_ifindex, 0);
+        network_free(nw);
+
+        /* A number is an interface index; 0 and one past INT_MAX are not. */
+        capture_begin(&c, dir);
+        nw = parse_body(dir, "[Network]\nNTP=fe80::8%0 fe80::9%2147483648 fe80::a%2147483647 fe80::b%7\n");
+        ASSERT_EQ_INT(capture_end(&c, "has an invalid interface index"), 2);
+        ASSERT_EQ_INT(nw->n_ntp, 2);
+        ASSERT_EQ_INT(nw->ntp[0].zone_ifindex, 2147483647);
+        ASSERT_STREQ(nw->ntp[1].zone, "7");
+        ASSERT_EQ_INT(nw->ntp[1].zone_ifindex, 7);
+        network_free(nw);
+
+        capture_begin(&c, dir);
+        nw = parse_body(dir, "[Network]\nNTP=ntp.example.org fe80::zz%eth0 10.0.0.1%eth0 10.0.0.2\n");
+        ASSERT_EQ_INT(capture_end(&c, "is not an address literal"), 3);
+        ASSERT_EQ_INT(nw->n_ntp, 1);
+        ASSERT_EQ_INT(nw->ntp[0].family, AF_INET);
         network_free(nw);
 
         test_rm_rf(dir);
@@ -1756,7 +1819,8 @@ int main(void) {
         test_route_value_errors();
         test_route_leaves_network_gateway();
         test_route_cap();
-        test_dns_ipv6_and_ntp_ipv6_ignored();
+        test_dns_and_ntp_ipv6();
+        test_ntp_ipv6_refused();
         test_ipv6_accept_ra_keys();
         test_ipv6_accept_ra_route_metric();
         test_ipv6_accept_ra_token();

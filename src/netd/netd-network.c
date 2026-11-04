@@ -204,25 +204,21 @@ static int config_parse_gateway(
 #define NETWORK_ADDR_LIST_MAX 128
 
 /*
- * DNS=/NTP=: a space-separated list of address literals -- netd has no
- * resolver, so a hostname here is a parse error for that one token, not a
- * lookup. A bad token is dropped with a warning; the rest of the line still
- * lands, the same per-directive tolerance the rest of this project uses.
+ * NTP=: a space-separated list of address literals -- netd has no resolver,
+ * so a hostname here is a parse error for that one token, not a lookup. A
+ * link-local IPv6 address may name its interface as `fe80::1%eth0` or by
+ * index as `fe80::1%2`; without one it is used on each link the file is
+ * applied to. A bad token is dropped
+ * with a warning; the rest of the line still lands, the same per-directive
+ * tolerance the rest of this project uses.
  */
-static int config_parse_addr_list(
-                const char *path,
-                unsigned line,
-                const char *lvalue,
-                const char *rvalue,
-                struct in_addr **list,
-                size_t *n) {
+static int config_parse_ntp(Network *nw, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
         char *copy, *saveptr = NULL, *tok;
 
         /* An empty assignment resets the list, as in systemd. */
         if (*rvalue == '\0') {
-                free(*list);
-                *list = NULL;
-                *n = 0;
+                nw->ntp = pico_mfree(nw->ntp);
+                nw->n_ntp = 0;
                 return 0;
         }
 
@@ -231,9 +227,10 @@ static int config_parse_addr_list(
                 return -ENOMEM;
 
         for (tok = strtok_r(copy, " \t", &saveptr); tok; tok = strtok_r(NULL, " \t", &saveptr)) {
-                struct in_addr a, *grown;
+                NetworkNtp e = { 0 }, *grown;
+                char *zone;
 
-                if (*n >= NETWORK_ADDR_LIST_MAX) {
+                if (nw->n_ntp >= NETWORK_ADDR_LIST_MAX) {
                         pico_log(PICO_LOG_WARNING,
                                  "%s:%u: %s= holds more than %d entries, ignoring the rest",
                                  path,
@@ -243,33 +240,93 @@ static int config_parse_addr_list(
                         break;
                 }
 
-                if (inet_pton(AF_INET, tok, &a) != 1) {
-                        struct in6_addr a6;
+                if (inet_pton(AF_INET, tok, &e.address.in) == 1)
+                        e.family = AF_INET;
+                else {
+                        zone = strchr(tok, '%');
+                        if (zone)
+                                *zone++ = '\0';
 
-                        if (inet_pton(AF_INET6, tok, &a6) == 1)
-                                pico_log(PICO_LOG_WARNING,
-                                         "%s:%u: %s= value '%s' is IPv6, which the SNTP client does not speak, ignoring",
-                                         path,
-                                         line,
-                                         lvalue,
-                                         tok);
-                        else
+                        if (inet_pton(AF_INET6, tok, &e.address.in6) != 1) {
+                                if (zone)
+                                        zone[-1] = '%';
                                 pico_log(PICO_LOG_WARNING,
                                          "%s:%u: %s= value '%s' is not an address literal, ignoring",
                                          path,
                                          line,
                                          lvalue,
                                          tok);
-                        continue;
+                                continue;
+                        }
+                        e.family = AF_INET6;
+
+                        /* A V6ONLY socket cannot send to a mapped address,
+                         * and no server answers from the others. */
+                        if (IN6_IS_ADDR_UNSPECIFIED(&e.address.in6) ||
+                            IN6_IS_ADDR_MULTICAST(&e.address.in6) || IN6_IS_ADDR_V4MAPPED(&e.address.in6)) {
+                                if (zone)
+                                        zone[-1] = '%';
+                                pico_log(PICO_LOG_WARNING,
+                                         "%s:%u: %s= value '%s' cannot be a server address, ignoring",
+                                         path,
+                                         line,
+                                         lvalue,
+                                         tok);
+                                continue;
+                        }
+
+                        if (zone) {
+                                if (!IN6_IS_ADDR_LINKLOCAL(&e.address.in6)) {
+                                        pico_log(PICO_LOG_WARNING,
+                                                 "%s:%u: %s= value '%s%%%s' takes an interface name only on a link-local address, ignoring",
+                                                 path,
+                                                 line,
+                                                 lvalue,
+                                                 tok,
+                                                 zone);
+                                        continue;
+                                }
+                                if (*zone == '\0' || strlen(zone) >= sizeof(e.zone) || strchr(zone, '/')) {
+                                        pico_log(PICO_LOG_WARNING,
+                                                 "%s:%u: %s= value '%s%%%s' has an invalid interface name, ignoring",
+                                                 path,
+                                                 line,
+                                                 lvalue,
+                                                 tok,
+                                                 zone);
+                                        continue;
+                                }
+                                memcpy(e.zone, zone, strlen(zone) + 1);
+
+                                /* A number is an interface index, as for
+                                 * systemd's rtnl_resolve_interface(). */
+                                if (strspn(zone, "0123456789") == strlen(zone)) {
+                                        unsigned long v;
+
+                                        errno = 0;
+                                        v = strtoul(zone, NULL, 10);
+                                        if (errno == ERANGE || v == 0 || v > INT_MAX) {
+                                                pico_log(PICO_LOG_WARNING,
+                                                         "%s:%u: %s= value '%s%%%s' has an invalid interface index, ignoring",
+                                                         path,
+                                                         line,
+                                                         lvalue,
+                                                         tok,
+                                                         zone);
+                                                continue;
+                                        }
+                                        e.zone_ifindex = (int) v;
+                                }
+                        }
                 }
 
-                grown = realloc(*list, (*n + 1) * sizeof(**list));
+                grown = realloc(nw->ntp, (nw->n_ntp + 1) * sizeof(*grown));
                 if (!grown) {
                         pico_mfree(copy);
                         return -ENOMEM;
                 }
-                *list = grown;
-                (*list)[(*n)++] = a;
+                nw->ntp = grown;
+                nw->ntp[nw->n_ntp++] = e;
         }
 
         pico_mfree(copy);
@@ -329,10 +386,6 @@ static int config_parse_dns(Network *nw, const char *path, unsigned line, const 
 
         pico_mfree(copy);
         return 0;
-}
-
-static int config_parse_ntp(Network *nw, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
-        return config_parse_addr_list(path, line, lvalue, rvalue, &nw->ntp, &nw->n_ntp);
 }
 
 static int config_parse_bool_field(
