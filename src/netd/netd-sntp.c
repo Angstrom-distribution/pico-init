@@ -31,12 +31,20 @@
  * chain follows the fixed order NetdSntpReject declares in netd-sntp.h
  * (pending-request correlation before the source-address compare, where
  * upstream checks source first); every check upstream performs is still here.
+ *
+ * Upstream opens one socket in the family of the server it is talking to
+ * (manager_listen_setup()); netd keeps one per family because it moves to
+ * the next server on every retry. For an IPv6 server the source compare
+ * also takes the port, and the interface of a link-local server, where
+ * upstream's sockaddr_equal() compares the address only; an IPv4 reply is
+ * matched by its address, as upstream does.
  */
 
 #include "netd-sntp.h"
 
 #include <endian.h>
 #include <errno.h>
+#include <netinet/in.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -64,10 +72,58 @@ static usec_t ntp_ts_short_to_usec(const NetdNtpTsShort *ts) {
         return (usec_t) sec * USEC_PER_SEC + (((usec_t) frac * USEC_PER_SEC) >> 16);
 }
 
+/* --- server addresses (pure) --- */
+
+int netd_sntp_addr_set(NetdSntpAddr *ret, int family, const NetdInAddr *a, int ifindex) {
+        if (!ret || !a)
+                return -EINVAL;
+
+        memset(ret, 0, sizeof(*ret));
+
+        switch (family) {
+        case AF_INET:
+                ret->in.sin_family = AF_INET;
+                ret->in.sin_port = htons(NETD_NTP_PORT);
+                ret->in.sin_addr = a->in;
+                return 0;
+        case AF_INET6:
+                ret->in6.sin6_family = AF_INET6;
+                ret->in6.sin6_port = htons(NETD_NTP_PORT);
+                ret->in6.sin6_addr = a->in6;
+                if (IN6_IS_ADDR_LINKLOCAL(&a->in6)) {
+                        if (ifindex <= 0)
+                                return -EINVAL;
+                        ret->in6.sin6_scope_id = (uint32_t) ifindex;
+                }
+                return 0;
+        default:
+                return -EINVAL;
+        }
+}
+
+bool netd_sntp_addr_eq(const NetdSntpAddr *a, const NetdSntpAddr *b) {
+        if (!a || !b || a->sa.sa_family != b->sa.sa_family)
+                return false;
+
+        switch (a->sa.sa_family) {
+        case AF_INET:
+                return a->in.sin_addr.s_addr == b->in.sin_addr.s_addr;
+        case AF_INET6:
+                if (a->in6.sin6_port != b->in6.sin6_port ||
+                    memcmp(&a->in6.sin6_addr, &b->in6.sin6_addr, sizeof(a->in6.sin6_addr)) != 0)
+                        return false;
+                /* The kernel reports a scope only for a link-local source. */
+                return !IN6_IS_ADDR_LINKLOCAL(&a->in6.sin6_addr) ||
+                                a->in6.sin6_scope_id == b->in6.sin6_scope_id;
+        default:
+                return false;
+        }
+}
+
 /* --- validation (pure) --- */
 
 NetdSntpReject netd_sntp_validate(
-                const void *packet, size_t size, const struct in_addr *source, const NetdSntpRequest *request) {
+                const void *packet, size_t size, const NetdSntpAddr *source, const NetdSntpRequest *request) {
         const NetdNtpMsg *m;
         uint8_t leap, version, mode, stratum;
         uint64_t floor, recv_sec, trans_sec;
@@ -82,7 +138,7 @@ NetdSntpReject netd_sntp_validate(
         if (!request->pending)
                 return NETD_SNTP_REJECT_UNSOLICITED;
 
-        if (source->s_addr != request->server.s_addr)
+        if (!netd_sntp_addr_eq(source, &request->server))
                 return NETD_SNTP_REJECT_SOURCE;
 
         m = (const NetdNtpMsg *) packet;
@@ -216,13 +272,64 @@ static int sntp_send_request(NetdSntp *s);
 static int sntp_arm_timer(NetdSntp *s, usec_t interval);
 static void netd_sntp_timer_fired(void *userdata, usec_t t);
 
+static int sntp_receive(NetdSntp *s, int fd);
+
 static int netd_sntp_io_callback(Netd *n, struct netd_epoll_tag *tag, uint32_t revents) {
         NetdSntp *s = tag->userdata;
 
         (void) n;
         (void) revents;
 
-        return netd_sntp_process(s);
+        return sntp_receive(s, tag->fd);
+}
+
+/* A UDP socket of `family` on an ephemeral port, registered with the loop.
+ * IPV6_V6ONLY keeps IPv4-mapped traffic off the IPv6 socket, so each reply
+ * arrives on the socket of its own family. 0 or -errno. */
+static int sntp_open_socket(NetdSntp *s, int family, int *ret_fd, struct netd_epoll_tag *tag) {
+        NetdSntpAddr any = { 0 };
+        socklen_t len;
+        int fd, one = 1, r;
+
+        fd = socket(family, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        if (fd < 0)
+                return -errno;
+
+        if (setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPNS, &one, sizeof(one)) < 0) {
+                r = -errno;
+                close(fd);
+                return r;
+        }
+
+        if (family == AF_INET6) {
+                if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one)) < 0) {
+                        r = -errno;
+                        close(fd);
+                        return r;
+                }
+                any.in6.sin6_family = AF_INET6;
+                any.in6.sin6_addr = in6addr_any;
+                len = sizeof(any.in6);
+        } else {
+                any.in.sin_family = AF_INET;
+                any.in.sin_addr.s_addr = htonl(INADDR_ANY);
+                len = sizeof(any.in);
+        }
+
+        if (bind(fd, &any.sa, len) < 0) {
+                r = -errno;
+                close(fd);
+                return r;
+        }
+
+        r = netd_loop_add_io(s->netd, tag, fd, EPOLLIN, NETD_EPOLL_SNTP, netd_sntp_io_callback, s);
+        if (r < 0) {
+                close(fd);
+                return r;
+        }
+
+        *ret_fd = fd;
+        return 0;
 }
 
 /* Fill `ts` with 8 random bytes, used as-is: the nonce is never a time, so it
@@ -261,10 +368,11 @@ static int sntp_arm_timer(NetdSntp *s, usec_t interval) {
  * no reply arrived in time. */
 static int sntp_send_request(NetdSntp *s) {
         NetdNtpMsg msg = { 0 };
-        struct sockaddr_in dest = { 0 };
+        const NetdSntpAddr *dest;
+        socklen_t dest_len;
         struct timespec ts;
         ssize_t len;
-        int r;
+        int fd, r;
 
         if (s->n_servers == 0)
                 return 0;
@@ -284,17 +392,35 @@ static int sntp_send_request(NetdSntp *s) {
         s->request.origin = (usec_t) ts.tv_sec * USEC_PER_SEC + (usec_t) ts.tv_nsec / 1000;
         s->request.sent_at = now_monotonic();
 
-        dest.sin_family = AF_INET;
-        dest.sin_port = htons(NETD_NTP_PORT);
-        dest.sin_addr = s->request.server;
+        dest = &s->request.server;
+        if (dest->sa.sa_family == AF_INET6) {
+                /* Tried again on every request: the failure may be EMFILE. */
+                if (s->fd6 < 0) {
+                        r = sntp_open_socket(s, AF_INET6, &s->fd6, &s->tag6);
+                        if (r < 0 && !s->warned_fd6)
+                                pico_log(PICO_LOG_WARNING,
+                                         "netd: sntp: cannot open an IPv6 socket, IPv6 servers are not asked: %s",
+                                         strerror(-r));
+                        s->warned_fd6 = s->warned_fd6 || r < 0;
+                }
+                fd = s->fd6;
+                dest_len = sizeof(dest->in6);
+        } else {
+                fd = s->fd;
+                dest_len = sizeof(dest->in);
+        }
 
-        len = sendto(s->fd, &msg, sizeof(msg), 0, (const struct sockaddr *) &dest, sizeof(dest));
-        if (len < 0)
-                r = -errno;
-        else if ((size_t) len != sizeof(msg))
-                r = -EIO;
-        else
-                r = 0;
+        if (fd < 0)
+                r = -EAFNOSUPPORT;
+        else {
+                len = sendto(fd, &msg, sizeof(msg), 0, &dest->sa, dest_len);
+                if (len < 0)
+                        r = -errno;
+                else if ((size_t) len != sizeof(msg))
+                        r = -EIO;
+                else
+                        r = 0;
+        }
 
         s->next_server = (s->next_server + 1) % s->n_servers;
 
@@ -319,8 +445,7 @@ static void netd_sntp_timer_fired(void *userdata, usec_t t) {
 
 int netd_sntp_new(Netd *n, NetdSntp **ret) {
         NetdSntp *s;
-        int fd, one = 1, r;
-        struct sockaddr_in any = { 0 };
+        int r;
 
         if (!n || !ret)
                 return -EINVAL;
@@ -331,44 +456,20 @@ int netd_sntp_new(Netd *n, NetdSntp **ret) {
 
         s->netd = n;
         s->fd = -1;
+        s->fd6 = -1;
         /* calloc() leaves tag.fd at 0, a valid descriptor number; -1 means
          * "none yet". */
         s->tag.fd = -1;
+        s->tag6.fd = -1;
 
-        fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-        if (fd < 0) {
-                r = -errno;
-                goto fail;
-        }
-
-        if (setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPNS, &one, sizeof(one)) < 0) {
-                r = -errno;
-                close(fd);
-                goto fail;
-        }
-
-        any.sin_family = AF_INET;
-        any.sin_addr.s_addr = htonl(INADDR_ANY);
-        if (bind(fd, (const struct sockaddr *) &any, sizeof(any)) < 0) {
-                r = -errno;
-                close(fd);
-                goto fail;
-        }
-
-        s->fd = fd;
-
-        r = netd_loop_add_io(n, &s->tag, fd, EPOLLIN, NETD_EPOLL_SNTP, netd_sntp_io_callback, s);
+        r = sntp_open_socket(s, AF_INET, &s->fd, &s->tag);
         if (r < 0) {
-                close(fd);
-                goto fail;
+                free(s);
+                return r;
         }
 
         *ret = s;
         return 0;
-
-fail:
-        free(s);
-        return r;
 }
 
 NetdSntp *netd_sntp_free(NetdSntp *s) {
@@ -381,21 +482,47 @@ NetdSntp *netd_sntp_free(NetdSntp *s) {
         /* Deregister before closing (netd-loop.h): a still-armed epoll entry
          * must never outlive the fd number it names. */
         (void) netd_loop_remove_io(s->netd, &s->tag);
+        (void) netd_loop_remove_io(s->netd, &s->tag6);
 
         if (s->fd >= 0)
                 (void) close(s->fd);
+        if (s->fd6 >= 0)
+                (void) close(s->fd6);
 
         free(s);
         return NULL;
 }
 
 int netd_sntp_set_servers(NetdSntp *s, const struct in_addr *servers, size_t n) {
+        NetdSntpAddr addrs[NETD_SNTP_MAX_SERVERS];
+
         if (!s)
                 return -EINVAL;
         if (n > 0 && !servers)
                 return -EINVAL;
         if (n > NETD_SNTP_MAX_SERVERS)
                 return -E2BIG;
+
+        for (size_t i = 0; i < n; i++) {
+                NetdInAddr a = { .in = servers[i] };
+
+                (void) netd_sntp_addr_set(&addrs[i], AF_INET, &a, 0);
+        }
+
+        return netd_sntp_set_server_addrs(s, addrs, n);
+}
+
+int netd_sntp_set_server_addrs(NetdSntp *s, const NetdSntpAddr *servers, size_t n) {
+        if (!s)
+                return -EINVAL;
+        if (n > 0 && !servers)
+                return -EINVAL;
+        if (n > NETD_SNTP_MAX_SERVERS)
+                return -E2BIG;
+
+        for (size_t i = 0; i < n; i++)
+                if (servers[i].sa.sa_family != AF_INET && servers[i].sa.sa_family != AF_INET6)
+                        return -EAFNOSUPPORT;
 
         for (size_t i = 0; i < n; i++)
                 s->servers[i] = servers[i];
@@ -432,8 +559,21 @@ int netd_sntp_stop(NetdSntp *s) {
 }
 
 int netd_sntp_process(NetdSntp *s) {
+        int r;
+
+        if (!s)
+                return -EINVAL;
+
+        r = sntp_receive(s, s->fd);
+        if (r < 0 || s->fd6 < 0)
+                return r;
+
+        return sntp_receive(s, s->fd6);
+}
+
+static int sntp_receive(NetdSntp *s, int fd) {
         uint8_t buf[512];
-        struct sockaddr_in src = { 0 };
+        NetdSntpAddr src = { 0 };
         /* Union, not a plain char array: msg_control must be suitably
          * aligned for struct cmsghdr, which a bare char buffer is not
          * guaranteed to be. Zero-initialized -- see glibc bug #20741,
@@ -460,10 +600,10 @@ int netd_sntp_process(NetdSntp *s) {
         int64_t offset, delay;
         int r;
 
-        if (!s)
-                return -EINVAL;
+        if (fd < 0)
+                return 0;
 
-        len = recvmsg(s->fd, &msg, MSG_DONTWAIT);
+        len = recvmsg(fd, &msg, MSG_DONTWAIT);
         if (len < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
                         return 0;
@@ -491,7 +631,7 @@ int netd_sntp_process(NetdSntp *s) {
                 dest = (usec_t) now_ts.tv_sec * USEC_PER_SEC + (usec_t) now_ts.tv_nsec / 1000;
         }
 
-        rej = netd_sntp_validate(buf, (size_t) len, &src.sin_addr, &s->request);
+        rej = netd_sntp_validate(buf, (size_t) len, &src, &s->request);
         if (rej != NETD_SNTP_ACCEPTED) {
                 pico_log(PICO_LOG_DEBUG, "netd: sntp: rejected reply: %s", netd_sntp_reject_to_string(rej));
                 return 0;

@@ -20,6 +20,7 @@
  * floor decision without calling the syscalls that would apply them.
  */
 
+#include <arpa/inet.h>
 #include <endian.h>
 #include <errno.h>
 #include <limits.h>
@@ -107,12 +108,14 @@ static void test_reject_names(void) {
 /* A fully NETD_SNTP_ACCEPTED-worthy request/reply/source triple. Every
  * validate() test below starts here and mutates exactly one thing, so a
  * failing test names precisely which check caught it. */
-static void baseline(NetdNtpMsg *m, NetdSntpRequest *req, struct in_addr *source) {
+static void baseline(NetdNtpMsg *m, NetdSntpRequest *req, NetdSntpAddr *source) {
+        NetdInAddr a = { .in.s_addr = htonl(0x7f000001) }; /* 127.0.0.1 */
+
         memset(m, 0, sizeof(*m));
         memset(req, 0, sizeof(*req));
 
         req->pending = true;
-        req->server.s_addr = htonl(0x7f000001); /* 127.0.0.1 */
+        ASSERT_EQ_INT(netd_sntp_addr_set(&req->server, AF_INET, &a, 0), 0);
         req->nonce.sec = htobe32(0x11223344);
         req->nonce.frac = htobe32(0x55667788);
 
@@ -128,7 +131,7 @@ static void baseline(NetdNtpMsg *m, NetdSntpRequest *req, struct in_addr *source
 static void test_validate_accepted(void) {
         NetdNtpMsg m;
         NetdSntpRequest req;
-        struct in_addr source;
+        NetdSntpAddr source;
 
         baseline(&m, &req, &source);
         ASSERT_EQ_INT(netd_sntp_validate(&m, sizeof(m), &source, &req), NETD_SNTP_ACCEPTED);
@@ -137,7 +140,7 @@ static void test_validate_accepted(void) {
 static void test_validate_malformed(void) {
         NetdNtpMsg m;
         NetdSntpRequest req;
-        struct in_addr source;
+        NetdSntpAddr source;
 
         baseline(&m, &req, &source);
         ASSERT_EQ_INT(netd_sntp_validate(&m, sizeof(m) - 1, &source, &req), NETD_SNTP_REJECT_MALFORMED);
@@ -146,7 +149,7 @@ static void test_validate_malformed(void) {
 static void test_validate_unsolicited(void) {
         NetdNtpMsg m;
         NetdSntpRequest req;
-        struct in_addr source;
+        NetdSntpAddr source;
 
         baseline(&m, &req, &source);
         req.pending = false;
@@ -156,11 +159,55 @@ static void test_validate_unsolicited(void) {
 static void test_validate_source(void) {
         NetdNtpMsg m;
         NetdSntpRequest req;
-        struct in_addr source;
+        NetdSntpAddr source;
 
         baseline(&m, &req, &source);
-        source.s_addr = htonl(0x7f000002); /* not the server we asked */
+        source.in.sin_addr.s_addr = htonl(0x7f000002); /* not the server we asked */
         ASSERT_EQ_INT(netd_sntp_validate(&m, sizeof(m), &source, &req), NETD_SNTP_REJECT_SOURCE);
+
+        /* IPv4 compares the address alone, as upstream's sockaddr_equal(). */
+        baseline(&m, &req, &source);
+        source.in.sin_port = htons(10123);
+        ASSERT_EQ_INT(netd_sntp_validate(&m, sizeof(m), &source, &req), NETD_SNTP_ACCEPTED);
+}
+
+/* IPv6: the address, the port and, for a link-local server, the interface
+ * must match; a reply of the other family never does. */
+static void test_validate_source_ipv6(void) {
+        NetdNtpMsg m;
+        NetdSntpRequest req;
+        NetdSntpAddr source;
+        NetdInAddr global, ll, v4 = { .in.s_addr = htonl(0x7f000001) };
+
+        ASSERT_EQ_INT(inet_pton(AF_INET6, "2001:db8::123", &global.in6), 1);
+        ASSERT_EQ_INT(inet_pton(AF_INET6, "fe80::123", &ll.in6), 1);
+
+        baseline(&m, &req, &source);
+        ASSERT_EQ_INT(netd_sntp_addr_set(&req.server, AF_INET6, &global, 0), 0);
+        source = req.server;
+        ASSERT_EQ_INT(netd_sntp_validate(&m, sizeof(m), &source, &req), NETD_SNTP_ACCEPTED);
+        source.in6.sin6_port = htons(10123);
+        ASSERT_EQ_INT(netd_sntp_validate(&m, sizeof(m), &source, &req), NETD_SNTP_REJECT_SOURCE);
+        source = req.server;
+        source.in6.sin6_addr.s6_addr[15] ^= 1;
+        ASSERT_EQ_INT(netd_sntp_validate(&m, sizeof(m), &source, &req), NETD_SNTP_REJECT_SOURCE);
+        ASSERT_EQ_INT(netd_sntp_addr_set(&source, AF_INET, &v4, 0), 0);
+        ASSERT_EQ_INT(netd_sntp_validate(&m, sizeof(m), &source, &req), NETD_SNTP_REJECT_SOURCE);
+
+        /* A global address carries no interface, so any is the same server. */
+        ASSERT_EQ_INT(netd_sntp_addr_set(&req.server, AF_INET6, &global, 3), 0);
+        ASSERT_EQ_INT(req.server.in6.sin6_scope_id, 0);
+
+        ASSERT_EQ_INT(netd_sntp_addr_set(&req.server, AF_INET6, &ll, 0), -EINVAL);
+        ASSERT_EQ_INT(netd_sntp_addr_set(&req.server, AF_INET6, &ll, 3), 0);
+        ASSERT_EQ_INT(req.server.in6.sin6_port, htons(NETD_NTP_PORT));
+        ASSERT_EQ_INT(req.server.in6.sin6_scope_id, 3);
+        source = req.server;
+        ASSERT_EQ_INT(netd_sntp_validate(&m, sizeof(m), &source, &req), NETD_SNTP_ACCEPTED);
+        source.in6.sin6_scope_id = 4;
+        ASSERT_EQ_INT(netd_sntp_validate(&m, sizeof(m), &source, &req), NETD_SNTP_REJECT_SOURCE);
+
+        ASSERT_EQ_INT(netd_sntp_addr_set(&source, AF_UNIX, &v4, 0), -EINVAL);
 }
 
 /* The anti-off-path-spoofing check: an attacker on a different path can spoof
@@ -168,7 +215,7 @@ static void test_validate_source(void) {
 static void test_validate_nonce(void) {
         NetdNtpMsg m;
         NetdSntpRequest req;
-        struct in_addr source;
+        NetdSntpAddr source;
 
         baseline(&m, &req, &source);
         m.origin_time.frac = htobe32(0xdeadbeef);
@@ -178,7 +225,7 @@ static void test_validate_nonce(void) {
 static void test_validate_zero_timestamp(void) {
         NetdNtpMsg m;
         NetdSntpRequest req;
-        struct in_addr source;
+        NetdSntpAddr source;
 
         baseline(&m, &req, &source);
         m.trans_time.sec = 0;
@@ -195,7 +242,7 @@ static void test_validate_zero_timestamp(void) {
 static void test_validate_epoch(void) {
         NetdNtpMsg m;
         NetdSntpRequest req;
-        struct in_addr source;
+        NetdSntpAddr source;
 
         baseline(&m, &req, &source);
         /* 2020-09-13, comfortably before NETD_TIME_EPOCH_SEC (2026-01-01). */
@@ -207,7 +254,7 @@ static void test_validate_epoch(void) {
 static void test_validate_leap(void) {
         NetdNtpMsg m;
         NetdSntpRequest req;
-        struct in_addr source;
+        NetdSntpAddr source;
 
         baseline(&m, &req, &source);
         m.field = NETD_NTP_FIELD(NETD_NTP_LEAP_NOTINSYNC, 4, NETD_NTP_MODE_SERVER);
@@ -217,7 +264,7 @@ static void test_validate_leap(void) {
 static void test_validate_stratum(void) {
         NetdNtpMsg m;
         NetdSntpRequest req;
-        struct in_addr source;
+        NetdSntpAddr source;
 
         baseline(&m, &req, &source);
         m.stratum = 0; /* kiss-o'-death */
@@ -231,7 +278,7 @@ static void test_validate_stratum(void) {
 static void test_validate_version(void) {
         NetdNtpMsg m;
         NetdSntpRequest req;
-        struct in_addr source;
+        NetdSntpAddr source;
 
         baseline(&m, &req, &source);
         m.field = NETD_NTP_FIELD(0, 2, NETD_NTP_MODE_SERVER);
@@ -241,7 +288,7 @@ static void test_validate_version(void) {
 static void test_validate_mode(void) {
         NetdNtpMsg m;
         NetdSntpRequest req;
-        struct in_addr source;
+        NetdSntpAddr source;
 
         baseline(&m, &req, &source);
         m.field = NETD_NTP_FIELD(0, 4, NETD_NTP_MODE_CLIENT);
@@ -251,7 +298,7 @@ static void test_validate_mode(void) {
 static void test_validate_root_distance(void) {
         NetdNtpMsg m;
         NetdSntpRequest req;
-        struct in_addr source;
+        NetdSntpAddr source;
 
         baseline(&m, &req, &source);
         m.root_dispersion.sec = htobe16(10); /* 10s >> NETD_SNTP_MAX_ROOT_DISTANCE_USEC (5s) */
@@ -679,6 +726,7 @@ int main(void) {
         test_validate_malformed();
         test_validate_unsolicited();
         test_validate_source();
+        test_validate_source_ipv6();
         test_validate_nonce();
         test_validate_zero_timestamp();
         test_validate_epoch();

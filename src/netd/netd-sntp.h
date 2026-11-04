@@ -14,6 +14,13 @@
  * eight-sample jitter/spike statistics, and server-list/DNS iteration --
  * servers arrive as addresses, from [Network] NTP= or from DHCP option 42.
  *
+ * A server is an IPv4 or IPv6 socket address. Each family has its own
+ * socket; the IPv6 one is opened when the first IPv6 server is asked, so a
+ * kernel without IPv6 costs nothing until one is configured. The source
+ * check compares the address, as upstream does, and for an IPv6 server also
+ * the port and the interface of a link-local server, so a reply from
+ * another port or link is not taken for that server's.
+ *
  * Two further checks are carried: a short-packet reject
  * (NETD_SNTP_REJECT_MALFORMED on a datagram smaller than the header), and an
  * epoch floor (NETD_SNTP_REJECT_EPOCH) that rejects recv_time/trans_time
@@ -40,6 +47,7 @@
 
 #include "../timer.h"
 #include "../util.h"
+#include "netd-addr.h"
 #include "netd-loop.h"
 
 typedef struct Netd Netd;
@@ -74,6 +82,14 @@ typedef struct NetdSntp NetdSntp;
 
 #define NETD_SNTP_MAX_SERVERS 8
 
+/* A server, or the source of a reply: port NETD_NTP_PORT, and for a
+ * link-local IPv6 server the interface in sin6_scope_id. */
+typedef union NetdSntpAddr {
+        struct sockaddr sa;
+        struct sockaddr_in in;
+        struct sockaddr_in6 in6;
+} NetdSntpAddr;
+
 /* A 32.32 fixed-point NTP timestamp, in network byte order as it sits on the
  * wire. Kept as raw uint32_t rather than a bitwise-tagged typedef: netd has
  * no sparse annotations, and an explicit be32toh() at each use is clearer
@@ -107,7 +123,7 @@ typedef struct NetdNtpMsg {
  * per-server state to age out. */
 typedef struct NetdSntpRequest {
         bool pending;
-        struct in_addr server;
+        NetdSntpAddr server;
         NetdNtpTs nonce; /* the random transmit timestamp that was sent */
         usec_t origin;   /* CLOCK_REALTIME at send, for the offset arithmetic */
         usec_t sent_at;  /* CLOCK_MONOTONIC at send, for the timeout */
@@ -144,10 +160,13 @@ typedef enum NetdSntpReject {
 struct NetdSntp {
         Netd *netd; /* borrowed */
 
-        int fd; /* UDP, SO_TIMESTAMPNS for the receive timestamp */
+        int fd; /* IPv4 UDP, SO_TIMESTAMPNS for the receive timestamp */
         struct netd_epoll_tag tag;
+        int fd6; /* IPv6 UDP, the same; -1 until an IPv6 server is asked */
+        struct netd_epoll_tag tag6;
+        bool warned_fd6; /* a failure to open fd6 was reported */
 
-        struct in_addr servers[NETD_SNTP_MAX_SERVERS];
+        NetdSntpAddr servers[NETD_SNTP_MAX_SERVERS];
         size_t n_servers;
         size_t next_server; /* round-robin cursor */
 
@@ -159,18 +178,20 @@ struct NetdSntp {
 
 /* --- netd-sntp.c --- */
 
-/* Allocate and open the socket. 0 or -errno. */
+/* Allocate and open the IPv4 socket. 0 or -errno. */
 int netd_sntp_new(Netd *n, NetdSntp **ret);
 
 NetdSntp *netd_sntp_free(NetdSntp *s); /* returns NULL */
 
 /*
- * Replace the server list. Called from netd_startup() with [Network] NTP=
- * and from link_apply_lease() with DHCP option 42, so the two sources cannot
- * accumulate stale entries across a lease change. An empty list stops the
- * client. 0 or -errno.
+ * Replace the server list. Called with [Network] NTP= at startup and reload
+ * (netd_sntp_set_server_addrs()) and from link_apply_lease() with DHCP
+ * option 42 (netd_sntp_set_servers()), so the two sources cannot accumulate
+ * stale entries across a lease change. An empty list stops the client. 0 or
+ * -errno; -EAFNOSUPPORT for a server of another family.
  */
 int netd_sntp_set_servers(NetdSntp *s, const struct in_addr *servers, size_t n);
+int netd_sntp_set_server_addrs(NetdSntp *s, const NetdSntpAddr *servers, size_t n);
 
 /* Send the first query and arm the retry timer. 0 or -errno; a no-op when the
  * server list is empty. */
@@ -179,20 +200,31 @@ int netd_sntp_start(NetdSntp *s);
 /* Cancel the timer and stop querying, without dropping the server list. */
 int netd_sntp_stop(NetdSntp *s);
 
-/* Socket-readiness callback: receive, validate, compute, and (on acceptance)
- * hand the offset to netd_time_adjust_clock(). 0 or -errno. */
+/* Socket-readiness callback: receive on each open socket, validate, compute,
+ * and (on acceptance) hand the offset to netd_time_adjust_clock(). 0 or
+ * -errno. */
 int netd_sntp_process(NetdSntp *s);
 
 /* --- pure helpers, exercised directly by test-netd-sntp --- */
 
+/* A server address on NETD_NTP_PORT. `ifindex` is kept only for a link-local
+ * IPv6 address, where it is required: on a global one it would pin the
+ * server to one interface. 0, or -EINVAL for another family or a link-local
+ * address without an interface. */
+int netd_sntp_addr_set(NetdSntpAddr *ret, int family, const NetdInAddr *a, int ifindex);
+
+/* Same family and address; for IPv6 also the same port and, for a
+ * link-local address, the same interface. */
+bool netd_sntp_addr_eq(const NetdSntpAddr *a, const NetdSntpAddr *b);
+
 /*
  * Every check from the list at the top of this file, in the order a cheap
  * check should precede an expensive one. `source` is the datagram's real
- * source address, not anything read out of the packet. Returns
+ * source address and port, not anything read out of the packet. Returns
  * NETD_SNTP_ACCEPTED or the first reason it failed.
  */
 NetdSntpReject netd_sntp_validate(
-                const void *packet, size_t size, const struct in_addr *source, const NetdSntpRequest *request);
+                const void *packet, size_t size, const NetdSntpAddr *source, const NetdSntpRequest *request);
 
 /*
  * The SNTP offset/delay arithmetic of RFC 5905 §8:

@@ -468,6 +468,9 @@ netd_tests = [
   'test-netd-codec',
   'test-netd-dhcp',
   'test-netd-sntp',
+  # IPv6 NTP servers: an exchange on ::1 and NTP= through an in-process netd,
+  # in a private user and network namespace.
+  'test-netd-sntp-ipv6',
   # Persistent-MAC generation for a random-hardware-address link
   # (netd_persistent_mac_derive() in netd-link.c): fixed siphash24 vectors
   # against the hash key from systemd's netif-util.c, plus the exemption cases
