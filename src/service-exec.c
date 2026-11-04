@@ -80,7 +80,10 @@
  * spans several PIDs. child_exec() dup2()s the socket over stdout and stderr;
  * stdin stays the console. Any failure (logd not installed, its socket not
  * yet present) yields stdout_fd == -1 and the console path is used instead,
- * so a missing logd never fails a spawn.
+ * so a missing logd never fails a spawn. The service that reads that socket
+ * (the activation target of the socket unit bound at logd's stdout path) gets
+ * no socket: a write into its own full queue would wait on itself, so its
+ * stdout and stderr are /dev/null unless it has a terminal.
  *
  * $VAR/${VAR} expansion in exec lines (v30's replace_env_argv()) runs in the
  * parent against the finished envp and produces a freshly owned argv for the
@@ -893,7 +896,8 @@ static int find_in_default_path(const char *name, char *buf, size_t bufsize) {
  * build_exec_envp()'s own layout-invariant comment).
  * `stdout_fd` (create_stdout_socket(), also parent-built) is likewise
  * excluded from the sweep, then dup2()'d over stdout/stderr at step 8;
- * -1 means "logd unavailable", the console fallback. `creds`
+ * -1 means "logd unavailable", the console fallback, or /dev/null when
+ * `stdout_null` is set (this service reads logd's socket itself). `creds`
  * (exec_creds_resolve(), parent-built too) is the User=/Group= result the
  * child applies at step 10 -- integers only, nothing left to look up.
  * `exec_fd` is the write end of a Type=exec service's O_CLOEXEC readiness
@@ -912,6 +916,7 @@ static _Noreturn void
                            unsigned n_sock_fds,
                            size_t pid_slot,
                            int stdout_fd,
+                           bool stdout_null,
                            int exec_fd,
                            const ExecCreds *creds,
                            bool tty_stdin,
@@ -1147,6 +1152,15 @@ static _Noreturn void
                                 _exit(PICO_EXIT_STDOUT);
                         if (dup2(stdout_fd, STDERR_FILENO) < 0)
                                 _exit(PICO_EXIT_STDERR);
+                } else if (stdout_null) {
+                        int nfd = open("/dev/null", O_WRONLY | O_NOCTTY);
+
+                        if (nfd < 0 || dup2(nfd, STDOUT_FILENO) < 0)
+                                _exit(PICO_EXIT_STDOUT);
+                        if (dup2(nfd, STDERR_FILENO) < 0)
+                                _exit(PICO_EXIT_STDERR);
+                        if (nfd > STDERR_FILENO)
+                                close(nfd);
                 } else {
                         if (dup2(fd, STDOUT_FILENO) < 0)
                                 _exit(PICO_EXIT_STDOUT);
@@ -1318,6 +1332,7 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
         char subgroup_path[PATH_MAX];
         const char *cgroup_dir = NULL;
         int stdout_fd;
+        bool stdout_null;
         int exec_pipe[2] = { -1, -1 };
         pid_t pid;
         int r;
@@ -1467,12 +1482,17 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
          * the main command the way LISTEN_FDS is above. -1 on any failure
          * means "no logd, use the console". Not for
          * a tty* unit: its stdout follows stdin to the terminal (child_exec()
-         * step 8). */
-        stdout_fd = service_standard_input_is_tty(s->standard_input) &&
-                                        s->standard_output != SERVICE_STDIO_OUTPUT_JOURNAL &&
-                                        s->standard_error != SERVICE_STDIO_OUTPUT_JOURNAL ?
-                        -1 :
-                        create_stdout_socket(UNIT(s)->id);
+         * step 8). Not for the service that reads the socket either, whatever
+         * its unit file says: connecting to its own queue makes a full queue
+         * block it on its own output, and it then never drains it. */
+        stdout_null = socket_serves_path(UNIT(s), PICO_LOGD_STDOUT_SOCKET_PATH);
+        if (stdout_null ||
+            (service_standard_input_is_tty(s->standard_input) &&
+             s->standard_output != SERVICE_STDIO_OUTPUT_JOURNAL &&
+             s->standard_error != SERVICE_STDIO_OUTPUT_JOURNAL))
+                stdout_fd = -1;
+        else
+                stdout_fd = create_stdout_socket(UNIT(s)->id);
 
         /* Every enter_* function sets the state before it spawns, so the
          * state names the command: upstream's EXEC_APPLY_TTY_STDIN set. */
@@ -1520,6 +1540,7 @@ int service_spawn(Service *s, char **argv, pid_t *ret_pid) {
                            (unsigned) n_sock_fds,
                            pid_slot,
                            stdout_fd,
+                           stdout_null,
                            exec_pipe[1],
                            &creds,
                            tty_stdin,

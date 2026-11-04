@@ -1189,6 +1189,37 @@ int socket_collect_fds(Unit *service, int *fds, size_t n_fds) {
         return (int) n;
 }
 
+bool socket_serves_path(Unit *service, const char *path) {
+        Manager *m;
+        size_t i;
+
+        if (!service || !path)
+                return false;
+
+        m = service->manager;
+        if (!m)
+                return false;
+
+        for (i = 0; i < m->n_units; i++) {
+                Unit *u = m->units[i];
+                Socket *s;
+                SocketPort *p;
+
+                if (u->type != UNIT_SOCKET)
+                        continue;
+
+                s = SOCKET(u);
+                if (s->accept || s->service != service)
+                        continue;
+
+                for (p = s->ports; p; p = p->next)
+                        if (p->path && strcmp(p->path, path) == 0)
+                                return true;
+        }
+
+        return false;
+}
+
 void socket_notify_service_starting(Unit *service) {
         Manager *m;
         size_t i;
