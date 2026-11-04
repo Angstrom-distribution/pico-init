@@ -1073,6 +1073,87 @@ static void test_section_header_and_key_validation(void) {
         ASSERT_STREQ(seen.first_key, "A");
 }
 
+struct header_seen {
+        unsigned n;
+        char names[4][16];
+        unsigned lines[4];
+        unsigned n_assign;
+        int abort_at; /* 1-based header number to fail on, 0 never */
+};
+
+static int header_record(const char *filename, unsigned line, const char *section, void *userdata) {
+        struct header_seen *h = userdata;
+
+        (void) filename;
+
+        if (h->n < 4) {
+                snprintf(h->names[h->n], sizeof(h->names[h->n]), "%s", section);
+                h->lines[h->n] = line;
+        }
+        h->n++;
+
+        return h->abort_at && h->n == (unsigned) h->abort_at ? -EINVAL : 0;
+}
+
+static int
+                header_assign(const char *filename,
+                              unsigned line,
+                              const char *section,
+                              const char *key,
+                              const char *value,
+                              void *userdata) {
+        struct header_seen *h = userdata;
+
+        (void) filename;
+        (void) line;
+        (void) section;
+        (void) key;
+        (void) value;
+
+        h->n_assign++;
+        return 0;
+}
+
+static int scan_headers(const char *content, struct header_seen *h) {
+        char *dir = test_tmpdir_new();
+        char path[PATH_MAX];
+        int r;
+
+        ASSERT_TRUE(dir != NULL);
+        ASSERT_EQ_INT(test_write_file(dir, "f", content), 0);
+        snprintf(path, sizeof(path), "%s/f", dir);
+        r = pico_conf_scan_full(path, header_assign, header_record, h);
+        test_rm_rf(dir);
+        free(dir);
+        return r;
+}
+
+/* Every accepted header is reported with its line, a repeated name each time;
+ * refused headers are not, and the assignment callback is unaffected. */
+static void test_section_handler_reports_headers(void) {
+        struct header_seen h;
+
+        memset(&h, 0, sizeof(h));
+        ASSERT_EQ_INT(scan_headers("[A]\nx=1\n\n[B]\ny=2\n[A]\nz=3\n[Bad\nw=4\n[C]junk\n[D]\n", &h), 0);
+        ASSERT_EQ_INT(h.n, 4);
+        ASSERT_STREQ(h.names[0], "A");
+        ASSERT_EQ_INT(h.lines[0], 1);
+        ASSERT_STREQ(h.names[1], "B");
+        ASSERT_EQ_INT(h.lines[1], 4);
+        ASSERT_STREQ(h.names[2], "A");
+        ASSERT_EQ_INT(h.lines[2], 6);
+        ASSERT_STREQ(h.names[3], "D");
+        ASSERT_EQ_INT(h.lines[3], 11);
+        ASSERT_EQ_INT(h.n_assign, 4);
+
+        /* an error from the section handler aborts the file */
+        memset(&h, 0, sizeof(h));
+        h.abort_at = 2;
+        ASSERT_EQ_INT(scan_headers("[A]\nx=1\n[B]\ny=2\n[C]\nz=3\n", &h), -EINVAL);
+        ASSERT_EQ_INT(h.n, 2);
+        ASSERT_EQ_INT(h.n_assign, 1);
+}
+
 /*
  * A dependency token is a filename before it is anything else, so it must be
  * validated before it is ever concatenated into a search-path entry.
@@ -2464,6 +2545,7 @@ int main(void) {
         test_env_file_shell_quoting();
         test_backslash_pairs_do_not_continue();
         test_section_header_and_key_validation();
+        test_section_handler_reports_headers();
         test_exec_start_pre_list_and_reset();
         test_standard_output_and_error();
         test_invalid_dependency_names_are_rejected();
