@@ -103,7 +103,7 @@ matches on `Name=` alone, or not at all if it has none.
 | --- | --- | --- |
 | `DHCP=` | `no`, `ipv4`, `ipv6`, `yes` (also any other boolean spelling, case-insensitive) | `yes` and `ipv4` start the DHCPv4 client. `ipv6` parses and does nothing. `yes` is IPv4 only in practice. Default `no`. |
 | `Address=` | `a.b.c.d/nn` or an IPv6 address with `/nn` | Static address, shorthand for an [`[Address]`](#address) section. Each line is its own address, and an empty assignment clears the addresses collected so far. A value without a prefix length is rejected. |
-| `Gateway=` | IPv4 address | Static default route, at the kernel's metric 0. |
+| `Gateway=` | IPv4 address | Static default route, at the kernel's metric 0. A default route with another metric, or through an IPv6 gateway, is a [`[Route]`](#route). |
 | `DNS=` | IPv4 address literals, space-separated | Written to `/etc/resolv.conf`. A host name is rejected: netd has no resolver. |
 | `NTP=` | IPv4 address literals, space-separated | SNTP servers. A host name is rejected. |
 | `DHCPServer=` | boolean | Run a DHCPv4 server on the link. Default no. |
@@ -137,7 +137,8 @@ delete netd sends the remaining addresses of the subnet and the default route
 again; whatever is still there is left as it is.
 
 Each link has one default route, whether from `Gateway=` or from a lease,
-and the kernel prefers the lowest metric. Metrics follow `systemd-networkd`.
+besides any default routes from [`[Route]`](#route), and the kernel prefers
+the lowest metric. Metrics follow `systemd-networkd`.
 A lease's default route uses `[DHCPv4] RouteMetric=`, 1024 when it is unset,
 the same on every link. `Gateway=` ignores `RouteMetric=` and has no metric
 of its own, so its route gets the kernel's 0, as a `systemd-networkd`
@@ -155,8 +156,9 @@ and 256 for an IPv6 address, as with `systemd-networkd`.
 Two differences from `systemd-networkd` remain. It adds the host route to a
 lease's router even when the router is inside the leased subnet, where netd
 adds it only for a router outside. It also keeps a `Gateway=` route at 0
-beside a lease's default route at `RouteMetric=`, where netd keeps the one
-default route per link described above.
+beside a lease's default route at `RouteMetric=`, where netd lets a lease's
+router replace `Gateway=` as described above. A `[Route]` default route is
+kept beside a lease's, as in `systemd-networkd`.
 
 A route is added next to existing ones, never over them, and netd removes
 only the routes it recorded adding. A netd that exits without its teardown,
@@ -212,6 +214,69 @@ addresses in the kernel; the next event for the link adds them again. The
 DHCP server serves from the first IPv4 entry, and LLDP advertises the lease
 address, or the first static IPv4 address without a lease.
 
+### [Route]
+
+A `[Route]` section describes one route in the main table; a file can have
+several, IPv4 and IPv6, at most 16 per file. Over that one warning is logged
+and the rest are ignored. `Gateway=` in `[Network]` is not one of them: it
+keeps the single default-route slot described above.
+
+| Key | Values | Behaviour |
+| --- | --- | --- |
+| `Destination=` | `a.b.c.d/nn`, an IPv6 prefix, or a bare address for a host route | Masked to its prefix. Without it the route is a default route. |
+| `Gateway=` | IPv4 or IPv6 address | Next hop. An empty assignment clears it. A section with only `Gateway=` is a default route. |
+| `Metric=` | unsigned decimal | Metric of the route; the kernel prefers the lowest. Default 0 for IPv4 and 1024 for IPv6, which is what the kernel gives an IPv6 route at 0. Plain decimal only, as `RouteMetric=`. |
+| `GatewayOnLink=` | boolean | `yes` adds the route with `onlink`, so the gateway need not lie in a subnet of the link. Without the key it is `yes` when there is a gateway and the file has no static address, with a warning, and `no` otherwise. |
+| `PreferredSource=` | address | Source address for traffic on the route. An empty value or `no` unsets it. |
+| `Scope=` | `global`, `site`, `link`, `host`, `nowhere`, 0 to 255 | IPv4 only. Default `link` without a gateway, `global` with one. Ignored with a warning on an IPv6 route. |
+
+The family comes from `Destination=`, `Gateway=` and `PreferredSource=`, which
+must agree; a section that mixes IPv4 and IPv6 is dropped with a warning. A
+section with none of the three is dropped too, with the `systemd-networkd`
+warning "[Route] section without Gateway=, Destination=, Source=, or
+PreferredSource= field configured". That is what happens to the `Metric=` of a
+`[Route]` section that holds nothing else: it is a no-op and never a metric on
+some other route.
+
+A section that has a key which changes what the route is, because netd cannot
+keep that meaning, is dropped whole with a warning, since installing a
+different route than asked is worse than installing none. Those keys are
+`Table=` other than `main` or 254, `Type=` other than `unicast`, `Source=`,
+`MultiPathRoute=`, `NextHop=`, and `Gateway=` set to `_dhcp4`, `_ipv6ra` or
+`_dhcp`. The other keys, `Protocol=`, `IPv6Preference=`, `MTUBytes=`,
+`HopLimit=`, `InitialCongestionWindow=` and the rest of the tuning keys, are
+dropped at debug level and the route is installed. When two sections give the
+same route the later one wins. Values that fail to parse keep the earlier
+value; unlike `[Address]`, an empty `Metric=` or `Scope=` is such a value.
+
+A `[Route]` default route is an ordinary entry. It stays beside a lease's
+default route and is never replaced by it, and a lost lease takes only the
+lease's route. A `[Route]` and `Gateway=` that name the same gateway at the
+same metric are one kernel route with two owners, which is deleted when both
+have let go, as long as both are added the same way. In a file with no static
+address a `[Route]` gateway is added `onlink` and `Gateway=` is not, which
+makes two kernel routes that a delete does not tell apart; set
+`GatewayOnLink=no` on the `[Route]`, or name the gateway once.
+
+A reload sends only what changed. A route that is unchanged makes no netlink
+write; for a changed route the new one is added before the old one is
+deleted, except for an IPv4 route at metric 0, which goes first because a
+delete at metric 0 matches any metric. netd removes only routes it added: one
+put on the link by something else stays through a reload and when netd stops.
+Removing a section, or losing the link's match, deletes the routes netd
+added.
+
+The kernel refuses a route whose gateway no address of the link reaches. netd
+keeps the entry, logs one warning, and tries again after every address or
+lease change, so a gateway that a lease's address, or an address added by a
+reload, puts in reach is installed then. A link with `DHCP=` off and such a
+route is `failed`, as it is for an unreachable `Gateway=`. Deleting an IPv4
+address makes the kernel drop routes that went through it, so after any IPv4
+delete netd sends the installed IPv4 routes again, with the rest of the
+subnet and the default route. A link taken down loses its routes in the
+kernel, and the next event for the link adds them again. IPv6 routes are
+skipped, with one warning per link, on a kernel without IPv6.
+
 ### [DHCPv4]
 
 | Key | Default | Behaviour |
@@ -262,14 +327,17 @@ DHCPServer=yes
 
 Everything not listed above. Notably:
 
-- IPv6 configuration beyond static addresses: `DHCP=ipv6`, router
+- IPv6 configuration beyond static addresses and routes: `DHCP=ipv6`, router
   advertisements, DHCPv6. The `[IPv6AcceptRA]` section and similar are dropped.
 - `[Address]` keys `Broadcast=` (it is derived from the prefix), `HomeAddress=`,
   `ManageTemporaryAddress=`, `AutoJoin=`, `NetLabel=` and `NFTSet=`, null
   addresses taken from an address pool, and IPv4 address conflict detection.
 - `[Match]` keys other than `Name=`; `.link` and `.netdev` files; virtual
   devices (bridges, VLANs, bonds).
-- `[Route]` and `[DHCPServer]` sections and their keys, so the
+- `[Route]` keys other than those above: policy routing tables, non-unicast
+  types, source and multipath routes, `Protocol=`, route metrics such as
+  `MTUBytes=`, and gateways taken from a lease or an advertisement.
+- The `[DHCPServer]` section and its keys, so the
   DHCP server's pool, lease times and options cannot be configured, and
   `Domains=`, `Hostname=`, `MTUBytes=`, `Bridge=` and `RequiredForOnline=`
   have no effect.
