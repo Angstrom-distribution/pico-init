@@ -110,6 +110,10 @@ fresh user namespace that creates the network namespace in the same call owns
 it and so holds `CAP_NET_ADMIN` inside it. The tests use that form. If the
 host disables unprivileged user namespaces, run them as root. `test-netd-sntp`
 runs a fake UDP/123 responder on loopback and needs no namespace.
+`test-netd-sntp-ipv6` runs its fake server on `::1` in the same kind of
+namespace and exits 77 when it cannot be created: it sends a reply the client
+accepts, and only the namespace makes the `clock_adjtime()` that follows fail
+with `EPERM` instead of adjusting the host clock.
 
 Tests that skip print the reason on stderr. A skipped test is not a pass: read
 the log before concluding that a run covered the code you changed.
