@@ -131,6 +131,12 @@ int socket_dispatch_io(sd_event_source *es, int fd, uint32_t revents, void *user
 int socket_collect_fds(Unit *service, int *fds, size_t n_fds);
 
 /*
+ * True when a socket unit paired with `service` (Accept=no) listens on the
+ * AF_UNIX `path`, that is, when `service` is the daemon that reads it.
+ */
+bool socket_serves_path(Unit *service, const char *path);
+
+/*
  * A service that is about to fork with fds collected via socket_collect_fds()
  * above must stop treating any paired socket's LISTENING state as "PID 1
  * owns this fd" -- from here the service does, until it dies (d137a488af).

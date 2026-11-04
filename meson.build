@@ -204,6 +204,8 @@ pico_tests = [
   'test-cgroup-delegate',
   'test-boot',
   'test-socket',
+  # The service that reads logd's stdout socket gets /dev/null, not that socket.
+  'test-service-stdout',
   'test-manager-state',
   'test-picoctl',
   'test-manager-ctrl',
