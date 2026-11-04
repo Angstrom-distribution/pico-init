@@ -352,6 +352,8 @@ netd_own_sources = files(
   'src/netd/lldp/lldp-frame.c',
   'src/netd/lldp/lldp-table.c',
   'src/netd/lldp/lldp-link.c',
+  # IPv6 router advertisements: the message codec and lifetime rules.
+  'src/netd/ndisc/ndisc-msg.c',
 )
 
 # The DHCPv4 implementation lifted from systemd v261.2 (commit 4925d9f07f).
@@ -469,6 +471,9 @@ netd_tests = [
   'test-netd-lldp-table',
   # LLDP over a veth pair in a private network namespace.
   'test-netd-lldp-link',
+  # Router advertisement parser and solicitation builder: fixed bytes,
+  # malformed options, a truncation and mutation run, lifetime arithmetic.
+  'test-netd-ndisc-msg',
   # --help, --version and refused arguments.
   'test-netd-opts',
 ]
