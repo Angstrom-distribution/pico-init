@@ -221,6 +221,8 @@ Everything is under `src/`.
 - `src/hostname-setup.c`, `src/machine-id-setup.c`, `src/clock-persist.c`:
   early boot state.
 - `src/status.c`, `src/os-release.c`, `src/pico-color.c`: boot console output.
+- `src/boot-text.c`: the architecture name and the timespan in the early boot
+  lines that use systemd's wording.
 - `src/signal.c`, `src/util.c`, `src/compat.c`: signalfd handling, shared
   helpers and logging, and the shims for quarried code.
 - `src/picoctl.c`, `src/pico-unit-lint.c`: client tools.

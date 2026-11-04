@@ -21,7 +21,7 @@ are listed under [Failure handling](#failure-handling).
 | 3    | Hostname                                        | `hostname-setup.c`   |
 | 4    | Clock restore                                   | `clock-persist.c`    |
 | 5    | Sysctl                                          | `mount-setup.c`      |
-| 6    | Log to `/dev/kmsg`, version line                | `main.c`             |
+| 6    | Log to `/dev/kmsg`, version/arch/hostname lines | `main.c`             |
 | 7    | Console greeting                                | `status.c`           |
 | 8    | Read `/etc/fstab`, check and remount root       | `root-check.c`       |
 | 9    | Mount the rest of `/etc/fstab`, activate swap   | `fstab-mount.c`      |
@@ -80,7 +80,12 @@ level.
 ending and trailing blanks, and calls `sethostname(2)`. A missing or empty
 file is not an error and leaves the kernel's value in place. The root
 filesystem is read as the kernel mounted it, so this runs before the root
-check.
+check. `hostname_setup()` logs nothing itself. Once the log sink exists
+(see [Logging and the console](#logging-and-the-console)), `main()` logs
+`Hostname set to <name>.` when the call changed the hostname, or the warning
+`Failed to set hostname to <name>: <error>` when `sethostname(2)` failed, or
+`Failed to read /etc/hostname: <error>` when the file exists but cannot be
+read. A hostname that was already set is not reported.
 
 ## Clock
 
@@ -121,7 +126,12 @@ Two output channels exist and are independent (`src/status.h`).
 `pico_log_to_kmsg()` redirects PID 1's own log records to `/dev/kmsg`. logd,
 when it starts, reads the ring from the beginning and so also holds every
 record emitted before it existed. The first record is
-`pico-init <version> (<git description>) running as PID 1`.
+`pico-init <version> (<git description>) running as PID 1`. It is followed by
+the two lines systemd prints at the same point, in its words:
+`Detected architecture <arch>.`, where `<arch>` is systemd's name for the
+`uname(2)` machine (`arm`, `arm64`, `x86-64`, `x86`, `riscv64`, ...; a machine
+pico-init has no name for is printed as `uname` gives it), and
+`Hostname set to <name>.` when `/etc/hostname` changed the hostname.
 
 `status_enable()` opens `/dev/console` for write (falling back to stdout) and
 `status_welcome()` prints the greeting. The greeting is the systemd one:
@@ -371,8 +381,14 @@ unit loading, presets and the cycle check are all covered.
 - A timer on the event loop feeds it every quarter of the timeout, at the
   loop's highest priority (`EVENT_PRIORITY_WATCHDOG`), so a busy loop
   cannot starve the feed, and a hung PID 1 lets the hardware reset the board.
-- The log line is
-  `watchdog armed: <device>, timeout <N>s, feeding every <M>ms`.
+- Two info lines are logged, in systemd's words:
+  `Using hardware watchdog <device>: '<identity>', version <n>.` (the version
+  is the firmware version in hex, as `WDIOC_GETSUPPORT` reports it; a driver
+  without that ioctl gets
+  `Using hardware watchdog <device>, no support for WDIOC_GETSUPPORT ioctl: <error>`)
+  and `Watchdog running with a hardware timeout of <time>.`, for example
+  `15min 30s` or `30s`. The timeout is the value read back from the driver.
+  Magic-close support and the feed interval are logged at debug level.
 
 The timeout and device path are not configurable at run time. There is no
 per-service `WatchdogSec=` supervision: `WATCHDOG=` keys sent over
