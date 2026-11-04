@@ -331,6 +331,7 @@ netd_own_sources = files(
   'src/netd/netd-loop.c',
   'src/netd/netd-link.c',
   'src/netd/netd-network.c',
+  'src/netd/netd-addr.c',
   'src/netd/netd-rtnl.c',
   # Low-level rtnetlink plumbing (request construction, send/recv,
   # NLMSG_ERROR decoding, generic attribute getters), split out of
@@ -446,6 +447,8 @@ install_symlink(
 # drives the server end to end against a scripted client over a veth pair.
 netd_tests = [
   'test-netd-network',
+  # IPv4/IPv6 literal parsing, masking and formatting (netd-addr.c).
+  'test-netd-addr',
   'test-netd-rtnl',
   'test-netd-codec',
   'test-netd-dhcp',
