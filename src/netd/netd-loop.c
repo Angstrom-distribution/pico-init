@@ -274,6 +274,32 @@ static int netd_rtnl_reenumerate(Netd *n) {
 
         n->rtnl_dump_in_progress = true;
         r = netd_rtnl_enumerate_links(n->rtnl);
+        if (r >= 0) {
+                /* What was known before, for a dump that fails part way:
+                 * it would otherwise leave links waiting for a link-local
+                 * address they already have. */
+                bool *ready = malloc((n->n_links + 1) * sizeof(*ready));
+                size_t n_ready = n->n_links;
+                int rr;
+
+                /* The link-local addresses the kernel made before netd ran;
+                 * a link without one yet sees it as a live event later. After
+                 * an overrun the dump is the only record: a link-local address
+                 * deleted while events were lost is not in it. */
+                for (size_t i = 0; i < n->n_links; i++) {
+                        if (ready)
+                                ready[i] = n->links[i]->ipv6ll_ready;
+                        n->links[i]->ipv6ll_ready = false;
+                }
+                rr = netd_rtnl_enumerate_addresses(n->rtnl);
+
+                if (rr < 0) {
+                        pico_log(PICO_LOG_WARNING, "netd: rtnl: address enumeration failed: %s", strerror(-rr));
+                        for (size_t i = 0; ready && i < n_ready && i < n->n_links; i++)
+                                n->links[i]->ipv6ll_ready = n->links[i]->ipv6ll_ready || ready[i];
+                }
+                free(ready);
+        }
         n->rtnl_dump_in_progress = false;
 
         if (r < 0)
@@ -454,6 +480,7 @@ int netd_startup(Netd *n) {
         }
 
         netd_rtnl_set_link_handler(n->rtnl, netd_link_rtnl_handler, n);
+        netd_rtnl_set_addr_handler(n->rtnl, netd_link_rtnl_addr_handler, n);
 
         r = netd_loop_add_io(
                         n,

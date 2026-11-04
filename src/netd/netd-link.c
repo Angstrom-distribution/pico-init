@@ -753,6 +753,50 @@ int netd_link_rtnl_handler(void *userdata, NetdRtnlLinkEvent event, const NetdRt
         }
 }
 
+static void link_set_ipv6ll(Link *l, bool removed, const NetdRtnlAddr *a) {
+        bool ready = !removed && !(a->flags & (IFA_F_TENTATIVE | IFA_F_DADFAILED));
+
+        if (ready) {
+                l->ipv6ll = a->address;
+                l->ipv6ll_ready = true;
+        } else if (netd_addr_eq(AF_INET6, &l->ipv6ll, &a->address))
+                l->ipv6ll_ready = false;
+}
+
+int netd_link_rtnl_addr_handler(void *userdata, bool removed, const NetdRtnlAddr *a) {
+        Netd *n = userdata;
+        Link *l;
+
+        if (!n || !a)
+                return -EINVAL;
+
+        l = netd_find_link(n, a->ifindex);
+        if (!l || a->family != AF_INET6)
+                return 0;
+
+        if (netd_addr_is_link_local(AF_INET6, &a->address))
+                link_set_ipv6ll(l, removed, a);
+
+        if (removed || !(a->flags & IFA_F_DADFAILED))
+                return 0;
+
+        for (size_t i = 0; i < l->n_addrs; i++) {
+                LinkAddress *s = &l->addrs[i];
+                char buf[INET6_ADDRSTRLEN];
+
+                if (s->family != AF_INET6 || !netd_addr_eq(AF_INET6, &s->address, &a->address) || s->dad_warned)
+                        continue;
+
+                pico_log(PICO_LOG_WARNING,
+                         "netd: %s: address %s is in use by another host (duplicate address detection failed)",
+                         l->ifname,
+                         netd_addr_to_string(AF_INET6, &s->address, buf));
+                s->dad_warned = true;
+        }
+
+        return 0;
+}
+
 /* --- static Address=/Gateway= convergence --- */
 
 static void link_address_from_network(const NetworkAddress *na, LinkAddress *out) {

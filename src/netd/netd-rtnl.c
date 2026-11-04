@@ -7,7 +7,8 @@
  * GPL-2.0-or-later like the rest of netd's own source. See netd-rtnl.h for
  * why it is hand-rolled and why there are two sockets.
  *
- * Link enumerate/match, RTM_NEWLINK/DELLINK subscription, link up/down,
+ * Link enumerate/match, RTM_NEWLINK/DELLINK subscription, IPv6 address
+ * events and enumeration, link up/down,
  * RTM_NEWADDR/DELADDR, RTM_NEWROUTE/DELROUTE including a default route, and
  * netd_rtnl_link_set_hwaddr() for persistent-MAC generation.
  *
@@ -66,10 +67,13 @@
 
 struct NetdRtnl {
         NlSock req;   /* private: synchronous request -> ACK only */
-        int event_fd; /* subscribed to RTNLGRP_LINK; the only fd netd polls */
+        int event_fd; /* subscribed to RTNLGRP_LINK and RTNLGRP_IPV6_IFADDR; the only fd netd polls */
 
         netd_rtnl_link_handler_t link_handler;
         void *link_userdata;
+
+        netd_rtnl_addr_handler_t addr_handler;
+        void *addr_userdata;
 
         /* ifindexes already reported through the handler, so a live
          * RTM_NEWLINK can be told apart from a first sighting (ADDED) versus
@@ -146,6 +150,67 @@ static int nl_parse_link(const struct nlmsghdr *nlh, NetdRtnlLink *out) {
         }
 
         return 0;
+}
+
+/* --- RTM_(NEW|DEL)ADDR parsing --- */
+
+/* As nl_parse_link(): `nlh` has passed NLMSG_OK. -EAFNOSUPPORT for an
+ * address that is not IPv6, which is not an error, just not delivered. */
+static int nl_parse_addr(const struct nlmsghdr *nlh, NetdRtnlAddr *out) {
+        const struct ifaddrmsg *ifa;
+        const struct rtattr *rta, *a;
+        int rem;
+
+        if (nlh->nlmsg_len < NLMSG_LENGTH(sizeof(*ifa)))
+                return -EBADMSG;
+
+        ifa = (const struct ifaddrmsg *) NLMSG_DATA(nlh);
+        if (ifa->ifa_family != AF_INET6)
+                return -EAFNOSUPPORT;
+
+        memset(out, 0, sizeof(*out));
+        out->ifindex = (int) ifa->ifa_index;
+        out->family = AF_INET6;
+        out->prefixlen = ifa->ifa_prefixlen;
+        out->scope = ifa->ifa_scope;
+        out->flags = ifa->ifa_flags;
+
+        if (out->ifindex <= 0 || out->prefixlen > 128)
+                return -EBADMSG;
+
+        rem = (int) (nlh->nlmsg_len - NLMSG_LENGTH(sizeof(*ifa)));
+        rta = (const struct rtattr *) ((const uint8_t *) ifa + NLMSG_ALIGN(sizeof(*ifa)));
+
+        (void) rtattr_get_u32(rta, rem, IFA_FLAGS, &out->flags);
+
+        a = rtattr_find(rta, rem, IFA_LOCAL);
+        if (!a)
+                a = rtattr_find(rta, rem, IFA_ADDRESS);
+        if (!a || RTA_PAYLOAD(a) != sizeof(struct in6_addr))
+                return -EBADMSG;
+
+        memcpy(out->address.bytes, RTA_DATA(a), sizeof(struct in6_addr));
+        return 0;
+}
+
+static void dispatch_addr(NetdRtnl *rtnl, const struct nlmsghdr *m) {
+        NetdRtnlAddr addr;
+        int r;
+
+        r = nl_parse_addr(m, &addr);
+        if (r == -EAFNOSUPPORT)
+                return;
+        if (r < 0) {
+                pico_log(PICO_LOG_WARNING, "netd: rtnl: dropping malformed address message: %s", strerror(-r));
+                return;
+        }
+
+        if (!rtnl->addr_handler)
+                return;
+
+        r = rtnl->addr_handler(rtnl->addr_userdata, m->nlmsg_type == RTM_DELADDR, &addr);
+        if (r < 0)
+                pico_log(PICO_LOG_WARNING, "netd: rtnl: address handler failed: %s", strerror(-r));
 }
 
 /* --- ADDED/CHANGED/REMOVED bookkeeping --- */
@@ -260,6 +325,17 @@ int netd_rtnl_new(NetdRtnl **ret) {
                 goto fail;
         rtnl->event_fd = event_sock.fd;
 
+        /* Best effort: without the group, solicitations wait for a link-local
+         * address the startup dump saw and lost detection goes unnoticed, but
+         * IPv4 and received advertisements still work. */
+        if (netd_ipv6_supported()) {
+                r = nl_sock_join_group(&event_sock, RTNLGRP_IPV6_IFADDR);
+                if (r < 0)
+                        pico_log(PICO_LOG_WARNING,
+                                 "netd: rtnl: cannot follow IPv6 address events, continuing without them: %s",
+                                 strerror(-r));
+        }
+
         *ret = rtnl;
         return 0;
 
@@ -296,32 +372,47 @@ void netd_rtnl_set_link_handler(NetdRtnl *rtnl, netd_rtnl_link_handler_t handler
         rtnl->link_userdata = userdata;
 }
 
+void netd_rtnl_set_addr_handler(NetdRtnl *rtnl, netd_rtnl_addr_handler_t handler, void *userdata) {
+        if (!rtnl)
+                return;
+
+        rtnl->addr_handler = handler;
+        rtnl->addr_userdata = userdata;
+}
+
 /* --- reading --- */
 
-int netd_rtnl_enumerate_links(NetdRtnl *rtnl) {
+/* A dump of links (RTM_GETLINK) or IPv6 addresses (RTM_GETADDR), each entry
+ * delivered as a new one. */
+static int rtnl_dump(NetdRtnl *rtnl, uint16_t type) {
         int attempt;
-
-        if (!rtnl)
-                return -EINVAL;
 
         for (attempt = 0; attempt < NETD_RTNL_DUMP_MAX_RETRIES; attempt++) {
                 struct nl_request req;
                 struct nlmsghdr *nlh;
-                struct ifinfomsg *ifi;
                 uint32_t seq;
                 int count = 0;
                 bool retry = false;
                 bool done = false;
                 int r;
 
-                nlh = nl_req_init(&req, RTM_GETLINK, NLM_F_REQUEST | NLM_F_DUMP);
+                nlh = nl_req_init(&req, type, NLM_F_REQUEST | NLM_F_DUMP);
                 if (!nlh)
                         return -ENOBUFS;
 
-                ifi = nl_reserve(&req, sizeof(*ifi));
-                if (!ifi)
-                        return -ENOBUFS;
-                ifi->ifi_family = AF_UNSPEC;
+                if (type == RTM_GETLINK) {
+                        struct ifinfomsg *ifi = nl_reserve(&req, sizeof(*ifi));
+
+                        if (!ifi)
+                                return -ENOBUFS;
+                        ifi->ifi_family = AF_UNSPEC;
+                } else {
+                        struct ifaddrmsg *ifa = nl_reserve(&req, sizeof(*ifa));
+
+                        if (!ifa)
+                                return -ENOBUFS;
+                        ifa->ifa_family = AF_INET6;
+                }
 
                 r = nl_finish_and_send(&rtnl->req, &req, &seq);
                 if (r < 0)
@@ -371,8 +462,11 @@ int netd_rtnl_enumerate_links(NetdRtnl *rtnl) {
                                         break;
                                 }
 
-                                if (m->nlmsg_type == RTM_NEWLINK) {
+                                if (m->nlmsg_type == RTM_NEWLINK && type == RTM_GETLINK) {
                                         dispatch_link(rtnl, m, true);
+                                        count++;
+                                } else if (m->nlmsg_type == RTM_NEWADDR && type == RTM_GETADDR) {
+                                        dispatch_addr(rtnl, m);
                                         count++;
                                 }
                         }
@@ -385,6 +479,23 @@ int netd_rtnl_enumerate_links(NetdRtnl *rtnl) {
         }
 
         return -ENOBUFS;
+}
+
+int netd_rtnl_enumerate_links(NetdRtnl *rtnl) {
+        if (!rtnl)
+                return -EINVAL;
+
+        return rtnl_dump(rtnl, RTM_GETLINK);
+}
+
+int netd_rtnl_enumerate_addresses(NetdRtnl *rtnl) {
+        if (!rtnl)
+                return -EINVAL;
+
+        if (!netd_ipv6_supported())
+                return 0;
+
+        return rtnl_dump(rtnl, RTM_GETADDR);
 }
 
 int netd_rtnl_process(NetdRtnl *rtnl) {
@@ -416,6 +527,12 @@ int netd_rtnl_process(NetdRtnl *rtnl) {
                         case RTM_NEWLINK:
                         case RTM_DELLINK:
                                 dispatch_link(rtnl, m, false);
+                                dispatched++;
+                                break;
+
+                        case RTM_NEWADDR:
+                        case RTM_DELADDR:
+                                dispatch_addr(rtnl, m);
                                 dispatched++;
                                 break;
 

@@ -142,6 +142,16 @@ fail:
         return -e;
 }
 
+int nl_sock_join_group(NlSock *sock, int group) {
+        if (!sock || sock->fd < 0)
+                return -EINVAL;
+
+        if (setsockopt(sock->fd, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, &group, sizeof(group)) < 0)
+                return -errno;
+
+        return 0;
+}
+
 void nl_sock_close(NlSock *sock) {
         if (!sock || sock->fd < 0)
                 return;

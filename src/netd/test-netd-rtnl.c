@@ -2538,6 +2538,142 @@ static void test_netns_resolv_ipv6(void) {
         printf("test-netd-rtnl: IPv6 resolv.conf subtest ok\n");
 }
 
+/* --- IPv6 address events --- */
+
+typedef struct AddrLog {
+        int news;
+        int dels;
+        uint32_t last_flags;
+} AddrLog;
+
+static AddrLog addr_log;
+static NetdInAddr addr_watch;
+
+static int record_addr(void *userdata, bool removed, const NetdRtnlAddr *a) {
+        (void) userdata;
+
+        if (!netd_addr_eq(AF_INET6, &a->address, &addr_watch))
+                return 0;
+
+        if (removed)
+                addr_log.dels++;
+        else {
+                addr_log.news++;
+                addr_log.last_flags = a->flags;
+        }
+        return 0;
+}
+
+/* The kernel announces an IPv6 address from its DAD work, after `ip`
+ * returns, so the test waits for it. */
+static void pump_addr_log(NetdRtnl *rtnl, const int *counter) {
+        for (int ms = 0; ms < 3000 && *counter == 0; ms += 20) {
+                ASSERT_TRUE(netd_rtnl_process(rtnl) >= 0);
+                if (*counter == 0)
+                        usleep(20 * 1000);
+        }
+}
+
+/* The layer reports IPv6 addresses added and removed by someone else, and a
+ * dump reports the ones already there. */
+static void test_netns_addr_events(void) {
+        NetdRtnl *rtnl = NULL;
+        int family;
+
+        if (!netd_ipv6_supported()) {
+                fprintf(stderr, "test-netd-rtnl: kernel without IPv6, skipping the address event subtest\n");
+                return;
+        }
+
+        enter_test_netns();
+        ASSERT_EQ_INT(netd_addr_parse("fd31::5", &family, &addr_watch), 0);
+        ASSERT_EQ_INT(netd_rtnl_new(&rtnl), 0);
+        netd_rtnl_set_addr_handler(rtnl, record_addr, NULL);
+
+        run_ip("link add name ae0 type veth peer name ae1");
+        run_ip("link set ae0 up");
+        memset(&addr_log, 0, sizeof(addr_log));
+        run_ip("-6 addr add fd31::5/64 dev ae0 nodad");
+        pump_addr_log(rtnl, &addr_log.news);
+        ASSERT_EQ_INT(addr_log.news, 1);
+        ASSERT_TRUE((addr_log.last_flags & IFA_F_NODAD) != 0);
+
+        memset(&addr_log, 0, sizeof(addr_log));
+        ASSERT_TRUE(netd_rtnl_enumerate_addresses(rtnl) >= 1);
+        ASSERT_EQ_INT(addr_log.news, 1);
+
+        memset(&addr_log, 0, sizeof(addr_log));
+        run_ip("-6 addr del fd31::5/64 dev ae0");
+        pump_addr_log(rtnl, &addr_log.dels);
+        ASSERT_EQ_INT(addr_log.dels, 1);
+
+        run_ip("link del ae0");
+        netd_rtnl_free(rtnl);
+
+        printf("test-netd-rtnl: IPv6 address event subtest ok\n");
+}
+
+/* Pumps the event socket until `done` holds, for at most `ms`. */
+static bool pump_until(Netd *n, bool (*done)(Link *), Link *l, int ms) {
+        for (; ms > 0; ms -= 50) {
+                (void) netd_rtnl_process(n->rtnl);
+                if (done(l))
+                        return true;
+                usleep(50 * 1000);
+        }
+
+        return done(l);
+}
+
+static bool ll_ready(Link *l) {
+        return l->ipv6ll_ready;
+}
+
+static bool ll_gone(Link *l) {
+        return !l->ipv6ll_ready;
+}
+
+static bool dad_warned(Link *l) {
+        return l->n_addrs == 1 && l->addrs[0].dad_warned;
+}
+
+/* The link learns its link-local address once the kernel's duplicate address
+ * detection has passed, and reports a static address another host already
+ * holds. Both take the kernel a second or two. */
+static void test_netns_link_local_and_dad_failure(void) {
+        NetdFixture f;
+        Link *l;
+
+        if (!netd_ipv6_supported()) {
+                fprintf(stderr, "test-netd-rtnl: kernel without IPv6, skipping the link-local subtest\n");
+                return;
+        }
+
+        enter_test_netns();
+        fixture_init(&f);
+        fixture_write(&f, "10-ll.network", "[Match]\nName=ll0\n\n[Network]\nAddress=fd32::2/64\n");
+        run_ip("link add name ll0 type veth peer name ll1");
+        run_ip("link set ll1 up");
+        run_ip("-6 addr add fd32::2/64 dev ll1 nodad");
+        fixture_start(&f);
+
+        l = fixture_link(&f, "ll0");
+        ASSERT_TRUE(pump_until(f.n, ll_ready, l, 5000));
+        run_shellf("ip -6 addr show dev ll0 scope link | grep -q '%s'", "fe80::");
+
+        ASSERT_TRUE(pump_until(f.n, dad_warned, l, 5000));
+        run_shell("ip -6 addr show dev ll0 | grep 'fd32::2/64' | grep -q dadfailed");
+
+        run_ip("link set ll0 down");
+        ASSERT_TRUE(pump_until(f.n, ll_gone, l, 3000));
+
+        run_ip("link del ll0");
+        ASSERT_TRUE(netd_rtnl_process(f.n->rtnl) >= 1);
+        fixture_stop(&f);
+
+        printf("test-netd-rtnl: link-local and DAD failure subtest ok\n");
+}
+
 static int reload_calls;
 
 static int count_reload(Netd *n) {
@@ -2608,6 +2744,8 @@ int main(void) {
         test_netns_route_survives_renumber();
         test_netns_route_back_after_link_down();
         test_netns_resolv_ipv6();
+        test_netns_addr_events();
+        test_netns_link_local_and_dad_failure();
         test_reload_dropped_after_exit_request();
 
         printf("test-netd-rtnl: ok\n");

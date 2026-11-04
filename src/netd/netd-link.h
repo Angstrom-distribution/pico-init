@@ -66,9 +66,10 @@ typedef struct LinkAddress {
         uint8_t prefixlen;
         uint8_t scope;
         bool has_peer;
-        bool installed; /* false once the kernel is known to have dropped it (link down) */
-        bool doomed;    /* during a converge pass: recorded but no longer wanted */
-        uint32_t flags; /* IFA_F_* */
+        bool installed;  /* false once the kernel is known to have dropped it (link down) */
+        bool doomed;     /* during a converge pass: recorded but no longer wanted */
+        bool dad_warned; /* the kernel's duplicate address detection failure was reported */
+        uint32_t flags;  /* IFA_F_* */
         NetdInAddr address;
         NetdInAddr peer;
         uint32_t route_metric;
@@ -166,6 +167,11 @@ struct Link {
         size_t n_routes;
         bool warned_no_ipv6_routes;
 
+        /* The kernel's IPv6 link-local address once duplicate address
+         * detection has passed on it, followed through address events. */
+        NetdInAddr ipv6ll;
+        bool ipv6ll_ready;
+
         struct in_addr address;
         unsigned char prefixlen;
         bool address_configured;
@@ -225,6 +231,14 @@ Link *netd_find_link_by_name(Netd *n, const char *ifname);
  * not be able to behave differently.
  */
 int netd_link_rtnl_handler(void *userdata, NetdRtnlLinkEvent event, const NetdRtnlLink *rl);
+
+/*
+ * The netd_rtnl_addr_handler_t installed by netd_startup(): follows the
+ * link-local address of each link and reports a static IPv6 address whose
+ * duplicate address detection failed. Writes nothing to the kernel while a
+ * dump is in progress.
+ */
+int netd_link_rtnl_addr_handler(void *userdata, bool removed, const NetdRtnlAddr *a);
 
 /*
  * Match `l` against the current .network set and apply it: bring the link up,
