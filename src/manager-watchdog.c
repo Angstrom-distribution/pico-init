@@ -34,6 +34,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "boot-text.h"
 #include "manager-watchdog.h"
 #include "manager.h"
 #include "sd-event.h"
@@ -204,6 +205,8 @@ int manager_watchdog_setup(Manager *m) {
         struct pico_manager_watchdog *wd;
         struct watchdog_info info;
         const char *path = NULL;
+        char timeout_text[32];
+        usec_t timeout;
         int fd, opt, r;
 
         if (!m || !m->event)
@@ -224,7 +227,10 @@ int manager_watchdog_setup(Manager *m) {
         wd->fd = fd;
 
         if (ioctl(fd, WDIOC_GETSUPPORT, &info) < 0)
-                pico_log(PICO_LOG_DEBUG, "%s: WDIOC_GETSUPPORT: %s", path, strerror(errno));
+                pico_log(PICO_LOG_INFO,
+                         "Using hardware watchdog %s, no support for WDIOC_GETSUPPORT ioctl: %s",
+                         path,
+                         strerror(errno));
         else {
                 char ident[sizeof(info.identity) + 1];
 
@@ -232,14 +238,18 @@ int manager_watchdog_setup(Manager *m) {
                 ident[sizeof(info.identity)] = '\0';
                 wd->magic_close = (info.options & WDIOF_MAGICCLOSE) != 0;
                 pico_log(PICO_LOG_INFO,
-                         "%s: %s (firmware 0x%" PRIx32 "), magic-close %s",
+                         "Using hardware watchdog %s: '%s', version %" PRIx32 ".",
                          path,
                          ident,
-                         info.firmware_version,
+                         info.firmware_version);
+                pico_log(PICO_LOG_DEBUG,
+                         "%s: magic-close %s",
+                         path,
                          wd->magic_close ? "supported" : "not supported");
         }
 
-        wd->interval = manager_watchdog_interval_from_timeout(watchdog_negotiate_timeout(fd));
+        timeout = watchdog_negotiate_timeout(fd);
+        wd->interval = manager_watchdog_interval_from_timeout(timeout);
 
         opt = WDIOS_ENABLECARD;
         if (ioctl(fd, WDIOC_SETOPTIONS, &opt) < 0 && errno != ENOTTY)
@@ -257,10 +267,9 @@ int manager_watchdog_setup(Manager *m) {
 
         m->watchdog = wd;
         pico_log(PICO_LOG_INFO,
-                 "watchdog armed: %s, timeout %" PRIu64 "s, feeding every %" PRIu64 "ms",
-                 path,
-                 (wd->interval * 4) / USEC_PER_SEC,
-                 wd->interval / USEC_PER_MSEC);
+                 "Watchdog running with a hardware timeout of %s.",
+                 pico_format_timespan(timeout_text, sizeof timeout_text, timeout));
+        pico_log(PICO_LOG_DEBUG, "%s: feeding every %" PRIu64 "ms", path, wd->interval / USEC_PER_MSEC);
 
         return 0;
 }
