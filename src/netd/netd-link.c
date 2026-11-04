@@ -61,6 +61,16 @@ static uint32_t link_route_metric(const Link *l, bool from_lease) {
  * during idempotent reconvergence is not a failure.
  */
 
+/* An IPv4 address with no peer, label, flags or scope, as the lease and the
+ * single Address= have always been sent. */
+static void address_v4(NetdRtnlAddress *a, int ifindex, const struct in_addr *addr, unsigned char prefixlen) {
+        memset(a, 0, sizeof(*a));
+        a->ifindex = ifindex;
+        a->family = AF_INET;
+        a->prefixlen = prefixlen;
+        a->address.in = *addr;
+}
+
 static int address_add_idempotent(
                 NetdRtnl *rtnl,
                 int ifindex,
@@ -68,13 +78,26 @@ static int address_add_idempotent(
                 unsigned char prefixlen,
                 uint32_t life,
                 uint32_t metric) {
-        int r = netd_rtnl_address_add(rtnl, ifindex, addr, prefixlen, NULL, life, metric);
+        NetdRtnlAddress a;
+        int r;
+
+        address_v4(&a, ifindex, addr, prefixlen);
+        a.valid_sec = life;
+        a.preferred_sec = life;
+        a.route_metric = metric;
+
+        r = netd_rtnl_address_add(rtnl, &a);
         return r == -EEXIST ? 0 : r;
 }
 
 static int address_del_idempotent(
                 NetdRtnl *rtnl, int ifindex, const struct in_addr *addr, unsigned char prefixlen) {
-        int r = netd_rtnl_address_del(rtnl, ifindex, addr, prefixlen);
+        NetdRtnlAddress a;
+        int r;
+
+        address_v4(&a, ifindex, addr, prefixlen);
+
+        r = netd_rtnl_address_del(rtnl, &a);
         return (r == -EADDRNOTAVAIL || r == -ENOENT) ? 0 : r;
 }
 
