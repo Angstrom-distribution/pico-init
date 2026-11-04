@@ -12,7 +12,7 @@
  * created in the same unshare() call is owned by it, so CAP_NET_ADMIN is
  * available there too. Failing to set up the namespace is fatal (exit(1) with
  * a message), never a silent pass. Each netns-using test function calls
- * enter_test_netns() itself (nested unshare()s are fine), so the test
+ * enter_test_netns() itself (it gives each a fresh net namespace), so the test
  * functions stay independent of each other's ordering in main().
  *
  * `dummy` interfaces may be unavailable (no /lib/modules), so every case
@@ -42,6 +42,13 @@
  * renumber and a lease loss, an unchanged reload leaves a lease's route
  * alone, turning DHCP= off drops the lease, and Gateway= with DHCP starts the
  * client without an Address=.
+ *
+ * [Route] sections install IPv4 and IPv6 routes with their own metrics,
+ * gateways and preferred source. A reload moves, adds and drops only what
+ * changed, and a route someone else added stays. A route sits beside a
+ * lease's default route, one that is also Gateway= is a single kernel route,
+ * a gateway no address reaches yet is installed once a lease or a reload
+ * brings one, and the routes come back after a renumber and a link down.
  */
 
 /* unshare()/CLONE_NEWUSER/CLONE_NEWNET are declared under glibc's __USE_GNU
@@ -59,6 +66,7 @@
 #include <sched.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -207,7 +215,21 @@ static void enter_test_netns(void) {
          * what the map files need. */
         uid_t outer_uid = getuid();
         gid_t outer_gid = getgid();
+        static bool in_userns;
         char buf[64];
+
+        /* One user namespace is enough: it grants CAP_SYS_ADMIN over the net
+         * namespaces made in it, and the kernel refuses to nest user
+         * namespaces more than 32 deep, which the later cases would reach. */
+        if (in_userns) {
+                if (unshare(CLONE_NEWNET) < 0) {
+                        fprintf(stderr, "test-netd-rtnl: unshare(CLONE_NEWNET): %s\n", strerror(errno));
+                        fprintf(stderr,
+                                "test-netd-rtnl: cannot prove netns isolation, refusing to report success\n");
+                        exit(1);
+                }
+                return;
+        }
 
         if (unshare(CLONE_NEWUSER | CLONE_NEWNET) < 0) {
                 fprintf(stderr, "test-netd-rtnl: unshare(CLONE_NEWUSER|CLONE_NEWNET): %s\n", strerror(errno));
@@ -224,6 +246,8 @@ static void enter_test_netns(void) {
 
         snprintf(buf, sizeof(buf), "0 %u 1\n", (unsigned) outer_gid);
         write_proc_file("/proc/self/gid_map", buf);
+
+        in_userns = true;
 }
 
 /* An IPv4 address with only the fields the older tests care about. */
@@ -2095,6 +2119,397 @@ static void test_netns_address_back_after_link_down(void) {
         printf("test-netd-rtnl: IPv6 address after link down subtest ok\n");
 }
 
+/* --- [Route] end to end ---
+ *
+ * Each case drains the event socket once after start, so the link's flags
+ * show it up, as they do in the daemon before a reload arrives. */
+
+/* Routes from [Route] sections with the metrics, gateways and preferred
+ * source asked for; a reload moves one, drops another and leaves a third
+ * alone; a route someone else added stays through all of it. */
+static void test_netns_route_sections(void) {
+        NetdFixture f;
+        Link *l;
+
+        enter_test_netns();
+        fixture_init(&f);
+        fixture_write(&f,
+                      "10-rt.network",
+                      "[Match]\nName=rt0\n\n[Network]\nAddress=10.120.0.2/24\n\n"
+                      "[Route]\nDestination=10.121.0.0/24\nGateway=10.120.0.1\nMetric=50\n\n"
+                      "[Route]\nDestination=10.122.0.0/24\nGateway=10.120.0.1\nPreferredSource=10.120.0.2\n\n"
+                      "[Route]\nDestination=10.123.0.7\n\n"
+                      "[Route]\nDestination=10.125.0.0/24\nGateway=10.120.0.1\n");
+        run_ip("link add name rt0 type veth peer name rt1");
+        fixture_start(&f);
+        ASSERT_TRUE(netd_rtnl_process(f.n->rtnl) >= 0);
+
+        l = fixture_link(&f, "rt0");
+        ASSERT_EQ_INT(l->state, LINK_CONFIGURED);
+        ASSERT_EQ_INT(l->n_routes, 4);
+        run_shell("ip -4 route show dev rt0 metric 50 | grep -q '^10\\.121\\.0\\.0/24 via 10\\.120\\.0\\.1 proto static'");
+        run_shell("ip -4 route show 10.122.0.0/24 | grep -q '^10\\.122\\.0\\.0/24 via 10\\.120\\.0\\.1 dev rt0 proto static src 10\\.120\\.0\\.2'");
+        run_shell("ip -4 route show 10.123.0.7/32 | grep -q '^10\\.123\\.0\\.7 dev rt0 proto static scope link'");
+        run_shell("ip -4 route show 10.125.0.0/24 metric 0 | grep -q 'via 10\\.120\\.0\\.1'");
+
+        run_ip("route add 10.129.0.0/16 via 10.120.0.1 dev rt0");
+
+        /* one metric moves, one section goes, one is unchanged, and a route at
+         * metric 0 takes a metric: the destination keeps exactly one route */
+        fixture_write(&f,
+                      "10-rt.network",
+                      "[Match]\nName=rt0\n\n[Network]\nAddress=10.120.0.2/24\n\n"
+                      "[Route]\nDestination=10.121.0.0/24\nGateway=10.120.0.1\nMetric=60\n\n"
+                      "[Route]\nDestination=10.123.0.7\n\n"
+                      "[Route]\nDestination=10.125.0.0/24\nGateway=10.120.0.1\nMetric=70\n");
+        ASSERT_TRUE(f.n->reload_handler(f.n) == 0);
+        ASSERT_EQ_INT(l->state, LINK_CONFIGURED);
+        ASSERT_EQ_INT(l->n_routes, 3);
+        run_shell("ip -4 route show dev rt0 metric 60 | grep -q '^10\\.121\\.0\\.0/24 via 10\\.120\\.0\\.1'");
+        run_shell("test -z \"$(ip -4 route show dev rt0 metric 50)\"");
+        run_shell("test -z \"$(ip -4 route show 10.122.0.0/24)\"");
+        run_shell("ip -4 route show 10.123.0.7/32 | grep -q 'dev rt0 proto static scope link'");
+        run_shell("test \"$(ip -4 route show 10.125.0.0/24 | wc -l)\" -eq 1");
+        run_shell("ip -4 route show 10.125.0.0/24 | grep -q 'metric 70'");
+
+        /* nothing changed: nothing is written */
+        run_ip("route del 10.123.0.7/32 dev rt0");
+        l->routes[1].installed = true;
+        ASSERT_TRUE(f.n->reload_handler(f.n) == 0);
+        run_shell("test -z \"$(ip -4 route show 10.123.0.7/32)\"");
+
+        /* the section goes: so does every route netd added, and only those */
+        fixture_write(&f, "10-rt.network", "[Match]\nName=rt0\n\n[Network]\nAddress=10.120.0.2/24\n");
+        ASSERT_TRUE(f.n->reload_handler(f.n) == 0);
+        ASSERT_EQ_INT(l->n_routes, 0);
+        run_shell("test -z \"$(ip -4 route show proto static | grep -v '^10\\.129\\.')\"");
+        run_shell("ip -4 route show 10.129.0.0/16 | grep -q 'via 10\\.120\\.0\\.1'");
+
+        run_ip("link del rt0");
+        ASSERT_TRUE(netd_rtnl_process(f.n->rtnl) >= 1);
+        fixture_stop(&f);
+
+        printf("test-netd-rtnl: [Route] sections subtest ok\n");
+}
+
+/* IPv6: a route via a link-local gateway, one via a global gateway in the
+ * connected prefix at its own metric, and a default route, with the kernel's
+ * 1024 for a metric left out. */
+static void test_netns_route_sections_v6(void) {
+        NetdFixture f;
+        Link *l;
+
+        if (!netd_ipv6_supported()) {
+                fprintf(stderr, "test-netd-rtnl: kernel without IPv6, skipping the IPv6 route subtest\n");
+                return;
+        }
+
+        enter_test_netns();
+        fixture_init(&f);
+        fixture_write(&f,
+                      "10-rv.network",
+                      "[Match]\nName=rv0\n\n[Address]\nAddress=fd21::2/64\nDuplicateAddressDetection=none\n\n"
+                      "[Route]\nDestination=fd22::/64\nGateway=fe80::1\n\n"
+                      "[Route]\nDestination=fd23::/64\nGateway=fd21::1\nMetric=300\n\n"
+                      "[Route]\nGateway=fd21::1\nMetric=2000\n");
+        run_ip("link add name rv0 type veth peer name rv1");
+        fixture_start(&f);
+        ASSERT_TRUE(netd_rtnl_process(f.n->rtnl) >= 0);
+
+        l = fixture_link(&f, "rv0");
+        ASSERT_EQ_INT(l->state, LINK_CONFIGURED);
+        ASSERT_EQ_INT(l->n_routes, 3);
+        run_shell("ip -6 route show dev rv0 | grep -q '^fd22::/64 via fe80::1 proto static metric 1024'");
+        run_shell("ip -6 route show dev rv0 | grep -q '^fd23::/64 via fd21::1 proto static metric 300'");
+        run_shell("ip -6 route show default dev rv0 | grep -q '^default via fd21::1 proto static metric 2000'");
+
+        fixture_write(&f,
+                      "10-rv.network",
+                      "[Match]\nName=rv0\n\n[Address]\nAddress=fd21::2/64\nDuplicateAddressDetection=none\n\n"
+                      "[Route]\nDestination=fd22::/64\nGateway=fe80::1\nMetric=500\n\n"
+                      "[Route]\nGateway=fd21::1\nMetric=2000\n");
+        ASSERT_TRUE(f.n->reload_handler(f.n) == 0);
+        run_shell("ip -6 route show dev rv0 | grep -q '^fd22::/64 via fe80::1 proto static metric 500'");
+        run_shell("test -z \"$(ip -6 route show dev rv0 | grep '^fd22::/64.*metric 1024')\"");
+        run_shell("test -z \"$(ip -6 route show dev rv0 | grep '^fd23::')\"");
+        run_shell("ip -6 route show default dev rv0 | grep -q 'metric 2000'");
+
+        fixture_write(&f,
+                      "10-rv.network",
+                      "[Match]\nName=rv0\n\n[Address]\nAddress=fd21::2/64\nDuplicateAddressDetection=none\n");
+        ASSERT_TRUE(f.n->reload_handler(f.n) == 0);
+        ASSERT_EQ_INT(l->n_routes, 0);
+        run_shell("test -z \"$(ip -6 route show proto static dev rv0)\"");
+
+        run_ip("link del rv0");
+        ASSERT_TRUE(netd_rtnl_process(f.n->rtnl) >= 1);
+        fixture_stop(&f);
+
+        printf("test-netd-rtnl: [Route] IPv6 subtest ok\n");
+}
+
+/* A Gateway= with no static address in the file is put on-link, as networkd
+ * does, so the route needs no address first. */
+static void test_netns_route_implicit_onlink(void) {
+        NetdFixture f;
+
+        enter_test_netns();
+        fixture_init(&f);
+        fixture_write(&f, "10-ro.network", "[Match]\nName=ro0\n\n[Route]\nGateway=10.124.0.1\nMetric=40\n");
+        run_ip("link add name ro0 type veth peer name ro1");
+        fixture_start(&f);
+        ASSERT_TRUE(netd_rtnl_process(f.n->rtnl) >= 0);
+
+        ASSERT_EQ_INT(fixture_link(&f, "ro0")->state, LINK_CONFIGURED);
+        run_shell("ip -4 route show default dev ro0 metric 40 | grep -q '^default via 10\\.124\\.0\\.1 proto static onlink'");
+
+        run_ip("link del ro0");
+        ASSERT_TRUE(netd_rtnl_process(f.n->rtnl) >= 1);
+        fixture_stop(&f);
+
+        printf("test-netd-rtnl: [Route] implicit onlink subtest ok\n");
+}
+
+/* A [Route] default route sits beside a lease's and is not replaced by it;
+ * losing the lease takes only the lease's route. */
+static void test_netns_route_beside_lease(void) {
+        NetdFixture f;
+        Link *l;
+
+        enter_test_netns();
+        fixture_init(&f);
+        fixture_write(&f,
+                      "10-rd.network",
+                      "[Match]\nName=rd0\n\n[Network]\nAddress=10.130.0.2/24\nDHCP=yes\n\n"
+                      "[Route]\nGateway=10.130.0.254\nMetric=200\n");
+        run_ip("link add name rd0 type veth peer name rd1");
+        fixture_start(&f);
+        ASSERT_TRUE(netd_rtnl_process(f.n->rtnl) >= 0);
+
+        l = fixture_link(&f, "rd0");
+        assert_one_default("rd0", "10\\.130\\.0\\.254", 200);
+
+        ASSERT_TRUE(link_apply_lease(l, make_lease("10.130.9.3", "255.255.255.0", "10.130.9.1")) == 0);
+        run_shell("test \"$(ip -4 route show default dev rd0 | wc -l)\" -eq 2");
+        run_shell("ip -4 route show default dev rd0 metric 200 | grep -q 'via 10\\.130\\.0\\.254 '");
+        run_shell("ip -4 route show default dev rd0 metric 1024 | grep -q 'via 10\\.130\\.9\\.1 '");
+
+        /* a renewal changes nothing */
+        ASSERT_TRUE(link_apply_lease(l, make_lease("10.130.9.3", "255.255.255.0", "10.130.9.1")) == 0);
+        run_shell("test \"$(ip -4 route show default dev rd0 | wc -l)\" -eq 2");
+
+        ASSERT_TRUE(link_lose_lease(l) == 0);
+        assert_one_default("rd0", "10\\.130\\.0\\.254", 200);
+        ASSERT_EQ_INT(l->n_routes, 1);
+        ASSERT_TRUE(l->routes[0].installed);
+
+        run_ip("link del rd0");
+        ASSERT_TRUE(netd_rtnl_process(f.n->rtnl) >= 1);
+        fixture_stop(&f);
+
+        printf("test-netd-rtnl: [Route] beside a lease subtest ok\n");
+}
+
+/* A [Route] and Gateway= at one gateway and metric are one kernel route with
+ * two owners: it stays until both let go. */
+static void test_netns_route_shares_gateway(void) {
+        NetdFixture f;
+        Link *l;
+
+        enter_test_netns();
+        fixture_init(&f);
+        fixture_write(&f,
+                      "10-rg.network",
+                      "[Match]\nName=rg0\n\n[Network]\nAddress=10.131.0.2/24\nGateway=10.131.0.254\n\n"
+                      "[Route]\nGateway=10.131.0.254\n");
+        run_ip("link add name rg0 type veth peer name rg1");
+        fixture_start(&f);
+        ASSERT_TRUE(netd_rtnl_process(f.n->rtnl) >= 0);
+
+        l = fixture_link(&f, "rg0");
+        assert_one_default("rg0", "10\\.131\\.0\\.254", 0);
+        ASSERT_TRUE(l->gateway_configured);
+        ASSERT_EQ_INT(l->n_routes, 1);
+
+        fixture_write(&f,
+                      "10-rg.network",
+                      "[Match]\nName=rg0\n\n[Network]\nAddress=10.131.0.2/24\nGateway=10.131.0.254\n");
+        ASSERT_TRUE(f.n->reload_handler(f.n) == 0);
+        assert_one_default("rg0", "10\\.131\\.0\\.254", 0);
+        ASSERT_EQ_INT(l->n_routes, 0);
+
+        fixture_write(&f,
+                      "10-rg.network",
+                      "[Match]\nName=rg0\n\n[Network]\nAddress=10.131.0.2/24\nGateway=10.131.0.254\n\n"
+                      "[Route]\nGateway=10.131.0.254\n");
+        ASSERT_TRUE(f.n->reload_handler(f.n) == 0);
+        fixture_write(&f,
+                      "10-rg.network",
+                      "[Match]\nName=rg0\n\n[Network]\nAddress=10.131.0.2/24\n\n[Route]\nGateway=10.131.0.254\n");
+        ASSERT_TRUE(f.n->reload_handler(f.n) == 0);
+        ASSERT_TRUE(!l->gateway_configured);
+        assert_one_default("rg0", "10\\.131\\.0\\.254", 0);
+
+        fixture_write(&f, "10-rg.network", "[Match]\nName=rg0\n\n[Network]\nAddress=10.131.0.2/24\n");
+        ASSERT_TRUE(f.n->reload_handler(f.n) == 0);
+        run_shell("test -z \"$(ip -4 route show default dev rg0)\"");
+
+        run_ip("link del rg0");
+        ASSERT_TRUE(netd_rtnl_process(f.n->rtnl) >= 1);
+        fixture_stop(&f);
+
+        printf("test-netd-rtnl: [Route] shared with Gateway= subtest ok\n");
+}
+
+/* A gateway no address reaches is kept and tried again. Without DHCP= that
+ * fails the link, as Gateway= does; with it a lease's address, and one added
+ * by a reload, bring the route, and losing the address takes it again. */
+static void test_netns_route_unreachable_gateway(void) {
+        NetdFixture f;
+        Link *l;
+
+        enter_test_netns();
+        fixture_init(&f);
+        fixture_write(&f,
+                      "10-ru.network",
+                      "[Match]\nName=ru0\n\n[Network]\nDHCP=yes\n\n"
+                      "[Route]\nDestination=10.142.0.0/24\nGateway=10.140.9.254\nGatewayOnLink=no\n");
+        run_ip("link add name ru0 type veth peer name ru1");
+        fixture_start(&f);
+        ASSERT_TRUE(netd_rtnl_process(f.n->rtnl) >= 0);
+
+        l = fixture_link(&f, "ru0");
+        ASSERT_EQ_INT(l->state, LINK_CONFIGURING);
+        ASSERT_EQ_INT(l->n_routes, 1);
+        ASSERT_TRUE(!l->routes[0].installed);
+        run_shell("test -z \"$(ip -4 route show 10.142.0.0/24)\"");
+
+        ASSERT_TRUE(link_apply_lease(l, make_lease("10.140.9.3", "255.255.255.0", NULL)) == 0);
+        ASSERT_TRUE(l->routes[0].installed);
+        run_shell("ip -4 route show 10.142.0.0/24 | grep -q 'via 10\\.140\\.9\\.254 dev ru0 proto static'");
+
+        ASSERT_TRUE(link_lose_lease(l) == 0);
+        ASSERT_EQ_INT(l->n_routes, 1);
+        ASSERT_TRUE(!l->routes[0].installed);
+        run_shell("test -z \"$(ip -4 route show 10.142.0.0/24)\"");
+
+        ASSERT_TRUE(link_apply_lease(l, make_lease("10.140.9.4", "255.255.255.0", NULL)) == 0);
+        ASSERT_TRUE(l->routes[0].installed);
+        run_shell("ip -4 route show 10.142.0.0/24 | grep -q 'via 10\\.140\\.9\\.254 dev ru0'");
+
+        run_ip("link del ru0");
+        ASSERT_TRUE(netd_rtnl_process(f.n->rtnl) >= 1);
+        fixture_stop(&f);
+
+        enter_test_netns();
+        fixture_init(&f);
+        fixture_write(&f,
+                      "10-rn.network",
+                      "[Match]\nName=rn0\n\n[Network]\nAddress=10.141.0.2/24\n\n"
+                      "[Route]\nDestination=10.143.0.0/24\nGateway=10.199.0.1\nGatewayOnLink=no\n");
+        run_ip("link add name rn0 type veth peer name rn1");
+        fixture_start(&f);
+        ASSERT_TRUE(netd_rtnl_process(f.n->rtnl) >= 0);
+
+        l = fixture_link(&f, "rn0");
+        ASSERT_EQ_INT(l->state, LINK_FAILED);
+        ASSERT_EQ_INT(l->n_routes, 1);
+        ASSERT_TRUE(!l->routes[0].installed);
+
+        fixture_write(&f,
+                      "10-rn.network",
+                      "[Match]\nName=rn0\n\n[Network]\nAddress=10.141.0.2/24\nAddress=10.199.0.2/24\n\n"
+                      "[Route]\nDestination=10.143.0.0/24\nGateway=10.199.0.1\nGatewayOnLink=no\n");
+        ASSERT_TRUE(f.n->reload_handler(f.n) == 0);
+        ASSERT_EQ_INT(l->state, LINK_CONFIGURED);
+        ASSERT_TRUE(l->routes[0].installed);
+        run_shell("ip -4 route show 10.143.0.0/24 | grep -q 'via 10\\.199\\.0\\.1 dev rn0'");
+
+        run_ip("link del rn0");
+        ASSERT_TRUE(netd_rtnl_process(f.n->rtnl) >= 1);
+        fixture_stop(&f);
+
+        printf("test-netd-rtnl: [Route] unreachable gateway subtest ok\n");
+}
+
+/* A renumber inside the leased subnet deletes the old address, and the
+ * kernel drops the routes with it; the [Route] routes come back, the on-link
+ * one at once and the one that needs the new address with it. */
+static void test_netns_route_survives_renumber(void) {
+        NetdFixture f;
+        Link *l;
+
+        enter_test_netns();
+        fixture_init(&f);
+        fixture_write(&f,
+                      "10-rr.network",
+                      "[Match]\nName=rr0\n\n[Network]\nDHCP=yes\n\n"
+                      "[Route]\nDestination=10.151.0.0/24\nGateway=10.150.0.254\nGatewayOnLink=yes\n\n"
+                      "[Route]\nDestination=10.152.0.0/24\nGateway=10.150.9.254\nGatewayOnLink=no\n");
+        run_ip("link add name rr0 type veth peer name rr1");
+        fixture_start(&f);
+        ASSERT_TRUE(netd_rtnl_process(f.n->rtnl) >= 0);
+
+        l = fixture_link(&f, "rr0");
+        ASSERT_TRUE(link_apply_lease(l, make_lease("10.150.9.3", "255.255.255.0", "10.150.9.1")) == 0);
+        run_shell("ip -4 route show 10.151.0.0/24 | grep -q 'via 10\\.150\\.0\\.254 dev rr0'");
+        run_shell("ip -4 route show 10.152.0.0/24 | grep -q 'via 10\\.150\\.9\\.254 dev rr0'");
+
+        ASSERT_TRUE(link_apply_lease(l, make_lease("10.150.9.4", "255.255.255.0", "10.150.9.1")) == 0);
+        run_shell("ip -4 addr show dev rr0 | grep -q '10\\.150\\.9\\.4/24'");
+        run_shell("! ip -4 addr show dev rr0 | grep -q '10\\.150\\.9\\.3/'");
+        run_shell("ip -4 route show 10.151.0.0/24 | grep -q 'via 10\\.150\\.0\\.254 dev rr0'");
+        run_shell("ip -4 route show 10.152.0.0/24 | grep -q 'via 10\\.150\\.9\\.254 dev rr0'");
+        assert_one_default("rr0", "10\\.150\\.9\\.1", 1024);
+        ASSERT_TRUE(l->routes[0].installed);
+        ASSERT_TRUE(l->routes[1].installed);
+
+        run_ip("link del rr0");
+        ASSERT_TRUE(netd_rtnl_process(f.n->rtnl) >= 1);
+        fixture_stop(&f);
+
+        printf("test-netd-rtnl: [Route] after a renumber subtest ok\n");
+}
+
+/* A link taken down loses its routes; the next event for it puts them back. */
+static void test_netns_route_back_after_link_down(void) {
+        NetdFixture f;
+        bool v6 = netd_ipv6_supported();
+
+        if (!v6)
+                fprintf(stderr,
+                        "test-netd-rtnl: kernel without IPv6, skipping the IPv6 part of the link down subtest\n");
+
+        enter_test_netns();
+        fixture_init(&f);
+        fixture_write(&f,
+                      "10-rl.network",
+                      v6 ? "[Match]\nName=rl0\n\n[Network]\nAddress=10.116.1.2/24\nAddress=fd17::2/64\n\n"
+                           "[Route]\nDestination=10.117.0.0/24\nGateway=10.116.1.1\n\n"
+                           "[Route]\nDestination=fd18::/64\nGateway=fe80::1\n" :
+                           "[Match]\nName=rl0\n\n[Network]\nAddress=10.116.1.2/24\n\n"
+                           "[Route]\nDestination=10.117.0.0/24\nGateway=10.116.1.1\n");
+        run_ip("link add name rl0 type veth peer name rl1");
+        fixture_start(&f);
+        ASSERT_TRUE(netd_rtnl_process(f.n->rtnl) >= 0);
+
+        run_shell("ip -4 route show 10.117.0.0/24 | grep -q 'via 10\\.116\\.1\\.1'");
+
+        run_ip("link set rl0 down");
+        run_shell("test -z \"$(ip -4 route show 10.117.0.0/24)\"");
+        ASSERT_TRUE(netd_rtnl_process(f.n->rtnl) >= 1);
+        run_shell("ip link show dev rl0 | grep -q '<[^>]*[,<]UP[,>]'");
+        run_shell("ip -4 route show 10.117.0.0/24 | grep -q 'via 10\\.116\\.1\\.1'");
+        if (v6)
+                run_shell("ip -6 route show dev rl0 | grep -q '^fd18::/64 via fe80::1'");
+
+        run_ip("link del rl0");
+        ASSERT_TRUE(netd_rtnl_process(f.n->rtnl) >= 1);
+        fixture_stop(&f);
+
+        printf("test-netd-rtnl: [Route] after link down subtest ok\n");
+}
+
 static int reload_calls;
 
 static int count_reload(Netd *n) {
@@ -2156,6 +2571,14 @@ int main(void) {
         test_netns_static_address_beside_lease();
         test_netns_foreign_address_survives();
         test_netns_address_back_after_link_down();
+        test_netns_route_sections();
+        test_netns_route_sections_v6();
+        test_netns_route_implicit_onlink();
+        test_netns_route_beside_lease();
+        test_netns_route_shares_gateway();
+        test_netns_route_unreachable_gateway();
+        test_netns_route_survives_renumber();
+        test_netns_route_back_after_link_down();
         test_reload_dropped_after_exit_request();
 
         printf("test-netd-rtnl: ok\n");

@@ -102,23 +102,6 @@ static int address_del_idempotent(
         return (r == -EADDRNOTAVAIL || r == -ENOENT) ? 0 : r;
 }
 
-/* The default route through `gw`, or the link-scope host route to it. */
-static void route_v4(NetdRtnlRoute *rt, int ifindex, const struct in_addr *gw, bool host, uint32_t metric) {
-        memset(rt, 0, sizeof(*rt));
-        rt->ifindex = ifindex;
-        rt->family = AF_INET;
-        rt->metric = metric;
-
-        if (host) {
-                rt->dst.in = *gw;
-                rt->dst_len = 32;
-                rt->scope = RT_SCOPE_LINK;
-        } else {
-                rt->gw.in = *gw;
-                rt->has_gw = true;
-        }
-}
-
 static int route_add_idempotent(NetdRtnl *rtnl, const NetdRtnlRoute *rt) {
         int r = netd_rtnl_route_add(rtnl, rt);
         return r == -EEXIST ? 0 : r;
@@ -127,34 +110,6 @@ static int route_add_idempotent(NetdRtnl *rtnl, const NetdRtnlRoute *rt) {
 static int route_del_idempotent(NetdRtnl *rtnl, const NetdRtnlRoute *rt) {
         int r = netd_rtnl_route_del(rtnl, rt);
         return (r == -ESRCH || r == -ENOENT) ? 0 : r;
-}
-
-static int route_add_default_idempotent(NetdRtnl *rtnl, int ifindex, const struct in_addr *gw, uint32_t metric) {
-        NetdRtnlRoute rt;
-
-        route_v4(&rt, ifindex, gw, false, metric);
-        return route_add_idempotent(rtnl, &rt);
-}
-
-static int route_del_default_idempotent(NetdRtnl *rtnl, int ifindex, const struct in_addr *gw, uint32_t metric) {
-        NetdRtnlRoute rt;
-
-        route_v4(&rt, ifindex, gw, false, metric);
-        return route_del_idempotent(rtnl, &rt);
-}
-
-static int route_add_host_idempotent(NetdRtnl *rtnl, int ifindex, const struct in_addr *dst, uint32_t metric) {
-        NetdRtnlRoute rt;
-
-        route_v4(&rt, ifindex, dst, true, metric);
-        return route_add_idempotent(rtnl, &rt);
-}
-
-static int route_del_host_idempotent(NetdRtnl *rtnl, int ifindex, const struct in_addr *dst, uint32_t metric) {
-        NetdRtnlRoute rt;
-
-        route_v4(&rt, ifindex, dst, true, metric);
-        return route_del_idempotent(rtnl, &rt);
 }
 
 /* True when `a`/`a_pfx` and `b`/`b_pfx` name the same connected-route
@@ -173,6 +128,147 @@ static bool same_subnet(struct in_addr a, unsigned char a_pfx, struct in_addr b,
 
 static int link_gateway_remove(Link *l);
 static uint32_t lease_remaining_sec(DhcpLease *lease);
+
+/* --- the static route table --- */
+
+static bool link_route_same(const LinkRoute *a, const LinkRoute *b) {
+        return a->family == b->family && a->dst_len == b->dst_len && a->scope == b->scope &&
+                        a->has_gw == b->has_gw && a->has_prefsrc == b->has_prefsrc && a->flags == b->flags &&
+                        a->metric == b->metric &&
+                        memcmp(a->dst.bytes, b->dst.bytes, sizeof(a->dst.bytes)) == 0 &&
+                        memcmp(a->gw.bytes, b->gw.bytes, sizeof(a->gw.bytes)) == 0 &&
+                        memcmp(a->prefsrc.bytes, b->prefsrc.bytes, sizeof(a->prefsrc.bytes)) == 0;
+}
+
+static void link_route_to_rtnl(const Link *l, const LinkRoute *r, NetdRtnlRoute *out) {
+        memset(out, 0, sizeof(*out));
+        out->ifindex = l->ifindex;
+        out->family = r->family;
+        out->dst_len = r->dst_len;
+        out->scope = r->scope;
+        out->dst = r->dst;
+        out->gw = r->gw;
+        out->has_gw = r->has_gw;
+        out->prefsrc = r->prefsrc;
+        out->has_prefsrc = r->has_prefsrc;
+        out->flags = r->flags;
+        out->metric = r->metric;
+}
+
+static LinkRoute *link_route_find(Link *l, const LinkRoute *like) {
+        for (size_t i = 0; i < l->n_routes; i++)
+                if (link_route_same(&l->routes[i], like))
+                        return &l->routes[i];
+
+        return NULL;
+}
+
+/* Forgets the record at `r`, which points into l->routes. */
+static void link_route_forget(Link *l, LinkRoute *r) {
+        size_t i = (size_t) (r - l->routes);
+
+        memmove(&l->routes[i], &l->routes[i + 1], (l->n_routes - i - 1) * sizeof(*r));
+        l->n_routes--;
+}
+
+/* Records `r`, or updates the record of the same route. */
+static int link_route_record(Link *l, const LinkRoute *r) {
+        LinkRoute *have = link_route_find(l, r), *grown;
+
+        if (have) {
+                *have = *r;
+                return 0;
+        }
+
+        if (l->n_routes >= LINK_ROUTES_MAX)
+                return -ENOSPC;
+
+        grown = realloc(l->routes, (l->n_routes + 1) * sizeof(*grown));
+        if (!grown)
+                return -ENOMEM;
+
+        l->routes = grown;
+        l->routes[l->n_routes++] = *r;
+        return 0;
+}
+
+static int link_route_send(Link *l, const LinkRoute *r) {
+        NetdRtnlRoute rt;
+
+        link_route_to_rtnl(l, r, &rt);
+        return route_add_idempotent(l->netd->rtnl, &rt);
+}
+
+/* A link that is gone has no routes left to delete. */
+static int link_route_unsend(Link *l, const LinkRoute *r) {
+        NetdRtnlRoute rt;
+        int rc;
+
+        link_route_to_rtnl(l, r, &rt);
+        rc = route_del_idempotent(l->netd->rtnl, &rt);
+        return rc == -ENODEV ? 0 : rc;
+}
+
+/* True when a [Route] entry that is not going away names this route: its
+ * kernel object then has two owners and is removed only when the last one
+ * lets go. */
+static bool link_static_route_owns(const Link *l, const LinkRoute *r) {
+        for (size_t i = 0; i < l->n_routes; i++)
+                if (!l->routes[i].doomed && link_route_same(&l->routes[i], r))
+                        return true;
+
+        return false;
+}
+
+/* The default route through `gw`, or the host route to it, as the single
+ * gateway slot sends them. */
+static void link_route_v4(LinkRoute *out, const struct in_addr *gw, bool host, uint32_t metric) {
+        memset(out, 0, sizeof(*out));
+        out->family = AF_INET;
+        out->metric = metric;
+
+        if (host) {
+                out->dst.in = *gw;
+                out->dst_len = 32;
+                out->scope = RT_SCOPE_LINK;
+        } else {
+                out->gw.in = *gw;
+                out->has_gw = true;
+        }
+}
+
+static bool link_gateway_owns(const Link *l, const LinkRoute *r) {
+        LinkRoute own;
+
+        if (!l->gateway_configured)
+                return false;
+
+        link_route_v4(&own, &l->gateway, false, l->gateway_metric);
+        if (link_route_same(&own, r))
+                return true;
+
+        link_route_v4(&own, &l->gateway, true, l->gateway_metric);
+        return l->gateway_host_route && link_route_same(&own, r);
+}
+
+static int link_gateway_route_add(Link *l, const struct in_addr *gw, bool host, uint32_t metric) {
+        LinkRoute id;
+
+        link_route_v4(&id, gw, host, metric);
+        return link_route_send(l, &id);
+}
+
+/* Deletes one of the gateway slot's routes unless a [Route] entry is the same
+ * route. */
+static int link_gateway_route_del(Link *l, const struct in_addr *gw, bool host, uint32_t metric) {
+        LinkRoute id;
+
+        link_route_v4(&id, gw, host, metric);
+        if (link_static_route_owns(l, &id))
+                return 0;
+
+        return link_route_unsend(l, &id);
+}
 
 /* --- the static address table --- */
 
@@ -301,9 +397,9 @@ static bool link_lease_owns_v4(const Link *l, struct in_addr addr, unsigned char
  * Deleting the primary IPv4 address of a subnet also deletes every secondary
  * one (net.ipv4.conf.*.promote_secondaries defaults to 0) and the routes that
  * went through it. After any IPv4 delete, send the other addresses of that
- * subnet and the default route again; what is still there answers EEXIST. A
- * route that cannot come back is forgotten, so the next converge sees it
- * missing instead of trusting the slot.
+ * subnet, the [Route] routes and the default route again; what is still there
+ * answers EEXIST. A route that cannot come back is forgotten, so the next
+ * converge sees it missing instead of trusting the record.
  */
 static void link_v4_address_deleted(Link *l, struct in_addr addr, unsigned char prefixlen) {
         Netd *n = l->netd;
@@ -338,14 +434,32 @@ static void link_v4_address_deleted(Link *l, struct in_addr addr, unsigned char 
                                  strerror(-r));
         }
 
+        /* What netd recorded as installed, doomed ones included: a later delete
+         * at metric 0 matches any metric, so it must find the route it means. */
+        for (size_t i = 0; i < l->n_routes; i++) {
+                LinkRoute *rt = &l->routes[i];
+
+                if (rt->family != AF_INET || !rt->installed)
+                        continue;
+
+                r = link_route_send(l, rt);
+                if (r < 0) {
+                        pico_log(PICO_LOG_DEBUG,
+                                 "netd: %s: a route did not survive an address delete: %s",
+                                 l->ifname,
+                                 strerror(-r));
+                        rt->installed = false;
+                }
+        }
+
         if (!l->gateway_configured)
                 return;
 
         r = 0;
         if (l->gateway_host_route)
-                r = route_add_host_idempotent(n->rtnl, l->ifindex, &l->gateway, l->gateway_metric);
+                r = link_gateway_route_add(l, &l->gateway, true, l->gateway_metric);
         if (r == 0)
-                r = route_add_default_idempotent(n->rtnl, l->ifindex, &l->gateway, l->gateway_metric);
+                r = link_gateway_route_add(l, &l->gateway, false, l->gateway_metric);
         if (r < 0) {
                 pico_log(PICO_LOG_WARNING,
                          "netd: %s: default route did not survive an address delete: %s",
@@ -523,6 +637,7 @@ Link *link_free(Link *l) {
 
         (void) link_remove_state_file(l);
         free(l->addrs);
+        free(l->routes);
 
         if (n) {
                 for (size_t i = 0; i < n->n_links; i++)
@@ -823,6 +938,187 @@ static int apply_static_addresses(Link *l, const Network *nw) {
         return first_error;
 }
 
+static void link_route_from_network(const NetworkRoute *nr, LinkRoute *out) {
+        memset(out, 0, sizeof(*out));
+        out->family = nr->family;
+        out->dst_len = nr->dst_len;
+        out->scope = nr->scope;
+        out->dst = nr->dst;
+        out->gw = nr->gw;
+        out->has_gw = nr->gw_family != 0;
+        out->prefsrc = nr->prefsrc;
+        out->has_prefsrc = nr->prefsrc_family != 0;
+        out->flags = nr->onlink ? RTNH_F_ONLINK : 0;
+        out->metric = nr->metric;
+}
+
+static void link_warn_route(const Link *l, const char *what, const LinkRoute *r, int rc) {
+        char dst[INET6_ADDRSTRLEN], gw[INET6_ADDRSTRLEN];
+
+        pico_log(PICO_LOG_WARNING,
+                 "netd: %s: failed to %s route %s/%u%s%s: %s",
+                 l->ifname,
+                 what,
+                 netd_addr_to_string(r->family, &r->dst, dst),
+                 (unsigned) r->dst_len,
+                 r->has_gw ? " via " : "",
+                 r->has_gw ? netd_addr_to_string(r->family, &r->gw, gw) : "",
+                 strerror(-rc));
+}
+
+/* What the kernel says of a gateway no address of the link reaches yet. */
+static bool route_unreachable(int rc) {
+        return rc == -ENETUNREACH || rc == -ENETDOWN || rc == -EHOSTUNREACH;
+}
+
+/* Deletes the kernel route of `r` (a record in l->routes) and forgets it. A
+ * route that is not installed is only forgotten: a delete of it could hit
+ * another route at the same gateway, and one the gateway slot also names stays
+ * in the kernel. */
+static int link_static_route_remove(Link *l, LinkRoute *r) {
+        LinkRoute gone = *r;
+        int rc;
+
+        if (gone.installed && !link_gateway_owns(l, &gone)) {
+                rc = link_route_unsend(l, &gone);
+                if (rc < 0) {
+                        link_warn_route(l, "remove", &gone, rc);
+                        return rc;
+                }
+        }
+
+        link_route_forget(l, r);
+        return 0;
+}
+
+/* True when a wanted route that is not in the table yet takes the place of
+ * `have`: the same destination and gateway at another metric. */
+static bool link_route_replaced(Link *l, const LinkRoute *have, const LinkRoute *want, size_t n_want) {
+        for (size_t k = 0; k < n_want; k++)
+                if (!link_route_find(l, &want[k]) && want[k].family == have->family &&
+                    want[k].dst_len == have->dst_len && want[k].has_gw == have->has_gw &&
+                    memcmp(want[k].dst.bytes, have->dst.bytes, sizeof(have->dst.bytes)) == 0 &&
+                    memcmp(want[k].gw.bytes, have->gw.bytes, sizeof(have->gw.bytes)) == 0)
+                        return true;
+
+        return false;
+}
+
+/*
+ * Brings the kernel's [Route] routes in line with the file, as
+ * apply_static_addresses() does for addresses: what is recorded and installed
+ * is left alone, what is new is added and what is no longer wanted is deleted,
+ * after the adds so that a changed metric never leaves the destination
+ * without a route. The exception is an IPv4 route at metric 0 that a new one
+ * replaces at the same destination and gateway: a delete at 0 matches any
+ * metric, so it goes first. Only routes netd recorded are ever deleted.
+ *
+ * A gateway that no address reaches yet (ENETUNREACH and its kin) stays
+ * recorded and not installed, with one warning, and is tried again by every
+ * later call: after an address or a lease changes, the next converge finds
+ * it reachable. The error is still returned, for a link that has nothing
+ * else that could bring the address.
+ */
+static int apply_static_routes(Link *l, const Network *nw) {
+        LinkRoute want[NETWORK_ROUTE_MAX];
+        size_t n_want = 0;
+        int first_error = 0, rc;
+
+        for (size_t i = 0; i < nw->n_routes && n_want < NETWORK_ROUTE_MAX; i++) {
+                const NetworkRoute *nr = &nw->routes[i];
+
+                if (nr->family == AF_INET6 && !netd_ipv6_supported()) {
+                        if (!l->warned_no_ipv6_routes)
+                                pico_log(PICO_LOG_WARNING,
+                                         "netd: %s: %s configures IPv6 routes but the kernel has no IPv6, skipping them",
+                                         l->ifname,
+                                         nw->basename);
+                        l->warned_no_ipv6_routes = true;
+                        continue;
+                }
+
+                link_route_from_network(nr, &want[n_want++]);
+        }
+
+        for (size_t i = 0; i < l->n_routes; i++) {
+                bool wanted = false;
+
+                for (size_t k = 0; k < n_want; k++)
+                        if (link_route_same(&l->routes[i], &want[k])) {
+                                wanted = true;
+                                break;
+                        }
+
+                l->routes[i].doomed = !wanted;
+        }
+
+        for (size_t i = 0; i < l->n_routes;) {
+                LinkRoute *have = &l->routes[i];
+                bool clash = have->doomed && have->installed && have->family == AF_INET &&
+                                have->metric == 0 && link_route_replaced(l, have, want, n_want);
+
+                if (!clash) {
+                        i++;
+                        continue;
+                }
+
+                rc = link_static_route_remove(l, have);
+                if (rc < 0) {
+                        if (!first_error)
+                                first_error = rc;
+                        i++;
+                }
+        }
+
+        for (size_t k = 0; k < n_want; k++) {
+                LinkRoute *have = link_route_find(l, &want[k]);
+
+                if (have && have->installed)
+                        continue;
+
+                want[k].warned = have && have->warned;
+                rc = link_route_send(l, &want[k]);
+                if (rc == 0) {
+                        want[k].installed = true;
+                        want[k].warned = false;
+                } else if (route_unreachable(rc)) {
+                        if (!want[k].warned)
+                                pico_log(PICO_LOG_WARNING,
+                                         "netd: %s: a route is not reachable yet, trying again when an address or lease changes: %s",
+                                         l->ifname,
+                                         strerror(-rc));
+                        want[k].warned = true;
+                        if (!first_error)
+                                first_error = rc;
+                } else {
+                        link_warn_route(l, "add", &want[k], rc);
+                        if (!first_error)
+                                first_error = rc;
+                        continue;
+                }
+
+                rc = link_route_record(l, &want[k]);
+                if (rc < 0 && !first_error)
+                        first_error = rc;
+        }
+
+        for (size_t i = 0; i < l->n_routes;) {
+                if (!l->routes[i].doomed) {
+                        i++;
+                        continue;
+                }
+
+                rc = link_static_route_remove(l, &l->routes[i]);
+                if (rc < 0) {
+                        if (!first_error)
+                                first_error = rc;
+                        i++;
+                }
+        }
+
+        return first_error;
+}
+
 /*
  * With DHCP= off the lease's address no longer has an owner: delete it before
  * the static addresses are settled, so one in its subnet is not made its
@@ -848,15 +1144,14 @@ static int link_drop_lease_address(Link *l, const Network *nw) {
 
 /* Removes the default route and, if there is one, its host route. */
 static int link_gateway_remove(Link *l) {
-        Netd *n = l->netd;
         int r;
 
-        r = route_del_default_idempotent(n->rtnl, l->ifindex, &l->gateway, l->gateway_metric);
+        r = link_gateway_route_del(l, &l->gateway, false, l->gateway_metric);
         if (r < 0)
                 return r;
 
         if (l->gateway_host_route) {
-                r = route_del_host_idempotent(n->rtnl, l->ifindex, &l->gateway, l->gateway_metric);
+                r = link_gateway_route_del(l, &l->gateway, true, l->gateway_metric);
                 if (r < 0)
                         pico_log(PICO_LOG_WARNING,
                                  "netd: %s: failed to remove gateway host route: %s",
@@ -882,7 +1177,6 @@ static int link_gateway_remove(Link *l) {
  * old route at 0 to the same router goes first instead.
  */
 static int link_gateway_replace(Link *l, const struct in_addr *gw, bool host_route, bool from_lease) {
-        Netd *n = l->netd;
         uint32_t new_metric = link_route_metric(l, from_lease), old_metric = l->gateway_metric;
         struct in_addr old_gw = l->gateway;
         bool had_gateway = l->gateway_configured, had_host_route = l->gateway_host_route;
@@ -896,15 +1190,15 @@ static int link_gateway_replace(Link *l, const struct in_addr *gw, bool host_rou
         }
 
         if (host_route) {
-                r = route_add_host_idempotent(n->rtnl, l->ifindex, gw, new_metric);
+                r = link_gateway_route_add(l, gw, true, new_metric);
                 if (r < 0)
                         return r;
         }
 
-        r = route_add_default_idempotent(n->rtnl, l->ifindex, gw, new_metric);
+        r = link_gateway_route_add(l, gw, false, new_metric);
         if (r < 0) {
                 if (host_route)
-                        (void) route_del_host_idempotent(n->rtnl, l->ifindex, gw, new_metric);
+                        (void) link_gateway_route_del(l, gw, true, new_metric);
                 return r;
         }
 
@@ -912,9 +1206,9 @@ static int link_gateway_replace(Link *l, const struct in_addr *gw, bool host_rou
                 bool same = old_gw.s_addr == gw->s_addr && old_metric == new_metric;
 
                 if (!same)
-                        (void) route_del_default_idempotent(n->rtnl, l->ifindex, &old_gw, old_metric);
+                        (void) link_gateway_route_del(l, &old_gw, false, old_metric);
                 if (had_host_route && (!same || !host_route))
-                        (void) route_del_host_idempotent(n->rtnl, l->ifindex, &old_gw, old_metric);
+                        (void) link_gateway_route_del(l, &old_gw, true, old_metric);
         }
 
         l->gateway = *gw;
@@ -1496,12 +1790,16 @@ static int link_configure_impl(Link *l) {
 
         /*
          * A down link has lost its IPv6 addresses (keep_addr_on_down is off
-         * by default), so the table is sent again below. IPv4 addresses stay.
+         * by default) and every route through it, so those are sent again
+         * below. IPv4 addresses stay.
          */
-        if (!(l->flags & IFF_UP))
+        if (!(l->flags & IFF_UP)) {
                 for (size_t i = 0; i < l->n_addrs; i++)
                         if (l->addrs[i].family == AF_INET6)
                                 l->addrs[i].installed = false;
+                for (size_t i = 0; i < l->n_routes; i++)
+                        l->routes[i].installed = false;
+        }
 
         /*
          * Before bringing the link up: a MAC change needs the link down.
@@ -1529,6 +1827,15 @@ static int link_configure_impl(Link *l) {
         r = apply_static_addresses(l, nw);
         if (r < 0) {
                 pico_log(PICO_LOG_WARNING, "netd: %s: failed to apply Address=: %s", l->ifname, strerror(-r));
+                l->state = LINK_FAILED;
+                return r;
+        }
+
+        /* Likewise a [Route] whose gateway no address reaches yet; each
+         * failure was already reported once. */
+        r = apply_static_routes(l, nw);
+        if (r < 0 && !network_dhcp4_enabled(nw)) {
+                pico_log(PICO_LOG_WARNING, "netd: %s: failed to apply [Route]: %s", l->ifname, strerror(-r));
                 l->state = LINK_FAILED;
                 return r;
         }
@@ -1658,8 +1965,26 @@ static int link_teardown_static_addresses(Link *l) {
         return ret;
 }
 
+/* Deletes every recorded [Route] route. One the gateway slot also names stays
+ * until the slot lets go. */
+static int link_teardown_static_routes(Link *l) {
+        int ret = 0;
+
+        for (size_t i = 0; i < l->n_routes;) {
+                int r = link_static_route_remove(l, &l->routes[i]);
+
+                if (r < 0) {
+                        if (ret == 0)
+                                ret = r;
+                        i++;
+                }
+        }
+
+        return ret;
+}
+
 /* What a lease put in the kernel: the default route, the address and the
- * lease file. Static addresses stay. */
+ * lease file. Static addresses and routes stay. */
 static int link_teardown_lease_state(Link *l) {
         int r, ret = 0;
 
@@ -1701,7 +2026,11 @@ static int link_teardown_lease_state(Link *l) {
  * not touched here). Never touches l->dhcp_client/l->dhcp_server.
  */
 static int link_teardown_kernel_state(Link *l) {
-        int r, ret = link_teardown_static_addresses(l);
+        int r, ret = link_teardown_static_routes(l);
+
+        r = link_teardown_static_addresses(l);
+        if (!ret)
+                ret = r;
 
         r = link_teardown_lease_state(l);
         return ret ? ret : r;
@@ -1924,6 +2253,10 @@ int link_apply_lease(Link *l, DhcpLease *lease) {
 
         link_apply_lease_router(l, lease, addr, prefixlen);
 
+        /* The lease's address may put a [Route] gateway in reach. */
+        if (nw)
+                (void) apply_static_routes(l, nw);
+
         old = l->lease;
         l->lease = lease; /* takes ownership, per netd-link.h */
         if (old)
@@ -2011,6 +2344,7 @@ int link_lose_lease(Link *l) {
                                  "netd: %s: failed to apply Address=: %s",
                                  l->ifname,
                                  strerror(-rr));
+                (void) apply_static_routes(l, l->network);
                 rr = apply_static_gateway(l, l->network);
                 if (rr < 0)
                         pico_log(PICO_LOG_WARNING,
