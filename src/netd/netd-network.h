@@ -151,6 +151,16 @@ typedef struct NetworkDns {
         NetdInAddr address;
 } NetworkDns;
 
+/* One NTP= server. A link-local IPv6 server is reached through `zone` when
+ * the value named one, otherwise through each link this file is applied
+ * to. */
+typedef struct NetworkNtp {
+        uint8_t family; /* AF_INET or AF_INET6 */
+        NetdInAddr address;
+        char zone[IFNAMSIZ]; /* the %ifname of a link-local server, or empty */
+        int zone_ifindex;    /* `zone` as an interface index when it is a number, else 0 */
+} NetworkNtp;
+
 struct Network {
         /*
          * Where it came from. `filename` is the full path of the file that
@@ -193,11 +203,11 @@ struct Network {
         bool gateway_set;
 
         /* Address literals only -- netd has no resolver, so a hostname in
-         * DNS= or NTP= is a parse error, not a lookup. DNS= takes both
-         * families; NTP= takes IPv4 only, because the SNTP client does. */
+         * DNS= or NTP= is a parse error, not a lookup. Both take either
+         * family; NTP= also takes a %ifname on a link-local address. */
         NetworkDns *dns;
         size_t n_dns;
-        struct in_addr *ntp;
+        NetworkNtp *ntp;
         size_t n_ntp;
 
         bool dhcp_server; /* DHCPServer= */

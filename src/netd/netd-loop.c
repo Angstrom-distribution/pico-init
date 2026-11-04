@@ -327,42 +327,85 @@ static int dispatch_rtnl_source(Netd *n, struct netd_epoll_tag *tag, uint32_t re
         r = netd_rtnl_process(n->rtnl);
         if (r == -ENOBUFS) {
                 pico_log(PICO_LOG_WARNING, "netd: rtnl: event socket overran, re-enumerating");
-                return netd_rtnl_reenumerate(n);
+                r = netd_rtnl_reenumerate(n);
+                netd_static_ntp_links_changed(n);
+                return r;
         }
 
         return r < 0 ? r : 0;
 }
 
+/* Append `a` unless it is listed already or the list is full. */
+static void static_ntp_add(NetdSntpAddr *servers, size_t *count, const NetdSntpAddr *a) {
+        if (*count >= NETD_SNTP_MAX_SERVERS)
+                return;
+
+        for (size_t k = 0; k < *count; k++)
+                if (netd_sntp_addr_eq(&servers[k], a))
+                        return;
+
+        servers[(*count)++] = *a;
+}
+
+/*
+ * One NTP= entry as server addresses. A link-local IPv6 server needs an
+ * interface: the link its %ifname or index names, or each link `nw` is
+ * applied to. An interface that is not there yet is picked up by
+ * netd_static_ntp_links_changed() when it appears.
+ */
+static void static_ntp_add_entry(Netd *n, Network *nw, const NetworkNtp *e, NetdSntpAddr *servers, size_t *count) {
+        NetdSntpAddr a;
+
+        if (e->family == AF_INET6 && IN6_IS_ADDR_LINKLOCAL(&e->address.in6)) {
+                if (e->zone[0] != '\0') {
+                        Link *l = e->zone_ifindex > 0 ? netd_find_link(n, e->zone_ifindex) :
+                                                        netd_find_link_by_name(n, e->zone);
+
+                        if (l && netd_sntp_addr_set(&a, AF_INET6, &e->address, l->ifindex) == 0)
+                                static_ntp_add(servers, count, &a);
+                        return;
+                }
+
+                for (size_t i = 0; i < n->n_links; i++)
+                        if (n->links[i]->network == nw &&
+                            netd_sntp_addr_set(&a, AF_INET6, &e->address, n->links[i]->ifindex) == 0)
+                                static_ntp_add(servers, count, &a);
+                return;
+        }
+
+        if (netd_sntp_addr_set(&a, e->family, &e->address, 0) == 0)
+                static_ntp_add(servers, count, &a);
+}
+
 /*
  * [Network] NTP=, across every loaded .network file (netd-sntp.h: "Called
- * from netd_startup() with [Network] NTP= and from link_apply_lease() with
- * DHCP option 42, so the two sources cannot accumulate stale entries across a
- * lease change"). There is exactly one NetdSntp on Netd, not one per link --
- * a single daemon-wide server list, rebuilt from scratch each time this
- * runs so a reload can't leave a stale entry from a file that no longer
+ * with [Network] NTP= at startup and reload ... and from link_apply_lease()
+ * with DHCP option 42, so the two sources cannot accumulate stale entries
+ * across a lease change"). There is exactly one NetdSntp on Netd, not one per
+ * link -- a single daemon-wide server list, rebuilt from scratch each time
+ * this runs so a reload can't leave a stale entry from a file that no longer
  * lists it. Best-effort throughout: a board with no NTP configured anywhere
  * is not a startup failure.
  */
-static void netd_apply_static_ntp(Netd *n) {
-        struct in_addr servers[NETD_SNTP_MAX_SERVERS];
+static size_t static_ntp_collect(Netd *n, NetdSntpAddr servers[NETD_SNTP_MAX_SERVERS]) {
         size_t count = 0;
 
         for (size_t i = 0; i < n->n_networks && count < NETD_SNTP_MAX_SERVERS; i++) {
                 Network *nw = n->networks[i];
 
-                for (size_t j = 0; j < nw->n_ntp && count < NETD_SNTP_MAX_SERVERS; j++) {
-                        bool dup = false;
-
-                        for (size_t k = 0; k < count; k++)
-                                if (servers[k].s_addr == nw->ntp[j].s_addr) {
-                                        dup = true;
-                                        break;
-                                }
-
-                        if (!dup)
-                                servers[count++] = nw->ntp[j];
-                }
+                for (size_t j = 0; j < nw->n_ntp && count < NETD_SNTP_MAX_SERVERS; j++)
+                        static_ntp_add_entry(n, nw, &nw->ntp[j], servers, &count);
         }
+
+        return count;
+}
+
+static void netd_apply_static_ntp(Netd *n) {
+        NetdSntpAddr servers[NETD_SNTP_MAX_SERVERS];
+        size_t count = static_ntp_collect(n, servers);
+
+        memcpy(n->static_ntp, servers, count * sizeof(servers[0]));
+        n->n_static_ntp = count;
 
         if (count == 0) {
                 /* No NTP= left anywhere: stop querying rather than leave a
@@ -381,8 +424,27 @@ static void netd_apply_static_ntp(Netd *n) {
                 }
         }
 
-        (void) netd_sntp_set_servers(n->sntp, servers, count);
+        (void) netd_sntp_set_server_addrs(n->sntp, servers, count);
         (void) netd_sntp_start(n->sntp);
+}
+
+/*
+ * Only a change rebuilds: the rebuild replaces the whole list, also servers
+ * a DHCP lease put there, and most link events (carrier, flags) change
+ * nothing here.
+ */
+void netd_static_ntp_links_changed(Netd *n) {
+        NetdSntpAddr servers[NETD_SNTP_MAX_SERVERS];
+        size_t count;
+
+        if (!n)
+                return;
+
+        count = static_ntp_collect(n, servers);
+        if (count == n->n_static_ntp && memcmp(servers, n->static_ntp, count * sizeof(servers[0])) == 0)
+                return;
+
+        netd_apply_static_ntp(n);
 }
 
 /*

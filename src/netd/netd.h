@@ -35,6 +35,7 @@
 #include "../timer.h"
 #include "../util.h"
 #include "netd-loop.h"
+#include "netd-sntp.h"
 
 typedef struct Netd Netd;
 
@@ -127,6 +128,10 @@ struct Netd {
 
         /* --- time (netd-sntp.c / netd-time.c) --- */
         NetdSntp *sntp; /* owned; NULL until a server list exists */
+        /* The list [Network] NTP= gave last, so that a link event rebuilds
+         * it only when it changes. */
+        NetdSntpAddr static_ntp[NETD_SNTP_MAX_SERVERS];
+        size_t n_static_ntp;
 
         /* --- paths, all owned and all settable for tests --- */
         char *runtime_dir;    /* NETD_RUNTIME_DIR */
@@ -201,6 +206,12 @@ int netd_reload(Netd *n);
 /* Bring interface `lo` up. Called from netd_startup(); separate so the rtnl
  * test can exercise it on its own. 0 or -errno. */
 int netd_bring_up_loopback(Netd *n);
+
+/* Rebuild the [Network] NTP= server list when the links a link-local NTP=
+ * server is reached through changed: one appeared, was renamed, matched
+ * another file or went away. Called after every live link event and after
+ * a re-enumeration. */
+void netd_static_ntp_links_changed(Netd *n);
 
 /* Replace a path with an owned copy. For tests. 0 or -errno. */
 int netd_set_network_path(Netd *n, const char * const *path);

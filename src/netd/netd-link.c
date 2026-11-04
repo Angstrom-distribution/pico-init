@@ -752,8 +752,10 @@ int netd_link_rtnl_handler(void *userdata, NetdRtnlLinkEvent event, const NetdRt
                  * needed here -- link_free()/link_deconfigure()'s rtnl
                  * writes cannot land mid-dump through this path. */
                 l = netd_find_link(n, rl->ifindex);
-                if (l)
+                if (l) {
                         (void) link_free(l);
+                        netd_static_ntp_links_changed(n);
+                }
                 return 0;
 
         case NETD_RTNL_LINK_ADDED:
@@ -782,7 +784,9 @@ int netd_link_rtnl_handler(void *userdata, NetdRtnlLinkEvent event, const NetdRt
                 if (n->rtnl_dump_in_progress)
                         return 0;
 
-                return link_configure(l);
+                r = link_configure(l);
+                netd_static_ntp_links_changed(n);
+                return r;
 
         case NETD_RTNL_LINK_CHANGED:
                 /* A live event only (netd-rtnl.h: a dump never reports
@@ -799,7 +803,9 @@ int netd_link_rtnl_handler(void *userdata, NetdRtnlLinkEvent event, const NetdRt
                 } else
                         link_update_snapshot(l, rl);
 
-                return link_configure(l);
+                r = link_configure(l);
+                netd_static_ntp_links_changed(n);
+                return r;
 
         default:
                 return -EINVAL;
@@ -1701,8 +1707,22 @@ static int link_start_dhcp_server(Link *l, const Network *nw) {
                 }
         }
 
+        /* Option 42 carries IPv4 servers only. */
         if (nw->n_ntp > 0) {
-                r = dhcp_server_set_ntp(server, nw->ntp, nw->n_ntp);
+                struct in_addr *ntp = calloc(nw->n_ntp, sizeof(*ntp));
+                size_t n_ntp = 0;
+
+                if (!ntp) {
+                        r = -ENOMEM;
+                        goto fail;
+                }
+
+                for (size_t i = 0; i < nw->n_ntp; i++)
+                        if (nw->ntp[i].family == AF_INET)
+                                ntp[n_ntp++] = nw->ntp[i].address.in;
+
+                r = n_ntp > 0 ? dhcp_server_set_ntp(server, ntp, n_ntp) : 0;
+                free(ntp);
                 if (r < 0)
                         goto fail;
         }

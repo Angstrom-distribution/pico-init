@@ -6,7 +6,12 @@
  *
  * Covered: a full exchange with a fake server on [::1]:123, a reply from
  * another port of the same address refused, an accepted reply ending the
- * request, and a mixed list asked in turn over the IPv4 and the IPv6 socket.
+ * request, a mixed list asked in turn over the IPv4 and the IPv6 socket, and
+ * an in-process netd turning NTP= into server addresses: a link-local server
+ * through the link its file matches, through its %ifname and through an
+ * interface index, a global IPv6 and an IPv4 server, and the list following
+ * a link that appears, is renamed away and back, comes to match another file
+ * and goes away.
  *
  * An accepted reply makes netd_sntp_process() call clock_adjtime(). The user
  * namespace is what makes that safe: CAP_SYS_TIME is checked against the
@@ -23,6 +28,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <sched.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,6 +42,7 @@
 
 #include "../test-util.h"
 #include "netd-loop.h"
+#include "netd-rtnl.h"
 #include "netd-sntp.h"
 #include "netd.h"
 
@@ -274,6 +281,146 @@ static void test_mixed_families(void) {
         printf("test-netd-sntp-ipv6: mixed families ok\n");
 }
 
+/* --- NTP= through an in-process netd --- */
+
+static int shellf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
+static int shellf(const char *fmt, ...) {
+        char cmd[512];
+        va_list ap;
+
+        va_start(ap, fmt);
+        vsnprintf(cmd, sizeof(cmd), fmt, ap);
+        va_end(ap);
+        return system(cmd);
+}
+
+static void run_ip(const char *args) {
+        if (shellf("ip %s >/dev/null 2>&1", args) != 0) {
+                fprintf(stderr, "test-netd-sntp-ipv6: `ip %s` failed\n", args);
+                exit(1);
+        }
+}
+
+static void pump(Netd *n, int ms) {
+        struct epoll_event events[16];
+        usec_t end = now_monotonic() + (usec_t) ms * USEC_PER_MSEC, now;
+
+        while ((now = now_monotonic()) < end) {
+                int k = epoll_wait(n->epoll_fd, events, 16, (int) ((end - now) / USEC_PER_MSEC) + 1);
+
+                for (int i = 0; i < k; i++) {
+                        struct netd_epoll_tag *tag = events[i].data.ptr;
+
+                        if (tag && tag->callback && tag->registered)
+                                (void) tag->callback(n, tag, events[i].events);
+                }
+                netd_loop_drain_pending_frees(n);
+        }
+}
+
+static void assert_server(const NetdSntpAddr *a, int family, const char *literal, unsigned ifindex) {
+        char buf[INET6_ADDRSTRLEN];
+
+        ASSERT_EQ_INT(a->sa.sa_family, family);
+        if (family == AF_INET6) {
+                ASSERT_STREQ(inet_ntop(AF_INET6, &a->in6.sin6_addr, buf, sizeof(buf)), literal);
+                ASSERT_EQ_INT(a->in6.sin6_port, htons(NETD_NTP_PORT));
+                ASSERT_EQ_INT(a->in6.sin6_scope_id, ifindex);
+        } else {
+                ASSERT_STREQ(inet_ntop(AF_INET, &a->in.sin_addr, buf, sizeof(buf)), literal);
+                ASSERT_EQ_INT(a->in.sin_port, htons(NETD_NTP_PORT));
+        }
+}
+
+static void wait_servers(Netd *n, size_t want) {
+        for (int i = 0; i < 40 && n->sntp->n_servers != want; i++)
+                pump(n, 50);
+        ASSERT_EQ_INT(n->sntp->n_servers, want);
+}
+
+static void test_static_ntp(void) {
+        char *dir = test_tmpdir_new();
+        char net_dir[256], run[256], state[256], resolv[256], conf[256];
+        const char *path[2] = { net_dir, NULL };
+        Netd *n = NULL;
+        unsigned ntp0, ntp1, ntp2, ntp3;
+
+        ASSERT_TRUE(dir != NULL);
+        ASSERT_EQ_INT(test_mkdir(dir, "network"), 0);
+        ASSERT_EQ_INT(test_mkdir(dir, "run"), 0);
+        ASSERT_EQ_INT(test_mkdir(dir, "state"), 0);
+        snprintf(net_dir, sizeof(net_dir), "%s/network", dir);
+        snprintf(run, sizeof(run), "%s/run", dir);
+        snprintf(state, sizeof(state), "%s/state", dir);
+        snprintf(resolv, sizeof(resolv), "%s/resolv.conf", dir);
+
+        run_ip("link add ntp0 type veth peer name ntp1");
+        ntp0 = if_nametoindex("ntp0");
+        ntp1 = if_nametoindex("ntp1");
+        ASSERT_TRUE(ntp0 > 0 && ntp1 > 0);
+
+        snprintf(conf,
+                 sizeof(conf),
+                 "[Match]\nName=ntp0\n[Network]\n"
+                 "NTP=fe80::1 fe80::2%%ntp1 fe80::3%%ntp2 fe80::4%%%u 2001:db8::123 10.0.0.123\n",
+                 ntp1);
+        ASSERT_EQ_INT(test_write_file(net_dir, "10-ntp.network", conf), 0);
+        ASSERT_EQ_INT(test_write_file(net_dir, "20-ntp.network", "[Match]\nName=ntpy\n[Network]\nNTP=fe80::5\n"),
+                      0);
+
+        ASSERT_EQ_INT(netd_new(&n), 0);
+        ASSERT_EQ_INT(netd_set_network_path(n, path), 0);
+        ASSERT_EQ_INT(netd_set_runtime_dir(n, run), 0);
+        ASSERT_EQ_INT(netd_set_state_dir(n, state), 0);
+        ASSERT_EQ_INT(netd_set_resolv_conf(n, resolv), 0);
+        ASSERT_EQ_INT(netd_startup(n), 0);
+
+        ASSERT_TRUE(n->sntp != NULL);
+        ASSERT_EQ_INT(n->sntp->n_servers, 5);
+        assert_server(&n->sntp->servers[0], AF_INET6, "fe80::1", ntp0);
+        assert_server(&n->sntp->servers[1], AF_INET6, "fe80::2", ntp1);
+        assert_server(&n->sntp->servers[2], AF_INET6, "fe80::4", ntp1);
+        assert_server(&n->sntp->servers[3], AF_INET6, "2001:db8::123", 0);
+        assert_server(&n->sntp->servers[4], AF_INET, "10.0.0.123", 0);
+
+        /* The link its %ifname names appears later. */
+        run_ip("link add ntp2 type veth peer name ntp3");
+        ntp2 = if_nametoindex("ntp2");
+        ntp3 = if_nametoindex("ntp3");
+        ASSERT_TRUE(ntp2 > 0 && ntp3 > 0);
+        wait_servers(n, 6);
+        assert_server(&n->sntp->servers[2], AF_INET6, "fe80::3", ntp2);
+        assert_server(&n->sntp->servers[3], AF_INET6, "fe80::4", ntp1);
+
+        /* Renamed away from the %ifname, and back. */
+        run_ip("link set ntp2 name ntpx");
+        wait_servers(n, 5);
+        assert_server(&n->sntp->servers[2], AF_INET6, "fe80::4", ntp1);
+
+        /* Renamed to match the file of a bare link-local server. */
+        run_ip("link set ntp3 name ntpy");
+        wait_servers(n, 6);
+        assert_server(&n->sntp->servers[5], AF_INET6, "fe80::5", ntp3);
+
+        run_ip("link set ntpx name ntp2");
+        wait_servers(n, 7);
+        assert_server(&n->sntp->servers[2], AF_INET6, "fe80::3", ntp2);
+
+        /* Gone: both ends of the pair take their servers with them. */
+        run_ip("link del ntp2");
+        wait_servers(n, 5);
+        assert_server(&n->sntp->servers[2], AF_INET6, "fe80::4", ntp1);
+        assert_server(&n->sntp->servers[4], AF_INET, "10.0.0.123", 0);
+
+        run_ip("link del ntp0");
+        (void) netd_rtnl_process(n->rtnl);
+        netd_free(n);
+        test_rm_rf(dir);
+        free(dir);
+        printf("test-netd-sntp-ipv6: NTP= servers ok\n");
+}
+
 int main(void) {
         if (access("/proc/net/if_inet6", F_OK) < 0) {
                 fprintf(stderr, "test-netd-sntp-ipv6: kernel without IPv6, skipping\n");
@@ -286,6 +433,7 @@ int main(void) {
 
         test_exchange_loopback();
         test_mixed_families();
+        test_static_ntp();
 
         printf("test-netd-sntp-ipv6: all checks passed\n");
         return 0;
