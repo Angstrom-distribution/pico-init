@@ -73,6 +73,7 @@ pico_init_core_sources = files(
   'src/manager-startup.c',
   'src/mount-setup.c',
   'src/hostname-setup.c',
+  'src/boot-text.c',
   # The wall clock across reboots on a board with a dead RTC: /etc/timestamp
   # restored first thing, saved periodically and at shutdown.
   'src/clock-persist.c',
@@ -263,6 +264,8 @@ pico_tests = [
   'test-manager-shutdown',
   # PID 1's argv and kernel command line.
   'test-init-opts',
+  # The architecture name and the timespan in the early boot lines.
+  'test-boot-text',
 ]
 
 # manager.h includes sd-event.h, so every test that reaches it (through
