@@ -80,6 +80,32 @@ typedef struct LinkAddress {
  * table grow without bound. */
 #define LINK_ADDRS_MAX (2 * 16)
 
+/*
+ * One static route netd put into the kernel, or wants there: what a reload
+ * compares and what a delete sends. Every field is part of the route's
+ * identity. A route the kernel refused as unreachable stays in the table with
+ * `installed` false, and is tried again whenever an address or a lease
+ * changes.
+ */
+typedef struct LinkRoute {
+        uint8_t family;
+        uint8_t dst_len;
+        uint8_t scope;
+        bool has_gw;
+        bool has_prefsrc;
+        bool installed; /* false while the kernel has not taken it, or has dropped it (link down) */
+        bool warned;    /* the failed add was already reported */
+        bool doomed;    /* during a converge pass: recorded but no longer wanted */
+        uint32_t flags; /* RTNH_F_* */
+        uint32_t metric;
+        NetdInAddr dst;
+        NetdInAddr gw;
+        NetdInAddr prefsrc;
+} LinkRoute;
+
+/* More than a file can ask for, as for LINK_ADDRS_MAX. */
+#define LINK_ROUTES_MAX (2 * 16)
+
 struct Link {
         Netd *netd; /* borrowed */
 
@@ -129,6 +155,16 @@ struct Link {
         size_t n_addrs;
         bool warned_no_ipv6;       /* IPv6 entries skipped on a kernel without IPv6, said once */
         bool warned_ipv6_disabled; /* IPv6 refusal said once, until an address is accepted */
+
+        /*
+         * Every route from a [Route] section, IPv4 and IPv6. The default
+         * route below is separate and stays the one slot it was: a [Route]
+         * with a gateway and no destination is an ordinary entry here, kept
+         * beside a lease's default route and never replaced by it.
+         */
+        LinkRoute *routes;
+        size_t n_routes;
+        bool warned_no_ipv6_routes;
 
         struct in_addr address;
         unsigned char prefixlen;
@@ -236,7 +272,9 @@ int link_deconfigure(Link *l);
  * 101's timezone handed to netd-sntp.c and netd-time.c by direct call.
  *
  * The lease's address is added beside the static ones, as networkd does;
- * one that a static entry also names is left as the static entry set it.
+ * one that a static entry also names is left as the static entry set it. Its
+ * default route is added beside any [Route] default route, and a [Route]
+ * whose gateway the new address puts in reach is installed then.
  *
  * Address application is three cases, not one, chosen from the addresses
  * themselves (netd-link.c's converge_address()) rather than from the
@@ -265,7 +303,8 @@ int link_apply_lease(Link *l, DhcpLease *lease);
 
 /*
  * Lease expired, was NAKed, or was DECLINEd: remove what it configured
- * (address, route, lease file), put back a static Gateway=, and go
+ * (address, route, lease file), put back a static Gateway=, settle the
+ * [Route] routes the address had made reachable, and go
  * back to LINK_CONFIGURING -- but leave
  * l->dhcp_client running. The client is not netd-link.c's to restart: it
  * already returns itself to INIT and restarts its own DISCOVER cycle
