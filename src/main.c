@@ -19,10 +19,12 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/reboot.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
+#include "boot-text.h"
 #include "clock-persist.h"
 #include "fstab-mount.h"
 #include "fstab.h"
@@ -690,6 +692,9 @@ int main(int argc, char *argv[]) {
         Manager *m = NULL;
         int64_t clock_target = 0;
         int clock_restored;
+        char hostname_name[HOST_NAME_MAX + 1];
+        int hostname_r;
+        struct utsname uts;
         int objective;
         int r;
 
@@ -736,9 +741,7 @@ int main(int argc, char *argv[]) {
 
         /* Needs the root filesystem mount_setup() left alone (/etc/hostname
          * lives there) and nothing else; best-effort, same as dev_setup. */
-        r = hostname_setup();
-        if (r < 0)
-                pico_log(PICO_LOG_WARNING, "hostname_setup: %s", strerror(-r));
+        hostname_r = hostname_setup(hostname_name);
 
         /*
          * Before anything that timestamps: the RTC on the boards this runs on
@@ -781,6 +784,20 @@ int main(int argc, char *argv[]) {
          * half of that split.
          */
         pico_log(PICO_LOG_INFO, "pico-init " PICO_INIT_VERSION_STRING " running as PID 1");
+
+        /* The same two lines systemd prints, in its words. The hostname was applied before
+         * the log sink existed, so it is reported here. */
+        if (uname(&uts) == 0)
+                pico_log(PICO_LOG_INFO, "Detected architecture %s.", pico_architecture_name(uts.machine));
+        if (hostname_r > 0)
+                pico_log(PICO_LOG_INFO, "Hostname set to <%s>.", hostname_name);
+        else if (hostname_r < 0 && hostname_name[0])
+                pico_log(PICO_LOG_WARNING,
+                         "Failed to set hostname to <%s>: %s",
+                         hostname_name,
+                         strerror(-hostname_r));
+        else if (hostname_r < 0)
+                pico_log(PICO_LOG_WARNING, "Failed to read /etc/hostname: %s", strerror(-hostname_r));
 
         /* argv after the kernel command line, as upstream: it wins. */
         boot_cmdline_load(&boot);
