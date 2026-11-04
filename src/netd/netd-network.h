@@ -101,6 +101,35 @@ typedef struct NetworkAddress {
  * change and some memory on every link; more is a mistake on these boards. */
 #define NETWORK_ADDRESS_MAX 16
 
+/*
+ * One route, from a [Route] section. Like NetworkAddress it holds only what
+ * can be applied: network_parse_file() drops the sections networkd drops, and
+ * the ones whose keys netd cannot honour, and fills in the scope, the IPv6
+ * metric and the on-link flag. Each key keeps the family of the address it
+ * was given until verification checks that they agree.
+ */
+typedef struct NetworkRoute {
+        uint8_t family;         /* AF_INET or AF_INET6 */
+        uint8_t dst_family;     /* of Destination=; 0 when unset */
+        uint8_t gw_family;      /* of Gateway=; 0 when unset */
+        uint8_t prefsrc_family; /* of PreferredSource=; 0 when unset */
+        unsigned char dst_len;  /* 0 without Destination=: the default route */
+        uint8_t scope;          /* RT_SCOPE_*; IPv4 only */
+        bool scope_set;
+        bool onlink;
+        bool onlink_set;
+        bool drop; /* a key whose meaning netd cannot keep: the whole section goes */
+        NetdInAddr dst;
+        NetdInAddr gw;
+        NetdInAddr prefsrc;
+        uint32_t metric;
+        unsigned line;
+} NetworkRoute;
+
+/* At most this many route entries per file, for the reason NETWORK_ADDRESS_MAX
+ * is bounded. */
+#define NETWORK_ROUTE_MAX 16
+
 struct Network {
         /*
          * Where it came from. `filename` is the full path of the file that
@@ -130,6 +159,14 @@ struct Network {
          */
         NetworkAddress *addresses;
         size_t n_addresses;
+
+        /*
+         * [Route] sections, in file order, at most NETWORK_ROUTE_MAX. A later
+         * section for the same route replaces the earlier one. [Network]
+         * Gateway= is not one of them: it keeps its own slot below.
+         */
+        NetworkRoute *routes;
+        size_t n_routes;
 
         struct in_addr gateway;
         bool gateway_set;

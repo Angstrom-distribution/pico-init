@@ -20,6 +20,7 @@
 #include <errno.h>
 #include <fnmatch.h>
 #include <limits.h>
+#include <linux/rtnetlink.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -62,6 +63,7 @@ Network *network_free(Network *nw) {
         free(nw->basename);
         pico_strv_free(nw->match_name);
         free(nw->addresses);
+        free(nw->routes);
         free(nw->dns);
         free(nw->ntp);
         free(nw);
@@ -354,14 +356,17 @@ static int parse_route_metric(const char *s, uint32_t *ret) {
 /* --- [Address] and Address= --- */
 
 /*
- * Parse state that lives only while one file is scanned. `cur` is the entry
- * the open [Address] section fills, -1 when there is none or the file is over
- * NETWORK_ADDRESS_MAX, whose entries are then ignored.
+ * Parse state that lives only while one file is scanned. `cur` and `cur_route`
+ * are the entries the open [Address] and [Route] sections fill, -1 when there
+ * is none or the file is over NETWORK_ADDRESS_MAX or NETWORK_ROUTE_MAX, whose
+ * entries are then ignored.
  */
 typedef struct NetworkParser {
         Network *nw;
         ssize_t cur;
+        ssize_t cur_route;
         bool warned_cap;
+        bool warned_route_cap;
 } NetworkParser;
 
 typedef int (*NetworkAddressParseFn)(
@@ -399,17 +404,49 @@ static ssize_t network_address_append(NetworkParser *p, const char *path, unsign
         return (ssize_t) nw->n_addresses++;
 }
 
+/* The same for a [Route] section. */
+static ssize_t network_route_append(NetworkParser *p, const char *path, unsigned line) {
+        Network *nw = p->nw;
+        NetworkRoute *grown;
+
+        if (nw->n_routes >= NETWORK_ROUTE_MAX) {
+                if (!p->warned_route_cap)
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s:%u: more than %d routes, ignoring the rest",
+                                 path,
+                                 line,
+                                 NETWORK_ROUTE_MAX);
+                p->warned_route_cap = true;
+                return -1;
+        }
+
+        grown = realloc(nw->routes, (nw->n_routes + 1) * sizeof(*grown));
+        if (!grown)
+                return -ENOMEM;
+
+        nw->routes = grown;
+        memset(&grown[nw->n_routes], 0, sizeof(*grown));
+        grown[nw->n_routes].line = line;
+        return (ssize_t) nw->n_routes++;
+}
+
 static int network_section_handler(const char *path, unsigned line, const char *section, void *userdata) {
         NetworkParser *p = userdata;
+        ssize_t i;
 
         p->cur = -1;
+        p->cur_route = -1;
 
         if (strcmp(section, "Address") == 0) {
-                ssize_t i = network_address_append(p, path, line);
-
+                i = network_address_append(p, path, line);
                 if (i == -ENOMEM)
                         return -ENOMEM;
                 p->cur = i;
+        } else if (strcmp(section, "Route") == 0) {
+                i = network_route_append(p, path, line);
+                if (i == -ENOMEM)
+                        return -ENOMEM;
+                p->cur_route = i;
         }
 
         return 0;
@@ -556,8 +593,8 @@ static int config_parse_section_preferred_lifetime(
         return 0;
 }
 
-static int config_parse_section_scope(
-                NetworkAddress *a, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+/* networkd's scope names, or a number from 0 to 255 (-EINVAL otherwise). */
+static int parse_scope(const char *s, uint8_t *ret) {
         static const struct {
                 const char *name;
                 uint8_t scope;
@@ -568,28 +605,40 @@ static int config_parse_section_scope(
                 {    "host", 254 },
                 { "nowhere", 255 },
         };
-        unsigned long v = 256;
+        unsigned long v;
+
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+                if (strcmp(s, names[i].name) == 0) {
+                        *ret = names[i].scope;
+                        return 0;
+                }
+
+        if (*s == '\0' || strlen(s) > 3 || strspn(s, "0123456789") != strlen(s))
+                return -EINVAL;
+
+        v = strtoul(s, NULL, 10);
+        if (v > 255)
+                return -EINVAL;
+
+        *ret = (uint8_t) v;
+        return 0;
+}
+
+static int config_parse_section_scope(
+                NetworkAddress *a, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        uint8_t v;
 
         if (*rvalue == '\0') {
                 a->scope_set = false;
                 return 0;
         }
 
-        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
-                if (strcmp(rvalue, names[i].name) == 0) {
-                        a->scope = names[i].scope;
-                        a->scope_set = true;
-                        return 0;
-                }
-
-        if (strlen(rvalue) <= 3 && strspn(rvalue, "0123456789") == strlen(rvalue))
-                v = strtoul(rvalue, NULL, 10);
-        if (v > 255) {
+        if (parse_scope(rvalue, &v) < 0) {
                 pico_log(PICO_LOG_WARNING, "%s:%u: invalid %s= value '%s', ignoring", path, line, lvalue, rvalue);
                 return 0;
         }
 
-        a->scope = (uint8_t) v;
+        a->scope = v;
         a->scope_set = true;
         return 0;
 }
@@ -747,6 +796,294 @@ static void network_verify_addresses(Network *nw, const char *path) {
         nw->n_addresses = n;
 }
 
+/* --- [Route] --- */
+
+typedef int (*NetworkRouteParseFn)(
+                NetworkRoute *r, const char *path, unsigned line, const char *lvalue, const char *rvalue);
+
+typedef struct NetworkRouteConfigItem {
+        const char *lvalue;
+        NetworkRouteParseFn parse;
+} NetworkRouteConfigItem;
+
+static void route_warn_invalid(const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        pico_log(PICO_LOG_WARNING, "%s:%u: invalid %s= value '%s', ignoring", path, line, lvalue, rvalue);
+}
+
+/*
+ * A key that changes what the route is: installing a different route than the
+ * file asks for is worse than installing none, so the section goes, with one
+ * warning.
+ */
+static void route_drop(NetworkRoute *r, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        if (r->drop)
+                return;
+
+        r->drop = true;
+        pico_log(PICO_LOG_WARNING,
+                 "%s:%u: %s=%s is not supported, ignoring the [Route] section",
+                 path,
+                 line,
+                 lvalue,
+                 rvalue);
+}
+
+/* A prefix, or a bare address for a host route. */
+static int route_destination_parse(const char *s, int *family, NetdInAddr *a, unsigned char *plen) {
+        int r;
+
+        if (strchr(s, '/'))
+                return netd_prefix_parse(s, family, a, plen);
+
+        r = netd_addr_parse(s, family, a);
+        if (r < 0)
+                return r;
+
+        *plen = *family == AF_INET ? 32 : 128;
+        return 0;
+}
+
+static int config_parse_route_destination(
+                NetworkRoute *r, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        NetdInAddr a;
+        unsigned char plen;
+        int family;
+
+        if (route_destination_parse(rvalue, &family, &a, &plen) < 0) {
+                route_warn_invalid(path, line, lvalue, rvalue);
+                return 0;
+        }
+
+        netd_addr_mask(family, &a, plen);
+        r->dst_family = (uint8_t) family;
+        r->dst = a;
+        r->dst_len = plen;
+        return 0;
+}
+
+static int config_parse_route_gateway(
+                NetworkRoute *r, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        NetdInAddr a;
+        int family;
+
+        if (*rvalue == '\0') {
+                r->gw_family = 0;
+                memset(&r->gw, 0, sizeof(r->gw));
+                return 0;
+        }
+
+        if (strcmp(rvalue, "_dhcp4") == 0 || strcmp(rvalue, "_ipv6ra") == 0 || strcmp(rvalue, "_dhcp") == 0) {
+                route_drop(r, path, line, lvalue, rvalue);
+                return 0;
+        }
+
+        if (netd_addr_parse(rvalue, &family, &a) < 0 || netd_addr_is_null(family, &a)) {
+                route_warn_invalid(path, line, lvalue, rvalue);
+                return 0;
+        }
+
+        r->gw_family = (uint8_t) family;
+        r->gw = a;
+        return 0;
+}
+
+static int config_parse_route_metric(
+                NetworkRoute *r, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        uint32_t v;
+
+        if (parse_route_metric(rvalue, &v) < 0) {
+                route_warn_invalid(path, line, lvalue, rvalue);
+                return 0;
+        }
+
+        r->metric = v;
+        return 0;
+}
+
+static int config_parse_route_onlink(
+                NetworkRoute *r, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        bool b;
+
+        if (*rvalue == '\0') {
+                r->onlink_set = false;
+                return 0;
+        }
+
+        if (network_parse_bool(rvalue, &b) < 0) {
+                route_warn_invalid(path, line, lvalue, rvalue);
+                return 0;
+        }
+
+        r->onlink = b;
+        r->onlink_set = true;
+        return 0;
+}
+
+/* "no" is networkd's way of refusing a source taken from a lease, which netd
+ * has none of; it leaves the key unset. */
+static int config_parse_route_prefsrc(
+                NetworkRoute *r, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        NetdInAddr a;
+        bool b;
+        int family;
+
+        if (*rvalue == '\0' || (network_parse_bool(rvalue, &b) == 0 && !b)) {
+                r->prefsrc_family = 0;
+                memset(&r->prefsrc, 0, sizeof(r->prefsrc));
+                return 0;
+        }
+
+        if (netd_addr_parse(rvalue, &family, &a) < 0 || netd_addr_is_null(family, &a)) {
+                route_warn_invalid(path, line, lvalue, rvalue);
+                return 0;
+        }
+
+        r->prefsrc_family = (uint8_t) family;
+        r->prefsrc = a;
+        return 0;
+}
+
+static int config_parse_route_scope(
+                NetworkRoute *r, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        uint8_t v;
+
+        if (parse_scope(rvalue, &v) < 0) {
+                route_warn_invalid(path, line, lvalue, rvalue);
+                return 0;
+        }
+
+        r->scope = v;
+        r->scope_set = true;
+        return 0;
+}
+
+/* The main table and the unicast type are what every route gets anyway. */
+static int config_parse_route_table(
+                NetworkRoute *r, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        if (*rvalue != '\0' && strcmp(rvalue, "main") != 0 && strcmp(rvalue, "254") != 0)
+                route_drop(r, path, line, lvalue, rvalue);
+
+        return 0;
+}
+
+static int config_parse_route_type(
+                NetworkRoute *r, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        if (*rvalue != '\0' && strcmp(rvalue, "unicast") != 0)
+                route_drop(r, path, line, lvalue, rvalue);
+
+        return 0;
+}
+
+static int config_parse_route_unsupported(
+                NetworkRoute *r, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        if (*rvalue != '\0')
+                route_drop(r, path, line, lvalue, rvalue);
+
+        return 0;
+}
+
+static const NetworkRouteConfigItem route_config_items[] = {
+        {     "Destination", config_parse_route_destination },
+        {         "Gateway",     config_parse_route_gateway },
+        {          "Metric",      config_parse_route_metric },
+        {   "GatewayOnLink",      config_parse_route_onlink },
+        { "PreferredSource",     config_parse_route_prefsrc },
+        {           "Scope",       config_parse_route_scope },
+        {           "Table",       config_parse_route_table },
+        {            "Type",        config_parse_route_type },
+        {          "Source", config_parse_route_unsupported },
+        {  "MultiPathRoute", config_parse_route_unsupported },
+        {         "NextHop", config_parse_route_unsupported },
+};
+
+static bool network_route_same(const NetworkRoute *a, const NetworkRoute *b) {
+        return a->family == b->family && a->dst_len == b->dst_len && a->scope == b->scope &&
+                        a->metric == b->metric && a->onlink == b->onlink &&
+                        (a->gw_family != 0) == (b->gw_family != 0) &&
+                        (a->prefsrc_family != 0) == (b->prefsrc_family != 0) &&
+                        memcmp(a->dst.bytes, b->dst.bytes, sizeof(a->dst.bytes)) == 0 &&
+                        memcmp(a->gw.bytes, b->gw.bytes, sizeof(a->gw.bytes)) == 0 &&
+                        memcmp(a->prefsrc.bytes, b->prefsrc.bytes, sizeof(a->prefsrc.bytes)) == 0;
+}
+
+/*
+ * Drops what networkd drops and fills in the defaults, once the whole file is
+ * read. A section without any of Gateway=, Destination= or PreferredSource=
+ * has no family and goes, so the `Metric=` line of a console image's [Route]
+ * is a warned no-op and never a metric on some route. The later of two
+ * identical routes wins.
+ */
+static void network_verify_routes(Network *nw, const char *path) {
+        size_t n = 0;
+
+        for (size_t i = 0; i < nw->n_routes; i++) {
+                NetworkRoute r = nw->routes[i];
+                size_t k;
+
+                if (r.drop)
+                        continue;
+
+                r.family = r.dst_family ? r.dst_family : (r.gw_family ? r.gw_family : r.prefsrc_family);
+                if (r.family == 0) {
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s:%u: [Route] section without Gateway=, Destination=, Source=, or PreferredSource= field configured, ignoring",
+                                 path,
+                                 r.line);
+                        continue;
+                }
+
+                if ((r.dst_family && r.dst_family != r.family) || (r.gw_family && r.gw_family != r.family) ||
+                    (r.prefsrc_family && r.prefsrc_family != r.family)) {
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s:%u: Destination=, Gateway= and PreferredSource= are not all IPv4 or all IPv6, ignoring the [Route] section",
+                                 path,
+                                 r.line);
+                        continue;
+                }
+
+                if (r.family == AF_INET6) {
+                        if (r.scope_set && r.scope != RT_SCOPE_UNIVERSE)
+                                pico_log(PICO_LOG_WARNING,
+                                         "%s:%u: Scope= is specified for an IPv6 route, ignoring it",
+                                         path,
+                                         r.line);
+
+                        r.scope = RT_SCOPE_UNIVERSE;
+                        /* The kernel's own default for a user route; recording it
+                         * keeps the delete and the comparison on the same value. */
+                        if (r.metric == 0)
+                                r.metric = 1024;
+                } else if (!r.scope_set)
+                        r.scope = r.gw_family ? RT_SCOPE_UNIVERSE : RT_SCOPE_LINK;
+
+                if (!r.onlink_set && r.gw_family && nw->n_addresses == 0) {
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s:%u: Gateway= without a static address configured, enabling GatewayOnLink=",
+                                 path,
+                                 r.line);
+                        r.onlink = true;
+                }
+
+                for (k = 0; k < n; k++)
+                        if (network_route_same(&nw->routes[k], &r))
+                                break;
+
+                if (k < n) {
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s:%u: the same route is set at line %u, using the later one",
+                                 path,
+                                 nw->routes[k].line,
+                                 r.line);
+                        memmove(&nw->routes[k], &nw->routes[k + 1], (n - k - 1) * sizeof(*nw->routes));
+                        n--;
+                }
+
+                nw->routes[n++] = r;
+        }
+
+        nw->n_routes = n;
+}
+
 /* A rejected value, the empty one included, keeps any earlier value: networkd
  * logs and ignores it too, rather than resetting. */
 static int config_parse_dhcp4_route_metric(
@@ -853,6 +1190,24 @@ static int network_conf_handler(
                 return 0;
         }
 
+        if (strcmp(section, "Route") == 0) {
+                if (p->cur_route < 0)
+                        return 0;
+
+                for (i = 0; i < sizeof(route_config_items) / sizeof(route_config_items[0]); i++)
+                        if (strcmp(route_config_items[i].lvalue, lvalue) == 0)
+                                return route_config_items[i].parse(
+                                                &nw->routes[p->cur_route], path, line, lvalue, rvalue);
+
+                pico_log(PICO_LOG_DEBUG,
+                         "%s:%u: unknown directive %s= in [%s], ignoring",
+                         path,
+                         line,
+                         lvalue,
+                         section);
+                return 0;
+        }
+
         for (i = 0; i < sizeof(network_config_items) / sizeof(network_config_items[0]); i++)
                 if (strcmp(network_config_items[i].section, section) == 0 &&
                     strcmp(network_config_items[i].lvalue, lvalue) == 0)
@@ -889,6 +1244,7 @@ int network_parse_file(const char *path, Network **ret) {
 
         parser.nw = nw;
         parser.cur = -1;
+        parser.cur_route = -1;
 
         r = pico_conf_scan_full(path, network_conf_handler, network_section_handler, &parser);
         if (r < 0) {
@@ -897,6 +1253,7 @@ int network_parse_file(const char *path, Network **ret) {
         }
 
         network_verify_addresses(nw, path);
+        network_verify_routes(nw, path);
 
         *ret = nw;
         return 0;
