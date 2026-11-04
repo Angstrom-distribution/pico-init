@@ -17,29 +17,43 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 
 #include "../util.h"
 #include "dhcp/dhcp-lease-internal.h"
+#include "netd-addr.h"
 #include "netd-link.h"
 #include "netd-network.h"
 #include "netd.h"
 
-/* Add `a` to `servers` if it is not already present and there is room.
- * Silently drops anything past NETD_RESOLV_MAX_NAMESERVERS -- glibc itself
- * reads no more than that, so a fourth entry would be misleading, not
- * generous. */
-static void add_nameserver(struct in_addr *servers, size_t *n, const struct in_addr *a) {
+/* One nameserver line: a link-local IPv6 server needs its interface. */
+typedef struct ResolvServer {
+        uint8_t family;
+        NetdInAddr address;
+        const char *ifname; /* borrowed from the Link, for a link-local server */
+} ResolvServer;
+
+/* Add a server unless it is already listed or the list is full. Silently
+ * drops anything past NETD_RESOLV_MAX_NAMESERVERS -- glibc itself reads no
+ * more than that, so a fourth entry would be misleading, not generous. */
+static void add_nameserver(ResolvServer *servers, size_t *n, int family, const NetdInAddr *a, const char *ifname) {
+        bool ll = family == AF_INET6 && netd_addr_is_link_local(AF_INET6, a);
+
         if (*n >= NETD_RESOLV_MAX_NAMESERVERS)
                 return;
 
         for (size_t i = 0; i < *n; i++)
-                if (servers[i].s_addr == a->s_addr)
+                if (servers[i].family == family && netd_addr_eq(family, &servers[i].address, a) &&
+                    (!ll || strcmp(servers[i].ifname, ifname) == 0))
                         return;
 
-        servers[(*n)++] = *a;
+        servers[*n].family = (uint8_t) family;
+        servers[*n].address = *a;
+        servers[*n].ifname = ifname;
+        (*n)++;
 }
 
 /* Atomic tmp+rename over a fixed suffix -- netd is single-threaded and this
@@ -82,7 +96,7 @@ static int write_atomic(const char *path, const char *content, size_t len) {
 }
 
 int netd_resolv_write(Netd *n) {
-        struct in_addr servers[NETD_RESOLV_MAX_NAMESERVERS];
+        ResolvServer servers[NETD_RESOLV_MAX_NAMESERVERS];
         size_t n_servers = 0;
         const char *domain = NULL;
         char buf[4096];
@@ -100,15 +114,17 @@ int netd_resolv_write(Netd *n) {
                         continue;
 
                 for (size_t j = 0; j < nw->n_dns; j++)
-                        add_nameserver(servers, &n_servers, &nw->dns[j]);
+                        add_nameserver(servers, &n_servers, nw->dns[j].family, &nw->dns[j].address, l->ifname);
 
                 if (nw->dhcp_use_dns && l->lease) {
                         const struct in_addr *dns;
                         int r = dhcp_lease_get_dns(l->lease, &dns);
 
-                        if (r > 0)
-                                for (int k = 0; k < r; k++)
-                                        add_nameserver(servers, &n_servers, &dns[k]);
+                        for (int k = 0; k < r; k++) {
+                                NetdInAddr a = { .in = dns[k] };
+
+                                add_nameserver(servers, &n_servers, AF_INET, &a, l->ifname);
+                        }
                 }
 
                 if (!domain && l->lease) {
@@ -130,12 +146,17 @@ int netd_resolv_write(Netd *n) {
                 off += (size_t) written;
 
         for (size_t i = 0; i < n_servers; i++) {
-                char ip[INET_ADDRSTRLEN];
+                const ResolvServer *s = &servers[i];
+                char ip[INET6_ADDRSTRLEN];
+                bool ll = s->family == AF_INET6 && netd_addr_is_link_local(AF_INET6, &s->address);
 
-                if (!inet_ntop(AF_INET, &servers[i], ip, sizeof(ip)))
-                        continue;
-
-                written = snprintf(buf + off, sizeof(buf) - off, "nameserver %s\n", ip);
+                written = snprintf(
+                                buf + off,
+                                sizeof(buf) - off,
+                                "nameserver %s%s%s\n",
+                                netd_addr_to_string(s->family, &s->address, ip),
+                                ll ? "%" : "",
+                                ll ? s->ifname : "");
                 if (written < 0 || (size_t) written >= sizeof(buf) - off)
                         break;
                 off += (size_t) written;

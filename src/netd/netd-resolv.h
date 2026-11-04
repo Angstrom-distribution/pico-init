@@ -32,8 +32,9 @@ typedef struct Netd Netd;
 /*
  * Rebuild the file from every configured link's static DNS= plus, where
  * UseDNS= allows, its lease's option 6 -- in link order, deduplicated, capped
- * at NETD_RESOLV_MAX_NAMESERVERS. The lease's domain name (option 15) becomes
- * a `search` line.
+ * at NETD_RESOLV_MAX_NAMESERVERS. IPv4 and IPv6 servers share the cap, and a
+ * link-local IPv6 server is written with its interface, `fe80::1%eth0`. The
+ * lease's domain name (option 15) becomes a `search` line.
  *
  * Called after any change to any link's DNS state, not incrementally: the
  * file is small, and a full rebuild cannot drift out of sync with the link

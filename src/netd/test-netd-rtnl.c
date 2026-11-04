@@ -2510,6 +2510,34 @@ static void test_netns_route_back_after_link_down(void) {
         printf("test-netd-rtnl: [Route] after link down subtest ok\n");
 }
 
+/* DNS= servers of both families reach resolv.conf in file order, a
+ * link-local one with its interface, and the cap of three counts both. */
+static void test_netns_resolv_ipv6(void) {
+        char resolv[PATH_MAX], text[1024];
+        NetdFixture f;
+
+        enter_test_netns();
+        fixture_init(&f);
+        fixture_write(&f,
+                      "10-dn.network",
+                      "[Match]\nName=dn0\n\n[Network]\nAddress=10.118.0.2/24\n"
+                      "DNS=2001:db8::53 fe80::1\nDNS=10.118.0.53 10.118.0.54\n");
+        run_ip("link add name dn0 type veth peer name dn1");
+        fixture_start(&f);
+
+        snprintf(resolv, sizeof(resolv), "%s/resolv.conf", f.tmp);
+        read_file_into(resolv, text, sizeof(text));
+        ASSERT_TRUE(strstr(text, "nameserver 2001:db8::53\nnameserver fe80::1%dn0\nnameserver 10.118.0.53\n") !=
+                    NULL);
+        ASSERT_TRUE(strstr(text, "10.118.0.54") == NULL);
+
+        run_ip("link del dn0");
+        ASSERT_TRUE(netd_rtnl_process(f.n->rtnl) >= 1);
+        fixture_stop(&f);
+
+        printf("test-netd-rtnl: IPv6 resolv.conf subtest ok\n");
+}
+
 static int reload_calls;
 
 static int count_reload(Netd *n) {
@@ -2579,6 +2607,7 @@ int main(void) {
         test_netns_route_unreachable_gateway();
         test_netns_route_survives_renumber();
         test_netns_route_back_after_link_down();
+        test_netns_resolv_ipv6();
         test_reload_dropped_after_exit_request();
 
         printf("test-netd-rtnl: ok\n");

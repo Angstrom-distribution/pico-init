@@ -130,6 +130,12 @@ typedef struct NetworkRoute {
  * is bounded. */
 #define NETWORK_ROUTE_MAX 16
 
+/* One DNS= server, IPv4 or IPv6, in the order the file lists it. */
+typedef struct NetworkDns {
+        uint8_t family; /* AF_INET or AF_INET6 */
+        NetdInAddr address;
+} NetworkDns;
+
 struct Network {
         /*
          * Where it came from. `filename` is the full path of the file that
@@ -172,8 +178,9 @@ struct Network {
         bool gateway_set;
 
         /* Address literals only -- netd has no resolver, so a hostname in
-         * DNS= or NTP= is a parse error, not a lookup. */
-        struct in_addr *dns;
+         * DNS= or NTP= is a parse error, not a lookup. DNS= takes both
+         * families; NTP= takes IPv4 only, because the SNTP client does. */
+        NetworkDns *dns;
         size_t n_dns;
         struct in_addr *ntp;
         size_t n_ntp;

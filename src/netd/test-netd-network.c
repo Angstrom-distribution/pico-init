@@ -172,7 +172,8 @@ static void test_empty_assignment_resets(void) {
         ASSERT_TRUE(!network_matches(nw, "eth0"));
         ASSERT_TRUE(network_matches(nw, "usb0"));
         ASSERT_EQ_INT(nw->n_dns, 1);
-        ASSERT_EQ_INT(nw->dns[0].s_addr, htonl(0x0a000002));
+        ASSERT_EQ_INT(nw->dns[0].family, AF_INET);
+        ASSERT_EQ_INT(nw->dns[0].address.in.s_addr, htonl(0x0a000002));
         ASSERT_EQ_INT(nw->n_ntp, 0);
 
         network_free(nw);
@@ -1569,6 +1570,36 @@ static void test_route_cap(void) {
         free(dir);
 }
 
+/* DNS= takes both families in file order; NTP= takes IPv4 only and says why
+ * it drops an IPv6 server. */
+static void test_dns_ipv6_and_ntp_ipv6_ignored(void) {
+        char *dir = test_tmpdir_new();
+        char buf[INET6_ADDRSTRLEN];
+        Capture c;
+        Network *nw;
+
+        ASSERT_TRUE(dir != NULL);
+        capture_begin(&c, dir);
+        nw = parse_body(dir,
+                        "[Network]\nDNS=2001:db8::53 10.0.0.53\nDNS=fe80::1 ::\n"
+                        "NTP=2001:db8::123 10.0.0.123\n");
+        ASSERT_EQ_INT(capture_end(&c, "is IPv6, which the SNTP client does not speak"), 1);
+
+        ASSERT_EQ_INT(nw->n_dns, 3);
+        ASSERT_EQ_INT(nw->dns[0].family, AF_INET6);
+        ASSERT_STREQ(netd_addr_to_string(AF_INET6, &nw->dns[0].address, buf), "2001:db8::53");
+        ASSERT_EQ_INT(nw->dns[1].family, AF_INET);
+        ASSERT_STREQ(netd_addr_to_string(AF_INET, &nw->dns[1].address, buf), "10.0.0.53");
+        ASSERT_EQ_INT(nw->dns[2].family, AF_INET6);
+        ASSERT_STREQ(netd_addr_to_string(AF_INET6, &nw->dns[2].address, buf), "fe80::1");
+        ASSERT_EQ_INT(nw->n_ntp, 1);
+        ASSERT_EQ_INT(nw->ntp[0].s_addr, htonl(0x0a00007b));
+        network_free(nw);
+
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
         test_defaults();
         test_dhcp_spellings();
@@ -1604,6 +1635,7 @@ int main(void) {
         test_route_value_errors();
         test_route_leaves_network_gateway();
         test_route_cap();
+        test_dns_ipv6_and_ntp_ipv6_ignored();
 
         printf("test-netd-network: ok\n");
         return EXIT_SUCCESS;

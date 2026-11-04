@@ -1528,6 +1528,9 @@ fail:
 
 /* --- DHCPv4 server --- */
 
+/* What fits in one option 6 (255 bytes of four-byte addresses). */
+#define NETD_SERVER_DNS_MAX 63
+
 /*
  * Create, configure and start a DHCPv4 server for `l`, pool derived from the
  * .network's own Address= (a usb0 gadget's static address doubles as the
@@ -1569,10 +1572,20 @@ static int link_start_dhcp_server(Link *l, const Network *nw) {
         if (r < 0)
                 goto fail;
 
+        /* DHCPv4 option 6 carries IPv4 servers only. */
         if (nw->n_dns > 0) {
-                r = dhcp_server_set_dns(server, nw->dns, nw->n_dns);
-                if (r < 0)
-                        goto fail;
+                struct in_addr dns[NETD_SERVER_DNS_MAX];
+                size_t n_dns = 0;
+
+                for (size_t i = 0; i < nw->n_dns && n_dns < NETD_SERVER_DNS_MAX; i++)
+                        if (nw->dns[i].family == AF_INET)
+                                dns[n_dns++] = nw->dns[i].address.in;
+
+                if (n_dns > 0) {
+                        r = dhcp_server_set_dns(server, dns, n_dns);
+                        if (r < 0)
+                                goto fail;
+                }
         }
 
         if (nw->n_ntp > 0) {

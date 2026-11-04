@@ -234,12 +234,22 @@ static int config_parse_addr_list(
                 }
 
                 if (inet_pton(AF_INET, tok, &a) != 1) {
-                        pico_log(PICO_LOG_WARNING,
-                                 "%s:%u: %s= value '%s' is not an address literal, ignoring",
-                                 path,
-                                 line,
-                                 lvalue,
-                                 tok);
+                        struct in6_addr a6;
+
+                        if (inet_pton(AF_INET6, tok, &a6) == 1)
+                                pico_log(PICO_LOG_WARNING,
+                                         "%s:%u: %s= value '%s' is IPv6, which the SNTP client does not speak, ignoring",
+                                         path,
+                                         line,
+                                         lvalue,
+                                         tok);
+                        else
+                                pico_log(PICO_LOG_WARNING,
+                                         "%s:%u: %s= value '%s' is not an address literal, ignoring",
+                                         path,
+                                         line,
+                                         lvalue,
+                                         tok);
                         continue;
                 }
 
@@ -256,8 +266,59 @@ static int config_parse_addr_list(
         return 0;
 }
 
+/* DNS=: the same list rules, both families. A %scope is not taken: a
+ * link-local server is written with the interface of its own link. */
 static int config_parse_dns(Network *nw, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
-        return config_parse_addr_list(path, line, lvalue, rvalue, &nw->dns, &nw->n_dns);
+        char *copy, *saveptr = NULL, *tok;
+
+        if (*rvalue == '\0') {
+                nw->dns = pico_mfree(nw->dns);
+                nw->n_dns = 0;
+                return 0;
+        }
+
+        copy = pico_strdup(rvalue);
+        if (!copy)
+                return -ENOMEM;
+
+        for (tok = strtok_r(copy, " \t", &saveptr); tok; tok = strtok_r(NULL, " \t", &saveptr)) {
+                NetworkDns *grown;
+                NetdInAddr a;
+                int family;
+
+                if (nw->n_dns >= NETWORK_ADDR_LIST_MAX) {
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s:%u: %s= holds more than %d entries, ignoring the rest",
+                                 path,
+                                 line,
+                                 lvalue,
+                                 NETWORK_ADDR_LIST_MAX);
+                        break;
+                }
+
+                if (netd_addr_parse(tok, &family, &a) < 0 || netd_addr_is_null(family, &a)) {
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s:%u: %s= value '%s' is not an address literal, ignoring",
+                                 path,
+                                 line,
+                                 lvalue,
+                                 tok);
+                        continue;
+                }
+
+                grown = realloc(nw->dns, (nw->n_dns + 1) * sizeof(*grown));
+                if (!grown) {
+                        pico_mfree(copy);
+                        return -ENOMEM;
+                }
+                nw->dns = grown;
+                nw->dns[nw->n_dns].family = (uint8_t) family;
+                nw->dns[nw->n_dns].address = a;
+                nw->n_dns++;
+        }
+
+        pico_mfree(copy);
+        return 0;
 }
 
 static int config_parse_ntp(Network *nw, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
