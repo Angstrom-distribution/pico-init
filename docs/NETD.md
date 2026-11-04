@@ -1,7 +1,7 @@
 # netd and netctl
 
 netd is pico-init's network daemon. It reads `systemd.network(5)` files from
-the directories `systemd-networkd` uses, configures static IPv4 addresses and
+the directories `systemd-networkd` uses, configures static IPv4 and IPv6 addresses and
 a default route, runs a DHCPv4 client and server, writes `/etc/resolv.conf`,
 sets the clock over SNTP, applies the time zone a DHCP server hands out, and
 speaks LLDP. It is an ordinary service supervised by pico-init, not part of
@@ -102,7 +102,7 @@ matches on `Name=` alone, or not at all if it has none.
 | Key | Values | Behaviour |
 | --- | --- | --- |
 | `DHCP=` | `no`, `ipv4`, `ipv6`, `yes` (also any other boolean spelling, case-insensitive) | `yes` and `ipv4` start the DHCPv4 client. `ipv6` parses and does nothing. `yes` is IPv4 only in practice. Default `no`. |
-| `Address=` | `a.b.c.d/nn` | Static IPv4 address. Only the first valid line is applied; later ones are parsed and ignored. A value without a prefix length is rejected. |
+| `Address=` | `a.b.c.d/nn` or an IPv6 address with `/nn` | Static address, shorthand for an [`[Address]`](#address) section. Each line is its own address, and an empty assignment clears the addresses collected so far. A value without a prefix length is rejected. |
 | `Gateway=` | IPv4 address | Static default route, at the kernel's metric 0. |
 | `DNS=` | IPv4 address literals, space-separated | Written to `/etc/resolv.conf`. A host name is rejected: netd has no resolver. |
 | `NTP=` | IPv4 address literals, space-separated | SNTP servers. A host name is rejected. |
@@ -131,7 +131,10 @@ puts it in reach, unless the lease names a different router.
 A new address in the same subnet as the old one, from a lease or a changed
 `Address=`, is put in after the old one is deleted. Deleting a link's last
 address makes the kernel drop its routes, so netd removes the default route
-first and adds it again for the new address.
+first and adds it again for the new address. Deleting the primary address of
+a subnet also deletes the other addresses of that subnet, so after any IPv4
+delete netd sends the remaining addresses of the subnet and the default route
+again; whatever is still there is left as it is.
 
 Each link has one default route, whether from `Gateway=` or from a lease,
 and the kernel prefers the lowest metric. Metrics follow `systemd-networkd`.
@@ -145,8 +148,9 @@ its own; no preference between them is documented. A host route to an
 off-subnet router uses the same metric as its default route. The kernel's
 prefix route for the leased address gets the lease's metric too: netd sends
 it with the address as `IFA_RT_PRIORITY`, as `systemd-networkd` does. The
-prefix route of `Address=` stays at the kernel's 0, the `systemd-networkd`
-default for `[Address] RouteMetric=`, which netd does not read.
+prefix route of an address from `Address=` or `[Address]` uses that
+section's `RouteMetric=`; without one the kernel uses 0 for an IPv4 address
+and 256 for an IPv6 address, as with `systemd-networkd`.
 
 Two differences from `systemd-networkd` remain. It adds the host route to a
 lease's router even when the router is inside the leased subnet, where netd
@@ -161,6 +165,52 @@ the kernel, and the next netd does not know about them. A stale route at the
 same router and metric is taken over as the new netd's own. One at another
 router or metric stays beside the new route, and is preferred to it when its
 metric is lower, until it is deleted by hand or the link goes away.
+
+### [Address]
+
+An `[Address]` section describes one address; a file can have several, and
+`Address=` lines in `[Network]` are the same thing in short form. Entries are
+kept in file order, IPv4 and IPv6, at most 16 per file; over that one warning
+is logged and the rest are ignored.
+
+| Key | Values | Behaviour |
+| --- | --- | --- |
+| `Address=` | `a.b.c.d/nn` or an IPv6 address with `/nn` | The address. A section without it is dropped with a warning. An empty assignment clears `Address=` and `Peer=` of the section. |
+| `Peer=` | address of the same family | Point-to-point peer. Only the address is read; the prefix length is that of `Address=`. A peer of the other family drops the entry. |
+| `Label=` | up to 15 characters | IPv4 address label. Ignored with a warning on an IPv6 address. |
+| `RouteMetric=` | unsigned decimal | Metric of the prefix route the kernel adds for the address. Default 0 for IPv4, 256 for IPv6. |
+| `PreferredLifetime=` | `forever`, `infinity`, `0` | `0` marks the address deprecated. The valid lifetime is always forever. |
+| `Scope=` | `global`, `site`, `link`, `host`, `nowhere`, 0 to 255 | Default `host` for 127.0.0.0/8 and `::1`, `link` for 169.254.0.0/16 and `fe80::/10`, otherwise `global`. |
+| `DuplicateAddressDetection=` | `ipv4`, `ipv6`, `both`, `none` | Only IPv6 detection has an effect: without it an IPv6 address is added with `nodad`. Default on for IPv6. The boolean spellings keep their `systemd-networkd` meaning, where `yes` turns detection off. |
+| `AddPrefixRoute=` | boolean | `no` adds the address without its prefix route. Default yes. |
+
+A null address, which `systemd-networkd` replaces with one from an address
+pool, is dropped with a warning. When two entries name the same address (an
+IPv4 address with its prefix length, an IPv6 address on its own) the later
+one wins. Values that fail to parse keep the earlier value, as for
+`RouteMetric=` in `[DHCPv4]`.
+
+A reload sends only what changed. An entry that is unchanged makes no netlink
+write; a changed lifetime or prefix route metric is sent in place (for IPv6
+also the peer and the flags); any other change deletes the address and adds it
+again. An IPv4 address that leaves a subnet where a new address arrives is
+deleted before the new one is added, and every other delete comes after the
+adds. netd removes only addresses it added: an address put on the link by
+something else stays through a reload and when netd stops, where
+`systemd-networkd` removes it unless `KeepConfiguration=` says otherwise.
+
+Static addresses and a lease's address coexist. A lease adds its address
+beside the static ones, and losing the lease or turning `DHCP=` off removes
+only the lease's address. An address that is both static and leased is kept as the
+static entry set it and is removed when neither names it any more.
+
+IPv6 addresses are skipped, with one warning per link, on a kernel without
+IPv6. An IPv6 address that the kernel refuses because IPv6 is disabled on the
+link is a warning, repeated only after an IPv6 address was accepted on the
+link in between, and does not fail the link. A link taken down loses its IPv6
+addresses in the kernel; the next event for the link adds them again. The
+DHCP server serves from the first IPv4 entry, and LLDP advertises the lease
+address, or the first static IPv4 address without a lease.
 
 ### [DHCPv4]
 
@@ -212,11 +262,14 @@ DHCPServer=yes
 
 Everything not listed above. Notably:
 
-- IPv6: `DHCP=ipv6`, router advertisements, DHCPv6, `Address=` with an IPv6
-  literal. The `[IPv6AcceptRA]` section and similar are dropped.
+- IPv6 configuration beyond static addresses: `DHCP=ipv6`, router
+  advertisements, DHCPv6. The `[IPv6AcceptRA]` section and similar are dropped.
+- `[Address]` keys `Broadcast=` (it is derived from the prefix), `HomeAddress=`,
+  `ManageTemporaryAddress=`, `AutoJoin=`, `NetLabel=` and `NFTSet=`, null
+  addresses taken from an address pool, and IPv4 address conflict detection.
 - `[Match]` keys other than `Name=`; `.link` and `.netdev` files; virtual
   devices (bridges, VLANs, bonds).
-- `[Route]`, `[Address]` and `[DHCPServer]` sections and their keys, so the
+- `[Route]` and `[DHCPServer]` sections and their keys, so the
   DHCP server's pool, lease times and options cannot be configured, and
   `Domains=`, `Hostname=`, `MTUBytes=`, `Bridge=` and `RequiredForOnline=`
   have no effect.
@@ -239,19 +292,19 @@ name), 15 (domain name), 42 (NTP) and 101 (time zone). Option 100 (POSIX
 time zone) is not used. A lease is applied by a direct function call, in this
 order:
 
-- Address, with the lease time as the kernel address lifetime. A renewal of
-  the same address refreshes the lifetime in place. A changed address in the
-  same subnet is replaced delete-first; a changed subnet is replaced
-  add-first.
+- Address, with the lease time as the kernel address lifetime, beside any
+  static addresses. A renewal of the same address refreshes the lifetime in
+  place. A changed address in the same subnet is replaced delete-first; a
+  changed subnet is replaced add-first.
 - A default route through the first router.
 - `/run/netd/leases/<ifindex>`.
 - `/etc/resolv.conf`, when `UseDNS=` allows.
 - SNTP servers from option 42, when `UseNTP=` allows.
 - The time zone from option 101, when `UseTimezone=` allows.
 
-When a lease expires, is NAKed or is declined, netd removes the link's address
-and default route, puts back a static `Address=` and `Gateway=` if the file
-has them, and the client starts a new DISCOVER cycle by itself. A reload that
+When a lease expires, is NAKed or is declined, netd removes the lease's address
+and default route, puts back a static `Gateway=` if the file has one, and the
+client starts a new DISCOVER cycle by itself. Static addresses stay. A reload that
 turns `DHCP=` off stops the client and forgets the lease, removing
 `/run/netd/leases/<ifindex>`; turning it back on starts without a lease. When
 netd starts and finds `/run/netd/leases/<ifindex>`, the client first asks for
@@ -264,7 +317,7 @@ address.
 
 ## DHCPv4 server
 
-`DHCPServer=yes` starts a server on the link. It needs an `Address=`; the
+`DHCPServer=yes` starts a server on the link. It needs an IPv4 `Address=`; the
 first one is the server address and the advertised router, and the pool is the
 rest of that subnet, excluding the network and broadcast addresses and the
 server address. The default lease time is one hour and the maximum is twelve
@@ -276,7 +329,7 @@ asks again. A request with a non-zero `giaddr` is rejected. Offering the same
 address to a client that DISCOVERs twice is done by hashing the client
 identifier into the pool, without remembering anything.
 
-If `DHCPServer=yes` is set without an `Address=`, the link goes to `failed`.
+If `DHCPServer=yes` is set without an IPv4 `Address=`, the link goes to `failed`.
 
 ## DNS: /etc/resolv.conf
 
@@ -366,7 +419,7 @@ on a link, when the link is deconfigured, and when netd stops. Frames carry:
 - System description: the OS pretty name.
 - Capabilities: station and router; router is marked enabled when IPv4
   forwarding is on.
-- Management address: the link's configured IPv4 address, when it has one.
+- Management address: the lease's IPv4 address, else the first static IPv4 address, when the link has one.
 
 ## Files netd writes
 
