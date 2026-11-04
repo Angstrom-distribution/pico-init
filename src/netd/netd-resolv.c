@@ -5,10 +5,10 @@
  * /etc/resolv.conf. See netd-resolv.h for the rules.
  *
  * A full rebuild from every link's static DNS= plus, where UseDNS=
- * allows it, the link's lease's option 6 -- and the lease's domainname
- * (option 15) as a single `search` line. There is no static equivalent of
- * the domain (netd-network.h's Network has no Domain= field), so `search`
- * only ever comes from DHCP.
+ * allows it, the link's lease's option 6 and its routers' RDNSS -- and the
+ * lease's domainname (option 15) and, where [IPv6AcceptRA] UseDomains=
+ * allows it, the routers' DNSSL as the `search` line. There is no static
+ * equivalent of the domain (netd-network.h's Network has no Domain= field).
  */
 
 #include "netd-resolv.h"
@@ -20,10 +20,12 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
 #include "../util.h"
 #include "dhcp/dhcp-lease-internal.h"
+#include "ndisc/ndisc-link.h"
 #include "netd-addr.h"
 #include "netd-link.h"
 #include "netd-network.h"
@@ -54,6 +56,19 @@ static void add_nameserver(ResolvServer *servers, size_t *n, int family, const N
         servers[*n].address = *a;
         servers[*n].ifname = ifname;
         (*n)++;
+}
+
+/* A search domain, unless already listed (case does not matter in DNS) or
+ * the list is full. */
+static void add_domain(const char **domains, size_t *n, const char *d) {
+        if (*n >= NETD_RESOLV_MAX_DOMAINS)
+                return;
+
+        for (size_t i = 0; i < *n; i++)
+                if (strcasecmp(domains[i], d) == 0)
+                        return;
+
+        domains[(*n)++] = d;
 }
 
 /* Atomic tmp+rename over a fixed suffix -- netd is single-threaded and this
@@ -97,7 +112,8 @@ static int write_atomic(const char *path, const char *content, size_t len) {
 
 int netd_resolv_write(Netd *n) {
         ResolvServer servers[NETD_RESOLV_MAX_NAMESERVERS];
-        size_t n_servers = 0;
+        const char *domains[NETD_RESOLV_MAX_DOMAINS];
+        size_t n_servers = 0, n_domains = 0;
         const char *domain = NULL;
         char buf[4096];
         size_t off = 0;
@@ -133,9 +149,29 @@ int netd_resolv_write(Netd *n) {
                         if (dhcp_lease_get_domainname(l->lease, &d) >= 0)
                                 domain = d;
                 }
+
+                if (nw->ra_use_dns && l->ndisc)
+                        for (size_t k = 0; k < l->ndisc->n_rdnss; k++) {
+                                NetdInAddr a = { .in6 = l->ndisc->rdnss[k].addr };
+
+                                add_nameserver(servers, &n_servers, AF_INET6, &a, l->ifname);
+                        }
         }
 
-        if (n_servers == 0 && !domain) {
+        /* The lease's domain first, then the routers' search lists, in link
+         * order. */
+        if (domain)
+                add_domain(domains, &n_domains, domain);
+        for (size_t i = 0; i < n->n_links; i++) {
+                Link *l = n->links[i];
+
+                if (!l->network || !l->network->ra_use_domains || !l->ndisc)
+                        continue;
+                for (size_t k = 0; k < l->ndisc->n_dnssl; k++)
+                        add_domain(domains, &n_domains, l->ndisc->dnssl[k].name);
+        }
+
+        if (n_servers == 0 && n_domains == 0) {
                 /* Nothing to write: never blank out a working file just
                  * because the last link lost its lease (netd-resolv.h). */
                 return 1;
@@ -162,8 +198,16 @@ int netd_resolv_write(Netd *n) {
                 off += (size_t) written;
         }
 
-        if (domain) {
-                written = snprintf(buf + off, sizeof(buf) - off, "search %s\n", domain);
+        if (n_domains > 0) {
+                written = snprintf(buf + off, sizeof(buf) - off, "search");
+                if (written > 0 && (size_t) written < sizeof(buf) - off)
+                        off += (size_t) written;
+                for (size_t i = 0; i < n_domains; i++) {
+                        written = snprintf(buf + off, sizeof(buf) - off, " %s", domains[i]);
+                        if (written > 0 && (size_t) written < sizeof(buf) - off)
+                                off += (size_t) written;
+                }
+                written = snprintf(buf + off, sizeof(buf) - off, "\n");
                 if (written > 0 && (size_t) written < sizeof(buf) - off)
                         off += (size_t) written;
         }

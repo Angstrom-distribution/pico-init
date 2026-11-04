@@ -485,6 +485,9 @@ netd_tests = [
   'test-netd-ndisc-iid',
   # Router advertisements over a veth pair in a private network namespace.
   'test-netd-ndisc-link',
+  # Router advertisements end to end through an in-process netd. It waits
+  # out real lifetimes, about 40 s, so it has its own timeout below.
+  'test-netd-ra',
   # --help, --version and refused arguments.
   'test-netd-opts',
 ]
@@ -496,7 +499,7 @@ foreach t : netd_tests
     include_directories: netd_includes,
     link_with: [netd_core, pico_init_core],
   )
-  test(t, exe)
+  test(t, exe, timeout: t == 'test-netd-ra' ? 120 : 30)
 endforeach
 
 # netctl's own tests: each built from only the one netctl-*.c file it is

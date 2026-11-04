@@ -22,7 +22,8 @@
  * lifecycle), netd-link.c (link table and per-link state machine),
  * netd-network.c (.network parser), netd-rtnl.c (the hand-rolled netlink
  * layer), netd-resolv.c (/etc/resolv.conf), netd-sntp.c and netd-time.c
- * (time), and src/netd/dhcp/ (the lifted DHCPv4 implementation).
+ * (time), src/netd/dhcp/ (the lifted DHCPv4 implementation), src/netd/lldp/
+ * and src/netd/ndisc/ (IPv6 router advertisements).
  */
 
 #pragma once

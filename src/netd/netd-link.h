@@ -73,7 +73,9 @@ typedef struct LinkAddress {
         NetdInAddr address;
         NetdInAddr peer;
         uint32_t route_metric;
+        uint32_t valid_sec;     /* UINT32_MAX forever; SLAAC: what was last sent */
         uint32_t preferred_sec; /* UINT32_MAX forever, 0 deprecated */
+        uint64_t sent_at;       /* SLAAC: CLOCK_MONOTONIC usec of the last send */
         char label[IFNAMSIZ];
 } LinkAddress;
 
@@ -94,11 +96,18 @@ typedef struct LinkRoute {
         uint8_t scope;
         bool has_gw;
         bool has_prefsrc;
-        bool installed; /* false while the kernel has not taken it, or has dropped it (link down) */
-        bool warned;    /* the failed add was already reported */
-        bool doomed;    /* during a converge pass: recorded but no longer wanted */
+        bool installed;   /* false while the kernel has not taken it, or has dropped it (link down) */
+        bool warned;      /* the failed add was already reported */
+        bool doomed;      /* during a converge pass: recorded but no longer wanted */
+        uint8_t protocol; /* RTPROT_*; 0 is RTPROT_STATIC */
+        uint8_t pref;     /* router advertisement routes: ICMPV6_ROUTER_PREF_* */
+        /* RTPROT_* of the kernel route when the other table, [Route] or
+         * router advertisements, put it in first; 0 when this entry did. */
+        uint8_t kernel_protocol;
         uint32_t flags; /* RTNH_F_* */
         uint32_t metric;
+        uint32_t expires_sec; /* router advertisement routes: what was last sent, UINT32_MAX none */
+        uint64_t sent_at;     /* CLOCK_MONOTONIC usec of that send */
         NetdInAddr dst;
         NetdInAddr gw;
         NetdInAddr prefsrc;
@@ -106,6 +115,13 @@ typedef struct LinkRoute {
 
 /* More than a file can ask for, as for LINK_ADDRS_MAX. */
 #define LINK_ROUTES_MAX (2 * 16)
+
+/* What router advertisements can put on a link: an address per prefix, a
+ * default route per router and an on-link route per prefix (ndisc-link.h). */
+#define LINK_RA_ADDRS_MAX 8
+#define LINK_RA_ROUTES_MAX 12
+
+typedef struct NdiscLink NdiscLink;
 
 struct Link {
         Netd *netd; /* borrowed */
@@ -115,6 +131,7 @@ struct Link {
         char ifname[IFNAMSIZ];
         unsigned int flags;
         uint16_t arp_type;
+        uint32_t mtu;
         uint8_t hw_addr[NETD_HW_ADDR_MAX];
         size_t hw_addr_len;
 
@@ -171,6 +188,23 @@ struct Link {
          * detection has passed on it, followed through address events. */
         NetdInAddr ipv6ll;
         bool ipv6ll_ready;
+
+        /*
+         * IPv6 router advertisements, owned; NULL unless IPv6AcceptRA= is in
+         * effect. What they put in the kernel is recorded beside the static
+         * tables, with the same rule: only what is recorded is deleted.
+         */
+        NdiscLink *ndisc;
+        LinkAddress *ra_addrs;
+        size_t n_ra_addrs;
+        LinkRoute *ra_routes;
+        size_t n_ra_routes;
+        uint64_t ra_dns_sig; /* of the servers and domains last written to resolv.conf */
+        uint32_t ra_mtu;     /* the MTU last written for IPv6 */
+        int ra_secret_state; /* 0 not read yet, 1 ra_secret holds the RFC 7217 secret, -1 none */
+        uint8_t ra_secret[16];
+        bool ra_accept_ra_done; /* accept_ra=0 written, or the failure reported */
+        bool ra_warned_token;   /* a token that cannot be made on this link was reported */
 
         struct in_addr address;
         unsigned char prefixlen;
