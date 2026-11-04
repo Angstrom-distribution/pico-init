@@ -58,6 +58,14 @@ static void test_defaults(void) {
         ASSERT_TRUE(nw->dhcp_use_timezone);
         ASSERT_TRUE(!nw->dhcp_route_metric_set);
 
+        ASSERT_EQ_INT(nw->ipv6_accept_ra, -1);
+        ASSERT_TRUE(nw->ra_use_gateway && nw->ra_use_onlink_prefix && nw->ra_use_autonomous_prefix);
+        ASSERT_TRUE(nw->ra_use_dns && nw->ra_use_mtu && !nw->ra_use_domains);
+        ASSERT_EQ_INT(nw->ra_route_metric[0], 512);
+        ASSERT_EQ_INT(nw->ra_route_metric[1], 1024);
+        ASSERT_EQ_INT(nw->ra_route_metric[2], 2048);
+        ASSERT_EQ_INT(nw->ra_token, NETWORK_RA_TOKEN_DEFAULT);
+
         ASSERT_TRUE(network_free(nw) == NULL);
 }
 
@@ -281,10 +289,11 @@ static void test_real_usb0_server_network_parses(void) {
 }
 
 /*
- * Typical console-image .network files: [DHCPv4] RouteMetric=, and whole
- * sections ([IPv6AcceptRA], [Route]) netd has no fields for at all, whose
- * RouteMetric=/Metric= must not leak into the DHCPv4 value. A parse failure
- * would otherwise only be found at boot.
+ * Typical console-image .network files: [DHCPv4] RouteMetric=, an
+ * [IPv6AcceptRA] RouteMetric= that sets the three router advertisement metrics
+ * and nothing else, and a [Route] section with only Metric=, which networkd
+ * drops. Neither may leak into the DHCPv4 value. A parse failure would
+ * otherwise only be found at boot.
  */
 static const char *console_10_en_network =
                 "[Match]\n"
@@ -373,6 +382,9 @@ static void assert_console_fixture_parses(
         ASSERT_EQ_INT(nw->n_ntp, 0);
         ASSERT_TRUE(nw->dhcp_route_metric_set);
         ASSERT_EQ_INT(nw->dhcp_route_metric, metric);
+        for (int i = 0; i < 3; i++)
+                ASSERT_EQ_INT(nw->ra_route_metric[i], metric);
+        ASSERT_EQ_INT(nw->ipv6_accept_ra, -1);
 
         network_free(nw);
         free(path);
@@ -1600,6 +1612,115 @@ static void test_dns_ipv6_and_ntp_ipv6_ignored(void) {
         free(dir);
 }
 
+/* [IPv6AcceptRA] keys and IPv6AcceptRA=, with networkd's spellings. */
+static void test_ipv6_accept_ra_keys(void) {
+        char *dir = test_tmpdir_new();
+        Network *nw;
+
+        ASSERT_TRUE(dir != NULL);
+
+        nw = parse_body(dir,
+                        "[Network]\nIPv6AcceptRA=no\n\n[IPv6AcceptRA]\nUseGateway=no\nUseOnLinkPrefix=no\n"
+                        "UseAutonomousPrefix=no\nUseDNS=no\nUseDomains=yes\nUseMTU=no\n"
+                        "RouteMetric=100:200:300\nUseHopLimit=no\nDHCPv6Client=no\n");
+        ASSERT_EQ_INT(nw->ipv6_accept_ra, 0);
+        ASSERT_TRUE(!nw->ra_use_gateway && !nw->ra_use_onlink_prefix && !nw->ra_use_autonomous_prefix);
+        ASSERT_TRUE(!nw->ra_use_dns && nw->ra_use_domains && !nw->ra_use_mtu);
+        ASSERT_EQ_INT(nw->ra_route_metric[0], 100);
+        ASSERT_EQ_INT(nw->ra_route_metric[1], 200);
+        ASSERT_EQ_INT(nw->ra_route_metric[2], 300);
+        ASSERT_TRUE(nw->dhcp_use_dns); /* [DHCPv4] UseDNS= is its own key */
+        network_free(nw);
+
+        nw = parse_body(dir, "[Network]\nIPv6AcceptRA=yes\n[IPv6AcceptRA]\nUseDomains=route\n");
+        ASSERT_EQ_INT(nw->ipv6_accept_ra, 1);
+        ASSERT_TRUE(!nw->ra_use_domains);
+        network_free(nw);
+
+        nw = parse_body(dir, "[Network]\nIPv6AcceptRA=yes\nIPv6AcceptRA=\n");
+        ASSERT_EQ_INT(nw->ipv6_accept_ra, -1);
+        network_free(nw);
+
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* RouteMetric= is one number or three strictly increasing ones; anything
+ * else keeps what was there. */
+static void test_ipv6_accept_ra_route_metric(void) {
+        static const struct {
+                const char *value;
+                uint32_t want[3];
+        } cases[] = {
+                {                      "10",                  { 10, 10, 10 } },
+                {           "512:1024:2048",             { 512, 1024, 2048 } },
+                {                   "3:2:1",                     { 7, 8, 9 } },
+                {                   "1:1:2",                     { 7, 8, 9 } },
+                {                     "1:2",                     { 7, 8, 9 } },
+                {                 "1:2:3:4",                     { 7, 8, 9 } },
+                {                    "1::3",                     { 7, 8, 9 } },
+                {                 "010:2:3",                     { 7, 8, 9 } },
+                { "0:4294967294:4294967295", { 0, 4294967294u, 4294967295u } },
+                {          "1:2:4294967296",                     { 7, 8, 9 } },
+                {                        "",                     { 7, 8, 9 } },
+        };
+        char *dir = test_tmpdir_new();
+        char body[256];
+
+        ASSERT_TRUE(dir != NULL);
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+                Network *nw;
+
+                snprintf(body,
+                         sizeof(body),
+                         "[IPv6AcceptRA]\nRouteMetric=7:8:9\nRouteMetric=%s\n",
+                         cases[i].value);
+                nw = parse_body(dir, body);
+                for (int k = 0; k < 3; k++)
+                        ASSERT_EQ_INT(nw->ra_route_metric[k], cases[i].want[k]);
+                ASSERT_TRUE(!nw->dhcp_route_metric_set);
+                network_free(nw);
+        }
+
+        test_rm_rf(dir);
+        free(dir);
+}
+
+static void test_ipv6_accept_ra_token(void) {
+        static const struct {
+                const char *body;
+                NetworkRaToken want;
+                const char *addr;
+        } cases[] = {
+                {                                   "[IPv6AcceptRA]\nToken=eui64\n",NETWORK_RA_TOKEN_EUI64,        NULL                                                                                    },
+                {                            "[IPv6AcceptRA]\nToken=prefixstable\n", NETWORK_RA_TOKEN_PREFIXSTABLE,        NULL },
+                {                        "[IPv6AcceptRA]\nToken=static:::1:2:3:4\n",       NETWORK_RA_TOKEN_STATIC, "::1:2:3:4" },
+                {                "[IPv6AcceptRA]\nToken=static:2001:db8::1:2:3:4\n",       NETWORK_RA_TOKEN_STATIC, "::1:2:3:4" },
+                {                                   "[Network]\nIPv6Token=::abcd\n",       NETWORK_RA_TOKEN_STATIC,    "::abcd" },
+                {               "[IPv6AcceptRA]\nToken=eui64\nToken=prefixstable\n", NETWORK_RA_TOKEN_PREFIXSTABLE,        NULL },
+                {                           "[IPv6AcceptRA]\nToken=eui64\nToken=\n",      NETWORK_RA_TOKEN_DEFAULT,        NULL },
+                { "[IPv6AcceptRA]\nToken=eui64\nToken=prefixstable:2001:db8::/64\n",
+                 NETWORK_RA_TOKEN_EUI64,        NULL                                                                           },
+                {          "[IPv6AcceptRA]\nToken=eui64\nToken=static:2001:db8::\n",        NETWORK_RA_TOKEN_EUI64,        NULL },
+                {                     "[IPv6AcceptRA]\nToken=eui64\nToken=random\n",        NETWORK_RA_TOKEN_EUI64,        NULL },
+        };
+        char *dir = test_tmpdir_new();
+        char buf[INET6_ADDRSTRLEN];
+
+        ASSERT_TRUE(dir != NULL);
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+                Network *nw = parse_body(dir, cases[i].body);
+
+                ASSERT_EQ_INT(nw->ra_token, cases[i].want);
+                if (cases[i].addr)
+                        ASSERT_STREQ(inet_ntop(AF_INET6, &nw->ra_token_addr, buf, sizeof(buf)), cases[i].addr);
+                network_free(nw);
+        }
+
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
         test_defaults();
         test_dhcp_spellings();
@@ -1636,6 +1757,9 @@ int main(void) {
         test_route_leaves_network_gateway();
         test_route_cap();
         test_dns_ipv6_and_ntp_ipv6_ignored();
+        test_ipv6_accept_ra_keys();
+        test_ipv6_accept_ra_route_metric();
+        test_ipv6_accept_ra_token();
 
         printf("test-netd-network: ok\n");
         return EXIT_SUCCESS;

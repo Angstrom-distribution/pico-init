@@ -71,6 +71,21 @@ typedef enum NetworkEmitLldp {
         NETWORK_EMIT_LLDP_CUSTOMER_BRIDGE,
 } NetworkEmitLldp;
 
+/* [IPv6AcceptRA] Token=: how a SLAAC address's interface identifier is made
+ * (ndisc-iid.h). DEFAULT is EUI-64 on Ethernet and prefixstable elsewhere, as
+ * in networkd. */
+typedef enum NetworkRaToken {
+        NETWORK_RA_TOKEN_DEFAULT,
+        NETWORK_RA_TOKEN_EUI64,
+        NETWORK_RA_TOKEN_STATIC,
+        NETWORK_RA_TOKEN_PREFIXSTABLE,
+} NetworkRaToken;
+
+/* networkd's [IPv6AcceptRA] RouteMetric= defaults, high:medium:low. */
+#define NETWORK_RA_METRIC_HIGH 512
+#define NETWORK_RA_METRIC_MEDIUM 1024
+#define NETWORK_RA_METRIC_LOW 2048
+
 /*
  * One address, from an [Address] section or an Address= line in [Network].
  * What an entry means is decided when the file is parsed: network_parse_file()
@@ -210,6 +225,21 @@ struct Network {
         uint32_t dhcp_route_metric;
         bool dhcp_route_metric_set;
         bool dhcp_route_metric_v4;
+
+        /* --- [IPv6AcceptRA] and [Network] IPv6AcceptRA= --- */
+
+        /* -1 when unset: on unless the link forwards IPv6, as in networkd. */
+        int ipv6_accept_ra;
+        bool ra_use_gateway;           /* UseGateway=, default yes */
+        bool ra_use_onlink_prefix;     /* UseOnLinkPrefix=, default yes */
+        bool ra_use_autonomous_prefix; /* UseAutonomousPrefix=, default yes */
+        bool ra_use_dns;               /* UseDNS=, default yes */
+        bool ra_use_domains;           /* UseDomains=, default no */
+        bool ra_use_mtu;               /* UseMTU=, default yes */
+        /* RouteMetric=, indexed high, medium, low like NdiscPref. */
+        uint32_t ra_route_metric[3];
+        NetworkRaToken ra_token;       /* Token=, or IPv6Token= in [Network] */
+        struct in6_addr ra_token_addr; /* NETWORK_RA_TOKEN_STATIC: the low 64 bits */
 };
 
 /* --- netd-network.c --- */
