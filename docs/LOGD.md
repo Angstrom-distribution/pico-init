@@ -15,8 +15,12 @@ export-format text on tmpfs, and nothing is written to persistent storage.
 | `picolog` | `bindir` | Ring reader, runs as any user that can read `/run/logd` |
 
 `logd.service` is a service with `Restart=on-failure` and `RestartSec=2`,
-wanted by `default.target`. `logd.socket` is wanted by
-`sockets.target`:
+wanted by `default.target`, with `StandardOutput=null`: `logd`'s own stdout
+and stderr are `/dev/null` and its diagnostics are discarded, because the
+logd socket would be its own input queue. If `logd` is started with a socket on fd 1 or fd 2 anyway, it makes
+them non-blocking and a log line that does not fit the queue is dropped.
+They are not sent to `/dev/kmsg` either, which `logd` reads back as kernel
+records. `logd.socket` is wanted by `sockets.target`:
 
 ```ini
 [Socket]
