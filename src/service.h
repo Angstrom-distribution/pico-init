@@ -29,6 +29,10 @@
 /* Where a service's stdout/stderr go when logd is not available. */
 #define PICO_CONSOLE_PATH "/dev/console"
 
+/* Upstream's DEFAULT_START_LIMIT_INTERVAL and DEFAULT_START_LIMIT_BURST. */
+#define PICO_START_LIMIT_INTERVAL_USEC (10 * USEC_PER_SEC)
+#define PICO_START_LIMIT_BURST 5
+
 /*
  * Exit codes service-exec.c's forked child _exit()s with when its own setup
  * fails, matching systemd.exec(5) numerically. The post-fork/pre-execve
@@ -322,11 +326,11 @@ typedef struct Service {
         usec_t timeout_stop_usec;  /* TimeoutStopSec=; USEC_INFINITY means never time out */
 
         /*
-         * Start-rate limiting. These four are not parseable unit-file
-         * settings, only upstream's hardcoded defaults (10s / 5 starts).
-         * start_limit_begin anchors a fixed window at the first attempt in
-         * it; start_limit_num counts attempts inside that window; a
-         * successful start does not reset either, only window expiry does.
+         * Start-rate limiting: StartLimitIntervalSec= and StartLimitBurst=,
+         * 0 in either disables it. start_limit_begin anchors a fixed window
+         * at the first attempt in it; start_limit_num counts attempts inside
+         * that window; a successful start does not reset either, only window
+         * expiry does. begin and num are runtime state, not configuration.
          */
         usec_t start_limit_interval;
         unsigned start_limit_burst;

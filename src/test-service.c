@@ -770,6 +770,200 @@ static void test_b7_start_limit_stops_the_loop(void) {
         free(dir);
 }
 
+/*
+ * Drives a crash loop through up to `max_iterations` reap/timer steps, or
+ * until the service is FAILED. `spacing` stands in for a RestartSec= the
+ * test cannot wait out: before each restart timer is dispatched, the
+ * window's start is moved back by that much, so the limit sees attempts
+ * `spacing` apart while the timer itself stays at a few milliseconds.
+ */
+static void crash_loop(Manager *m, Service *s, unsigned max_iterations, usec_t spacing) {
+        unsigned i;
+
+        for (i = 0; i < max_iterations && s->state != SERVICE_FAILED; i++) {
+                if (s->main_pid > 0) {
+                        ASSERT_TRUE(reap_for(s, 2000));
+                } else if (s->state == SERVICE_AUTO_RESTART) {
+                        if (spacing > 0 && s->start_limit_begin > spacing)
+                                s->start_limit_begin -= spacing;
+                        ASSERT_TRUE(wait_for_timer(m, 2000));
+                } else {
+                        break;
+                }
+        }
+}
+
+/*
+ * crash_loop() moves the window start back by `spacing` before every restart,
+ * up to five times in these tests, so it needs that much monotonic time to
+ * have passed since boot.
+ */
+static bool crash_spacing_possible(const char *test, usec_t spacing) {
+        usec_t needed = 5 * spacing + USEC_PER_SEC;
+
+        if (now_monotonic() > needed)
+                return true;
+
+        printf("test-service: %s needs %llu s of uptime, skipping\n",
+               test,
+               (unsigned long long) (needed / USEC_PER_SEC));
+        return false;
+}
+
+/* A service that fails at once, restarts, and is loaded from `extra` appended to a fixed [Service]. */
+static Service *load_crasher(Manager *m, const char *dir, const char *extra) {
+        char text[512];
+
+        snprintf(text,
+                 sizeof(text),
+                 "[Unit]\n%s\n[Service]\nType=simple\nExecStart=/nonexistent/does-not-exist\n"
+                 "Restart=on-failure\nRestartSec=6s\n",
+                 extra);
+        return load_service(m, dir, "crasher.service", text);
+}
+
+/*
+ * The case that motivated honouring StartLimit*=: RestartSec=6s spaces the
+ * attempts so far apart that the default 5 starts in 10 s never trips, so a
+ * persistent failure restarted forever. The first half shows that with the
+ * defaults; the second that StartLimitIntervalSec=60/StartLimitBurst=3
+ * ends it in the failed state with the start-limit result. The 6 s are
+ * emulated by crash_loop(): the parsed RestartSec= is asserted, then
+ * replaced with a few milliseconds.
+ */
+static void test_start_limit_long_restart_sec(void) {
+        Manager *m;
+        Service *s;
+        char *dir;
+
+        if (!crash_spacing_possible("start limit with a long RestartSec=", 6 * USEC_PER_SEC))
+                return;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        m = manager_for(dir);
+        s = load_crasher(m, dir, "");
+        ASSERT_TRUE(s->restart_usec == 6 * USEC_PER_SEC);
+        ASSERT_TRUE(s->start_limit_interval == 10 * USEC_PER_SEC);
+        ASSERT_EQ_INT(s->start_limit_burst, 5);
+        s->restart_usec = 5 * USEC_PER_MSEC;
+
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        crash_loop(m, s, 40, 6 * USEC_PER_SEC);
+        ASSERT_TRUE(s->state != SERVICE_FAILED);
+        ASSERT_TRUE(s->result != SERVICE_FAILURE_START_LIMIT);
+        ASSERT_TRUE(s->n_restarts >= 12);
+        manager_free(m);
+
+        m = manager_for(dir);
+        s = load_crasher(m, dir, "StartLimitIntervalSec=60\nStartLimitBurst=3");
+        ASSERT_TRUE(s->restart_usec == 6 * USEC_PER_SEC);
+        ASSERT_TRUE(s->start_limit_interval == 60 * USEC_PER_SEC);
+        ASSERT_EQ_INT(s->start_limit_burst, 3);
+        s->restart_usec = 5 * USEC_PER_MSEC;
+
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        crash_loop(m, s, 40, 6 * USEC_PER_SEC);
+        ASSERT_EQ_INT(s->state, SERVICE_FAILED);
+        ASSERT_EQ_INT(s->result, SERVICE_FAILURE_START_LIMIT);
+        ASSERT_TRUE(s->timer_event == NULL);
+        ASSERT_EQ_INT(s->start_limit_num, 4);
+        ASSERT_EQ_INT(s->n_restarts, 3);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* A unit's own burst applies at once, with no spacing between attempts. */
+static void test_start_limit_burst_override(void) {
+        Manager *m;
+        Service *s;
+        char *dir;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        s = load_crasher(m, dir, "StartLimitBurst=2");
+        s->restart_usec = 5 * USEC_PER_MSEC;
+
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        crash_loop(m, s, 20, 0);
+        ASSERT_EQ_INT(s->state, SERVICE_FAILED);
+        ASSERT_EQ_INT(s->result, SERVICE_FAILURE_START_LIMIT);
+        ASSERT_EQ_INT(s->start_limit_num, 3);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* 0 in either setting disables the limit: the loop outlasts the default burst and nothing is counted. */
+static void test_start_limit_zero_disables(void) {
+        static const char * const extras[] = {
+                "StartLimitIntervalSec=0\nStartLimitBurst=2",
+                "StartLimitBurst=0",
+        };
+        size_t i;
+
+        for (i = 0; i < sizeof(extras) / sizeof(extras[0]); i++) {
+                Manager *m;
+                Service *s;
+                char *dir;
+
+                dir = test_tmpdir_new();
+                ASSERT_TRUE(dir != NULL);
+                m = manager_for(dir);
+
+                s = load_crasher(m, dir, extras[i]);
+                s->restart_usec = 5 * USEC_PER_MSEC;
+
+                ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+                crash_loop(m, s, 30, 0);
+                ASSERT_TRUE(s->state != SERVICE_FAILED);
+                ASSERT_TRUE(s->result != SERVICE_FAILURE_START_LIMIT);
+                ASSERT_TRUE(s->n_restarts >= 10);
+                ASSERT_EQ_INT(s->start_limit_num, 0);
+
+                manager_free(m);
+                test_rm_rf(dir);
+                free(dir);
+        }
+}
+
+/*
+ * "infinity" does not disable the limit, as upstream: the window never
+ * expires, so even attempts 15 s apart, beyond the default 10 s window,
+ * count against the burst.
+ */
+static void test_start_limit_infinity_never_expires(void) {
+        Manager *m;
+        Service *s;
+        char *dir;
+
+        if (!crash_spacing_possible("start limit infinity", 15 * USEC_PER_SEC))
+                return;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+        m = manager_for(dir);
+
+        s = load_crasher(m, dir, "StartLimitIntervalSec=infinity\nStartLimitBurst=3");
+        s->restart_usec = 5 * USEC_PER_MSEC;
+
+        ASSERT_EQ_INT(unit_start(UNIT(s)), 0);
+        crash_loop(m, s, 40, 15 * USEC_PER_SEC);
+        ASSERT_EQ_INT(s->state, SERVICE_FAILED);
+        ASSERT_EQ_INT(s->result, SERVICE_FAILURE_START_LIMIT);
+        ASSERT_EQ_INT(s->start_limit_num, 4);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 static bool jobs_idle_done(void *userdata) {
         return ((Manager *) userdata)->n_jobs == 0;
 }
@@ -4174,6 +4368,10 @@ int main(void) {
         test_start_timeout();
         test_crash_restart();
         test_b7_start_limit_stops_the_loop();
+        test_start_limit_long_restart_sec();
+        test_start_limit_burst_override();
+        test_start_limit_zero_disables();
+        test_start_limit_infinity_never_expires();
         test_start_limit_from_failed_finishes_job();
         test_stop_signals_whole_cgroup();
         test_kill_mode_leftovers();

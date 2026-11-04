@@ -65,6 +65,7 @@
 #include "unit.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h> /* snprintf, for the degradation record's name=qualifier form */
@@ -1536,6 +1537,70 @@ static int config_parse_timeout_stop_sec(
         return 0;
 }
 
+/*
+ * StartLimitIntervalSec=/StartLimitBurst= are legal in [Unit] of any unit
+ * type and in [Service] of old units, but only a service has a start limit
+ * here; on other types they are dropped and recorded like any unimplemented
+ * directive.
+ */
+static Service *unit_to_service_for_start_limit(Unit *u, const char *lvalue) {
+        if (u->type != UNIT_SERVICE) {
+                pico_log(PICO_LOG_DEBUG, "%s: %s= only applies to services, ignoring", u->id, lvalue);
+                (void) unit_add_degradation(u, lvalue);
+                return NULL;
+        }
+        return SERVICE(u);
+}
+
+/* A bad value is recorded as "Name=", like RestartSec= and the timeouts. */
+static void start_limit_bad_value(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        char name[64];
+
+        pico_log(PICO_LOG_WARNING, "%s:%u: invalid %s= value '%s', ignoring", path, line, lvalue, rvalue);
+        snprintf(name, sizeof(name), "%s=", lvalue);
+        (void) unit_add_degradation(u, name);
+}
+
+/* An empty value does not parse and keeps the previous value, as upstream's config_parse_sec(). */
+static int config_parse_start_limit_interval_sec(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        Service *s = unit_to_service_for_start_limit(u, lvalue);
+        usec_t v;
+
+        if (!s)
+                return 0;
+
+        if (parse_usec(rvalue, &v) < 0) {
+                start_limit_bad_value(u, path, line, lvalue, rvalue);
+                return 0;
+        }
+
+        s->start_limit_interval = v;
+        return 0;
+}
+
+static int config_parse_start_limit_burst(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        Service *s = unit_to_service_for_start_limit(u, lvalue);
+        unsigned long v;
+        char *end;
+
+        if (!s)
+                return 0;
+
+        /* strtoul() takes a sign and leading blanks; a count has neither, and an empty value is no count. */
+        errno = 0;
+        v = strtoul(rvalue, &end, 10);
+        if (*rvalue < '0' || *rvalue > '9' || errno != 0 || *end != '\0' || v > UINT_MAX) {
+                start_limit_bad_value(u, path, line, lvalue, rvalue);
+                return 0;
+        }
+
+        s->start_limit_burst = (unsigned) v;
+        return 0;
+}
+
 /* --- [Socket] handlers --- */
 
 /* A [Socket] directive on a non-socket unit is a misplaced-directive
@@ -1834,6 +1899,12 @@ static const ConfigItem config_items[] = {
         { SECTION_SERVICE,          "EnvironmentFile",            config_parse_environment_file },
         { SECTION_SERVICE,                  "Restart",                     config_parse_restart },
         { SECTION_SERVICE,               "RestartSec",                 config_parse_restart_sec },
+        {    SECTION_UNIT,    "StartLimitIntervalSec",    config_parse_start_limit_interval_sec },
+        {    SECTION_UNIT,       "StartLimitInterval",    config_parse_start_limit_interval_sec },
+        {    SECTION_UNIT,          "StartLimitBurst",           config_parse_start_limit_burst },
+        { SECTION_SERVICE,    "StartLimitIntervalSec",    config_parse_start_limit_interval_sec },
+        { SECTION_SERVICE,       "StartLimitInterval",    config_parse_start_limit_interval_sec },
+        { SECTION_SERVICE,          "StartLimitBurst",           config_parse_start_limit_burst },
         { SECTION_SERVICE,          "RemainAfterExit",           config_parse_remain_after_exit },
         { SECTION_SERVICE,                 "Delegate",                    config_parse_delegate },
         { SECTION_SERVICE,                 "KillMode",                   config_parse_kill_mode },

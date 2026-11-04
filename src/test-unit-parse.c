@@ -2449,8 +2449,124 @@ static void test_shipped_seatd_and_picowl_units_load(void) {
         free(dir);
 }
 
+/* Writes a unit file and loads it into a fresh manager. */
+static Service *load_with(Manager **m, const char *dir, const char *name, const char *text) {
+        ASSERT_EQ_INT(test_write_file(dir, name, text), 0);
+        *m = manager_for(dir);
+        return SERVICE(load_one(*m, name));
+}
+
+/*
+ * StartLimitIntervalSec=/StartLimitBurst= in [Unit] and [Service], the
+ * StartLimitInterval= spelling, and bad values, an empty one included,
+ * that keep the previous value and are recorded. 0 and "infinity" are
+ * stored as typed: only the start-limit check gives 0 its "disabled"
+ * meaning.
+ */
+static void test_start_limit_directives(void) {
+        Manager *m;
+        Service *s;
+        char *dir = test_tmpdir_new();
+
+        ASSERT_TRUE(dir != NULL);
+
+        s = load_with(&m, dir, "d.service", "[Service]\nExecStart=/bin/true\n");
+        ASSERT_TRUE(s->start_limit_interval == 10 * USEC_PER_SEC);
+        ASSERT_EQ_INT(s->start_limit_burst, 5);
+        ASSERT_EQ_INT(UNIT(s)->n_degraded_directives, 0);
+        manager_free(m);
+
+        s = load_with(&m,
+                      dir,
+                      "u.service",
+                      "[Unit]\nStartLimitIntervalSec=1min\nStartLimitBurst=3\n"
+                      "[Service]\nExecStart=/bin/true\n");
+        ASSERT_TRUE(s->start_limit_interval == 60 * USEC_PER_SEC);
+        ASSERT_EQ_INT(s->start_limit_burst, 3);
+        ASSERT_EQ_INT(UNIT(s)->n_degraded_directives, 0);
+        manager_free(m);
+
+        s = load_with(&m,
+                      dir,
+                      "s.service",
+                      "[Service]\nExecStart=/bin/true\nStartLimitInterval=30\nStartLimitBurst=7\n");
+        ASSERT_TRUE(s->start_limit_interval == 30 * USEC_PER_SEC);
+        ASSERT_EQ_INT(s->start_limit_burst, 7);
+        ASSERT_EQ_INT(UNIT(s)->n_degraded_directives, 0);
+        manager_free(m);
+
+        s = load_with(&m,
+                      dir,
+                      "zero.service",
+                      "[Unit]\nStartLimitIntervalSec=0\nStartLimitBurst=0\n"
+                      "[Service]\nExecStart=/bin/true\n");
+        ASSERT_TRUE(s->start_limit_interval == 0);
+        ASSERT_EQ_INT(s->start_limit_burst, 0);
+        manager_free(m);
+
+        s = load_with(&m,
+                      dir,
+                      "inf.service",
+                      "[Unit]\nStartLimitIntervalSec=infinity\n[Service]\nExecStart=/bin/true\n");
+        ASSERT_TRUE(s->start_limit_interval == USEC_INFINITY);
+        manager_free(m);
+
+        s = load_with(&m,
+                      dir,
+                      "empty.service",
+                      "[Unit]\nStartLimitIntervalSec=1min\nStartLimitIntervalSec=\n"
+                      "StartLimitBurst=9\nStartLimitBurst=\n[Service]\nExecStart=/bin/true\n");
+        ASSERT_TRUE(s->start_limit_interval == 60 * USEC_PER_SEC);
+        ASSERT_EQ_INT(s->start_limit_burst, 9);
+        ASSERT_EQ_INT(UNIT(s)->n_degraded_directives, 2);
+        ASSERT_STREQ(UNIT(s)->degraded_directives[0], "StartLimitIntervalSec=");
+        ASSERT_STREQ(UNIT(s)->degraded_directives[1], "StartLimitBurst=");
+        manager_free(m);
+
+        s = load_with(&m,
+                      dir,
+                      "empty-first.service",
+                      "[Unit]\nStartLimitIntervalSec=\nStartLimitBurst=\n[Service]\nExecStart=/bin/true\n");
+        ASSERT_TRUE(s->start_limit_interval == 10 * USEC_PER_SEC);
+        ASSERT_EQ_INT(s->start_limit_burst, 5);
+        ASSERT_EQ_INT(UNIT(s)->n_degraded_directives, 2);
+        manager_free(m);
+
+        s = load_with(&m,
+                      dir,
+                      "bad.service",
+                      "[Unit]\nStartLimitIntervalSec=soon\nStartLimitBurst=-1\n"
+                      "[Service]\nExecStart=/bin/true\n");
+        ASSERT_TRUE(s->start_limit_interval == 10 * USEC_PER_SEC);
+        ASSERT_EQ_INT(s->start_limit_burst, 5);
+        ASSERT_EQ_INT(UNIT(s)->n_degraded_directives, 2);
+        ASSERT_STREQ(UNIT(s)->degraded_directives[0], "StartLimitIntervalSec=");
+        ASSERT_STREQ(UNIT(s)->degraded_directives[1], "StartLimitBurst=");
+        manager_free(m);
+
+        s = load_with(&m,
+                      dir,
+                      "bad2.service",
+                      "[Unit]\nStartLimitBurst=3x\n[Service]\nExecStart=/bin/true\n"
+                      "StartLimitBurst=99999999999999999999\n");
+        ASSERT_EQ_INT(s->start_limit_burst, 5);
+        ASSERT_EQ_INT(UNIT(s)->n_degraded_directives, 1);
+        manager_free(m);
+
+        /* Not a service: legal in systemd, nothing to apply it to here. */
+        ASSERT_EQ_INT(test_write_file(dir, "t.target", "[Unit]\nStartLimitBurst=3\n"), 0);
+        m = manager_for(dir);
+        ASSERT_EQ_INT(load_one(m, "t.target")->n_degraded_directives, 1);
+        ASSERT_STREQ(load_one(m, "t.target")->degraded_directives[0], "StartLimitBurst");
+        manager_free(m);
+
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
         test_service_fields();
+        test_start_limit_directives();
         test_unknown_directives_are_tolerated();
         test_degradation_record();
         test_degradation_record_covers_deps_and_timeouts();
