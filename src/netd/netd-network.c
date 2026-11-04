@@ -51,6 +51,16 @@ int network_new(Network **ret) {
         nw->dhcp_use_ntp = true;
         nw->dhcp_use_timezone = true;
 
+        nw->ipv6_accept_ra = -1;
+        nw->ra_use_gateway = true;
+        nw->ra_use_onlink_prefix = true;
+        nw->ra_use_autonomous_prefix = true;
+        nw->ra_use_dns = true;
+        nw->ra_use_mtu = true;
+        nw->ra_route_metric[0] = NETWORK_RA_METRIC_HIGH;
+        nw->ra_route_metric[1] = NETWORK_RA_METRIC_MEDIUM;
+        nw->ra_route_metric[2] = NETWORK_RA_METRIC_LOW;
+
         *ret = nw;
         return 0;
 }
@@ -1181,6 +1191,168 @@ static int config_parse_dhcp_legacy_route_metric(
         return 0;
 }
 
+/* --- [IPv6AcceptRA] --- */
+
+static int config_parse_ipv6_accept_ra(
+                Network *nw, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        bool b;
+
+        if (*rvalue == '\0') {
+                nw->ipv6_accept_ra = -1;
+                return 0;
+        }
+
+        if (network_parse_bool(rvalue, &b) < 0) {
+                pico_log(PICO_LOG_WARNING, "%s:%u: invalid %s= value '%s', ignoring", path, line, lvalue, rvalue);
+                return 0;
+        }
+
+        nw->ipv6_accept_ra = b;
+        return 0;
+}
+
+static int config_parse_ra_use_gateway(
+                Network *nw, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        return config_parse_bool_field(path, line, lvalue, rvalue, &nw->ra_use_gateway);
+}
+
+static int config_parse_ra_use_onlink_prefix(
+                Network *nw, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        return config_parse_bool_field(path, line, lvalue, rvalue, &nw->ra_use_onlink_prefix);
+}
+
+static int config_parse_ra_use_autonomous_prefix(
+                Network *nw, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        return config_parse_bool_field(path, line, lvalue, rvalue, &nw->ra_use_autonomous_prefix);
+}
+
+static int config_parse_ra_use_dns(
+                Network *nw, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        return config_parse_bool_field(path, line, lvalue, rvalue, &nw->ra_use_dns);
+}
+
+static int config_parse_ra_use_mtu(
+                Network *nw, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        return config_parse_bool_field(path, line, lvalue, rvalue, &nw->ra_use_mtu);
+}
+
+/* networkd's "route" puts the domains on resolved's routing list only, which
+ * resolv.conf cannot express: here it is the same as no. */
+static int config_parse_ra_use_domains(
+                Network *nw, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        if (strcmp(rvalue, "route") == 0) {
+                pico_log(PICO_LOG_DEBUG,
+                         "%s:%u: %s=route has no resolv.conf equivalent, treating it as no",
+                         path,
+                         line,
+                         lvalue);
+                nw->ra_use_domains = false;
+                return 0;
+        }
+
+        return config_parse_bool_field(path, line, lvalue, rvalue, &nw->ra_use_domains);
+}
+
+/* "N" for all three, or "high:medium:low" strictly increasing, as networkd's
+ * config_parse_ndisc_route_metric(). A rejected value keeps the previous one. */
+static int config_parse_ra_route_metric(
+                Network *nw, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        uint32_t m[3];
+        char buf[3 * 11 + 3];
+        char *p = buf;
+
+        if (parse_route_metric(rvalue, &m[0]) == 0) {
+                m[1] = m[2] = m[0];
+                goto set;
+        }
+
+        if (strlen(rvalue) >= sizeof(buf))
+                goto invalid;
+        memcpy(buf, rvalue, strlen(rvalue) + 1);
+
+        for (unsigned i = 0; i < 3; i++) {
+                char *colon = strchr(p, ':');
+
+                if ((i < 2) != (colon != NULL))
+                        goto invalid;
+                if (colon)
+                        *colon = '\0';
+                if (parse_route_metric(p, &m[i]) < 0)
+                        goto invalid;
+                p = colon ? colon + 1 : p;
+        }
+
+        if (m[0] >= m[1] || m[1] >= m[2])
+                goto invalid;
+
+set:
+        memcpy(nw->ra_route_metric, m, sizeof(m));
+        return 0;
+
+invalid:
+        pico_log(PICO_LOG_WARNING, "%s:%u: invalid %s= value '%s', ignoring", path, line, lvalue, rvalue);
+        return 0;
+}
+
+/*
+ * eui64, prefixstable, or static:ADDRESS (a bare address also means static),
+ * whose low 64 bits are the identifier. networkd collects several tokens per
+ * link; netd keeps one, the last. The prefixstable forms with a prefix filter
+ * or a secret key are not supported and are ignored.
+ */
+static int config_parse_ra_token(
+                Network *nw, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        struct in6_addr a;
+        const char *addr;
+
+        if (*rvalue == '\0') {
+                nw->ra_token = NETWORK_RA_TOKEN_DEFAULT;
+                return 0;
+        }
+
+        if (strcmp(rvalue, "eui64") == 0) {
+                nw->ra_token = NETWORK_RA_TOKEN_EUI64;
+                return 0;
+        }
+
+        if (strcmp(rvalue, "prefixstable") == 0) {
+                nw->ra_token = NETWORK_RA_TOKEN_PREFIXSTABLE;
+                return 0;
+        }
+
+        if (strncmp(rvalue, "prefixstable", strlen("prefixstable")) == 0) {
+                pico_log(PICO_LOG_WARNING,
+                         "%s:%u: %s=%s: a prefix or secret key with prefixstable is not supported, ignoring",
+                         path,
+                         line,
+                         lvalue,
+                         rvalue);
+                return 0;
+        }
+
+        addr = strncmp(rvalue, "static:", strlen("static:")) == 0 ? rvalue + strlen("static:") : rvalue;
+
+        if (inet_pton(AF_INET6, addr, &a) != 1) {
+                pico_log(PICO_LOG_WARNING, "%s:%u: invalid %s= value '%s', ignoring", path, line, lvalue, rvalue);
+                return 0;
+        }
+
+        memset(a.s6_addr, 0, 8);
+        if (IN6_IS_ADDR_UNSPECIFIED(&a)) {
+                pico_log(PICO_LOG_WARNING,
+                         "%s:%u: %s=%s has no interface identifier in its low 64 bits, ignoring",
+                         path,
+                         line,
+                         lvalue,
+                         rvalue);
+                return 0;
+        }
+
+        nw->ra_token = NETWORK_RA_TOKEN_STATIC;
+        nw->ra_token_addr = a;
+        return 0;
+}
+
 typedef int (*NetworkParseFn)(
                 Network *nw, const char *path, unsigned line, const char *lvalue, const char *rvalue);
 
@@ -1191,28 +1363,39 @@ typedef struct NetworkConfigItem {
 } NetworkConfigItem;
 
 static const NetworkConfigItem network_config_items[] = {
-        {   "Match",        "Name",               config_parse_match_name },
-        { "Network",        "DHCP",                     config_parse_dhcp },
-        { "Network",     "Gateway",                  config_parse_gateway },
-        { "Network",         "DNS",                      config_parse_dns },
-        { "Network",         "NTP",                      config_parse_ntp },
-        { "Network",  "DHCPServer",              config_parse_dhcp_server },
-        { "Network",        "LLDP",                     config_parse_lldp },
-        { "Network",    "EmitLLDP",                config_parse_emit_lldp },
-        {  "DHCPv4",      "UseDNS",                  config_parse_use_dns },
-        {  "DHCPv4",      "UseNTP",                  config_parse_use_ntp },
-        {  "DHCPv4", "UseTimezone",             config_parse_use_timezone },
-        {  "DHCPv4", "RouteMetric",       config_parse_dhcp4_route_metric },
-        {    "DHCP", "RouteMetric", config_parse_dhcp_legacy_route_metric },
+        {        "Match",                "Name",               config_parse_match_name },
+        {      "Network",                "DHCP",                     config_parse_dhcp },
+        {      "Network",             "Gateway",                  config_parse_gateway },
+        {      "Network",                 "DNS",                      config_parse_dns },
+        {      "Network",                 "NTP",                      config_parse_ntp },
+        {      "Network",          "DHCPServer",              config_parse_dhcp_server },
+        {      "Network",                "LLDP",                     config_parse_lldp },
+        {      "Network",            "EmitLLDP",                config_parse_emit_lldp },
+        {       "DHCPv4",              "UseDNS",                  config_parse_use_dns },
+        {       "DHCPv4",              "UseNTP",                  config_parse_use_ntp },
+        {       "DHCPv4",         "UseTimezone",             config_parse_use_timezone },
+        {       "DHCPv4",         "RouteMetric",       config_parse_dhcp4_route_metric },
+        {         "DHCP",         "RouteMetric", config_parse_dhcp_legacy_route_metric },
+        {      "Network",        "IPv6AcceptRA",           config_parse_ipv6_accept_ra },
+        {      "Network",           "IPv6Token",                 config_parse_ra_token },
+        { "IPv6AcceptRA",          "UseGateway",           config_parse_ra_use_gateway },
+        { "IPv6AcceptRA",     "UseOnLinkPrefix",     config_parse_ra_use_onlink_prefix },
+        { "IPv6AcceptRA", "UseAutonomousPrefix", config_parse_ra_use_autonomous_prefix },
+        { "IPv6AcceptRA",              "UseDNS",               config_parse_ra_use_dns },
+        { "IPv6AcceptRA",          "UseDomains",           config_parse_ra_use_domains },
+        { "IPv6AcceptRA",              "UseMTU",               config_parse_ra_use_mtu },
+        { "IPv6AcceptRA",         "RouteMetric",          config_parse_ra_route_metric },
+        { "IPv6AcceptRA",               "Token",                 config_parse_ra_token },
 };
 
 /*
  * The conf-scan.h handler: dispatches one already-scanned assignment through
  * network_config_items[], and logs-and-drops anything not in it -- the same
  * drop-in tolerance rule unit-parse.c's own handler applies (see that file),
- * so a section this parser has never heard of (e.g. [IPv6AcceptRA]) simply
- * never matches a row here and falls straight to the debug log below. [DHCP]
- * has a row for RouteMetric= only; its other keys take the same path.
+ * so a section this parser has never heard of simply never matches a row here
+ * and falls straight to the debug log below. [DHCP] has a row for
+ * RouteMetric= only; its other keys take the same path, as do the
+ * [IPv6AcceptRA] keys netd does not implement.
  */
 static int network_conf_handler(
                 const char *path,
