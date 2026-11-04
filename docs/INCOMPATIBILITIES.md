@@ -115,6 +115,7 @@ or resource-control directive leaves the service unconfined.
 | `Conflicts=`                |                                                 |
 | `ConditionPathExists=`      | See [Conditions](#conditions).                  |
 | `ConditionPathIsDirectory=` | See [Conditions](#conditions).                  |
+| `StartLimitIntervalSec=`, `StartLimitBurst=` | See [Start limit](#start-limit). `StartLimitInterval=` is accepted as the old spelling. |
 
 Dependency tokens are expanded with `%n %N %p %i` per token. `%I` is not
 available in dependency names. A token that is not a valid unit name is
@@ -139,6 +140,7 @@ logged and skipped.
 | `GuessMainPID=`         | Boolean.                                        |
 | `Restart=`              | `no`, `on-success`, `on-failure`, `on-abnormal`, `on-watchdog`, `on-abort`, `always`. |
 | `RestartSec=`           | Time span.                                      |
+| `StartLimitIntervalSec=`, `StartLimitBurst=` | As in [Unit]. systemd accepts `StartLimitInterval=` and `StartLimitBurst=` here; `StartLimitIntervalSec=` is accepted too. |
 | `RemainAfterExit=`      | Boolean.                                        |
 | `TimeoutStartSec=`      | Time span or `infinity`.                        |
 | `TimeoutStopSec=`       | Time span or `infinity`.                        |
@@ -194,7 +196,7 @@ degradation record.
 | `StandardInput=` other than the four above (`null`, `file:`, `data`, ...) | Ignored. | `StandardInput` |
 | `StandardOutput=`, `StandardError=` with another value (`console`, `tty`, `kmsg`, `file:`, `socket`, ...) | Ignored. | the directive name |
 | `TTYPath=` not absolute    | Ignored.                                        | `TTYPath` |
-| `RestartSec=`, `TimeoutStartSec=`, `TimeoutStopSec=` that do not parse | Ignored, default kept. | `RestartSec=`, `TimeoutStartSec=`, `TimeoutStopSec=` |
+| `RestartSec=`, `TimeoutStartSec=`, `TimeoutStopSec=`, `StartLimitIntervalSec=`, `StartLimitBurst=` that do not parse | Ignored, the previous value is kept. | the directive name followed by `=` |
 | A second `ExecStart=`      | Replaces the first.                             | `ExecStart=multiple` |
 | `Exec*=` with a `@`, `+`, `!` or `:` prefix | The whole line is ignored.      | `ExecStart=@` (and so on, with the directive and prefix) |
 | `Condition*=|...`          | Triggering conditions are dropped.              | `ConditionPathExists=|` |
@@ -225,10 +227,10 @@ is a load failure (below).
   not accepted and trip the degradation above.
 - **`TimeoutStartSec=0` and `TimeoutStopSec=0`** mean `infinity`, as in
   systemd. `RestartSec=0` means restart immediately.
-- **Defaults** are 90 seconds for both timeouts and 100 ms for
-  `RestartSec=`. The start limit is fixed at 5 starts in 10 seconds and
-  cannot be changed: `StartLimitIntervalSec=` and `StartLimitBurst=` are
-  recorded as dropped.
+- **Defaults** are 90 seconds for both timeouts, 100 ms for `RestartSec=`,
+  and 5 starts in 10 seconds for the start limit. There is no
+  `DefaultStartLimitIntervalSec=` or `DefaultStartLimitBurst=`, because there
+  is no `system.conf`.
 - **`Delegate=`** with a list of controllers is parsed, with names pico-init
   does not know skipped. An empty value delegates with no controllers.
   `DelegateSubgroup=` is honoured as described in
@@ -344,6 +346,31 @@ service held up by `RemainAfterExit=` can be reloaded too.
   `PropagatesReloadTo=` and `ReloadPropagatedFrom=` are not supported.
 - `$MAINPID` is also set for `ExecStop=` and `ExecStopPost=` while the main
   process is alive; before it was unset there.
+
+### Start limit
+
+A service may be started `StartLimitBurst=` times (default 5) within a
+`StartLimitIntervalSec=` window (default 10 s). The window is fixed, as in
+systemd: it opens at the first start and the count restarts only when the
+interval has passed, so a successful start does not reset it. A start over
+the limit is refused, the service ends `failed` with `Result=start-limit-hit`
+and `Restart=` stops. The check runs when a start is attempted, not when a
+restart is scheduled, so `RestartSec=` only spaces the attempts: a service
+that fails at once with `RestartSec=6s` needs a `StartLimitIntervalSec=`
+longer than the default, such as `StartLimitIntervalSec=60` with
+`StartLimitBurst=3`, to end in the failed state.
+
+- An interval or a burst of 0 disables the limit.
+- `infinity` is not a disable: the window never expires, so the limit caps
+  the starts for as long as the unit stays loaded. `picoctl reset-failed`
+  clears the window of a failed unit.
+- An empty assignment does not parse, as in systemd: it is recorded like
+  any bad value and the previous value is kept.
+- A reload picks up changed values and leaves the running window alone.
+- `StartLimitAction=` is not implemented and is recorded as dropped. There
+  is no emergency action: a unit that hits the limit stays failed and the
+  system keeps running.
+- On a unit that is not a service the settings are recorded as dropped.
 
 ### Presets
 
