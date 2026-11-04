@@ -10,6 +10,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <limits.h>
+#include <linux/if_addr.h>
 #include <net/if_arp.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,7 +34,7 @@
  * route to an off-subnet router and the prefix route of the leased address
  * use [DHCPv4] RouteMetric=, default 1024 (networkd's DHCP_ROUTE_METRIC). A
  * Gateway= route has no metric of its own, so it gets the kernel's 0, as does
- * the prefix route of Address=.
+ * the prefix route of an Address= without RouteMetric=.
  *
  * Links sharing a metric do not collide: routes are added with
  * NLM_F_CREATE|NLM_F_APPEND and deleted by oif, gateway and priority (see
@@ -61,8 +62,7 @@ static uint32_t link_route_metric(const Link *l, bool from_lease) {
  * during idempotent reconvergence is not a failure.
  */
 
-/* An IPv4 address with no peer, label, flags or scope, as the lease and the
- * single Address= have always been sent. */
+/* An IPv4 address with no peer, label, flags or scope, as a lease's is sent. */
 static void address_v4(NetdRtnlAddress *a, int ifindex, const struct in_addr *addr, unsigned char prefixlen) {
         memset(a, 0, sizeof(*a));
         a->ifindex = ifindex;
@@ -136,13 +136,201 @@ static bool same_subnet(struct in_addr a, unsigned char a_pfx, struct in_addr b,
 }
 
 static int link_gateway_remove(Link *l);
+static uint32_t lease_remaining_sec(DhcpLease *lease);
+
+/* --- the static address table --- */
+
+/* One address is one kernel object: an IPv4 address by (address, prefix
+ * length), an IPv6 address by its address alone. */
+static bool link_address_same(const LinkAddress *a, const LinkAddress *b) {
+        return a->family == b->family && netd_addr_eq(a->family, &a->address, &b->address) &&
+                        (a->family == AF_INET6 || a->prefixlen == b->prefixlen);
+}
+
+static bool link_address_equal(const LinkAddress *a, const LinkAddress *b) {
+        return link_address_same(a, b) && a->prefixlen == b->prefixlen && a->scope == b->scope &&
+                        a->flags == b->flags && a->has_peer == b->has_peer &&
+                        (!a->has_peer || netd_addr_eq(a->family, &a->peer, &b->peer)) &&
+                        a->route_metric == b->route_metric && a->preferred_sec == b->preferred_sec &&
+                        strcmp(a->label, b->label) == 0;
+}
+
+/*
+ * What an NLM_F_REPLACE changes in place. IPv4 takes only the lifetimes and
+ * the prefix route metric; IPv6 also takes the peer and the flags. Anything
+ * else needs the address deleted and added again.
+ */
+static bool link_address_updatable(const LinkAddress *have, const LinkAddress *want) {
+        if (have->prefixlen != want->prefixlen || have->scope != want->scope ||
+            strcmp(have->label, want->label) != 0)
+                return false;
+
+        if (have->family == AF_INET6)
+                return true;
+
+        return have->flags == want->flags && have->has_peer == want->has_peer &&
+                        (!have->has_peer || netd_addr_eq(AF_INET, &have->peer, &want->peer));
+}
+
+static void link_address_to_rtnl(const Link *l, const LinkAddress *a, NetdRtnlAddress *out) {
+        memset(out, 0, sizeof(*out));
+        out->ifindex = l->ifindex;
+        out->family = a->family;
+        out->prefixlen = a->prefixlen;
+        out->scope = a->scope;
+        out->address = a->address;
+        out->peer = a->peer;
+        out->has_peer = a->has_peer;
+        out->flags = a->flags;
+        out->valid_sec = UINT32_MAX;
+        out->preferred_sec = a->preferred_sec;
+        out->route_metric = a->route_metric;
+        out->label = a->label[0] ? a->label : NULL;
+}
+
+static LinkAddress *link_address_find(Link *l, const LinkAddress *like) {
+        for (size_t i = 0; i < l->n_addrs; i++)
+                if (link_address_same(&l->addrs[i], like))
+                        return &l->addrs[i];
+
+        return NULL;
+}
+
+static int link_address_send(Link *l, const LinkAddress *a) {
+        NetdRtnlAddress ra;
+        int r;
+
+        link_address_to_rtnl(l, a, &ra);
+        r = netd_rtnl_address_add(l->netd->rtnl, &ra);
+        return r == -EEXIST ? 0 : r;
+}
+
+static int link_address_unsend(Link *l, const LinkAddress *a) {
+        NetdRtnlAddress ra;
+        int r;
+
+        link_address_to_rtnl(l, a, &ra);
+        r = netd_rtnl_address_del(l->netd->rtnl, &ra);
+        return (r == -EADDRNOTAVAIL || r == -ENOENT || r == -ENODEV) ? 0 : r;
+}
+
+/* Forgets the record at `a`, which points into l->addrs. */
+static void link_address_forget(Link *l, LinkAddress *a) {
+        size_t i = (size_t) (a - l->addrs);
+
+        memmove(&l->addrs[i], &l->addrs[i + 1], (l->n_addrs - i - 1) * sizeof(*a));
+        l->n_addrs--;
+}
+
+/* Records `a`, or updates the record of the same address. */
+static int link_address_record(Link *l, const LinkAddress *a) {
+        LinkAddress *have = link_address_find(l, a), *grown;
+
+        if (have) {
+                *have = *a;
+                return 0;
+        }
+
+        if (l->n_addrs >= LINK_ADDRS_MAX)
+                return -ENOSPC;
+
+        grown = realloc(l->addrs, (l->n_addrs + 1) * sizeof(*grown));
+        if (!grown)
+                return -ENOMEM;
+
+        l->addrs = grown;
+        l->addrs[l->n_addrs++] = *a;
+        return 0;
+}
+
+/* True when a static entry also names this IPv4 address: its kernel object
+ * then has two owners and is removed only when the last one lets go. */
+static bool link_static_owns_v4(const Link *l, struct in_addr addr, unsigned char prefixlen) {
+        for (size_t i = 0; i < l->n_addrs; i++) {
+                const LinkAddress *a = &l->addrs[i];
+
+                if (a->family == AF_INET && !a->doomed && a->prefixlen == prefixlen &&
+                    a->address.in.s_addr == addr.s_addr)
+                        return true;
+        }
+
+        return false;
+}
+
+static bool link_lease_owns_v4(const Link *l, struct in_addr addr, unsigned char prefixlen) {
+        return l->address_configured && l->prefixlen == prefixlen && l->address.s_addr == addr.s_addr;
+}
+
+/*
+ * Deleting the primary IPv4 address of a subnet also deletes every secondary
+ * one (net.ipv4.conf.*.promote_secondaries defaults to 0) and the routes that
+ * went through it. After any IPv4 delete, send the other addresses of that
+ * subnet and the default route again; what is still there answers EEXIST. A
+ * route that cannot come back is forgotten, so the next converge sees it
+ * missing instead of trusting the slot.
+ */
+static void link_v4_address_deleted(Link *l, struct in_addr addr, unsigned char prefixlen) {
+        Netd *n = l->netd;
+        int r;
+
+        for (size_t i = 0; i < l->n_addrs; i++) {
+                const LinkAddress *a = &l->addrs[i];
+
+                if (a->family != AF_INET || a->doomed ||
+                    !same_subnet(a->address.in, a->prefixlen, addr, prefixlen))
+                        continue;
+
+                r = link_address_send(l, a);
+                if (r < 0)
+                        pico_log(PICO_LOG_WARNING,
+                                 "netd: %s: failed to restore an address after a delete: %s",
+                                 l->ifname,
+                                 strerror(-r));
+        }
+
+        if (l->address_configured && same_subnet(l->address, l->prefixlen, addr, prefixlen) &&
+            !(l->address.s_addr == addr.s_addr && l->prefixlen == prefixlen) &&
+            !link_static_owns_v4(l, l->address, l->prefixlen)) {
+                uint32_t life = l->lease ? lease_remaining_sec(l->lease) : UINT32_MAX;
+
+                r = address_add_idempotent(
+                                n->rtnl, l->ifindex, &l->address, l->prefixlen, life, l->address_metric);
+                if (r < 0)
+                        pico_log(PICO_LOG_WARNING,
+                                 "netd: %s: failed to restore the lease address after a delete: %s",
+                                 l->ifname,
+                                 strerror(-r));
+        }
+
+        if (!l->gateway_configured)
+                return;
+
+        r = 0;
+        if (l->gateway_host_route)
+                r = route_add_host_idempotent(n->rtnl, l->ifindex, &l->gateway, l->gateway_metric);
+        if (r == 0)
+                r = route_add_default_idempotent(n->rtnl, l->ifindex, &l->gateway, l->gateway_metric);
+        if (r < 0) {
+                pico_log(PICO_LOG_WARNING,
+                         "netd: %s: default route did not survive an address delete: %s",
+                         l->ifname,
+                         strerror(-r));
+                l->gateway_configured = false;
+                l->gateway_host_route = false;
+                l->gateway_from_lease = false;
+        }
+}
 
 /*
  * The kernel flushes a link's routes with its last IPv4 address, so the
  * default route goes first and the caller adds it back; left in place, the
- * slot would claim a route the kernel no longer has.
+ * slot would claim a route the kernel no longer has. A lease address that a
+ * static entry also names stays in the kernel.
  */
 static int link_address_del(Link *l) {
+        struct in_addr addr = l->address;
+        unsigned char prefixlen = l->prefixlen;
+        bool shared = link_static_owns_v4(l, addr, prefixlen);
         int r;
 
         if (l->gateway_configured) {
@@ -151,11 +339,15 @@ static int link_address_del(Link *l) {
                         return r;
         }
 
-        r = address_del_idempotent(l->netd->rtnl, l->ifindex, &l->address, l->prefixlen);
-        if (r < 0)
-                return r;
+        if (!shared) {
+                r = address_del_idempotent(l->netd->rtnl, l->ifindex, &addr, prefixlen);
+                if (r < 0)
+                        return r;
+        }
 
         l->address_configured = false;
+        if (!shared)
+                link_v4_address_deleted(l, addr, prefixlen);
         return 0;
 }
 
@@ -178,9 +370,8 @@ static int link_address_del(Link *l) {
  *      shortest possible address-less window; the two addresses never share
  *      a connected route, so there is no secondary/cascade risk.
  *
- * `lifetime_sec` is UINT32_MAX for a static Address=, the lease time for a
- * DHCP one; `metric` is the prefix route's. Shared by apply_static_address()
- * and link_apply_lease().
+ * `lifetime_sec` is the lease time and `metric` the prefix route's. Used for
+ * the lease only; static entries have their own table.
  */
 static int converge_address(
                 Link *l,
@@ -189,10 +380,14 @@ static int converge_address(
                 uint32_t lifetime_sec,
                 uint32_t metric) {
         Netd *n = l->netd;
+        bool shared = link_static_owns_v4(l, *want, want_pfx);
         int r;
 
+        /* An address a static entry also names keeps the static entry's
+         * lifetime and metric: the lease only records that it is there. */
         if (l->address_configured && l->address.s_addr == want->s_addr && l->prefixlen == want_pfx) {
-                r = address_add_idempotent(n->rtnl, l->ifindex, want, want_pfx, lifetime_sec, metric);
+                r = shared ? 0 :
+                             address_add_idempotent(n->rtnl, l->ifindex, want, want_pfx, lifetime_sec, metric);
                 if (r < 0)
                         return r;
         } else if (l->address_configured && same_subnet(l->address, l->prefixlen, *want, want_pfx)) {
@@ -200,16 +395,24 @@ static int converge_address(
                 if (r < 0)
                         return r;
 
-                r = address_add_idempotent(n->rtnl, l->ifindex, want, want_pfx, lifetime_sec, metric);
+                r = shared ? 0 :
+                             address_add_idempotent(n->rtnl, l->ifindex, want, want_pfx, lifetime_sec, metric);
                 if (r < 0)
                         return r;
         } else {
-                r = address_add_idempotent(n->rtnl, l->ifindex, want, want_pfx, lifetime_sec, metric);
+                r = shared ? 0 :
+                             address_add_idempotent(n->rtnl, l->ifindex, want, want_pfx, lifetime_sec, metric);
                 if (r < 0)
                         return r;
 
-                if (l->address_configured)
-                        (void) address_del_idempotent(n->rtnl, l->ifindex, &l->address, l->prefixlen);
+                if (l->address_configured && !link_static_owns_v4(l, l->address, l->prefixlen)) {
+                        struct in_addr old = l->address;
+                        unsigned char old_pfx = l->prefixlen;
+
+                        (void) address_del_idempotent(n->rtnl, l->ifindex, &old, old_pfx);
+                        l->address_configured = false;
+                        link_v4_address_deleted(l, old, old_pfx);
+                }
         }
 
         l->address = *want;
@@ -283,6 +486,7 @@ Link *link_free(Link *l) {
                 l->lease = dhcp_lease_unref(l->lease);
 
         (void) link_remove_state_file(l);
+        free(l->addrs);
 
         if (n) {
                 for (size_t i = 0; i < n->n_links; i++)
@@ -400,36 +604,210 @@ int netd_link_rtnl_handler(void *userdata, NetdRtnlLinkEvent event, const NetdRt
 
 /* --- static Address=/Gateway= convergence --- */
 
-static int apply_static_address(Link *l, const Network *nw) {
-        const NetworkAddress *want = network_first_address_v4(nw);
+static void link_address_from_network(const NetworkAddress *na, LinkAddress *out) {
+        memset(out, 0, sizeof(*out));
+        out->family = na->family;
+        out->prefixlen = na->prefixlen;
+        out->scope = na->scope;
+        out->address = na->address;
+        out->peer = na->peer;
+        out->has_peer = na->peer_set;
+        out->route_metric = na->route_metric;
+        out->preferred_sec = na->deprecated ? 0 : UINT32_MAX;
+        memcpy(out->label, na->label, sizeof(out->label));
 
-        if (!want) {
-                if (!l->address_configured)
-                        return 0;
+        if (na->family == AF_INET6 && !na->dad)
+                out->flags |= IFA_F_NODAD;
+        if (na->no_prefix_route)
+                out->flags |= IFA_F_NOPREFIXROUTE;
+}
 
-                /*
-                 * No Address= does not mean no address: with DHCP= still on,
-                 * the one in the kernel is the lease's, and a reload must
-                 * leave it alone (the lease and its client stay, see
-                 * link_configure_impl()) instead of deleting an address
-                 * nothing will bring back until the next renewal.
-                 */
-                if (l->lease && network_dhcp4_enabled(nw))
-                        return 0;
+static void link_warn_address(const Link *l, const char *what, const LinkAddress *a, int r) {
+        char buf[INET6_ADDRSTRLEN];
 
-                return link_address_del(l);
+        pico_log(PICO_LOG_WARNING,
+                 "netd: %s: failed to %s address %s/%u: %s",
+                 l->ifname,
+                 what,
+                 netd_addr_to_string(a->family, &a->address, buf),
+                 (unsigned) a->prefixlen,
+                 strerror(-r));
+}
+
+/* Deletes the kernel address of `a` (a record in l->addrs) and forgets it. */
+static int link_static_address_remove(Link *l, LinkAddress *a, bool cascade) {
+        LinkAddress gone = *a;
+        int r;
+
+        /* A lease address that is also this one stays in the kernel. */
+        if (!(gone.family == AF_INET && link_lease_owns_v4(l, gone.address.in, gone.prefixlen))) {
+                r = link_address_unsend(l, &gone);
+                if (r < 0) {
+                        link_warn_address(l, "remove", &gone, r);
+                        return r;
+                }
         }
 
-        /* Already exactly right: leave it strictly alone. Reloading must not
-         * bounce a working interface (netd-link.h on link_reconfigure()). A
-         * held lease's address keeps its metric; once DHCP= is off it is
-         * Address='s, at 0. */
-        if (l->address_configured && l->address.s_addr == want->address.in.s_addr &&
-            l->prefixlen == want->prefixlen &&
-            (l->address_metric == 0 || (l->lease && network_dhcp4_enabled(nw))))
+        link_address_forget(l, a);
+        if (cascade && gone.family == AF_INET)
+                link_v4_address_deleted(l, gone.address.in, gone.prefixlen);
+        return 0;
+}
+
+/*
+ * Brings the kernel's static addresses in line with the file: what is
+ * recorded and still wanted is left alone (an unchanged reload makes no
+ * netlink write), what is new is added, what differs is replaced in place when
+ * the kernel takes that, and what is no longer wanted is deleted. Only
+ * addresses netd recorded are ever deleted.
+ *
+ * Order, for the kernel's secondary-address rule (see converge_address()):
+ * an address that is going away and shares an IPv4 subnet with a new one is
+ * deleted first; everything else is added first and deleted last, so the
+ * link is never without an address it keeps. Every IPv4 delete re-sends what
+ * the kernel may have taken with it.
+ */
+static int apply_static_addresses(Link *l, const Network *nw) {
+        LinkAddress want[NETWORK_ADDRESS_MAX];
+        size_t n_want = 0;
+        int first_error = 0, r;
+
+        for (size_t i = 0; i < nw->n_addresses && n_want < NETWORK_ADDRESS_MAX; i++) {
+                const NetworkAddress *na = &nw->addresses[i];
+
+                if (na->family == AF_INET6 && !netd_ipv6_supported()) {
+                        if (!l->warned_no_ipv6)
+                                pico_log(PICO_LOG_WARNING,
+                                         "netd: %s: %s configures IPv6 addresses but the kernel has no IPv6, skipping them",
+                                         l->ifname,
+                                         nw->basename);
+                        l->warned_no_ipv6 = true;
+                        continue;
+                }
+
+                link_address_from_network(na, &want[n_want++]);
+        }
+
+        for (size_t i = 0; i < l->n_addrs; i++) {
+                bool wanted = false;
+
+                for (size_t k = 0; k < n_want; k++)
+                        if (link_address_same(&l->addrs[i], &want[k])) {
+                                wanted = true;
+                                break;
+                        }
+
+                l->addrs[i].doomed = !wanted;
+        }
+
+        /* Phase A: a doomed IPv4 address in the subnet of one about to be
+         * added goes first, so the new one is not made its secondary. */
+        for (size_t i = 0; i < l->n_addrs;) {
+                LinkAddress *have = &l->addrs[i];
+                bool clash = false;
+
+                for (size_t k = 0; have->doomed && have->family == AF_INET && k < n_want; k++)
+                        if (want[k].family == AF_INET && !link_address_find(l, &want[k]) &&
+                            same_subnet(have->address.in, have->prefixlen, want[k].address.in, want[k].prefixlen))
+                                clash = true;
+
+                if (!clash) {
+                        i++;
+                        continue;
+                }
+
+                r = link_static_address_remove(l, have, true);
+                if (r < 0) {
+                        if (!first_error)
+                                first_error = r;
+                        i++;
+                }
+        }
+
+        /* Phase B */
+        for (size_t k = 0; k < n_want; k++) {
+                LinkAddress *have = link_address_find(l, &want[k]);
+
+                if (have && have->installed && link_address_equal(have, &want[k]))
+                        continue;
+
+                if (have && (!have->installed || !link_address_updatable(have, &want[k]))) {
+                        if (have->installed) {
+                                r = link_static_address_remove(l, have, true);
+                                if (r < 0) {
+                                        if (!first_error)
+                                                first_error = r;
+                                        continue;
+                                }
+                        } else
+                                link_address_forget(l, have);
+                        have = NULL;
+                }
+
+                r = link_address_send(l, &want[k]);
+                if (r < 0 && want[k].family == AF_INET6 && (r == -EACCES || r == -EPERM)) {
+                        /* IPv6 is disabled on this link (disable_ipv6); not a failed link.
+                         * Every link event retries, so say it once. */
+                        if (!l->warned_ipv6_disabled)
+                                link_warn_address(l, "add", &want[k], r);
+                        l->warned_ipv6_disabled = true;
+                        continue;
+                }
+                if (r < 0) {
+                        link_warn_address(l, "add", &want[k], r);
+                        if (!first_error)
+                                first_error = r;
+                        continue;
+                }
+
+                if (want[k].family == AF_INET6)
+                        l->warned_ipv6_disabled = false;
+
+                want[k].installed = true;
+                r = link_address_record(l, &want[k]);
+                if (r < 0 && !first_error)
+                        first_error = r;
+        }
+
+        /* Phase C */
+        for (size_t i = 0; i < l->n_addrs;) {
+                if (!l->addrs[i].doomed) {
+                        i++;
+                        continue;
+                }
+
+                r = link_static_address_remove(l, &l->addrs[i], true);
+                if (r < 0) {
+                        if (!first_error)
+                                first_error = r;
+                        i++;
+                }
+        }
+
+        return first_error;
+}
+
+/*
+ * With DHCP= off the lease's address no longer has an owner: delete it before
+ * the static addresses are settled, so one in its subnet is not made its
+ * secondary. An address a static entry also names is only released, and that
+ * entry's add refreshes it to the static lifetime.
+ */
+static int link_drop_lease_address(Link *l, const Network *nw) {
+        if (!l->address_configured || network_dhcp4_enabled(nw))
                 return 0;
 
-        return converge_address(l, &want->address.in, want->prefixlen, UINT32_MAX, 0);
+        for (size_t i = 0; i < nw->n_addresses; i++) {
+                const NetworkAddress *na = &nw->addresses[i];
+
+                if (na->family == AF_INET && na->prefixlen == l->prefixlen &&
+                    na->address.in.s_addr == l->address.s_addr) {
+                        l->address_configured = false;
+                        return 0;
+                }
+        }
+
+        return link_address_del(l);
 }
 
 /* Removes the default route and, if there is one, its host route. */
@@ -631,7 +1009,7 @@ static void link_reapply_lease_routes(Link *l, const Network *nw) {
         metric = link_lease_route_metric(l);
         life = lease_remaining_sec(l->lease);
         if (l->address_configured && l->address.s_addr == addr.s_addr && l->prefixlen == prefixlen &&
-            l->address_metric != metric && life > 0) {
+            l->address_metric != metric && life > 0 && !link_static_owns_v4(l, addr, prefixlen)) {
                 r = address_add_idempotent(l->netd->rtnl, l->ifindex, &addr, prefixlen, life, metric);
                 if (r < 0)
                         pico_log(PICO_LOG_WARNING,
@@ -1081,6 +1459,15 @@ static int link_configure_impl(Link *l) {
         l->state = LINK_CONFIGURING;
 
         /*
+         * A down link has lost its IPv6 addresses (keep_addr_on_down is off
+         * by default), so the table is sent again below. IPv4 addresses stay.
+         */
+        if (!(l->flags & IFF_UP))
+                for (size_t i = 0; i < l->n_addrs; i++)
+                        if (l->addrs[i].family == AF_INET6)
+                                l->addrs[i].installed = false;
+
+        /*
          * Before bringing the link up: a MAC change needs the link down.
          * Self-gating, see link_apply_persistent_mac().
          */
@@ -1093,7 +1480,17 @@ static int link_configure_impl(Link *l) {
                 return r;
         }
 
-        r = apply_static_address(l, nw);
+        r = link_drop_lease_address(l, nw);
+        if (r < 0) {
+                pico_log(PICO_LOG_WARNING,
+                         "netd: %s: failed to remove the lease address: %s",
+                         l->ifname,
+                         strerror(-r));
+                l->state = LINK_FAILED;
+                return r;
+        }
+
+        r = apply_static_addresses(l, nw);
         if (r < 0) {
                 pico_log(PICO_LOG_WARNING, "netd: %s: failed to apply Address=: %s", l->ifname, strerror(-r));
                 l->state = LINK_FAILED;
@@ -1207,14 +1604,27 @@ int link_reconfigure(Link *l) {
         return link_configure(l);
 }
 
-/*
- * The kernel/lease-file half of teardown, shared by link_deconfigure() (which
- * also stops DHCP outright) and link_lose_lease() (which does not -- see
- * that function's doc in netd-link.h for why the DHCP client is not touched
- * here). Never touches l->dhcp_client/l->dhcp_server.
- */
-static int link_teardown_kernel_state(Link *l) {
-        Netd *n = l->netd;
+/* Deletes every recorded static address. A kernel that already dropped one
+ * (link gone, IPv6 flushed on link down) is not an error. */
+static int link_teardown_static_addresses(Link *l) {
+        int ret = 0;
+
+        for (size_t i = 0; i < l->n_addrs;) {
+                int r = link_static_address_remove(l, &l->addrs[i], false);
+
+                if (r < 0) {
+                        if (ret == 0)
+                                ret = r;
+                        i++;
+                }
+        }
+
+        return ret;
+}
+
+/* What a lease put in the kernel: the default route, the address and the
+ * lease file. Static addresses stay. */
+static int link_teardown_lease_state(Link *l) {
         int r, ret = 0;
 
         if (l->gateway_configured) {
@@ -1224,13 +1634,12 @@ static int link_teardown_kernel_state(Link *l) {
                                  "netd: %s: failed to remove route: %s",
                                  l->ifname,
                                  strerror(-r));
-                        if (ret == 0)
-                                ret = r;
+                        ret = r;
                 }
         }
 
         if (l->address_configured) {
-                r = address_del_idempotent(n->rtnl, l->ifindex, &l->address, l->prefixlen);
+                r = link_address_del(l);
                 if (r < 0) {
                         pico_log(PICO_LOG_WARNING,
                                  "netd: %s: failed to remove address: %s",
@@ -1238,8 +1647,7 @@ static int link_teardown_kernel_state(Link *l) {
                                  strerror(-r));
                         if (ret == 0)
                                 ret = r;
-                } else
-                        l->address_configured = false;
+                }
         }
 
         if (l->lease) {
@@ -1248,6 +1656,19 @@ static int link_teardown_kernel_state(Link *l) {
         }
 
         return ret;
+}
+
+/*
+ * The kernel/lease-file half of teardown, shared by link_deconfigure() (which
+ * also stops DHCP outright) and link_lose_lease() (which uses only the lease
+ * half -- see that function's doc in netd-link.h for why the DHCP client is
+ * not touched here). Never touches l->dhcp_client/l->dhcp_server.
+ */
+static int link_teardown_kernel_state(Link *l) {
+        int r, ret = link_teardown_static_addresses(l);
+
+        r = link_teardown_lease_state(l);
+        return ret ? ret : r;
 }
 
 static void dhcp_client_unref_void(void *p) {
@@ -1336,9 +1757,25 @@ static void link_stop_lldp(Link *l) {
         link_release_dhcp_object(l, lldp, lldp_link_free_void, "LLDP state");
 }
 
+/* The management address is the lease's, else the first static IPv4 one. */
 static void link_lldp_update_address(Link *l) {
-        if (l->lldp)
-                lldp_link_set_address(l->lldp, l->address_configured, l->address);
+        struct in_addr none = { 0 };
+
+        if (!l->lldp)
+                return;
+
+        if (l->address_configured) {
+                lldp_link_set_address(l->lldp, true, l->address);
+                return;
+        }
+
+        for (size_t i = 0; i < l->n_addrs; i++)
+                if (l->addrs[i].family == AF_INET && l->addrs[i].installed) {
+                        lldp_link_set_address(l->lldp, true, l->addrs[i].address.in);
+                        return;
+                }
+
+        lldp_link_set_address(l->lldp, false, none);
 }
 
 /*
@@ -1526,11 +1963,12 @@ int link_lose_lease(Link *l) {
                 return -EBUSY;
 
         l->applying_lease = true;
-        r = link_teardown_kernel_state(l);
+        r = link_teardown_lease_state(l);
 
-        /* The teardown took the one address and route slot, static or not. */
+        /* The static addresses stayed; this settles any the lease's delete
+         * cost, and puts Gateway= back. */
         if (l->network) {
-                int rr = apply_static_address(l, l->network);
+                int rr = apply_static_addresses(l, l->network);
 
                 if (rr < 0)
                         pico_log(PICO_LOG_WARNING,

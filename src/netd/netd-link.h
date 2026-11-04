@@ -55,6 +55,31 @@ typedef enum LinkState {
         _LINK_STATE_MAX,
 } LinkState;
 
+/*
+ * One static address netd put into the kernel, with the fields it sent, so a
+ * reload can tell "already correct" from "needs replacing" without reading
+ * the kernel back. Leases do not use this table: the lease has its own slot
+ * in Link.
+ */
+typedef struct LinkAddress {
+        uint8_t family;
+        uint8_t prefixlen;
+        uint8_t scope;
+        bool has_peer;
+        bool installed; /* false once the kernel is known to have dropped it (link down) */
+        bool doomed;    /* during a converge pass: recorded but no longer wanted */
+        uint32_t flags; /* IFA_F_* */
+        NetdInAddr address;
+        NetdInAddr peer;
+        uint32_t route_metric;
+        uint32_t preferred_sec; /* UINT32_MAX forever, 0 deprecated */
+        char label[IFNAMSIZ];
+} LinkAddress;
+
+/* More than a file can ask for, so a delete that keeps failing cannot let the
+ * table grow without bound. */
+#define LINK_ADDRS_MAX (2 * 16)
+
 struct Link {
         Netd *netd; /* borrowed */
 
@@ -96,12 +121,20 @@ struct Link {
          * what it added and a reconfigure can tell "already correct" from
          * "needs replacing". Not re-read from the kernel: another process
          * adding an address is not netd's to remove.
+         *
+         * `addrs` is every static address, IPv4 and IPv6. The fields below
+         * are the lease's address only, which lives beside them.
          */
+        LinkAddress *addrs;
+        size_t n_addrs;
+        bool warned_no_ipv6;       /* IPv6 entries skipped on a kernel without IPv6, said once */
+        bool warned_ipv6_disabled; /* IPv6 refusal said once, until an address is accepted */
+
         struct in_addr address;
         unsigned char prefixlen;
         bool address_configured;
-        /* The prefix route's metric (IFA_RT_PRIORITY): a lease's RouteMetric=,
-         * 0 for Address=. A reload compares it to move the prefix route. */
+        /* The prefix route's metric (IFA_RT_PRIORITY): the lease's RouteMetric=.
+         * A reload compares it to move the prefix route. */
         uint32_t address_metric;
 
         struct in_addr gateway;
@@ -159,7 +192,7 @@ int netd_link_rtnl_handler(void *userdata, NetdRtnlLinkEvent event, const NetdRt
 
 /*
  * Match `l` against the current .network set and apply it: bring the link up,
- * add any static Address=/Gateway=, arm the DHCPv4 client when DHCP= says so,
+ * add the static addresses and any Gateway=, arm the DHCPv4 client when DHCP= says so,
  * start the DHCPv4 server when DHCPServer=yes.
  *
  * Idempotent: it is called on the
@@ -202,11 +235,13 @@ int link_deconfigure(Link *l);
  * when UseNTP=/UseTimezone= allow it -- option 42's NTP servers and option
  * 101's timezone handed to netd-sntp.c and netd-time.c by direct call.
  *
+ * The lease's address is added beside the static ones, as networkd does;
+ * one that a static entry also names is left as the static entry set it.
+ *
  * Address application is three cases, not one, chosen from the addresses
- * themselves (netd-link.c's converge_address(), shared with static Address=
- * reconfiguration) rather than from the DhcpClientEvent -- the two give the
- * same answer, and the addresses are the ground truth the kernel actually
- * cares about:
+ * themselves (netd-link.c's converge_address()) rather than from the
+ * DhcpClientEvent -- the two give the same answer, and the addresses are the
+ * ground truth the kernel actually cares about:
  *
  *   1. RENEW, i.e. the *same* address/prefix as already configured (the
  *      common case: T1/T2 firing with nothing else changed) -- a single
@@ -230,7 +265,7 @@ int link_apply_lease(Link *l, DhcpLease *lease);
 
 /*
  * Lease expired, was NAKed, or was DECLINEd: remove what it configured
- * (address, route, lease file), put back a static Address=/Gateway=, and go
+ * (address, route, lease file), put back a static Gateway=, and go
  * back to LINK_CONFIGURING -- but leave
  * l->dhcp_client running. The client is not netd-link.c's to restart: it
  * already returns itself to INIT and restarts its own DISCOVER cycle

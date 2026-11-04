@@ -53,6 +53,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <linux/if_addr.h>
+#include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <net/if.h>
 #include <sched.h>
@@ -62,6 +63,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -447,7 +449,8 @@ static void test_netns_static_network_and_sighup(void) {
         l = netd_find_link_by_name(n, "nettest0");
         ASSERT_TRUE(l != NULL);
         ASSERT_EQ_INT(l->state, LINK_CONFIGURED);
-        ASSERT_TRUE(l->address_configured);
+        ASSERT_EQ_INT(l->n_addrs, 1);
+        ASSERT_TRUE(l->addrs[0].installed);
         ASSERT_TRUE(l->gateway_configured);
 
         run_shell("ip -4 addr show dev nettest0 | grep -q '10\\.252\\.0\\.5/24'");
@@ -1168,7 +1171,9 @@ static void test_netns_lease_default_metric_routes(void) {
         /* DHCP= off with Address= at the leased address: Address='s metric. */
         fixture_write(&f, "05-dmp.network", "[Match]\nName=dmp0\n\n[Network]\nAddress=10.103.0.2/24\n");
         ASSERT_TRUE(f.n->reload_handler(f.n) == 0);
-        ASSERT_EQ_INT(fixture_link(&f, "dmp0")->address_metric, 0);
+        ASSERT_TRUE(!fixture_link(&f, "dmp0")->address_configured);
+        ASSERT_EQ_INT(fixture_link(&f, "dmp0")->n_addrs, 1);
+        ASSERT_EQ_INT(fixture_link(&f, "dmp0")->addrs[0].route_metric, 0);
         run_shell("ip -4 route show dev dmp0 metric 0 | grep -q '^10\\.103\\.0\\.0/24 '");
         run_shell("test \"$(ip -4 route show dev dmp0 | wc -l)\" -eq 1");
 
@@ -1588,7 +1593,10 @@ static void test_netns_lose_lease_restores_static(void) {
 
         l = fixture_link(&f, "ll0");
 
+        /* The lease's address is added beside Address=, as networkd does. */
         ASSERT_TRUE(link_apply_lease(l, make_lease("10.95.0.3", "255.255.255.0", "10.95.0.254")) == 0);
+        run_shell("ip -4 addr show dev ll0 | grep -q '10\\.95\\.0\\.2/24'");
+        run_shell("ip -4 addr show dev ll0 | grep -q '10\\.95\\.0\\.3/24'");
         assert_one_default("ll0", "10\\.95\\.0\\.254", 1024);
         ASSERT_TRUE(link_lose_lease(l) == 0);
         ASSERT_TRUE(l->lease == NULL);
@@ -1652,6 +1660,310 @@ static void test_netns_dhcp_off_drops_lease(void) {
         printf("test-netd-rtnl: DHCP= off drops the lease subtest ok\n");
 }
 
+/* --- [Address] end to end --- */
+
+/* A socket on the IPv4 and IPv6 address groups, to count the RTM_NEWADDR the
+ * kernel sends: a re-sent address is announced again, an untouched one is
+ * not. */
+static int addr_monitor_open(void) {
+        struct sockaddr_nl sa;
+        int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, NETLINK_ROUTE);
+
+        ASSERT_TRUE(fd >= 0);
+        memset(&sa, 0, sizeof(sa));
+        sa.nl_family = AF_NETLINK;
+        sa.nl_groups = (1u << (RTNLGRP_IPV4_IFADDR - 1)) | (1u << (RTNLGRP_IPV6_IFADDR - 1));
+        ASSERT_TRUE(bind(fd, (struct sockaddr *) &sa, sizeof(sa)) == 0);
+        return fd;
+}
+
+/* Drains the socket and counts, per literal in `addrs`, the RTM_NEWADDR whose
+ * IFA_LOCAL (IFA_ADDRESS without one) is that address. */
+static void addr_monitor_counts(int fd, const char * const *addrs, int *counts, size_t n) {
+        union {
+                struct nlmsghdr hdr;
+                uint8_t buf[8192];
+        } rb;
+        NetdInAddr want[4];
+        int family[4];
+        ssize_t len;
+
+        ASSERT_TRUE(n <= 4);
+        for (size_t i = 0; i < n; i++) {
+                ASSERT_EQ_INT(netd_addr_parse(addrs[i], &family[i], &want[i]), 0);
+                counts[i] = 0;
+        }
+
+        while ((len = recv(fd, rb.buf, sizeof(rb.buf), 0)) > 0) {
+                for (const struct nlmsghdr *nlh = &rb.hdr; NLMSG_OK(nlh, (size_t) len);
+                     nlh = NLMSG_NEXT(nlh, len)) {
+                        const struct ifaddrmsg *ifa = NLMSG_DATA(nlh);
+                        const struct rtattr *rta, *local = NULL, *plain = NULL;
+                        int rem;
+
+                        if (nlh->nlmsg_type != RTM_NEWADDR)
+                                continue;
+
+                        rta = IFA_RTA(ifa);
+                        rem = (int) IFA_PAYLOAD(nlh);
+                        for (; RTA_OK(rta, rem); rta = RTA_NEXT(rta, rem)) {
+                                if (rta->rta_type == IFA_LOCAL)
+                                        local = rta;
+                                else if (rta->rta_type == IFA_ADDRESS)
+                                        plain = rta;
+                        }
+
+                        if (!local)
+                                local = plain;
+                        if (!local)
+                                continue;
+
+                        for (size_t i = 0; i < n; i++) {
+                                size_t size = family[i] == AF_INET ? 4 : 16;
+
+                                if (ifa->ifa_family == family[i] && RTA_PAYLOAD(local) >= size &&
+                                    memcmp(RTA_DATA(local), want[i].bytes, size) == 0)
+                                        counts[i]++;
+                        }
+                }
+        }
+}
+
+/* Two IPv4 addresses and an IPv6 one from [Network] and two [Address]
+ * sections, with the prefix routes at the metrics asked for. */
+static void test_netns_address_sections(void) {
+        NetdFixture f;
+
+        enter_test_netns();
+        fixture_init(&f);
+        fixture_write(&f,
+                      "10-ad.network",
+                      "[Match]\nName=ad0\n\n[Network]\nAddress=10.110.0.2/24\n\n"
+                      "[Address]\nAddress=10.111.0.2/24\nRouteMetric=50\nLabel=ad0:b\n\n"
+                      "[Address]\nAddress=fd11::2/64\nDuplicateAddressDetection=none\nRouteMetric=300\n");
+        run_ip("link add name ad0 type veth peer name ad1");
+        fixture_start(&f);
+
+        ASSERT_EQ_INT(fixture_link(&f, "ad0")->state, LINK_CONFIGURED);
+        run_shell("ip -4 addr show dev ad0 | grep -q '10\\.110\\.0\\.2/24'");
+        run_shell("ip -4 addr show dev ad0 | grep -q '10\\.111\\.0\\.2/24 .* ad0:b'");
+        run_shell("ip -4 route show dev ad0 metric 0 | grep -q '^10\\.110\\.0\\.0/24 '");
+        run_shell("ip -4 route show dev ad0 metric 50 | grep -q '^10\\.111\\.0\\.0/24 '");
+
+        if (!netd_ipv6_supported())
+                fprintf(stderr, "test-netd-rtnl: kernel without IPv6, skipping the IPv6 address assertions\n");
+        else {
+                ASSERT_EQ_INT(fixture_link(&f, "ad0")->n_addrs, 3);
+                run_shell("ip -6 -o addr show dev ad0 | grep -q 'fd11::2/64.* nodad'");
+                run_shell("ip -6 route show dev ad0 metric 300 | grep -q '^fd11::/64 '");
+        }
+
+        run_ip("link del ad0");
+        ASSERT_TRUE(netd_rtnl_process(f.n->rtnl) >= 1);
+        fixture_stop(&f);
+
+        printf("test-netd-rtnl: [Address] sections subtest ok\n");
+}
+
+/* A reload writes only what changed: one address goes, one moves its prefix
+ * route, and a third that did not change is not sent again. */
+static void test_netns_address_reload_diff(void) {
+        const char * const watched[2] = { "10.112.1.2", "10.112.2.2" };
+        NetdFixture f;
+        int counts[2], mon;
+
+        enter_test_netns();
+        fixture_init(&f);
+        fixture_write(&f,
+                      "10-ar.network",
+                      "[Match]\nName=ar0\n\n[Network]\nAddress=10.112.0.2/24\n\n"
+                      "[Address]\nAddress=10.112.1.2/24\nRouteMetric=20\n\n"
+                      "[Address]\nAddress=10.112.2.2/24\nRouteMetric=30\nLabel=ar0:c\n");
+        run_ip("link add name ar0 type veth peer name ar1");
+        fixture_start(&f);
+        mon = addr_monitor_open();
+
+        fixture_write(&f,
+                      "10-ar.network",
+                      "[Match]\nName=ar0\n\n[Address]\nAddress=10.112.1.2/24\nRouteMetric=25\n\n"
+                      "[Address]\nAddress=10.112.2.2/24\nRouteMetric=30\nLabel=ar0:c\n");
+        ASSERT_TRUE(f.n->reload_handler(f.n) == 0);
+
+        run_shell("! ip -4 addr show dev ar0 | grep -q '10\\.112\\.0\\.2/'");
+        run_shell("ip -4 route show dev ar0 metric 25 | grep -q '^10\\.112\\.1\\.0/24 '");
+        run_shell("test -z \"$(ip -4 route show dev ar0 metric 20)\"");
+        run_shell("ip -4 route show dev ar0 metric 30 | grep -q '^10\\.112\\.2\\.0/24 '");
+        addr_monitor_counts(mon, watched, counts, 2);
+        ASSERT_EQ_INT(counts[0], 1); /* moved: sent again */
+        ASSERT_EQ_INT(counts[1], 0); /* unchanged: not sent */
+
+        /* nothing changed: no address is announced again */
+        ASSERT_TRUE(f.n->reload_handler(f.n) == 0);
+        addr_monitor_counts(mon, watched, counts, 2);
+        ASSERT_EQ_INT(counts[0], 0);
+        ASSERT_EQ_INT(counts[1], 0);
+
+        close(mon);
+        run_ip("link del ar0");
+        ASSERT_TRUE(netd_rtnl_process(f.n->rtnl) >= 1);
+        fixture_stop(&f);
+
+        printf("test-netd-rtnl: [Address] reload diff subtest ok\n");
+}
+
+/* Deleting the primary address of a subnet takes its secondaries with it;
+ * the others of that subnet and the default route are sent again. */
+static void test_netns_address_same_subnet_survives_delete(void) {
+        NetdFixture f;
+
+        enter_test_netns();
+        fixture_init(&f);
+        fixture_write(&f,
+                      "10-as.network",
+                      "[Match]\nName=as0\n\n[Network]\nAddress=10.113.0.2/24\nAddress=10.113.0.3/24\n"
+                      "Gateway=10.113.0.254\n");
+        run_ip("link add name as0 type veth peer name as1");
+        fixture_start(&f);
+
+        run_shell("ip -4 addr show dev as0 | grep -q '10\\.113\\.0\\.2/24'");
+        run_shell("ip -4 addr show dev as0 | grep -q '10\\.113\\.0\\.3/24'");
+
+        fixture_write(&f,
+                      "10-as.network",
+                      "[Match]\nName=as0\n\n[Network]\nAddress=10.113.0.3/24\nGateway=10.113.0.254\n");
+        ASSERT_TRUE(f.n->reload_handler(f.n) == 0);
+        run_shell("! ip -4 addr show dev as0 | grep -q '10\\.113\\.0\\.2/'");
+        run_shell("ip -4 addr show dev as0 | grep -q '10\\.113\\.0\\.3/24'");
+        assert_one_default("as0", "10\\.113\\.0\\.254", 0);
+
+        /* a renumber inside the subnet: the leaving address goes before the new one */
+        fixture_write(&f,
+                      "10-as.network",
+                      "[Match]\nName=as0\n\n[Network]\nAddress=10.113.0.4/24\nAddress=10.113.0.3/24\n"
+                      "Gateway=10.113.0.254\n");
+        ASSERT_TRUE(f.n->reload_handler(f.n) == 0);
+        fixture_write(&f,
+                      "10-as.network",
+                      "[Match]\nName=as0\n\n[Network]\nAddress=10.113.0.4/24\nGateway=10.113.0.254\n");
+        ASSERT_TRUE(f.n->reload_handler(f.n) == 0);
+        run_shell("ip -4 addr show dev as0 | grep -q '10\\.113\\.0\\.4/24'");
+        run_shell("! ip -4 addr show dev as0 | grep -q '10\\.113\\.0\\.3/'");
+        assert_one_default("as0", "10\\.113\\.0\\.254", 0);
+
+        run_ip("link del as0");
+        ASSERT_TRUE(netd_rtnl_process(f.n->rtnl) >= 1);
+        fixture_stop(&f);
+
+        printf("test-netd-rtnl: [Address] same-subnet delete subtest ok\n");
+}
+
+/* Address= and DHCP= give the link both addresses; losing the lease leaves
+ * the static one, and a lease at the static address is not removed with it. */
+static void test_netns_static_address_beside_lease(void) {
+        NetdFixture f;
+        Link *l;
+
+        enter_test_netns();
+        fixture_init(&f);
+        fixture_write(&f, "10-sl.network", "[Match]\nName=sl0\n\n[Network]\nAddress=10.114.0.2/24\nDHCP=yes\n");
+        run_ip("link add name sl0 type veth peer name sl1");
+        fixture_start(&f);
+
+        l = fixture_link(&f, "sl0");
+        ASSERT_TRUE(link_apply_lease(l, make_lease("10.114.9.3", "255.255.255.0", NULL)) == 0);
+        run_shell("ip -4 addr show dev sl0 | grep -q '10\\.114\\.0\\.2/24'");
+        run_shell("ip -4 addr show dev sl0 | grep -q '10\\.114\\.9\\.3/24'");
+        ASSERT_TRUE(l->address_configured);
+        ASSERT_EQ_INT(l->n_addrs, 1);
+
+        ASSERT_TRUE(link_lose_lease(l) == 0);
+        run_shell("ip -4 addr show dev sl0 | grep -q '10\\.114\\.0\\.2/24'");
+        run_shell("! ip -4 addr show dev sl0 | grep -q '10\\.114\\.9\\.3/'");
+        ASSERT_TRUE(!l->address_configured);
+
+        /* a lease at the static address: nothing extra, and losing it keeps the address */
+        ASSERT_TRUE(link_apply_lease(l, make_lease("10.114.0.2", "255.255.255.0", NULL)) == 0);
+        run_shell("test \"$(ip -4 addr show dev sl0 | grep -c 'inet 10\\.114\\.0\\.2/24')\" -eq 1");
+        ASSERT_TRUE(link_lose_lease(l) == 0);
+        run_shell("ip -4 addr show dev sl0 | grep -q '10\\.114\\.0\\.2/24'");
+        ASSERT_EQ_INT(l->n_addrs, 1);
+
+        /* the static address leaves a reload while the lease holds its own */
+        ASSERT_TRUE(link_apply_lease(l, make_lease("10.114.0.50", "255.255.255.0", NULL)) == 0);
+        fixture_write(&f, "10-sl.network", "[Match]\nName=sl0\n\n[Network]\nDHCP=yes\n");
+        ASSERT_TRUE(f.n->reload_handler(f.n) == 0);
+        run_shell("! ip -4 addr show dev sl0 | grep -q '10\\.114\\.0\\.2/'");
+        run_shell("ip -4 addr show dev sl0 | grep -q '10\\.114\\.0\\.50/24'");
+
+        run_ip("link del sl0");
+        ASSERT_TRUE(netd_rtnl_process(f.n->rtnl) >= 1);
+        fixture_stop(&f);
+
+        printf("test-netd-rtnl: static address beside a lease subtest ok\n");
+}
+
+/* An address netd did not add is not netd's to remove: it survives a reload
+ * that drops netd's own, and the teardown. */
+static void test_netns_foreign_address_survives(void) {
+        NetdFixture f;
+
+        enter_test_netns();
+        fixture_init(&f);
+        fixture_write(&f, "10-fa.network", "[Match]\nName=fa0\n\n[Network]\nAddress=10.115.0.2/24\n");
+        run_ip("link add name fa0 type veth peer name fa1");
+        fixture_start(&f);
+
+        run_ip("addr add 10.115.9.99/24 dev fa0");
+        fixture_write(&f, "10-fa.network", "[Match]\nName=fa0\n\n[Network]\nAddress=10.115.1.2/24\n");
+        ASSERT_TRUE(f.n->reload_handler(f.n) == 0);
+        run_shell("! ip -4 addr show dev fa0 | grep -q '10\\.115\\.0\\.2/'");
+        run_shell("ip -4 addr show dev fa0 | grep -q '10\\.115\\.1\\.2/24'");
+        run_shell("ip -4 addr show dev fa0 | grep -q '10\\.115\\.9\\.99/24'");
+
+        fixture_stop(&f);
+        run_shell("! ip -4 addr show dev fa0 | grep -q '10\\.115\\.1\\.2/'");
+        run_shell("ip -4 addr show dev fa0 | grep -q '10\\.115\\.9\\.99/24'");
+        run_ip("link del fa0");
+
+        printf("test-netd-rtnl: foreign address subtest ok\n");
+}
+
+/* A link taken down loses its IPv6 addresses; the next event for it puts the
+ * static ones back. */
+static void test_netns_address_back_after_link_down(void) {
+        NetdFixture f;
+
+        if (!netd_ipv6_supported()) {
+                fprintf(stderr, "test-netd-rtnl: kernel without IPv6, skipping the link down subtest\n");
+                return;
+        }
+
+        enter_test_netns();
+        fixture_init(&f);
+        fixture_write(&f,
+                      "10-ld.network",
+                      "[Match]\nName=ld0\n\n[Network]\nAddress=10.116.0.2/24\nAddress=fd16::2/64\n");
+        run_ip("link add name ld0 type veth peer name ld1");
+        fixture_start(&f);
+
+        run_shell("ip -6 addr show dev ld0 | grep -q 'fd16::2/64'");
+
+        run_ip("link set ld0 down");
+        run_shell("! ip -6 addr show dev ld0 | grep -q 'fd16::2/64'");
+        run_shell("ip -4 addr show dev ld0 | grep -q '10\\.116\\.0\\.2/24'");
+
+        ASSERT_TRUE(netd_rtnl_process(f.n->rtnl) >= 1);
+        run_shell("ip link show dev ld0 | grep -q '<[^>]*[,<]UP[,>]'");
+        run_shell("ip -6 addr show dev ld0 | grep -q 'fd16::2/64'");
+        run_shell("ip -4 addr show dev ld0 | grep -q '10\\.116\\.0\\.2/24'");
+
+        run_ip("link del ld0");
+        ASSERT_TRUE(netd_rtnl_process(f.n->rtnl) >= 1);
+        fixture_stop(&f);
+
+        printf("test-netd-rtnl: IPv6 address after link down subtest ok\n");
+}
+
 static int reload_calls;
 
 static int count_reload(Netd *n) {
@@ -1706,6 +2018,12 @@ int main(void) {
         test_netns_gateway_dhcp_no_address();
         test_netns_lose_lease_restores_static();
         test_netns_dhcp_off_drops_lease();
+        test_netns_address_sections();
+        test_netns_address_reload_diff();
+        test_netns_address_same_subnet_survives_delete();
+        test_netns_static_address_beside_lease();
+        test_netns_foreign_address_survives();
+        test_netns_address_back_after_link_down();
         test_reload_dropped_after_exit_request();
 
         printf("test-netd-rtnl: ok\n");
