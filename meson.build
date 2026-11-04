@@ -356,6 +356,8 @@ netd_own_sources = files(
   # the SLAAC interface identifiers.
   'src/netd/ndisc/ndisc-msg.c',
   'src/netd/ndisc/ndisc-iid.c',
+  # The per-link solicitation, receive and expiry engine.
+  'src/netd/ndisc/ndisc-link.c',
 )
 
 # The DHCPv4 implementation lifted from systemd v261.2 (commit 4925d9f07f).
@@ -481,6 +483,8 @@ netd_tests = [
   'test-netd-ndisc-msg',
   # SLAAC interface identifiers: EUI-64, static tokens and RFC 7217 vectors.
   'test-netd-ndisc-iid',
+  # Router advertisements over a veth pair in a private network namespace.
+  'test-netd-ndisc-link',
   # --help, --version and refused arguments.
   'test-netd-opts',
 ]

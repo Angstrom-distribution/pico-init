@@ -38,6 +38,7 @@ typedef enum NetdEpollSource {
         NETD_EPOLL_DHCP_SERVER,
         NETD_EPOLL_SNTP,
         NETD_EPOLL_LLDP,
+        NETD_EPOLL_NDISC,
         _NETD_EPOLL_SOURCE_MAX,
 } NetdEpollSource;
 
