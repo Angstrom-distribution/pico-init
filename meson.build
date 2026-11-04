@@ -352,8 +352,10 @@ netd_own_sources = files(
   'src/netd/lldp/lldp-frame.c',
   'src/netd/lldp/lldp-table.c',
   'src/netd/lldp/lldp-link.c',
-  # IPv6 router advertisements: the message codec and lifetime rules.
+  # IPv6 router advertisements: the message codec and lifetime rules, and
+  # the SLAAC interface identifiers.
   'src/netd/ndisc/ndisc-msg.c',
+  'src/netd/ndisc/ndisc-iid.c',
 )
 
 # The DHCPv4 implementation lifted from systemd v261.2 (commit 4925d9f07f).
@@ -385,10 +387,13 @@ netd_dhcp_sources = files(
   'src/netd/dhcp/siphash24.c',
 )
 
+# sd_id128_lib for its HMAC-SHA256: the RFC 7217 secret is networkd's
+# application-specific machine ID (ndisc-iid.h).
 netd_core = static_library(
   'netd-core',
   netd_own_sources + netd_dhcp_sources,
   include_directories: netd_includes,
+  link_with: sd_id128_lib,
 )
 
 # link_whole for netd's own objects, as for pico-init-core above; link_with
@@ -474,6 +479,8 @@ netd_tests = [
   # Router advertisement parser and solicitation builder: fixed bytes,
   # malformed options, a truncation and mutation run, lifetime arithmetic.
   'test-netd-ndisc-msg',
+  # SLAAC interface identifiers: EUI-64, static tokens and RFC 7217 vectors.
+  'test-netd-ndisc-iid',
   # --help, --version and refused arguments.
   'test-netd-opts',
 ]
