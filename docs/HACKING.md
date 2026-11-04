@@ -88,6 +88,11 @@ than skip". What each group needs, as read from the tests:
 - `test-netd-rtnl`, `test-netd-dhcp` and `test-netd-lldp-link` use veth pairs
   in a network namespace made with `unshare(CLONE_NEWUSER|CLONE_NEWNET)`.
   They exit 1 if the namespace cannot be created; see below.
+- `test-netd-ra` uses the same namespace. Its checks that need the kernel's
+  own router advertisement handling off run only where `accept_ra` under
+  `/proc/sys/net/ipv6/conf` can be written, and its `Token=prefixstable` case
+  bind-mounts a machine ID over `/etc/machine-id` in a private mount
+  namespace. When either is refused it runs the other checks and exits 77.
 - `test-fsid-real` needs `blkid` and the relevant `mkfs` tools, and skips
   (77) per format.
 - `test-picoctl` needs `systemctl` on `PATH` for its comparison cases, and

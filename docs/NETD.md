@@ -2,7 +2,8 @@
 
 netd is pico-init's network daemon. It reads `systemd.network(5)` files from
 the directories `systemd-networkd` uses, configures static IPv4 and IPv6 addresses and
-a default route, runs a DHCPv4 client and server, writes `/etc/resolv.conf`,
+routes, takes IPv6 addresses and routes from router advertisements, runs a
+DHCPv4 client and server, writes `/etc/resolv.conf`,
 sets the clock over SNTP, applies the time zone a DHCP server hands out, and
 speaks LLDP. It is an ordinary service supervised by pico-init, not part of
 PID 1. netctl is its `networkctl`-style client. This document is the
@@ -32,9 +33,9 @@ Startup order:
 2. Move `CLOCK_REALTIME` forward if it is earlier than the clock floor (see
    [Clock floor](#clock-floor)).
 3. Load every `.network` file.
-4. Open the rtnetlink socket and subscribe to link events.
+4. Open the rtnetlink socket and subscribe to link and IPv6 address events.
 5. Bring `lo` up. It does not go through `.network` matching.
-6. Enumerate existing links and configure them.
+6. Enumerate existing links and their IPv6 addresses, and configure the links.
 7. Start SNTP if `[Network] NTP=` named any server.
 
 A link that matches a `.network` file is brought up before anything else is
@@ -104,8 +105,10 @@ matches on `Name=` alone, or not at all if it has none.
 | `DHCP=` | `no`, `ipv4`, `ipv6`, `yes` (also any other boolean spelling, case-insensitive) | `yes` and `ipv4` start the DHCPv4 client. `ipv6` parses and does nothing. `yes` is IPv4 only in practice. Default `no`. |
 | `Address=` | `a.b.c.d/nn` or an IPv6 address with `/nn` | Static address, shorthand for an [`[Address]`](#address) section. Each line is its own address, and an empty assignment clears the addresses collected so far. A value without a prefix length is rejected. |
 | `Gateway=` | IPv4 address | Static default route, at the kernel's metric 0. A default route with another metric, or through an IPv6 gateway, is a [`[Route]`](#route). |
-| `DNS=` | IPv4 address literals, space-separated | Written to `/etc/resolv.conf`. A host name is rejected: netd has no resolver. |
-| `NTP=` | IPv4 address literals, space-separated | SNTP servers. A host name is rejected. |
+| `DNS=` | IPv4 and IPv6 address literals, space-separated | Written to `/etc/resolv.conf` in file order; a link-local IPv6 server is written with the link's interface. A host name or a `%scope` is rejected: netd has no resolver. |
+| `NTP=` | IPv4 address literals, space-separated | SNTP servers. A host name is rejected, and an IPv6 address is ignored with a warning: the SNTP client speaks IPv4 only. |
+| `IPv6AcceptRA=` | boolean | Take addresses and routes from IPv6 router advertisements; see [IPv6 router advertisements](#ipv6-router-advertisements). Unset, it is on unless the link forwards IPv6. |
+| `IPv6Token=` | as `[IPv6AcceptRA] Token=` | Legacy spelling of `Token=`. |
 | `DHCPServer=` | boolean | Run a DHCPv4 server on the link. Default no. |
 | `LLDP=` | boolean, `routers-only` | Receive LLDP neighbour announcements. Default no. |
 | `EmitLLDP=` | boolean, `nearest-bridge`, `non-tpmr-bridge`, `customer-bridge` | Transmit LLDP to the given group address. `yes` means `nearest-bridge`. Default no. |
@@ -300,7 +303,29 @@ next reload; the address is sent again with what is left of the lease.
 `[DHCP] RouteMetric=` is read as the legacy spelling of the same key. A
 `[DHCPv4]` value wins over it in whichever order the two appear. `[DHCP]` is
 read for this key only; its other keys are dropped. `RouteMetric=` in
-`[IPv6AcceptRA]` is dropped with the rest of that section.
+`[IPv6AcceptRA]` is a different key and never sets it.
+
+### [IPv6AcceptRA]
+
+| Key | Default | Behaviour |
+| --- | --- | --- |
+| `UseGateway=` | yes | A default route through each router that announces a router lifetime. |
+| `UseOnLinkPrefix=` | yes | An on-link route for each prefix with the L flag. |
+| `UseAutonomousPrefix=` | yes | A SLAAC address for each /64 prefix with the A flag. |
+| `UseDNS=` | yes | RDNSS servers into `/etc/resolv.conf`. Independent of `[DHCPv4] UseDNS=`. |
+| `UseDomains=` | no | `yes` puts DNSSL domains on the `search` line. `route` is treated as `no`: `resolv.conf` has no routing-only domains. |
+| `UseMTU=` | yes | The advertised MTU as the link's IPv6 MTU, when it is between 1280 and the link MTU. |
+| `RouteMetric=` | 512:1024:2048 | Metric of the routes from a router of high, medium and low preference. One number sets all three; three, separated by colons, must be strictly increasing. Plain decimal only. A rejected value keeps the earlier one. |
+| `Token=` | EUI-64 on Ethernet, `prefixstable` otherwise | How the interface identifier of a SLAAC address is made: `eui64`, `static:ADDRESS` (or a bare address; its low 64 bits are used and must not be zero) or `prefixstable` (RFC 7217). A later line replaces an earlier one and an empty value restores the default. |
+
+`systemd-networkd` keeps several tokens per link; netd keeps one. The
+`prefixstable` forms with a prefix filter or a secret key are ignored with a
+warning. The `prefixstable` identifier is the one `systemd-networkd` makes for
+the same machine ID, interface name and hardware address, so a board keeps its
+addresses when it moves from `systemd-networkd` to netd, except on a wireless
+link, where `systemd-networkd` also hashes the SSID. Without a machine ID,
+`prefixstable` falls back to EUI-64 where the link has a 6 byte hardware
+address and makes no address otherwise.
 
 ### Example
 
@@ -327,8 +352,15 @@ DHCPServer=yes
 
 Everything not listed above. Notably:
 
-- IPv6 configuration beyond static addresses and routes: `DHCP=ipv6`, router
-  advertisements, DHCPv6. The `[IPv6AcceptRA]` section and similar are dropped.
+- DHCPv6 and prefix delegation: `DHCP=ipv6` parses and does nothing, and the
+  M and O flags of a router advertisement are logged once at debug level.
+- Of router advertisements: route information options (`UseRoutePrefix=`),
+  redirects, PREF64, DNR, captive portals, `UseHopLimit=`,
+  `UseReachableTime=`, `UseRetransmissionTime=`, the router, prefix and route
+  allow and deny lists, `RouteTable=`, `QuickAck=`, `NetLabel=`, `NFTSet=`,
+  temporary (privacy) addresses and `IPv6PrivacyExtensions=`, more than one
+  token per link, and `DHCPv6Client=`.
+- IPv6 servers in `NTP=`.
 - `[Address]` keys `Broadcast=` (it is derived from the prefix), `HomeAddress=`,
   `ManageTemporaryAddress=`, `AutoJoin=`, `NetLabel=` and `NFTSet=`, null
   addresses taken from an address pool, and IPv4 address conflict detection.
@@ -345,7 +377,9 @@ Everything not listed above. Notably:
   `ClientIdentifier=`.
 - DHCP server static leases, lease persistence across a netd restart, relay
   and DHCPINFORM.
-- Link-local addressing, `ConfigureWithoutCarrier=`, `ActivationPolicy=`.
+- `LinkLocalAddressing=` (the kernel makes the IPv6 link-local address),
+  `IPv6DuplicateAddressDetection=`, `ConfigureWithoutCarrier=`,
+  `ActivationPolicy=`.
 - Host names in `DNS=` and `NTP=`.
 
 Of what a DHCP lease carries, netd applies the address, the first router
@@ -399,6 +433,78 @@ identifier into the pool, without remembering anything.
 
 If `DHCPServer=yes` is set without an IPv4 `Address=`, the link goes to `failed`.
 
+## IPv6 router advertisements
+
+On a link where `IPv6AcceptRA=` is in effect, netd solicits and receives
+router advertisements itself and installs what they announce. The kernel's
+own handling is switched off with `accept_ra=0` on every link a `.network`
+file matches, also where netd does not take advertisements, as
+`systemd-networkd` does, so the kernel and netd never install the same routes
+at different metrics. The setting is not restored when netd stops. A kernel
+that refuses the write (a read-only `/proc/sys`) is reported once per link.
+
+`IPv6AcceptRA=` unset means on, unless
+`/proc/sys/net/ipv6/conf/<link>/forwarding` is set. It is never on for
+loopback, for a link without multicast, or on a kernel without IPv6.
+
+Router solicitations start once the link has carrier and its link-local
+address has passed duplicate address detection: one after a random delay of
+up to 1 s (RFC 4861 6.3.7), then after 4 s, doubling up to an hour with 10%
+jitter (RFC 7559), until an advertisement with a router lifetime arrives. An
+advertisement is used only when its hop limit is 255, it arrived on the link
+and its source is link-local (RFC 4861 6.1.2); one with a zero-length or
+overrunning option is dropped whole, and a malformed option is skipped on its
+own. At most 16 advertisements are read per wakeup.
+
+What is installed, each with protocol `ra` and the metric of
+`[IPv6AcceptRA] RouteMetric=` for the router's preference (a reserved
+preference counts as medium):
+
+- a default route through each router with a non-zero router lifetime
+  (`UseGateway=`), with the router's preference as `pref`;
+- an on-link route for each prefix with the L flag (`UseOnLinkPrefix=`), at
+  the metric of the router that last announced it;
+- a SLAAC address for each /64 prefix with the A flag (`UseAutonomousPrefix=`),
+  with `noprefixroute`;
+- the MTU (`UseMTU=`), and the RDNSS servers and DNSSL domains in
+  `/etc/resolv.conf`.
+
+Routes carry what is left of their lifetime as their expiry and addresses as
+their valid and preferred lifetimes, so the kernel removes them by itself if
+netd is no longer running when they run out. An advertisement that changes
+nothing writes nothing to the kernel; a route's expiry and an address's valid
+and preferred lifetimes are each sent again only when the kernel's copy has
+less than half of what was last sent left. An address therefore stays
+preferred while advertisements arrive more often than every half of its
+preferred lifetime. Options with a lifetime of zero are applied before the
+others. A prefix lifetime of zero removes its on-link route at once, while
+its address follows the two-hour rule of RFC 4862 5.5.3 e. Two routers of the
+same preference get routes at the same metric, which the kernel joins into
+one route with two next hops, as it does for `systemd-networkd`; a router
+that leaves takes only its own next hop.
+
+A [`[Route]`](#route) with the destination, gateway and metric of an
+advertised route is the same kernel route, whatever its `onlink` and
+preferred source. It stays while either of the two holds it and is deleted
+when the last one lets go, whichever of them added it. Once a `[Route]` has
+held it the kernel keeps it without an expiry, so it outlives netd if netd
+stops while only the advertisement holds it.
+
+A SLAAC address that fails duplicate address detection is made again with
+the next RFC 7217 counter, up to three, when its token is `prefixstable`; with
+any other token netd gives up on that prefix with a warning, until the prefix
+goes away. A static IPv6 address that fails detection is reported once.
+
+netd keeps at most 4 routers, 8 prefixes, 4 DNS servers and 4 search domains
+per link, about 2 KiB; a new entry beyond that is ignored, with one warning,
+until an entry expires. `systemd-networkd` keeps up to 64 of each.
+
+Carrier loss forgets everything learnt on the link and removes what it
+installed, as `systemd-networkd` does. So do `IPv6AcceptRA=no` on a reload,
+the link losing its `.network` match, and the link going away. A reload that
+changes only `[IPv6AcceptRA]` keys keeps what was learnt and applies the new
+settings at once.
+
 ## DNS: /etc/resolv.conf
 
 netd writes `/etc/resolv.conf` directly, replacing it atomically with
@@ -406,9 +512,15 @@ a temporary file and `rename(2)`. The file is rebuilt from scratch whenever
 any link's DNS state changes:
 
 - Per link, in link order: the static `DNS=` addresses, then the lease's
-  option 6 addresses unless `UseDNS=no`.
+  option 6 addresses unless `[DHCPv4] UseDNS=no`, then the RDNSS servers of
+  the link's routers unless `[IPv6AcceptRA] UseDNS=no`. IPv4 and IPv6
+  servers are listed together.
 - Duplicates are removed and the list is capped at three `nameserver` lines.
-- The first lease's domain name (option 15) becomes one `search` line.
+- A link-local IPv6 server is written with its interface, as
+  `nameserver fe80::1%eth0`; glibc reads the suffix as the interface.
+- The `search` line holds the first lease's domain name (option 15), then
+  the DNSSL domains of links with `[IPv6AcceptRA] UseDomains=yes`, without
+  duplicates, at most six.
 - When there is no nameserver and no search domain, the existing file is
   left alone. netd never replaces a working file with an empty one.
 
@@ -502,6 +614,8 @@ is tmpfs.
 | `/run/netd/lldp/<ifindex>` | LLDP neighbours. Removed when the table is empty. |
 | `/etc/resolv.conf` | See [DNS](#dns-etcresolvconf). |
 | `/etc/localtime` | Symlink to the DHCP-supplied zone. |
+| `/proc/sys/net/ipv6/conf/<link>/accept_ra` | `0` on every matched link; see [IPv6 router advertisements](#ipv6-router-advertisements). |
+| `/proc/sys/net/ipv6/conf/<link>/mtu` | The advertised MTU, with `UseMTU=`. |
 | `/var/lib/netd/clock` | Mtime marks the last accepted SNTP sync. |
 
 The formats are netd's own and stable; they are not `systemd-networkd`'s
