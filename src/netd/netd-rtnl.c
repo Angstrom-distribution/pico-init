@@ -526,24 +526,19 @@ static void derive_broadcast(const struct in_addr *address, unsigned char prefix
         ret->s_addr = address->s_addr | ~mask_be;
 }
 
-int netd_rtnl_address_add(
-                NetdRtnl *rtnl,
-                int ifindex,
-                const struct in_addr *address,
-                unsigned char prefixlen,
-                const struct in_addr *broadcast,
-                uint32_t lifetime_sec,
-                uint32_t route_metric) {
-
+int netd_rtnl_address_add(NetdRtnl *rtnl, const NetdRtnlAddress *a) {
         struct nl_request req;
         struct nlmsghdr *nlh;
         struct ifaddrmsg *ifa;
-        struct in_addr bcast;
         struct ifa_cacheinfo ci;
+        size_t size;
         int r;
 
-        if (!rtnl || ifindex <= 0 || !address || prefixlen > 32)
+        if (!rtnl || !a || a->ifindex <= 0 || (a->family != AF_INET && a->family != AF_INET6) ||
+            a->prefixlen > (a->family == AF_INET ? 32 : 128))
                 return -EINVAL;
+
+        size = a->family == AF_INET ? sizeof(struct in_addr) : sizeof(struct in6_addr);
 
         nlh = nl_req_init(&req, RTM_NEWADDR, NLM_F_REQUEST | NLM_F_CREATE | NLM_F_REPLACE | NLM_F_ACK);
         if (!nlh)
@@ -553,55 +548,68 @@ int netd_rtnl_address_add(
         if (!ifa)
                 return -ENOBUFS;
 
-        ifa->ifa_family = AF_INET;
-        ifa->ifa_prefixlen = prefixlen;
-        ifa->ifa_flags = 0;
-        ifa->ifa_scope = 0;
-        ifa->ifa_index = (unsigned) ifindex;
+        ifa->ifa_family = a->family;
+        ifa->ifa_prefixlen = a->prefixlen;
+        ifa->ifa_flags = (uint8_t) (a->flags & 0xff);
+        ifa->ifa_scope = a->scope;
+        ifa->ifa_index = (unsigned) a->ifindex;
 
-        r = nl_add_attr(&req, IFA_LOCAL, address, sizeof(*address));
+        r = nl_add_attr(&req, IFA_LOCAL, a->address.bytes, size);
         if (r < 0)
                 return r;
 
-        r = nl_add_attr(&req, IFA_ADDRESS, address, sizeof(*address));
+        r = nl_add_attr(&req, IFA_ADDRESS, a->has_peer ? a->peer.bytes : a->address.bytes, size);
         if (r < 0)
                 return r;
 
-        if (broadcast)
-                bcast = *broadcast;
-        else
-                derive_broadcast(address, prefixlen, &bcast);
+        if (a->family == AF_INET && !a->has_peer) {
+                struct in_addr bcast;
 
-        r = nl_add_attr(&req, IFA_BROADCAST, &bcast, sizeof(bcast));
-        if (r < 0)
-                return r;
+                derive_broadcast(&a->address.in, a->prefixlen, &bcast);
+                r = nl_add_attr(&req, IFA_BROADCAST, &bcast, sizeof(bcast));
+                if (r < 0)
+                        return r;
+        }
 
-        /* UINT32_MAX passed straight through as ifa_valid/ifa_prefered is
-         * already the kernel's own "forever" sentinel -- no special-casing
-         * needed, per netd-rtnl.h. */
+        if (a->family == AF_INET && a->label && a->label[0] != '\0') {
+                r = nl_add_attr(&req, IFA_LABEL, a->label, strlen(a->label) + 1);
+                if (r < 0)
+                        return r;
+        }
+
         memset(&ci, 0, sizeof(ci));
-        ci.ifa_prefered = lifetime_sec;
-        ci.ifa_valid = lifetime_sec;
+        ci.ifa_prefered = a->preferred_sec;
+        ci.ifa_valid = a->valid_sec;
 
         r = nl_add_attr(&req, IFA_CACHEINFO, &ci, sizeof(ci));
         if (r < 0)
                 return r;
 
-        r = nl_add_attr(&req, IFA_RT_PRIORITY, &route_metric, sizeof(route_metric));
+        r = nl_add_attr(&req, IFA_RT_PRIORITY, &a->route_metric, sizeof(a->route_metric));
         if (r < 0)
                 return r;
+
+        if (a->flags != 0) {
+                r = nl_add_attr(&req, IFA_FLAGS, &a->flags, sizeof(a->flags));
+                if (r < 0)
+                        return r;
+        }
 
         return rtnl_execute(rtnl, &req);
 }
 
-int netd_rtnl_address_del(NetdRtnl *rtnl, int ifindex, const struct in_addr *address, unsigned char prefixlen) {
+int netd_rtnl_address_del(NetdRtnl *rtnl, const NetdRtnlAddress *a) {
         struct nl_request req;
         struct nlmsghdr *nlh;
         struct ifaddrmsg *ifa;
+        size_t size;
         int r;
 
-        if (!rtnl || ifindex <= 0 || !address || prefixlen > 32)
+        if (!rtnl || !a || a->ifindex <= 0 || (a->family != AF_INET && a->family != AF_INET6) ||
+            a->prefixlen > (a->family == AF_INET ? 32 : 128))
                 return -EINVAL;
+
+        size = a->family == AF_INET ? sizeof(struct in_addr) : sizeof(struct in6_addr);
 
         nlh = nl_req_init(&req, RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK);
         if (!nlh)
@@ -611,15 +619,15 @@ int netd_rtnl_address_del(NetdRtnl *rtnl, int ifindex, const struct in_addr *add
         if (!ifa)
                 return -ENOBUFS;
 
-        ifa->ifa_family = AF_INET;
-        ifa->ifa_prefixlen = prefixlen;
-        ifa->ifa_index = (unsigned) ifindex;
+        ifa->ifa_family = a->family;
+        ifa->ifa_prefixlen = a->prefixlen;
+        ifa->ifa_index = (unsigned) a->ifindex;
 
-        r = nl_add_attr(&req, IFA_LOCAL, address, sizeof(*address));
+        r = nl_add_attr(&req, IFA_LOCAL, a->address.bytes, size);
         if (r < 0)
                 return r;
 
-        r = nl_add_attr(&req, IFA_ADDRESS, address, sizeof(*address));
+        r = nl_add_attr(&req, IFA_ADDRESS, a->has_peer ? a->peer.bytes : a->address.bytes, size);
         if (r < 0)
                 return r;
 

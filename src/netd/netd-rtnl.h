@@ -50,6 +50,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "netd-addr.h"
+
 typedef struct NetdRtnl NetdRtnl;
 
 /* The maximum hardware address netd stores. 6 covers ether and the CDC-Subset
@@ -169,33 +171,51 @@ int netd_rtnl_link_down(NetdRtnl *rtnl, int ifindex);
 int netd_rtnl_link_set_hwaddr(NetdRtnl *rtnl, int ifindex, const uint8_t *addr, size_t len);
 
 /*
- * RTM_NEWADDR, NLM_F_REQUEST|NLM_F_CREATE|NLM_F_REPLACE|NLM_F_ACK.
+ * One address, as RTM_NEWADDR/RTM_DELADDR carries it.
  *
- * IFA_LOCAL and IFA_ADDRESS are both set to `address` (they differ only for
- * point-to-point links, which no pico target has), and IFA_BROADCAST is
- * derived from the prefix unless `broadcast` is non-NULL. Omitting the
- * broadcast address is a real bug on the DHCP path: the client's own
- * broadcast socket then never sees the server's renewal replies.
- *
- * `lifetime_sec` is the DHCP lease time, passed through as IFA_CACHEINFO so
- * the kernel expires the address if netd dies before the lease does;
- * UINT32_MAX means forever, which is what a static Address= gets.
+ * `peer` is IFA_ADDRESS when `has_peer`; without one IFA_ADDRESS repeats
+ * `address`. `flags` holds IFA_F_*: the low eight bits go into ifa_flags and
+ * the whole word into IFA_FLAGS, which is only sent when non-zero, so a
+ * request without flags is the same on the wire as before IFA_FLAGS was used.
+ * `scope` is ifa_scope (RT_SCOPE_UNIVERSE is 0). `valid_sec` and
+ * `preferred_sec` go into IFA_CACHEINFO; UINT32_MAX is the kernel's own
+ * "forever", which is what a static address gets, and the lease time is
+ * what a DHCP address gets, so the kernel expires it if netd dies before the
+ * lease does. `label` (IPv4 only, NULL for none) is IFA_LABEL.
  *
  * `route_metric` goes into IFA_RT_PRIORITY, the metric of the prefix route
  * the kernel adds for the address (0 is the kernel's default), as
  * systemd-networkd sends it. Re-sending the address with another metric
  * moves the existing prefix route.
  */
-int netd_rtnl_address_add(
-                NetdRtnl *rtnl,
-                int ifindex,
-                const struct in_addr *address,
-                unsigned char prefixlen,
-                const struct in_addr *broadcast,
-                uint32_t lifetime_sec,
-                uint32_t route_metric);
+typedef struct NetdRtnlAddress {
+        int ifindex;
+        uint8_t family; /* AF_INET or AF_INET6 */
+        uint8_t prefixlen;
+        uint8_t scope;
+        NetdInAddr address;
+        NetdInAddr peer;
+        bool has_peer;
+        uint32_t flags;
+        uint32_t valid_sec;
+        uint32_t preferred_sec;
+        uint32_t route_metric;
+        const char *label;
+} NetdRtnlAddress;
 
-int netd_rtnl_address_del(NetdRtnl *rtnl, int ifindex, const struct in_addr *address, unsigned char prefixlen);
+/*
+ * RTM_NEWADDR, NLM_F_REQUEST|NLM_F_CREATE|NLM_F_REPLACE|NLM_F_ACK.
+ *
+ * IFA_LOCAL is `address`. IFA_BROADCAST is derived from the prefix for IPv4
+ * without a peer: omitting it is a real bug on the DHCP path, because the
+ * client's own broadcast socket then never sees the server's renewal replies.
+ */
+int netd_rtnl_address_add(NetdRtnl *rtnl, const NetdRtnlAddress *address);
+
+/* RTM_DELADDR by family, prefix length, IFA_LOCAL and IFA_ADDRESS (the peer
+ * for a point-to-point address, which the kernel matches it by). The other
+ * fields are ignored. */
+int netd_rtnl_address_del(NetdRtnl *rtnl, const NetdRtnlAddress *address);
 
 /*
  * RTM_NEWROUTE, RTN_UNICAST / RT_TABLE_MAIN / RT_SCOPE_UNIVERSE (or LINK when

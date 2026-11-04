@@ -52,6 +52,8 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <limits.h>
+#include <linux/if_addr.h>
+#include <linux/rtnetlink.h>
 #include <net/if.h>
 #include <sched.h>
 #include <signal.h>
@@ -222,6 +224,22 @@ static void enter_test_netns(void) {
         write_proc_file("/proc/self/gid_map", buf);
 }
 
+/* An IPv4 address with only the fields the older tests care about. */
+static int add_v4(NetdRtnl *rtnl, int ifindex, const struct in_addr *addr, unsigned char plen, uint32_t metric) {
+        NetdRtnlAddress a;
+
+        memset(&a, 0, sizeof(a));
+        a.ifindex = ifindex;
+        a.family = AF_INET;
+        a.prefixlen = plen;
+        a.address.in = *addr;
+        a.valid_sec = UINT32_MAX;
+        a.preferred_sec = UINT32_MAX;
+        a.route_metric = metric;
+
+        return netd_rtnl_address_add(rtnl, &a);
+}
+
 static void test_netns_rtnl(void) {
         NetdRtnl *rtnl = NULL;
         EventLog log;
@@ -274,7 +292,7 @@ static void test_netns_rtnl(void) {
         ASSERT_TRUE(r == 0);
 
         addr.s_addr = htonl(0x0AFA0001); /* 10.250.0.1 */
-        r = netd_rtnl_address_add(rtnl, veth->ifindex, &addr, 24, NULL, UINT32_MAX, 0);
+        r = add_v4(rtnl, veth->ifindex, &addr, 24, 0);
         ASSERT_TRUE(r == 0);
 
         gw.s_addr = htonl(0x0AFA00FE); /* 10.250.0.254, on-link via the /24 just added */
@@ -749,9 +767,9 @@ static void test_netns_route_same_metric(void) {
         ib = (int) ifindex_of("rmb0");
 
         ASSERT_EQ_INT(inet_pton(AF_INET, "10.70.0.2", &addr), 1);
-        ASSERT_TRUE(netd_rtnl_address_add(rtnl, ia, &addr, 24, NULL, UINT32_MAX, 0) == 0);
+        ASSERT_TRUE(add_v4(rtnl, ia, &addr, 24, 0) == 0);
         ASSERT_EQ_INT(inet_pton(AF_INET, "10.71.0.2", &addr), 1);
-        ASSERT_TRUE(netd_rtnl_address_add(rtnl, ib, &addr, 24, NULL, UINT32_MAX, 0) == 0);
+        ASSERT_TRUE(add_v4(rtnl, ib, &addr, 24, 0) == 0);
         ASSERT_EQ_INT(inet_pton(AF_INET, "10.70.0.1", &gwa), 1);
         ASSERT_EQ_INT(inet_pton(AF_INET, "10.71.0.1", &gwb), 1);
 
@@ -996,14 +1014,14 @@ static void test_netns_address_prefix_metric(void) {
         i = (int) ifindex_of("pm0");
         ASSERT_EQ_INT(inet_pton(AF_INET, "10.78.0.2", &addr), 1);
 
-        ASSERT_EQ_INT(netd_rtnl_address_add(rtnl, i, &addr, 24, NULL, UINT32_MAX, 1024), 0);
+        ASSERT_EQ_INT(add_v4(rtnl, i, &addr, 24, 1024), 0);
         run_shell("ip -4 route show dev pm0 metric 1024 | grep -q '^10\\.78\\.0\\.0/24 '");
 
-        ASSERT_EQ_INT(netd_rtnl_address_add(rtnl, i, &addr, 24, NULL, UINT32_MAX, 300), 0);
+        ASSERT_EQ_INT(add_v4(rtnl, i, &addr, 24, 300), 0);
         run_shell("ip -4 route show dev pm0 metric 300 | grep -q '^10\\.78\\.0\\.0/24 '");
         run_shell("test \"$(ip -4 route show dev pm0 | wc -l)\" -eq 1");
 
-        ASSERT_EQ_INT(netd_rtnl_address_add(rtnl, i, &addr, 24, NULL, UINT32_MAX, 0), 0);
+        ASSERT_EQ_INT(add_v4(rtnl, i, &addr, 24, 0), 0);
         run_shell("ip -4 route show dev pm0 metric 0 | grep -q '^10\\.78\\.0\\.0/24 '");
         run_shell("test \"$(ip -4 route show dev pm0 | wc -l)\" -eq 1");
 
@@ -1011,6 +1029,87 @@ static void test_netns_address_prefix_metric(void) {
         netd_rtnl_free(rtnl);
 
         printf("test-netd-rtnl: prefix route metric subtest ok\n");
+}
+
+/* The address request carries IPv4 label, peer and scope, and IPv6 with
+ * flags and lifetimes; delete removes each by the fields the kernel matches. */
+static void test_netns_address_struct(void) {
+        NetdRtnl *rtnl = NULL;
+        NetdRtnlAddress a;
+        int i, f;
+
+        enter_test_netns();
+
+        ASSERT_TRUE(netd_rtnl_new(&rtnl) == 0);
+        run_ip("link add name as0 type veth peer name as1");
+        run_ip("link set as0 up");
+        i = (int) ifindex_of("as0");
+
+        memset(&a, 0, sizeof(a));
+        a.ifindex = i;
+        a.family = AF_INET;
+        a.prefixlen = 24;
+        a.scope = RT_SCOPE_LINK;
+        a.valid_sec = UINT32_MAX;
+        a.preferred_sec = 0;
+        a.label = "as0:lab";
+        ASSERT_EQ_INT(netd_addr_parse("10.79.0.2", &f, &a.address), 0);
+        ASSERT_EQ_INT(netd_rtnl_address_add(rtnl, &a), 0);
+        run_shell("ip -4 -o addr show dev as0 label as0:lab | grep -q '10\\.79\\.0\\.2/24 brd 10\\.79\\.0\\.255 scope link'");
+        run_shell("ip -4 -o addr show dev as0 | grep -q ' scope link deprecated '");
+        ASSERT_EQ_INT(netd_rtnl_address_del(rtnl, &a), 0);
+        run_shell("! ip -4 addr show dev as0 | grep -q '10\\.79\\.0\\.2'");
+        ASSERT_EQ_INT(netd_rtnl_address_del(rtnl, &a), -EADDRNOTAVAIL);
+
+        memset(&a, 0, sizeof(a));
+        a.ifindex = i;
+        a.family = AF_INET;
+        a.prefixlen = 32;
+        a.valid_sec = UINT32_MAX;
+        a.preferred_sec = UINT32_MAX;
+        a.has_peer = true;
+        ASSERT_EQ_INT(netd_addr_parse("10.79.1.2", &f, &a.address), 0);
+        ASSERT_EQ_INT(netd_addr_parse("10.79.1.1", &f, &a.peer), 0);
+        ASSERT_EQ_INT(netd_rtnl_address_add(rtnl, &a), 0);
+        run_shell("ip -4 -o addr show dev as0 | grep -q '10\\.79\\.1\\.2 peer 10\\.79\\.1\\.1/32'");
+        ASSERT_EQ_INT(netd_rtnl_address_del(rtnl, &a), 0);
+        run_shell("! ip -4 addr show dev as0 | grep -q '10\\.79\\.1\\.2'");
+
+        if (!netd_ipv6_supported())
+                fprintf(stderr, "test-netd-rtnl: kernel without IPv6, skipping the IPv6 address assertions\n");
+        else {
+                memset(&a, 0, sizeof(a));
+                a.ifindex = i;
+                a.family = AF_INET6;
+                a.prefixlen = 64;
+                a.valid_sec = UINT32_MAX;
+                a.preferred_sec = UINT32_MAX;
+                a.route_metric = 600;
+                a.flags = IFA_F_NODAD | IFA_F_NOPREFIXROUTE;
+                ASSERT_EQ_INT(netd_addr_parse("fd79::2", &f, &a.address), 0);
+                ASSERT_EQ_INT(netd_rtnl_address_add(rtnl, &a), 0);
+                run_shell("ip -6 -o addr show dev as0 | grep -q 'fd79::2/64.* noprefixroute'");
+                run_shell("ip -6 -o addr show dev as0 | grep -q 'fd79::2/64.* nodad'");
+                run_shell("! ip -6 route show dev as0 | grep -q '^fd79::/64'");
+
+                ASSERT_EQ_INT(netd_rtnl_address_del(rtnl, &a), 0);
+                run_shell("! ip -6 addr show dev as0 | grep -q 'fd79::2'");
+
+                a.flags = IFA_F_NODAD;
+                a.route_metric = 600;
+                ASSERT_EQ_INT(netd_rtnl_address_add(rtnl, &a), 0);
+                run_shell("ip -6 route show dev as0 metric 600 | grep -q '^fd79::/64'");
+                ASSERT_EQ_INT(netd_rtnl_address_del(rtnl, &a), 0);
+        }
+
+        a.family = AF_UNSPEC;
+        ASSERT_EQ_INT(netd_rtnl_address_add(rtnl, &a), -EINVAL);
+        ASSERT_EQ_INT(netd_rtnl_address_del(rtnl, &a), -EINVAL);
+
+        run_ip("link del as0");
+        netd_rtnl_free(rtnl);
+
+        printf("test-netd-rtnl: address struct subtest ok\n");
 }
 
 /* A lease without RouteMetric= puts its default route, its host route to an
@@ -1595,6 +1694,7 @@ int main(void) {
         test_netns_route_metric_default_and_static();
         test_netns_route_metric_reload();
         test_netns_address_prefix_metric();
+        test_netns_address_struct();
         test_netns_lease_default_metric_routes();
         test_netns_default_metric_two_links();
         test_netns_static_gateway_two_links();
