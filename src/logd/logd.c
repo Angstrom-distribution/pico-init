@@ -26,12 +26,14 @@
 #define _GNU_SOURCE
 
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "../signal.h"
@@ -76,6 +78,28 @@ static bool get_listen_fds(int *stdout_fd, int *syslog_fd) {
         *stdout_fd = LOGD_LISTEN_FDS_START;
         *syslog_fd = LOGD_LISTEN_FDS_START + 1;
         return true;
+}
+
+/*
+ * Run as a plain service, fd 1 and 2 are datagram sockets connected to logd's
+ * own input socket. A blocking write into a full queue then waits for a
+ * reader that is this very process, so make them non-blocking and let a log
+ * line be dropped instead. O_NONBLOCK sits on the open file description,
+ * which is shared with the descriptors of the same invocation only; logd
+ * spawns no children and never reads fd 1 or 2.
+ */
+static void logd_stdio_nonblock(void) {
+        for (int fd = STDOUT_FILENO; fd <= STDERR_FILENO; fd++) {
+                struct stat st;
+                int flags;
+
+                if (fstat(fd, &st) < 0 || !S_ISSOCK(st.st_mode))
+                        continue;
+
+                flags = fcntl(fd, F_GETFL);
+                if (flags >= 0 && !(flags & O_NONBLOCK))
+                        (void) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        }
 }
 
 static void logd_usage(void) {
@@ -145,6 +169,8 @@ int main(int argc, char *argv[]) {
         int epoll_fd = -1;
         bool activated;
         int r;
+
+        logd_stdio_nonblock();
 
         r = logd_parse_argv(argc, argv, &runtime_dir_override, &max_bytes_override);
         if (r < 0)
