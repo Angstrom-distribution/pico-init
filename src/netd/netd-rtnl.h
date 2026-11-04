@@ -23,8 +23,9 @@
  * and VLAN attributes, MACsec, WireGuard, tc, policy routing -- is out of
  * scope, and it was most of that type table.
  *
- * TWO SOCKETS. `event_fd` is subscribed to RTNLGRP_LINK and is
- * the only one epoll ever sees; the request socket is private and every
+ * TWO SOCKETS. `event_fd` is subscribed to RTNLGRP_LINK and
+ * RTNLGRP_IPV6_IFADDR and is the only one epoll ever sees; the request socket
+ * is private and every
  * operation on it is a synchronous request -> ACK exchange. One socket would
  * work too, but then every synchronous request would have to buffer the
  * unsolicited multicast messages that arrive while it waits for its own ACK,
@@ -94,11 +95,34 @@ typedef enum NetdRtnlLinkEvent {
  */
 typedef int (*netd_rtnl_link_handler_t)(void *userdata, NetdRtnlLinkEvent event, const NetdRtnlLink *link);
 
+/*
+ * One IPv6 address as RTM_NEWADDR/RTM_DELADDR reports it: IFA_LOCAL, or
+ * IFA_ADDRESS when there is no local address, and IFA_FLAGS, or ifa_flags
+ * when the kernel sent no IFA_FLAGS. IPv4 address events are not delivered.
+ */
+typedef struct NetdRtnlAddr {
+        int ifindex;
+        uint8_t family;
+        uint8_t prefixlen;
+        uint8_t scope;
+        uint32_t flags; /* IFA_F_* */
+        NetdInAddr address;
+} NetdRtnlAddr;
+
+/*
+ * Delivered for every IPv6 RTM_NEWADDR (`removed` false) and RTM_DELADDR
+ * (`removed` true) on the event socket, and for every entry of
+ * netd_rtnl_enumerate_addresses() as a new address. Returning negative logs.
+ */
+typedef int (*netd_rtnl_addr_handler_t)(void *userdata, bool removed, const NetdRtnlAddr *addr);
+
 /* --- lifecycle --- */
 
 /*
  * Open both sockets, set NETLINK_EXT_ACK and a receive buffer large enough
- * for a link dump, bind the event socket to RTNLGRP_LINK. 0 or -errno.
+ * for a link dump, bind the event socket to RTNLGRP_LINK and, when the kernel
+ * has IPv6, RTNLGRP_IPV6_IFADDR; a failure to join the second is logged and
+ * not returned. 0 or -errno.
  *
  * Note what this does *not* do: it does not enumerate. Subscription happens
  * here and enumeration is a separate call, so netd_startup() can order them
@@ -117,6 +141,9 @@ int netd_rtnl_event_fd(NetdRtnl *rtnl);
 /* Install the link event/enumeration handler. */
 void netd_rtnl_set_link_handler(NetdRtnl *rtnl, netd_rtnl_link_handler_t handler, void *userdata);
 
+/* Install the IPv6 address event/enumeration handler. */
+void netd_rtnl_set_addr_handler(NetdRtnl *rtnl, netd_rtnl_addr_handler_t handler, void *userdata);
+
 /* --- reading --- */
 
 /*
@@ -134,8 +161,16 @@ void netd_rtnl_set_link_handler(NetdRtnl *rtnl, netd_rtnl_link_handler_t handler
 int netd_rtnl_enumerate_links(NetdRtnl *rtnl);
 
 /*
+ * RTM_GETADDR dump of every IPv6 address, delivered through the address
+ * handler, with the same retry rules as the link dump. Returns the number of
+ * addresses seen, or -errno.
+ */
+int netd_rtnl_enumerate_addresses(NetdRtnl *rtnl);
+
+/*
  * Call on event_fd epoll readiness: drain everything pending and dispatch
- * each RTM_NEWLINK/RTM_DELLINK through the handler. Returns the number
+ * each RTM_NEWLINK/RTM_DELLINK through the link handler and each IPv6
+ * RTM_NEWADDR/RTM_DELADDR through the address handler. Returns the number
  * dispatched, or -errno.
  *
  * A multicast socket that overruns returns ENOBUFS and the kernel has thrown

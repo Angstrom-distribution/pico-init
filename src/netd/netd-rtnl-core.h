@@ -89,6 +89,9 @@ int nl_sock_open(NlSock *sock, bool subscribe_link_group);
 /* Closes sock->fd if open; idempotent, leaves sock->fd == -1. */
 void nl_sock_close(NlSock *sock);
 
+/* Joins one more multicast group (RTNLGRP_*). 0 or -errno. */
+int nl_sock_join_group(NlSock *sock, int group);
+
 /* --- socket-level send/receive --- */
 
 /*
