@@ -6,6 +6,7 @@ path = [
   "NEWS",
   "docs/**",
   "CONTRIBUTING.md",
+  "AGENTS.md",
   "SECURITY.md",
   "CODE_OF_CONDUCT.md",
   "LICENSE",
