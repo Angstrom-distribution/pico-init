@@ -7,8 +7,9 @@
  * Covers: the [DHCPv4] defaults (in particular UseTimezone=yes, netd's
  * divergence from networkd); RouteMetric= in [DHCPv4] and the legacy [DHCP]
  * section; usb0.network and usb0-server.network fixtures for a USB gadget
- * link; fixtures using sections outside netd's subset ([IPv6AcceptRA],
- * [Route]); the three-directory search path
+ * link; fixtures using sections outside netd's subset ([IPv6AcceptRA]) and a
+ * [Route] section that holds only Metric=; [Address] and [Route] sections;
+ * the three-directory search path
  * with basename shadowing and lexicographic union ordering; [Match] Name=
  * glob matching, including the "no [Match] Name= matches nothing" rule; and
  * unknown-section/directive tolerance. It also holds a regression for the
@@ -19,6 +20,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <linux/rtnetlink.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -364,6 +366,7 @@ static void assert_console_fixture_parses(
         ASSERT_TRUE(nw->dhcp_use_timezone); /* the file says so explicitly */
         ASSERT_TRUE(nw->dhcp_use_dns);      /* untouched, still defaults yes */
         ASSERT_EQ_INT(nw->n_addresses, 0);
+        ASSERT_EQ_INT(nw->n_routes, 0); /* the [Route] section holds only Metric= */
         ASSERT_TRUE(!nw->gateway_set);
         ASSERT_EQ_INT(nw->n_dns, 0);
         ASSERT_EQ_INT(nw->n_ntp, 0);
@@ -1148,6 +1151,424 @@ static void test_address_cap(void) {
         free(dir);
 }
 
+/* --- [Route] --- */
+
+static const char *route_str(int family, const NetdInAddr *a, char buf[INET6_ADDRSTRLEN]) {
+        return netd_addr_to_string(family, a, buf);
+}
+
+/* Every key lands on its own section, in file order, both families. */
+static void test_route_sections(void) {
+        char *dir = test_tmpdir_new();
+        char buf[INET6_ADDRSTRLEN];
+        Capture cap;
+        Network *nw;
+        const NetworkRoute *r;
+
+        ASSERT_TRUE(dir != NULL);
+        capture_begin(&cap, dir);
+        nw = parse_body(dir,
+                        "[Match]\n"
+                        "Name=net0\n"
+                        "[Network]\n"
+                        "Address=10.0.0.2/24\n"
+                        "[Route]\n"
+                        "Destination=10.1.0.0/16\n"
+                        "Gateway=10.0.0.1\n"
+                        "Metric=50\n"
+                        "PreferredSource=10.0.0.2\n"
+                        "[Route]\n"
+                        "Destination=fd01::/64\n"
+                        "Gateway=fe80::1\n"
+                        "[Route]\n"
+                        "Gateway=10.0.0.254\n"
+                        "Metric=200\n"
+                        "GatewayOnLink=yes\n"
+                        "[Route]\n"
+                        "Destination=10.5.0.7\n"
+                        "Scope=site\n");
+        ASSERT_EQ_INT(capture_end(&cap, "ignoring"), 0);
+        ASSERT_EQ_INT(nw->n_routes, 4);
+
+        r = &nw->routes[0];
+        ASSERT_EQ_INT(r->family, AF_INET);
+        ASSERT_STREQ(route_str(r->family, &r->dst, buf), "10.1.0.0");
+        ASSERT_EQ_INT(r->dst_len, 16);
+        ASSERT_STREQ(route_str(r->family, &r->gw, buf), "10.0.0.1");
+        ASSERT_EQ_INT(r->metric, 50);
+        ASSERT_STREQ(route_str(r->family, &r->prefsrc, buf), "10.0.0.2");
+        ASSERT_EQ_INT(r->prefsrc_family, AF_INET);
+        ASSERT_EQ_INT(r->scope, RT_SCOPE_UNIVERSE);
+        ASSERT_TRUE(!r->onlink);
+        ASSERT_EQ_INT(r->line, 5);
+
+        r = &nw->routes[1];
+        ASSERT_EQ_INT(r->family, AF_INET6);
+        ASSERT_STREQ(route_str(r->family, &r->dst, buf), "fd01::");
+        ASSERT_EQ_INT(r->dst_len, 64);
+        ASSERT_STREQ(route_str(r->family, &r->gw, buf), "fe80::1");
+        ASSERT_EQ_INT(r->metric, 1024);
+        ASSERT_EQ_INT(r->prefsrc_family, 0);
+
+        /* a Gateway= alone is a default route */
+        r = &nw->routes[2];
+        ASSERT_EQ_INT(r->family, AF_INET);
+        ASSERT_EQ_INT(r->dst_family, 0);
+        ASSERT_EQ_INT(r->dst_len, 0);
+        ASSERT_STREQ(route_str(r->family, &r->gw, buf), "10.0.0.254");
+        ASSERT_EQ_INT(r->metric, 200);
+        ASSERT_TRUE(r->onlink);
+
+        /* a bare address is a host route; no gateway makes the scope link unless Scope= says */
+        r = &nw->routes[3];
+        ASSERT_EQ_INT(r->dst_len, 32);
+        ASSERT_EQ_INT(r->gw_family, 0);
+        ASSERT_EQ_INT(r->scope, 200);
+
+        network_free(nw);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+static void test_route_defaults_and_masking(void) {
+        char *dir = test_tmpdir_new();
+        char buf[INET6_ADDRSTRLEN];
+        Capture cap;
+        Network *nw;
+
+        ASSERT_TRUE(dir != NULL);
+        capture_begin(&cap, dir);
+        nw = parse_body(dir,
+                        "[Match]\n"
+                        "Name=net0\n"
+                        "[Network]\n"
+                        "Address=10.0.0.2/24\n"
+                        "[Route]\n"
+                        "Destination=10.1.2.3/16\n"
+                        "[Route]\n"
+                        "Destination=fd00:1:2:3::5/64\n"
+                        "Scope=global\n"
+                        "[Route]\n"
+                        "Destination=fd00:2::/64\n"
+                        "Metric=7\n"
+                        "Scope=host\n"
+                        "[Route]\n"
+                        "Destination=10.2.0.0/16\n"
+                        "Gateway=10.0.0.1\n"
+                        "Scope=link\n");
+        /* Scope=global on IPv6 is the default and says nothing; host is ignored with a warning */
+        ASSERT_EQ_INT(capture_end(&cap, "Scope= is specified for an IPv6 route"), 1);
+        ASSERT_EQ_INT(nw->n_routes, 4);
+
+        /* masked to the prefix; no Gateway= means the connected scope */
+        ASSERT_STREQ(route_str(AF_INET, &nw->routes[0].dst, buf), "10.1.0.0");
+        ASSERT_EQ_INT(nw->routes[0].scope, RT_SCOPE_LINK);
+        ASSERT_EQ_INT(nw->routes[0].metric, 0);
+
+        /* IPv6: masked, universe scope, the kernel's metric 1024 for 0 */
+        ASSERT_STREQ(route_str(AF_INET6, &nw->routes[1].dst, buf), "fd00:1:2:3::");
+        ASSERT_EQ_INT(nw->routes[1].scope, RT_SCOPE_UNIVERSE);
+        ASSERT_EQ_INT(nw->routes[1].metric, 1024);
+        ASSERT_EQ_INT(nw->routes[2].scope, RT_SCOPE_UNIVERSE);
+        ASSERT_EQ_INT(nw->routes[2].metric, 7);
+
+        /* an explicit Scope= on IPv4 wins over the default */
+        ASSERT_EQ_INT(nw->routes[3].scope, RT_SCOPE_LINK);
+
+        network_free(nw);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* A key that changes what the route is drops the whole section; the main
+ * table and the unicast type are what every route has and are accepted. */
+static void test_route_unsupported_keys_drop_the_section(void) {
+        static const struct {
+                const char *key;
+                bool kept;
+        } cases[] = {
+                {                   "Table=main",  true },
+                {                    "Table=254",  true },
+                {                    "Table=100", false },
+                {                    "Table=vrf", false },
+                {                 "Type=unicast",  true },
+                {               "Type=blackhole", false },
+                {                   "Type=local", false },
+                {           "Source=10.9.0.0/24", false },
+                { "MultiPathRoute=10.0.0.1@eth0", false },
+                {                    "NextHop=3", false },
+                {               "Gateway=_dhcp4", false },
+                {              "Gateway=_ipv6ra", false },
+                {                "Gateway=_dhcp", false },
+                {                       "Table=",  true },
+        };
+        char *dir = test_tmpdir_new();
+
+        ASSERT_TRUE(dir != NULL);
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+                char body[256];
+                Capture cap;
+                Network *nw;
+                int hits;
+
+                snprintf(body,
+                         sizeof(body),
+                         "[Match]\nName=net0\n[Network]\nAddress=10.0.0.2/24\n[Route]\nDestination=10.7.0.0/16\n%s\n",
+                         cases[i].key);
+                capture_begin(&cap, dir);
+                nw = parse_body(dir, body);
+                hits = capture_end(&cap, "ignoring the [Route] section");
+
+                if (cases[i].kept != (nw->n_routes == 1))
+                        fprintf(stderr, "[Route] %s: n_routes=%zu\n", cases[i].key, nw->n_routes);
+                ASSERT_TRUE(cases[i].kept == (nw->n_routes == 1));
+                ASSERT_EQ_INT(hits, cases[i].kept ? 0 : 1);
+                network_free(nw);
+        }
+
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* A section that names no family has nothing to install: the Metric= of a
+ * console image's [Route] must stay a warned no-op. A mixed family goes too. */
+static void test_route_sections_dropped(void) {
+        char *dir = test_tmpdir_new();
+        Capture cap;
+        Network *nw;
+
+        ASSERT_TRUE(dir != NULL);
+        capture_begin(&cap, dir);
+        nw = parse_body(dir,
+                        "[Match]\n"
+                        "Name=net0\n"
+                        "[Network]\n"
+                        "Address=10.0.0.2/24\n"
+                        "[Route]\n"
+                        "Metric=10\n"
+                        "[Route]\n"
+                        "Scope=link\n"
+                        "[Route]\n"
+                        "Destination=10.1.0.0/16\n"
+                        "Gateway=fe80::1\n"
+                        "[Route]\n"
+                        "Gateway=10.0.0.1\n"
+                        "PreferredSource=fd00::1\n"
+                        "[Route]\n"
+                        "Destination=10.3.0.0/16\n"
+                        "Gateway=10.0.0.1\n");
+        ASSERT_EQ_INT(capture_end(&cap, "section without Gateway=, Destination="), 2);
+        ASSERT_EQ_INT(nw->n_routes, 1);
+        ASSERT_EQ_INT(nw->routes[0].line, 15);
+        network_free(nw);
+
+        /* the same file read again says the same about the mixed families */
+        capture_begin(&cap, dir);
+        nw = parse_body(dir,
+                        "[Match]\n"
+                        "Name=net0\n"
+                        "[Route]\n"
+                        "Destination=10.1.0.0/16\n"
+                        "Gateway=fe80::1\n");
+        ASSERT_EQ_INT(capture_end(&cap, "not all IPv4 or all IPv6"), 1);
+        ASSERT_EQ_INT(nw->n_routes, 0);
+        network_free(nw);
+
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* A Gateway= with no static address in the file cannot be reached through a
+ * connected route, so networkd puts it on-link and says so. */
+static void test_route_implicit_onlink(void) {
+        static const struct {
+                const char *network;
+                const char *route;
+                bool onlink;
+                int warnings;
+        } cases[] = {
+                {            "[Network]\nDHCP=yes\n","[Route]\nDestination=10.1.0.0/16\nGateway=10.0.0.1\n",  true,1                                                                                                                    },
+                {            "[Network]\nDHCP=yes\n",
+                 "[Route]\nDestination=10.1.0.0/16\nGateway=10.0.0.1\nGatewayOnLink=no\n", false,
+                 0                                                                                                    },
+                { "[Network]\nAddress=10.0.0.2/24\n",
+                 "[Route]\nDestination=10.1.0.0/16\nGateway=10.0.0.1\n", false,
+                 0                                                                                                    },
+                { "[Network]\nAddress=10.0.0.2/24\n",
+                 "[Route]\nDestination=10.1.0.0/16\nGateway=10.0.0.1\nGatewayOnLink=yes\n",  true,
+                 0                                                                                                    },
+                {            "[Network]\nDHCP=yes\n",                   "[Route]\nDestination=10.1.0.0/16\n", false, 0 },
+                {            "[Network]\nDHCP=yes\n",    "[Route]\nDestination=fd01::/64\nGateway=fe80::1\n",  true, 1 },
+        };
+        char *dir = test_tmpdir_new();
+
+        ASSERT_TRUE(dir != NULL);
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+                char body[512];
+                Capture cap;
+                Network *nw;
+
+                snprintf(body, sizeof(body), "[Match]\nName=net0\n%s%s", cases[i].network, cases[i].route);
+                capture_begin(&cap, dir);
+                nw = parse_body(dir, body);
+                ASSERT_EQ_INT(capture_end(&cap, "enabling GatewayOnLink="), cases[i].warnings);
+                ASSERT_EQ_INT(nw->n_routes, 1);
+                ASSERT_TRUE(nw->routes[0].onlink == cases[i].onlink);
+                network_free(nw);
+        }
+
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* The later of two sections for one route wins; a different metric is a
+ * different route. */
+static void test_route_duplicates_later_wins(void) {
+        char *dir = test_tmpdir_new();
+        Capture cap;
+        Network *nw;
+
+        ASSERT_TRUE(dir != NULL);
+        capture_begin(&cap, dir);
+        nw = parse_body(dir,
+                        "[Match]\n"
+                        "Name=net0\n"
+                        "[Network]\n"
+                        "Address=10.0.0.2/24\n"
+                        "[Route]\n"
+                        "Destination=10.1.0.0/16\n"
+                        "Gateway=10.0.0.1\n"
+                        "[Route]\n"
+                        "Destination=10.1.0.0/16\n"
+                        "Gateway=10.0.0.1\n"
+                        "Metric=5\n"
+                        "[Route]\n"
+                        "Destination=10.1.5.5/16\n"
+                        "Gateway=10.0.0.1\n");
+        ASSERT_EQ_INT(capture_end(&cap, "the same route is set at line 12"), 1);
+        ASSERT_EQ_INT(nw->n_routes, 2);
+        ASSERT_EQ_INT(nw->routes[0].metric, 5);
+        ASSERT_EQ_INT(nw->routes[0].line, 8);
+        ASSERT_EQ_INT(nw->routes[1].metric, 0);
+        ASSERT_EQ_INT(nw->routes[1].line, 12);
+
+        network_free(nw);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* Values that fail to parse keep the earlier one; an empty Gateway= or
+ * PreferredSource= unsets it; the tuning keys are read and dropped. */
+static void test_route_value_errors(void) {
+        char *dir = test_tmpdir_new();
+        Capture cap;
+        Network *nw;
+
+        ASSERT_TRUE(dir != NULL);
+        capture_begin(&cap, dir);
+        nw = parse_body(dir,
+                        "[Match]\n"
+                        "Name=net0\n"
+                        "[Network]\n"
+                        "Address=10.0.0.2/24\n"
+                        "[Route]\n"
+                        "Destination=10.1.0.0/16\n"
+                        "Destination=10.1.0.0/40\n"
+                        "Destination=\n"
+                        "Gateway=10.0.0.1\n"
+                        "Gateway=0.0.0.0\n"
+                        "Gateway=host.example\n"
+                        "Metric=10\n"
+                        "Metric=abc\n"
+                        "Metric=\n"
+                        "Metric=0x10\n"
+                        "Scope=never\n"
+                        "GatewayOnLink=maybe\n"
+                        "PreferredSource=10.0.0.2\n"
+                        "PreferredSource=nonsense\n"
+                        "MTUBytes=1400\n"
+                        "Protocol=boot\n"
+                        "IPv6Preference=high\n"
+                        "InitialCongestionWindow=20\n"
+                        "[Route]\n"
+                        "Destination=10.2.0.0/16\n"
+                        "Gateway=10.0.0.1\n"
+                        "Gateway=\n"
+                        "PreferredSource=10.0.0.2\n"
+                        "PreferredSource=no\n");
+        ASSERT_EQ_INT(capture_end(&cap, "invalid"), 10);
+        ASSERT_EQ_INT(nw->n_routes, 2);
+
+        ASSERT_EQ_INT(nw->routes[0].dst_len, 16);
+        ASSERT_EQ_INT(nw->routes[0].gw_family, AF_INET);
+        ASSERT_EQ_INT(nw->routes[0].gw.bytes[3], 1);
+        ASSERT_EQ_INT(nw->routes[0].metric, 10);
+        ASSERT_EQ_INT(nw->routes[0].prefsrc.bytes[3], 2);
+        ASSERT_TRUE(!nw->routes[0].onlink);
+
+        ASSERT_EQ_INT(nw->routes[1].gw_family, 0);
+        ASSERT_EQ_INT(nw->routes[1].prefsrc_family, 0);
+        ASSERT_EQ_INT(nw->routes[1].scope, RT_SCOPE_LINK);
+
+        network_free(nw);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* [Network] Gateway= is not a [Route]: it keeps its own slot. */
+static void test_route_leaves_network_gateway(void) {
+        char *dir = test_tmpdir_new();
+        Network *nw;
+
+        ASSERT_TRUE(dir != NULL);
+        nw = parse_body(dir,
+                        "[Match]\n"
+                        "Name=net0\n"
+                        "[Network]\n"
+                        "Address=10.0.0.2/24\n"
+                        "Gateway=10.0.0.1\n"
+                        "[Route]\n"
+                        "Gateway=10.0.0.1\n");
+        ASSERT_TRUE(nw->gateway_set);
+        ASSERT_EQ_INT(nw->n_routes, 1);
+
+        network_free(nw);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* Over the cap one warning is logged for the file; the keys of a section past
+ * it are skipped without effect. */
+static void test_route_cap(void) {
+        char *dir = test_tmpdir_new();
+        char body[4096];
+        size_t off;
+        Capture cap;
+        Network *nw;
+
+        ASSERT_TRUE(dir != NULL);
+        off = (size_t) snprintf(body, sizeof(body), "[Match]\nName=net0\n[Network]\nAddress=10.0.0.2/24\n");
+        for (int i = 0; i < 24; i++)
+                off += (size_t) snprintf(
+                                body + off,
+                                sizeof(body) - off,
+                                "[Route]\nDestination=10.%d.0.0/16\nGateway=10.0.0.1\nMetric=%d\n",
+                                i,
+                                i + 1);
+
+        capture_begin(&cap, dir);
+        nw = parse_body(dir, body);
+        ASSERT_EQ_INT(capture_end(&cap, "more than 16 routes"), 1);
+
+        ASSERT_EQ_INT(nw->n_routes, NETWORK_ROUTE_MAX);
+        ASSERT_EQ_INT(nw->routes[0].metric, 1);
+        ASSERT_EQ_INT(nw->routes[15].metric, 16);
+
+        network_free(nw);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
         test_defaults();
         test_dhcp_spellings();
@@ -1174,6 +1595,15 @@ int main(void) {
         test_address_empty_assignment_clears();
         test_address_value_errors_keep_earlier_value();
         test_address_cap();
+        test_route_sections();
+        test_route_defaults_and_masking();
+        test_route_unsupported_keys_drop_the_section();
+        test_route_sections_dropped();
+        test_route_implicit_onlink();
+        test_route_duplicates_later_wins();
+        test_route_value_errors();
+        test_route_leaves_network_gateway();
+        test_route_cap();
 
         printf("test-netd-network: ok\n");
         return EXIT_SUCCESS;
