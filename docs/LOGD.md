@@ -17,10 +17,15 @@ export-format text on tmpfs, and nothing is written to persistent storage.
 `logd.service` is a service with `Restart=on-failure` and `RestartSec=2`,
 wanted by `default.target`, with `StandardOutput=null`: `logd`'s own stdout
 and stderr are `/dev/null` and its diagnostics are discarded, because the
-logd socket would be its own input queue. If `logd` is started with a socket on fd 1 or fd 2 anyway, it makes
-them non-blocking and a log line that does not fit the queue is dropped.
-They are not sent to `/dev/kmsg` either, which `logd` reads back as kernel
-records. `logd.socket` is wanted by `sockets.target`:
+logd socket would be its own input queue. PID 1 does not depend on that
+line: the service that is the activation target of the socket unit bound at
+`/run/logd/stdout` never gets the logd socket as stdout or stderr, whatever
+its unit file or an override says (see
+[Service stdout and stderr](#service-stdout-and-stderr)). If `logd` is
+started with a socket on fd 1 or fd 2 anyway, it makes them non-blocking and
+a log line that does not fit the queue is dropped. They are not sent to
+`/dev/kmsg` either, which `logd` reads back as kernel records. `logd.socket`
+is wanted by `sockets.target`:
 
 ```ini
 [Socket]
@@ -70,7 +75,8 @@ flush the pending line tails (see below) and end `logd` with status 0.
 
 ### Service stdout and stderr
 
-For every start of every service command (not only `ExecStart=`), PID 1
+For every start of every service command (not only `ExecStart=`), except
+those of the service that reads the socket (see the table), PID 1
 creates an `AF_UNIX`/`SOCK_DGRAM` socket in the parent before `fork()`,
 binds it to a unique abstract-namespace name of the form
 `pico-init-stdout/<unit>/<counter>`, connects it to `/run/logd/stdout`, and
@@ -87,6 +93,7 @@ The default is chosen by `StandardInput=` and `StandardOutput=`:
 | `StandardInput=tty*` with no explicit `journal` | the terminal (stdin) |
 | `StandardOutput=journal`, `journal+console`, `syslog`, `syslog+console` | logd socket, even with a tty on stdin; the `+console` copy is not made |
 | `StandardOutput=null` | `/dev/null` |
+| The service that is the activation target of the socket unit bound at `/run/logd/stdout`, every command of it | `/dev/null`, also with `StandardOutput=journal`; a terminal or connection on stdin still wins |
 | `StandardError=` unset | follows an explicit `StandardOutput=` |
 | logd socket cannot be created or connected | `/dev/console` |
 
