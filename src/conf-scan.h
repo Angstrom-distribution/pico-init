@@ -39,8 +39,28 @@ typedef int (*pico_conf_handler_t)(
                 void *userdata);
 
 /*
+ * Called once per accepted [Section] header, before its assignments. A header
+ * that is refused (no closing bracket, control characters) is not reported.
+ * `section` is the name without the brackets, valid only for the call. Return
+ * 0 to continue, or -errno to abort the whole file.
+ */
+typedef int (*pico_conf_section_handler_t)(
+                const char *filename, unsigned line, const char *section, void *userdata);
+
+/*
  * Scan `filename`, invoking `handler` per assignment. Returns 0 on success or
  * -errno. A malformed line is logged and skipped rather than failing the file,
  * so a partially broken config still yields everything it got right.
  */
 int pico_conf_scan(const char *filename, pico_conf_handler_t handler, void *userdata);
+
+/*
+ * As pico_conf_scan(), and `section_handler` (may be NULL) is also called for
+ * each accepted header, so a caller can tell a repeated section from one
+ * longer section.
+ */
+int pico_conf_scan_full(
+                const char *filename,
+                pico_conf_handler_t handler,
+                pico_conf_section_handler_t section_handler,
+                void *userdata);

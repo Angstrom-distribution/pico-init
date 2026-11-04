@@ -101,6 +101,7 @@ static bool cs_line_is_comment(const char *l) {
  */
 static int
                 cs_scan_line(pico_conf_handler_t handler,
+                             pico_conf_section_handler_t section_handler,
                              void *userdata,
                              const char *filename,
                              unsigned line,
@@ -146,6 +147,9 @@ static int
 
                 *section = pico_mfree(*section); /* 91ffff962: free before replacing */
                 *section = name;
+
+                if (section_handler)
+                        return section_handler(filename, line, name, userdata);
                 return 0;
         }
 
@@ -167,6 +171,14 @@ static int
 }
 
 int pico_conf_scan(const char *filename, pico_conf_handler_t handler, void *userdata) {
+        return pico_conf_scan_full(filename, handler, NULL, userdata);
+}
+
+int pico_conf_scan_full(
+                const char *filename,
+                pico_conf_handler_t handler,
+                pico_conf_section_handler_t section_handler,
+                void *userdata) {
         FILE *f;
         char *rawline = NULL;
         size_t rawcap = 0;
@@ -222,7 +234,14 @@ int pico_conf_scan(const char *filename, pico_conf_handler_t handler, void *user
                                 continue;
 
                         if (cs_line_is_blank(l)) {
-                                r = cs_scan_line(handler, userdata, filename, line, &section, continuation);
+                                r = cs_scan_line(
+                                                handler,
+                                                section_handler,
+                                                userdata,
+                                                filename,
+                                                line,
+                                                &section,
+                                                continuation);
                                 continuation = pico_mfree(continuation);
                                 if (r < 0)
                                         break;
@@ -260,7 +279,7 @@ int pico_conf_scan(const char *filename, pico_conf_handler_t handler, void *user
                         continue;
                 }
 
-                r = cs_scan_line(handler, userdata, filename, line, &section, l);
+                r = cs_scan_line(handler, section_handler, userdata, filename, line, &section, l);
                 if (l == continuation)
                         continuation = pico_mfree(continuation);
                 if (r < 0)
@@ -270,7 +289,7 @@ int pico_conf_scan(const char *filename, pico_conf_handler_t handler, void *user
         /* 4f29e0db1: a file ending mid-continuation must still parse that
          * last line. */
         if (r == 0 && continuation)
-                r = cs_scan_line(handler, userdata, filename, line, &section, continuation);
+                r = cs_scan_line(handler, section_handler, userdata, filename, line, &section, continuation);
         continuation = pico_mfree(continuation);
         section = pico_mfree(section);
 
