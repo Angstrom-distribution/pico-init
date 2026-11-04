@@ -14,14 +14,28 @@
 
 #pragma once
 
+#include <stddef.h>
+
+/*
+ * Reads the first line of path into buf (size bytes, at least 2), without
+ * its line ending and trailing blanks. Returns the length, 0 when there is
+ * nothing to apply (no such file, empty file or a blank line; buf may then
+ * be unchanged), or -errno on a read failure.
+ */
+int hostname_read(const char *path, char *buf, size_t size);
+
 /*
  * Reads /etc/hostname and applies it via sethostname(2).
  *
- * Best-effort and silent on the common "nothing to do" cases: a missing or
- * empty /etc/hostname just leaves the kernel default alone, matching
- * systemd's own hostname_setup() behaviour -- a board with no configured
- * hostname is not a boot failure. Returns 0 on success (including the
- * nothing-to-do cases) or -errno on a real failure applying a hostname that
- * was actually read.
+ * Best-effort: a missing or empty /etc/hostname just leaves the kernel
+ * default alone, matching systemd's own hostname_setup() behaviour -- a
+ * board with no configured hostname is not a boot failure. Returns 1 when
+ * the call changed the hostname, 0 when there was nothing to change, or
+ * -errno on a real failure.
+ *
+ * name must hold HOST_NAME_MAX + 1 bytes. It is set to the hostname that
+ * was applied (return 1) or that could not be applied (sethostname(2)
+ * failed), and to "" otherwise. Nothing is logged: this runs before
+ * /dev/kmsg is the log sink, so the caller reports the result once it is.
  */
-int hostname_setup(void);
+int hostname_setup(char *name);
