@@ -1,3 +1,109 @@
+# CHANGES WITH 0.4.0:
+
+        netd reads [Address], [Route] and [IPv6AcceptRA] sections and takes
+        IPv6 addresses, routes, DNS servers and NTP servers, and the default
+        route metrics follow networkd. A service can set its own start limit.
+        logd no longer blocks on its own output, which kept every other
+        service from logging and could hold up the boot.
+
+##        PID 1 and unit files:
+
+        * StartLimitIntervalSec= (and the older StartLimitInterval=) and
+          StartLimitBurst= are read from [Unit] and [Service]. The defaults
+          stay 10 s and 5. 0 disables the limit, an empty assignment keeps the
+          previous value, and infinity is a window that never expires, as in
+          systemd. A service that fails at once and restarts every few seconds
+          now ends in the failed state with start-limit-hit. StartLimitAction=
+          and the DefaultStartLimit settings are not implemented.
+
+        * The service that is the activation target of the socket unit
+          listening on /run/logd/stdout gets /dev/null as stdout and stderr,
+          whatever its unit file says, because connecting it to the socket it
+          reads makes a full queue block it on its own output. See logd.
+
+        * Early boot prints systemd's lines: "Detected architecture arm.",
+          "Hostname set to <name>." and, for the hardware watchdog, "Using
+          hardware watchdog <device>: '<identity>', version <hex>." and
+          "Watchdog running with a hardware timeout of <time>.". The lines
+          carry pico-init's tag, not systemd[1]. The old "watchdog armed" line
+          is now a debug message. A hostname that cannot be set is reported
+          through the kernel ring and reaches logd.
+
+##        logd:
+
+        * logd no longer deadlocks at startup. PID 1 connected the stdout and
+          stderr of every service, logd included, to the socket logd reads;
+          when other services had filled that queue before logd started, its
+          first log line blocked it for ever, and every service that then
+          wrote to stdout or stderr blocked too. Symptoms were a log that
+          showed only kernel lines, a dbus.service start that timed out, a
+          netd that never sent a DHCP request and a boot splash that never
+          gave way to the compositor. logd.service has StandardOutput=null,
+          logd makes a socket on fd 1 or 2 non-blocking, and PID 1 refuses the
+          self-connection (see PID 1 and unit files). logd's own diagnostics
+          are not logged in a normal boot.
+
+##        netd:
+
+        * [Address] sections, any number per file, with Address=, Peer=,
+          Label=, RouteMetric=, PreferredLifetime=, Scope=,
+          DuplicateAddressDetection= and AddPrefixRoute=, for IPv4 and IPv6.
+          Several Address= lines in [Network] are several addresses. A static
+          address and the address of a DHCP lease now coexist on a link, as in
+          systemd-networkd; the lease no longer replaces the static address.
+          Peer= reads only the address.
+
+        * [Route] sections, any number per file, with Destination=, Gateway=,
+          Metric=, GatewayOnLink=, PreferredSource= and Scope=, for IPv4 and
+          IPv6. A [Route] default route stays beside a lease's default route.
+          A section with a key that changes what the route is, such as Table=
+          other than main, Type= other than unicast or Source=, is dropped
+          with a warning.
+
+        * IPv6 router advertisements: netd sends router solicitations, parses
+          advertisements (prefixes, router lifetime and preference, MTU, RDNSS
+          and DNSSL) and installs SLAAC addresses, default and on-link routes,
+          the IPv6 MTU and DNS servers with their lifetimes. [IPv6AcceptRA]
+          takes UseGateway=, UseOnLinkPrefix=, UseAutonomousPrefix=, UseDNS=,
+          UseDomains=, UseMTU=, RouteMetric= and Token=, and IPv6AcceptRA= in
+          [Network] turns it off or on. Interface identifiers are EUI-64,
+          static or prefixstable (RFC 7217). DHCPv6 and prefix delegation are
+          not implemented.
+
+        * DNS= and NTP= take IPv6 literals. The SNTP client has a socket per
+          family and rebuilds its server list when a link appears, is renamed
+          or goes away. NTP= takes address literals only. An IPv6 reply must
+          come from port 123 and, for a link-local server, from the right
+          interface.
+
+        * [DHCPv4] RouteMetric= is the metric of the lease's default route, of
+          its router's host route and of the leased address's prefix route;
+          unset it is 1024, as in systemd-networkd. A Gateway= route keeps the
+          kernel's metric 0. Routes are added with NLM_F_APPEND and removed by
+          interface, gateway and metric, so links that share a metric no
+          longer replace or remove each other's route.
+
+        * A reload re-points every link before it reconfigures any, so a link
+          no longer reads the Network of a link that was already freed.
+
+##        Build and tests:
+
+        * New tests: test-boot-text, test-hostname-setup, test-logd-stdio,
+          test-service-stdout, test-netd-addr, test-netd-ndisc-msg,
+          test-netd-ndisc-iid, test-netd-ndisc-link, test-netd-ra and
+          test-netd-sntp-ipv6, and additions to the unit parser, service,
+          reload, netd network and rtnetlink tests. test-netd-ra,
+          test-netd-sntp-ipv6 and test-service-stdout run in namespaces and
+          need root.
+
+##        Miscellaneous:
+
+        * AGENTS.md describes how to work on pico-init.
+
+##        Contributions from:
+
+        Koen Kooi
+
 # CHANGES WITH 0.3.2:
 
         A service can be reloaded: pico-init runs ExecReload= and picoctl has
