@@ -141,12 +141,6 @@
 #define PICO_DEFAULT_TIMEOUT_USEC (90 * USEC_PER_SEC)
 #define PICO_DEFAULT_RESTART_USEC (100 * USEC_PER_MSEC)
 
-/* v30's hardcoded numbers, still upstream's defaults. Not exposed as
- * StartLimitIntervalSec=/StartLimitBurst=: a unit file cannot disable the
- * limit. */
-#define PICO_START_LIMIT_INTERVAL_USEC (10 * USEC_PER_SEC)
-#define PICO_START_LIMIT_BURST 5
-
 /* --- tri-state pid liveness --- */
 
 /*
@@ -588,12 +582,20 @@ static void service_forking_locate_main_pid(Service *s) {
  * kernel allows, and the tight loop can starve job dispatch badly enough
  * that even shutdown never gets scheduled.
  *
+ * An interval or a burst of 0 disables the limit, as upstream's
+ * ratelimit_below(): nothing is counted then. "infinity" is not a disable
+ * there either: the window never expires, so it caps the starts for the
+ * unit's lifetime (until `picoctl reset-failed`).
+ *
  * CLOCK_BOOTTIME would be more correct (a CLOCK_MONOTONIC window survives
  * suspend/resume as a stale prohibition), but util.h only exposes
  * CLOCK_MONOTONIC and there is no suspend/resume support.
  */
 static bool service_start_limit_check(Service *s) {
         usec_t now = now_monotonic();
+
+        if (s->start_limit_interval == 0 || s->start_limit_burst == 0)
+                return true;
 
         if (s->start_limit_begin == 0 || now - s->start_limit_begin > s->start_limit_interval) {
                 s->start_limit_begin = now;
@@ -1183,11 +1185,19 @@ static int service_do_start(Service *s) {
         /* After "is a start even legal" (the caller already checked), before
          * any state change or fork. */
         if (!service_start_limit_check(s)) {
+                char interval[32] = "infinity";
+
+                if (s->start_limit_interval != USEC_INFINITY)
+                        snprintf(interval,
+                                 sizeof(interval),
+                                 "%llu us",
+                                 (unsigned long long) s->start_limit_interval);
+
                 pico_log(PICO_LOG_WARNING,
-                         "%s: start request repeated too quickly (limit %u per %llu us), refusing",
+                         "%s: start request repeated too quickly (limit %u per %s), refusing",
                          UNIT(s)->id,
                          s->start_limit_burst,
-                         (unsigned long long) s->start_limit_interval);
+                         interval);
                 /* The one result allowed to overwrite a stored failure: this
                  * is a fresh attempt, and going through service_enter_dead()
                  * here would let Restart= immediately re-trigger the very

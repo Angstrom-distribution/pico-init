@@ -134,11 +134,15 @@ static void test_reload_updates_running_service(void) {
         pid = fork_sleeper();
         s->state = SERVICE_RUNNING;
         s->main_pid = pid;
+        s->start_limit_begin = 123;
+        s->start_limit_num = 2;
 
         ASSERT_EQ_INT(test_write_file(dir,
                                       "a.service",
                                       "[Unit]\n"
                                       "Description=New description\n"
+                                      "StartLimitIntervalSec=1min\n"
+                                      "StartLimitBurst=3\n"
                                       "\n"
                                       "[Service]\n"
                                       "Type=oneshot\n"
@@ -165,6 +169,8 @@ static void test_reload_updates_running_service(void) {
         ASSERT_TRUE(s->environment[2] == NULL);
         ASSERT_EQ_INT(s->restart, SERVICE_RESTART_ON_FAILURE);
         ASSERT_EQ_INT(s->restart_usec, 7 * USEC_PER_SEC);
+        ASSERT_TRUE(s->start_limit_interval == 60 * USEC_PER_SEC);
+        ASSERT_EQ_INT(s->start_limit_burst, 3);
         ASSERT_TRUE(s->remain_after_exit);
         ASSERT_TRUE(u->wanted_by != NULL);
         ASSERT_STREQ(u->wanted_by[0], "multi-user.target");
@@ -173,6 +179,8 @@ static void test_reload_updates_running_service(void) {
         ASSERT_EQ_INT(u->n_degraded_directives, 0);
 
         /* runtime state untouched, and the process never signalled */
+        ASSERT_TRUE(s->start_limit_begin == 123);
+        ASSERT_EQ_INT(s->start_limit_num, 2);
         ASSERT_EQ_INT(s->state, SERVICE_RUNNING);
         ASSERT_EQ_INT(s->main_pid, pid);
         ASSERT_TRUE(u->job == NULL);

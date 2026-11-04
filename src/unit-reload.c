@@ -141,6 +141,8 @@ static void service_swap_directives(Service *s, Service *fresh) {
         SWAP_FIELD(s->restart_usec, fresh->restart_usec);
         SWAP_FIELD(s->timeout_start_usec, fresh->timeout_start_usec);
         SWAP_FIELD(s->timeout_stop_usec, fresh->timeout_stop_usec);
+        SWAP_FIELD(s->start_limit_interval, fresh->start_limit_interval);
+        SWAP_FIELD(s->start_limit_burst, fresh->start_limit_burst);
 }
 
 /* Something is mid-flight on u that is still reading its current values. */
