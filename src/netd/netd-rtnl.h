@@ -261,6 +261,11 @@ int netd_rtnl_address_del(NetdRtnl *rtnl, const NetdRtnlAddress *address);
  * so callers that record a route use 1024 for it. `scope` is rtm_scope for
  * IPv4 (RT_SCOPE_UNIVERSE is 0) and always universe for IPv6. `flags` holds
  * RTNH_F_*, in practice RTNH_F_ONLINK. `protocol` 0 is RTPROT_STATIC.
+ *
+ * A route from a router advertisement carries its preference (RTA_PREF) and
+ * a lifetime (RTA_EXPIRES, seconds) after which the kernel drops it by
+ * itself, so a route outlives a netd that died only by what is left of its
+ * lifetime. Both are sent on adds only.
  */
 typedef struct NetdRtnlRoute {
         int ifindex;
@@ -273,8 +278,11 @@ typedef struct NetdRtnlRoute {
         NetdInAddr prefsrc;
         bool has_gw;
         bool has_prefsrc;
+        bool has_pref;
+        uint8_t pref; /* ICMPV6_ROUTER_PREF_*, IPv6 only, sent when has_pref */
         uint32_t flags;
         uint32_t metric;
+        uint32_t expires_sec; /* IPv6 only: RTA_EXPIRES when neither 0 nor UINT32_MAX */
 } NetdRtnlRoute;
 
 /*
@@ -284,7 +292,9 @@ typedef struct NetdRtnlRoute {
  * CREATE|APPEND is what systemd-networkd sends for every route: routes that
  * differ only in output interface or gateway coexist at one metric, the one
  * added first ahead of later ones, and an identical add returns -EEXIST
- * rather than replacing anything.
+ * rather than replacing anything. For IPv6 that -EEXIST still sets the
+ * route's expiry from the new RTA_EXPIRES, which is how a lifetime is
+ * refreshed.
  *
  * netd_rtnl_route_del() sends the same attributes, and the kernel matches a
  * delete on the output interface, gateway, protocol, scope and priority, so it

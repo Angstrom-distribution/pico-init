@@ -801,8 +801,23 @@ static int build_route(struct nl_request *req, uint16_t type, uint16_t flags, co
         if (r < 0)
                 return r;
 
-        if (rt->has_prefsrc)
-                return nl_add_attr(req, RTA_PREFSRC, rt->prefsrc.bytes, size);
+        if (rt->has_prefsrc) {
+                r = nl_add_attr(req, RTA_PREFSRC, rt->prefsrc.bytes, size);
+                if (r < 0)
+                        return r;
+        }
+
+        if (type != RTM_NEWROUTE || rt->family != AF_INET6)
+                return 0;
+
+        if (rt->has_pref) {
+                r = nl_add_attr(req, RTA_PREF, &rt->pref, sizeof(rt->pref));
+                if (r < 0)
+                        return r;
+        }
+
+        if (rt->expires_sec != 0 && rt->expires_sec != UINT32_MAX)
+                return nl_add_attr(req, RTA_EXPIRES, &rt->expires_sec, sizeof(rt->expires_sec));
 
         return 0;
 }

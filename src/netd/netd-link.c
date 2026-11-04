@@ -10,6 +10,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <limits.h>
+#include <linux/icmpv6.h>
 #include <linux/if_addr.h>
 #include <linux/rtnetlink.h>
 #include <net/if_arp.h>
@@ -24,6 +25,8 @@
 #include "dhcp/dhcp-server-internal.h"
 #include "dhcp/siphash24.h"
 #include "lldp/lldp-link.h"
+#include "ndisc/ndisc-iid.h"
+#include "ndisc/ndisc-link.h"
 #include "netd-network.h"
 #include "netd-resolv.h"
 #include "netd-sntp.h"
@@ -153,6 +156,10 @@ static void link_route_to_rtnl(const Link *l, const LinkRoute *r, NetdRtnlRoute 
         out->has_prefsrc = r->has_prefsrc;
         out->flags = r->flags;
         out->metric = r->metric;
+        out->protocol = r->protocol;
+        out->has_pref = r->protocol == RTPROT_RA;
+        out->pref = r->pref;
+        out->expires_sec = r->expires_sec;
 }
 
 static LinkRoute *link_route_find(Link *l, const LinkRoute *like) {
@@ -199,12 +206,21 @@ static int link_route_send(Link *l, const LinkRoute *r) {
         return route_add_idempotent(l->netd->rtnl, &rt);
 }
 
+/* The kernel deletes a route only by the protocol it was added with. */
+static uint8_t link_route_kernel_protocol(const LinkRoute *r) {
+        if (r->kernel_protocol)
+                return r->kernel_protocol;
+
+        return r->protocol ? r->protocol : RTPROT_STATIC;
+}
+
 /* A link that is gone has no routes left to delete. */
 static int link_route_unsend(Link *l, const LinkRoute *r) {
         NetdRtnlRoute rt;
         int rc;
 
         link_route_to_rtnl(l, r, &rt);
+        rt.protocol = link_route_kernel_protocol(r);
         rc = route_del_idempotent(l->netd->rtnl, &rt);
         return rc == -ENODEV ? 0 : rc;
 }
@@ -218,6 +234,39 @@ static bool link_static_route_owns(const Link *l, const LinkRoute *r) {
                         return true;
 
         return false;
+}
+
+/*
+ * One IPv6 kernel route, keyed as the kernel keys it: destination, metric
+ * and next hop. `onlink` and a preferred source do not make a second one,
+ * and a second add of the same route only clears or refreshes its expiry.
+ */
+static bool link_route_same_ipv6_object(const LinkRoute *a, const LinkRoute *b) {
+        return a->family == AF_INET6 && b->family == AF_INET6 && a->dst_len == b->dst_len &&
+                        a->has_gw == b->has_gw && a->metric == b->metric &&
+                        memcmp(a->dst.bytes, b->dst.bytes, sizeof(a->dst.bytes)) == 0 &&
+                        memcmp(a->gw.bytes, b->gw.bytes, sizeof(a->gw.bytes)) == 0;
+}
+
+/* The installed [Route] entry, not going away, that is the same kernel
+ * route as the advertised route `r`, or NULL. */
+static const LinkRoute *link_static_route_holding(const Link *l, const LinkRoute *r) {
+        for (size_t i = 0; i < l->n_routes; i++)
+                if (!l->routes[i].doomed && l->routes[i].installed &&
+                    link_route_same_ipv6_object(&l->routes[i], r))
+                        return &l->routes[i];
+
+        return NULL;
+}
+
+/* The installed advertised route that is the same kernel route as the
+ * [Route] entry `r`, or NULL. */
+static const LinkRoute *link_ra_route_holding(const Link *l, const LinkRoute *r) {
+        for (size_t i = 0; i < l->n_ra_routes; i++)
+                if (l->ra_routes[i].installed && link_route_same_ipv6_object(&l->ra_routes[i], r))
+                        return &l->ra_routes[i];
+
+        return NULL;
 }
 
 /* The default route through `gw`, or the host route to it, as the single
@@ -314,7 +363,7 @@ static void link_address_to_rtnl(const Link *l, const LinkAddress *a, NetdRtnlAd
         out->peer = a->peer;
         out->has_peer = a->has_peer;
         out->flags = a->flags;
-        out->valid_sec = UINT32_MAX;
+        out->valid_sec = a->valid_sec;
         out->preferred_sec = a->preferred_sec;
         out->route_metric = a->route_metric;
         out->label = a->label[0] ? a->label : NULL;
@@ -589,6 +638,7 @@ int link_new(Netd *n, const NetdRtnlLink *rl, Link **ret) {
         l->ifindex = rl->ifindex;
         l->flags = rl->flags;
         l->arp_type = rl->arp_type;
+        l->mtu = rl->mtu;
         l->hw_addr_len = rl->hw_addr_len;
         memcpy(l->hw_addr, rl->hw_addr, sizeof(l->hw_addr));
 
@@ -638,6 +688,8 @@ Link *link_free(Link *l) {
         (void) link_remove_state_file(l);
         free(l->addrs);
         free(l->routes);
+        free(l->ra_addrs);
+        free(l->ra_routes);
 
         if (n) {
                 for (size_t i = 0; i < n->n_links; i++)
@@ -677,6 +729,7 @@ Link *netd_find_link_by_name(Netd *n, const char *ifname) {
 static void link_update_snapshot(Link *l, const NetdRtnlLink *rl) {
         l->flags = rl->flags;
         l->arp_type = rl->arp_type;
+        l->mtu = rl->mtu;
         l->hw_addr_len = rl->hw_addr_len;
         memcpy(l->hw_addr, rl->hw_addr, sizeof(l->hw_addr));
         memcpy(l->ifname, rl->ifname, sizeof(l->ifname) - 1);
@@ -763,6 +816,10 @@ static void link_set_ipv6ll(Link *l, bool removed, const NetdRtnlAddr *a) {
                 l->ipv6ll_ready = false;
 }
 
+/* Defined with the router advertisement glue below. */
+static void link_ndisc_update_state(Link *l);
+static void link_ra_address_event(Link *l, bool removed, const NetdRtnlAddr *a);
+
 int netd_link_rtnl_addr_handler(void *userdata, bool removed, const NetdRtnlAddr *a) {
         Netd *n = userdata;
         Link *l;
@@ -774,8 +831,14 @@ int netd_link_rtnl_addr_handler(void *userdata, bool removed, const NetdRtnlAddr
         if (!l || a->family != AF_INET6)
                 return 0;
 
-        if (netd_addr_is_link_local(AF_INET6, &a->address))
+        if (netd_addr_is_link_local(AF_INET6, &a->address)) {
                 link_set_ipv6ll(l, removed, a);
+                if (!n->rtnl_dump_in_progress)
+                        link_ndisc_update_state(l);
+        }
+
+        if (!n->rtnl_dump_in_progress)
+                link_ra_address_event(l, removed, a);
 
         if (removed || !(a->flags & IFA_F_DADFAILED))
                 return 0;
@@ -808,6 +871,7 @@ static void link_address_from_network(const NetworkAddress *na, LinkAddress *out
         out->peer = na->peer;
         out->has_peer = na->peer_set;
         out->route_metric = na->route_metric;
+        out->valid_sec = UINT32_MAX;
         out->preferred_sec = na->deprecated ? 0 : UINT32_MAX;
         memcpy(out->label, na->label, sizeof(out->label));
 
@@ -1017,13 +1081,13 @@ static bool route_unreachable(int rc) {
 
 /* Deletes the kernel route of `r` (a record in l->routes) and forgets it. A
  * route that is not installed is only forgotten: a delete of it could hit
- * another route at the same gateway, and one the gateway slot also names stays
- * in the kernel. */
+ * another route at the same gateway, and one the gateway slot or a router
+ * advertisement also holds stays in the kernel. */
 static int link_static_route_remove(Link *l, LinkRoute *r) {
         LinkRoute gone = *r;
         int rc;
 
-        if (gone.installed && !link_gateway_owns(l, &gone)) {
+        if (gone.installed && !link_gateway_owns(l, &gone) && !link_ra_route_holding(l, &gone)) {
                 rc = link_route_unsend(l, &gone);
                 if (rc < 0) {
                         link_warn_route(l, "remove", &gone, rc);
@@ -1123,8 +1187,11 @@ static int apply_static_routes(Link *l, const Network *nw) {
                 want[k].warned = have && have->warned;
                 rc = link_route_send(l, &want[k]);
                 if (rc == 0) {
+                        const LinkRoute *ra = link_ra_route_holding(l, &want[k]);
+
                         want[k].installed = true;
                         want[k].warned = false;
+                        want[k].kernel_protocol = ra ? link_route_kernel_protocol(ra) : 0;
                 } else if (route_unreachable(rc)) {
                         if (!want[k].warned)
                                 pico_log(PICO_LOG_WARNING,
@@ -1401,6 +1468,8 @@ static void link_reapply_lease_routes(Link *l, const Network *nw) {
 static void link_stop_dhcp_client(Link *l);
 static void link_stop_dhcp_server(Link *l);
 static void link_sync_lldp(Link *l, const Network *nw);
+static void link_sync_ndisc(Link *l, const Network *nw);
+static void link_stop_ndisc(Link *l);
 
 /* --- DHCPv4 client --- */
 
@@ -1856,6 +1925,10 @@ static int link_configure_impl(Link *l) {
                                 l->addrs[i].installed = false;
                 for (size_t i = 0; i < l->n_routes; i++)
                         l->routes[i].installed = false;
+                for (size_t i = 0; i < l->n_ra_addrs; i++)
+                        l->ra_addrs[i].installed = false;
+                for (size_t i = 0; i < l->n_ra_routes; i++)
+                        l->ra_routes[i].installed = false;
         }
 
         /*
@@ -1961,6 +2034,7 @@ static int link_configure_impl(Link *l) {
                 link_stop_dhcp_server(l);
 
         link_sync_lldp(l, nw);
+        link_sync_ndisc(l, nw);
 
         l->state = converged ? LINK_CONFIGURED : LINK_CONFIGURING;
 
@@ -2243,6 +2317,593 @@ static void link_sync_lldp(Link *l, const Network *nw) {
         lldp_link_set_carrier(l->lldp, (l->flags & (IFF_UP | IFF_RUNNING)) == (IFF_UP | IFF_RUNNING));
 }
 
+/* --- IPv6 router advertisements ---
+ *
+ * ndisc-link.c keeps what the routers announce; this turns it into kernel
+ * state with the link's [IPv6AcceptRA] settings, by the same rule as the
+ * static tables: work out what is wanted, compare it with what is recorded,
+ * add what is missing and delete only what netd recorded. An advertisement
+ * that changes nothing writes nothing. Addresses and routes carry what is
+ * left of their lifetime, so the kernel drops them by itself if netd is gone
+ * when it runs out; they are sent again only when the kernel's copy has less
+ * than half of what was last sent left, which bounds the writes an
+ * advertisement storm can cause.
+ */
+
+#define NETD_SYSCTL_IPV6 "/proc/sys/net/ipv6/conf/"
+
+static const uint8_t ndisc_pref_to_kernel[_NDISC_PREF_MAX] = {
+        [NDISC_PREF_HIGH] = ICMPV6_ROUTER_PREF_HIGH,
+        [NDISC_PREF_MEDIUM] = ICMPV6_ROUTER_PREF_MEDIUM,
+        [NDISC_PREF_LOW] = ICMPV6_ROUTER_PREF_LOW,
+};
+
+static int link_sysctl_ipv6_write(const Link *l, const char *key, const char *value) {
+        char path[sizeof(NETD_SYSCTL_IPV6) + IFNAMSIZ + 32];
+        FILE *f;
+        int r = 0;
+
+        snprintf(path, sizeof(path), NETD_SYSCTL_IPV6 "%s/%s", l->ifname, key);
+        f = fopen(path, "we");
+        if (!f)
+                return -errno;
+
+        if (fputs(value, f) < 0)
+                r = -EIO;
+        if (fclose(f) != 0 && r == 0)
+                r = -errno;
+        return r;
+}
+
+/* Unset IPv6AcceptRA= follows forwarding, as networkd's link_ndisc_enabled():
+ * a link that routes does not take routes from advertisements. */
+static bool link_ipv6_forwarding(const Link *l) {
+        char path[sizeof(NETD_SYSCTL_IPV6) + IFNAMSIZ + 32], c = '0';
+        FILE *f;
+
+        snprintf(path, sizeof(path), NETD_SYSCTL_IPV6 "%s/forwarding", l->ifname);
+        f = fopen(path, "re");
+        if (!f)
+                return false;
+        if (fread(&c, 1, 1, f) != 1)
+                c = '0';
+        (void) fclose(f);
+        return c != '0';
+}
+
+static bool link_ndisc_wanted(const Link *l, const Network *nw) {
+        if (!netd_ipv6_supported() || (l->flags & IFF_LOOPBACK) || !(l->flags & IFF_MULTICAST))
+                return false;
+
+        if (nw->ipv6_accept_ra >= 0)
+                return nw->ipv6_accept_ra;
+
+        return !link_ipv6_forwarding(l);
+}
+
+static bool link_carrier(const Link *l) {
+        return (l->flags & (IFF_UP | IFF_RUNNING)) == (IFF_UP | IFF_RUNNING);
+}
+
+/* What the kernel still has of a lifetime sent `sent` seconds long at
+ * `sent_at`; UINT32_MAX for one sent without an end. */
+static uint32_t ra_kernel_left(uint32_t sent, uint64_t sent_at, usec_t now) {
+        usec_t gone;
+
+        if (sent == UINT32_MAX)
+                return UINT32_MAX;
+
+        gone = now > sent_at ? (now - sent_at) / USEC_PER_SEC : 0;
+        return gone >= sent ? 0 : sent - (uint32_t) gone;
+}
+
+/* A lifetime is sent again when the kernel's copy would run out well before
+ * the one now wanted. */
+static bool ra_lifetime_stale(uint32_t want, uint32_t sent, uint64_t sent_at, usec_t now) {
+        uint32_t left = ra_kernel_left(sent, sent_at, now);
+
+        if (want <= left)
+                return false;
+
+        return want == UINT32_MAX || left < sent / 2;
+}
+
+/* The interface identifier the link's Token= asks for, falling back as
+ * networkd does. 0 with *ret set, or -errno with the reason logged once. */
+static int link_ra_generate(Link *l, const Network *nw, NdiscPrefix *p, struct in6_addr *ret) {
+        bool ether = l->arp_type == ARPHRD_ETHER && l->hw_addr_len == 6;
+        NetworkRaToken token = nw->ra_token;
+        struct in6_addr prefix = p->prefix;
+        uint8_t used;
+        int r;
+
+        if (token == NETWORK_RA_TOKEN_DEFAULT)
+                token = ether ? NETWORK_RA_TOKEN_EUI64 : NETWORK_RA_TOKEN_PREFIXSTABLE;
+
+        if (token == NETWORK_RA_TOKEN_STATIC) {
+                ndisc_iid_static(&prefix, &nw->ra_token_addr, ret);
+                return 0;
+        }
+
+        if (token == NETWORK_RA_TOKEN_PREFIXSTABLE && l->ra_secret_state == 0) {
+                NetdId128 mid;
+
+                l->ra_secret_state = -1;
+                if (netd_machine_id(&mid) >= 0 && !id128_is_null(&mid)) {
+                        ndisc_stable_secret(mid.bytes, l->ra_secret);
+                        l->ra_secret_state = 1;
+                }
+        }
+
+        if (token == NETWORK_RA_TOKEN_PREFIXSTABLE && l->ra_secret_state < 0) {
+                if (!l->ra_warned_token)
+                        pico_log(PICO_LOG_WARNING,
+                                 "netd: %s: no machine ID for stable SLAAC addresses, %s",
+                                 l->ifname,
+                                 ether ? "using EUI-64" : "not making any");
+                l->ra_warned_token = true;
+                token = NETWORK_RA_TOKEN_EUI64;
+        }
+
+        if (token == NETWORK_RA_TOKEN_EUI64) {
+                r = ndisc_iid_eui64(&prefix, l->hw_addr, l->hw_addr_len, ret);
+                if (r < 0 && !l->ra_warned_token)
+                        pico_log(PICO_LOG_WARNING,
+                                 "netd: %s: Token=eui64 needs a 6 byte hardware address, not making SLAAC addresses",
+                                 l->ifname);
+                if (r < 0)
+                        l->ra_warned_token = true;
+                return r;
+        }
+
+        r = ndisc_iid_stable_from(
+                        l->ra_secret, &prefix, l->ifname, l->hw_addr, l->hw_addr_len, p->dad_counter, &used, ret);
+        if (r < 0)
+                return r;
+
+        p->dad_counter = used;
+        return 0;
+}
+
+/* An entry whose lifetime ran out before the expiry timer fired is left out:
+ * a route sent with 0 s left would get no expiry at all. */
+static size_t link_ra_wanted_routes(const Link *l, const Network *nw, LinkRoute *want, usec_t now) {
+        const NdiscLink *e = l->ndisc;
+        size_t n = 0;
+
+        for (size_t i = 0; nw->ra_use_gateway && i < e->n_routers && n < LINK_RA_ROUTES_MAX; i++) {
+                const NdiscRouter *rt = &e->routers[i];
+                LinkRoute *w;
+
+                if (ndisc_lifetime_remaining(now, rt->until) == 0)
+                        continue;
+
+                w = &want[n++];
+                memset(w, 0, sizeof(*w));
+                w->family = AF_INET6;
+                w->has_gw = true;
+                w->gw.in6 = rt->addr;
+                w->protocol = RTPROT_RA;
+                w->pref = ndisc_pref_to_kernel[rt->pref];
+                w->metric = nw->ra_route_metric[rt->pref];
+                w->expires_sec = ndisc_lifetime_remaining(now, rt->until);
+        }
+
+        for (size_t i = 0; nw->ra_use_onlink_prefix && i < e->n_prefixes && n < LINK_RA_ROUTES_MAX; i++) {
+                const NdiscPrefix *p = &e->prefixes[i];
+                LinkRoute *w;
+
+                if (ndisc_lifetime_remaining(now, p->onlink_until) == 0)
+                        continue;
+
+                w = &want[n++];
+                memset(w, 0, sizeof(*w));
+                w->family = AF_INET6;
+                w->dst.in6 = p->prefix;
+                w->dst_len = p->prefixlen;
+                w->protocol = RTPROT_RA;
+                w->pref = ndisc_pref_to_kernel[p->pref];
+                w->metric = nw->ra_route_metric[p->pref];
+                w->expires_sec = ndisc_lifetime_remaining(now, p->onlink_until);
+        }
+
+        return n;
+}
+
+static size_t link_ra_wanted_addresses(Link *l, const Network *nw, LinkAddress *want, usec_t now) {
+        NdiscLink *e = l->ndisc;
+        size_t n = 0;
+
+        for (size_t i = 0; nw->ra_use_autonomous_prefix && i < e->n_prefixes && n < LINK_RA_ADDRS_MAX; i++) {
+                NdiscPrefix *p = &e->prefixes[i];
+                LinkAddress *w;
+                struct in6_addr a;
+
+                /* A lifetime that ran out before the expiry timer fired:
+                 * valid 0 is EINVAL to the kernel. */
+                if (ndisc_lifetime_remaining(now, p->valid_until) == 0 || p->dad_given_up ||
+                    link_ra_generate(l, nw, p, &a) < 0)
+                        continue;
+
+                w = &want[n++];
+                memset(w, 0, sizeof(*w));
+                w->family = AF_INET6;
+                w->prefixlen = p->prefixlen;
+                w->address.in6 = a;
+                w->flags = IFA_F_NOPREFIXROUTE;
+                w->valid_sec = ndisc_lifetime_remaining(now, p->valid_until);
+                w->preferred_sec = ndisc_lifetime_remaining(now, p->preferred_until);
+        }
+
+        return n;
+}
+
+/* The same route, protocol aside: one kernel object. */
+static LinkRoute *ra_route_find(LinkRoute *table, size_t n, const LinkRoute *like) {
+        for (size_t i = 0; i < n; i++)
+                if (link_route_same(&table[i], like))
+                        return &table[i];
+
+        return NULL;
+}
+
+static void link_ra_route_delete(Link *l, size_t i) {
+        LinkRoute gone = l->ra_routes[i];
+        int r;
+
+        memmove(&l->ra_routes[i], &l->ra_routes[i + 1], (l->n_ra_routes - i - 1) * sizeof(gone));
+        l->n_ra_routes--;
+
+        if (!gone.installed || link_static_route_holding(l, &gone))
+                return;
+
+        r = link_route_unsend(l, &gone);
+        if (r < 0)
+                link_warn_route(l, "remove", &gone, r);
+}
+
+static void link_ra_address_delete(Link *l, size_t i) {
+        LinkAddress gone = l->ra_addrs[i];
+        int r;
+
+        memmove(&l->ra_addrs[i], &l->ra_addrs[i + 1], (l->n_ra_addrs - i - 1) * sizeof(gone));
+        l->n_ra_addrs--;
+
+        if (!gone.installed || link_address_find(l, &gone))
+                return;
+
+        r = link_address_unsend(l, &gone);
+        if (r < 0)
+                link_warn_address(l, "remove", &gone, r);
+}
+
+static void link_ra_converge_routes(Link *l, LinkRoute *want, size_t n_want, usec_t now) {
+        for (size_t k = 0; k < n_want; k++) {
+                LinkRoute *have = ra_route_find(l->ra_routes, l->n_ra_routes, &want[k]);
+                int r;
+
+                if (have && have->installed &&
+                    !ra_lifetime_stale(want[k].expires_sec, have->expires_sec, have->sent_at, now))
+                        continue;
+
+                if (!have) {
+                        LinkRoute *grown;
+
+                        if (l->n_ra_routes >= LINK_RA_ROUTES_MAX)
+                                continue;
+                        grown = realloc(l->ra_routes, (l->n_ra_routes + 1) * sizeof(*grown));
+                        if (!grown)
+                                continue;
+                        l->ra_routes = grown;
+                }
+
+                r = link_route_send(l, &want[k]);
+                if (r < 0) {
+                        if (!have || have->installed)
+                                link_warn_route(l, "add", &want[k], r);
+                        if (have)
+                                have->installed = false;
+                        continue;
+                }
+
+                want[k].installed = true;
+                want[k].sent_at = now;
+                if (have && have->installed)
+                        want[k].kernel_protocol = have->kernel_protocol;
+                else {
+                        const LinkRoute *st = link_static_route_holding(l, &want[k]);
+
+                        want[k].kernel_protocol = st ? link_route_kernel_protocol(st) : 0;
+                }
+                if (!have)
+                        have = &l->ra_routes[l->n_ra_routes++];
+                *have = want[k];
+        }
+
+        for (size_t i = l->n_ra_routes; i > 0; i--)
+                if (!ra_route_find(want, n_want, &l->ra_routes[i - 1]))
+                        link_ra_route_delete(l, i - 1);
+}
+
+static LinkAddress *ra_address_find(LinkAddress *table, size_t n, const LinkAddress *like) {
+        for (size_t i = 0; i < n; i++)
+                if (link_address_same(&table[i], like))
+                        return &table[i];
+
+        return NULL;
+}
+
+static void link_ra_converge_addresses(Link *l, LinkAddress *want, size_t n_want, usec_t now) {
+        for (size_t k = 0; k < n_want; k++) {
+                LinkAddress *have = ra_address_find(l->ra_addrs, l->n_ra_addrs, &want[k]);
+                int r;
+
+                /* The preferred lifetime is usually the shorter one: left
+                 * alone, the kernel deprecates the address while the router
+                 * still prefers it. */
+                if (have && have->installed &&
+                    !ra_lifetime_stale(want[k].valid_sec, have->valid_sec, have->sent_at, now) &&
+                    !ra_lifetime_stale(want[k].preferred_sec, have->preferred_sec, have->sent_at, now) &&
+                    (want[k].preferred_sec == 0) ==
+                                    (ra_kernel_left(have->preferred_sec, have->sent_at, now) == 0))
+                        continue;
+
+                /* A static entry for the same address keeps its own lifetimes. */
+                if (link_address_find(l, &want[k]))
+                        continue;
+
+                if (!have) {
+                        LinkAddress *grown;
+
+                        if (l->n_ra_addrs >= LINK_RA_ADDRS_MAX)
+                                continue;
+                        grown = realloc(l->ra_addrs, (l->n_ra_addrs + 1) * sizeof(*grown));
+                        if (!grown)
+                                continue;
+                        l->ra_addrs = grown;
+                }
+
+                r = link_address_send(l, &want[k]);
+                if (r < 0) {
+                        if (!have || have->installed)
+                                link_warn_address(l, "add", &want[k], r);
+                        if (have)
+                                have->installed = false;
+                        continue;
+                }
+
+                want[k].installed = true;
+                want[k].sent_at = now;
+                if (!have)
+                        have = &l->ra_addrs[l->n_ra_addrs++];
+                *have = want[k];
+        }
+
+        for (size_t i = l->n_ra_addrs; i > 0; i--)
+                if (!ra_address_find(want, n_want, &l->ra_addrs[i - 1]))
+                        link_ra_address_delete(l, i - 1);
+}
+
+/* A digest of the servers and domains resolv.conf takes from this link, so
+ * an advertisement that only refreshes them does not rewrite the file. */
+static uint64_t link_ra_dns_sig(const Link *l, const Network *nw) {
+        static const uint8_t key[16] = { 'n', 'e', 't', 'd', '-', 'r', 'a', '-', 'd', 'n', 's' };
+        const NdiscLink *e = l->ndisc;
+        struct siphash state;
+
+        if (!e)
+                return 0;
+
+        siphash24_init(&state, key);
+        for (size_t i = 0; nw && nw->ra_use_dns && i < e->n_rdnss; i++)
+                siphash24_compress(&e->rdnss[i].addr, sizeof(e->rdnss[i].addr), &state);
+        siphash24_compress("|", 1, &state);
+        for (size_t i = 0; nw && nw->ra_use_domains && i < e->n_dnssl; i++)
+                siphash24_compress(e->dnssl[i].name, strlen(e->dnssl[i].name) + 1, &state);
+
+        return siphash24_finalize(&state);
+}
+
+static void link_ra_apply_mtu(Link *l, const Network *nw) {
+        uint32_t mtu = l->ndisc ? l->ndisc->mtu : 0;
+        char value[16];
+        int r;
+
+        if (!nw->ra_use_mtu || mtu == 0 || mtu == l->ra_mtu)
+                return;
+
+        l->ra_mtu = mtu;
+        if (mtu < 1280 || (l->mtu > 0 && mtu > l->mtu)) {
+                pico_log(PICO_LOG_DEBUG,
+                         "netd: %s: ignoring the advertised MTU %u (link MTU %u)",
+                         l->ifname,
+                         (unsigned) mtu,
+                         (unsigned) l->mtu);
+                return;
+        }
+
+        snprintf(value, sizeof(value), "%u\n", (unsigned) mtu);
+        r = link_sysctl_ipv6_write(l, "mtu", value);
+        if (r < 0)
+                pico_log(PICO_LOG_WARNING,
+                         "netd: %s: cannot set the IPv6 MTU to %u: %s",
+                         l->ifname,
+                         mtu,
+                         strerror(-r));
+}
+
+/*
+ * Brings the kernel in line with what the routers announce and what the
+ * link's [IPv6AcceptRA] lets through. With no engine running everything
+ * recorded goes. Adds come first, deletes after, so a changed metric or token
+ * never leaves the link without a route or an address.
+ */
+static void link_converge_ndisc(Link *l) {
+        const Network *nw = l->network;
+        LinkRoute routes[LINK_RA_ROUTES_MAX];
+        LinkAddress addrs[LINK_RA_ADDRS_MAX];
+        size_t n_routes = 0, n_addrs = 0;
+        usec_t now = now_monotonic();
+        uint64_t sig;
+        int r;
+
+        if (nw && ndisc_link_is_running(l->ndisc)) {
+                n_routes = link_ra_wanted_routes(l, nw, routes, now);
+                n_addrs = link_ra_wanted_addresses(l, nw, addrs, now);
+        }
+
+        link_ra_converge_addresses(l, addrs, n_addrs, now);
+        link_ra_converge_routes(l, routes, n_routes, now);
+
+        if (nw && l->ndisc)
+                link_ra_apply_mtu(l, nw);
+
+        sig = ndisc_link_is_running(l->ndisc) ? link_ra_dns_sig(l, nw) : 0;
+        if (sig != l->ra_dns_sig) {
+                l->ra_dns_sig = sig;
+                r = netd_resolv_write(l->netd);
+                if (r < 0)
+                        pico_log(PICO_LOG_WARNING, "netd: resolv.conf: %s", strerror(-r));
+        }
+}
+
+static void link_ndisc_notify(void *userdata) {
+        link_converge_ndisc(userdata);
+}
+
+static void link_ndisc_update_state(Link *l) {
+        if (l->ndisc)
+                ndisc_link_set_state(l->ndisc, link_carrier(l), l->ipv6ll_ready);
+}
+
+/*
+ * Address events for the SLAAC addresses. One flagged DADFAILED lost
+ * duplicate address detection: a stable identifier is made again with the
+ * next counter, up to RFC 7217's three, and any other kind of token gives up
+ * on that prefix. One the kernel deleted otherwise ran out of lifetime, or
+ * went with the link, and is only forgotten; the next advertisement adds it
+ * again if it is still announced.
+ */
+static void link_ra_address_event(Link *l, bool removed, const NetdRtnlAddr *a) {
+        LinkAddress *have = NULL;
+        bool dad_failed;
+        char buf[INET6_ADDRSTRLEN];
+
+        for (size_t i = 0; i < l->n_ra_addrs; i++)
+                if (netd_addr_eq(AF_INET6, &l->ra_addrs[i].address, &a->address)) {
+                        have = &l->ra_addrs[i];
+                        break;
+                }
+
+        if (!have)
+                return;
+
+        /* The kernel marks the address DADFAILED, and deletes it at once
+         * when its lifetime is finite. */
+        dad_failed = a->flags & IFA_F_DADFAILED;
+        if (!removed && !dad_failed)
+                return;
+
+        if (dad_failed && l->ndisc) {
+                NdiscLink *e = l->ndisc;
+                bool stable = l->network &&
+                                (l->network->ra_token == NETWORK_RA_TOKEN_PREFIXSTABLE ||
+                                 (l->network->ra_token == NETWORK_RA_TOKEN_DEFAULT &&
+                                  !(l->arp_type == ARPHRD_ETHER && l->hw_addr_len == 6)));
+
+                for (size_t i = 0; i < e->n_prefixes; i++) {
+                        NdiscPrefix *p = &e->prefixes[i];
+
+                        if (memcmp(p->prefix.s6_addr, a->address.bytes, 8) != 0)
+                                continue;
+
+                        if (stable && l->ra_secret_state > 0 && p->dad_counter + 1 < NDISC_IID_STABLE_RETRIES) {
+                                p->dad_counter++;
+                                pico_log(PICO_LOG_INFO,
+                                         "netd: %s: SLAAC address %s is in use by another host, making another one",
+                                         l->ifname,
+                                         netd_addr_to_string(AF_INET6, &a->address, buf));
+                        } else {
+                                p->dad_given_up = true;
+                                pico_log(PICO_LOG_WARNING,
+                                         "netd: %s: SLAAC address %s is in use by another host, giving up on its prefix",
+                                         l->ifname,
+                                         netd_addr_to_string(AF_INET6, &a->address, buf));
+                        }
+                }
+        }
+
+        /* A DADFAILED address stays in the kernel until it is deleted. */
+        have->installed = !removed;
+        link_ra_address_delete(l, (size_t) (have - l->ra_addrs));
+        if (dad_failed)
+                link_converge_ndisc(l);
+}
+
+static void link_stop_ndisc(Link *l) {
+        NdiscLink *e = l->ndisc;
+
+        if (e) {
+                ndisc_link_stop(e);
+                l->ndisc = NULL;
+                link_release_dhcp_object(l, e, ndisc_link_free_void, "router advertisement state");
+        }
+
+        if (l->n_ra_addrs > 0 || l->n_ra_routes > 0 || l->ra_dns_sig != 0)
+                link_converge_ndisc(l);
+        l->ra_mtu = 0;
+}
+
+/*
+ * Brings router advertisements in line with IPv6AcceptRA=. The kernel's own
+ * handling is switched off on every matched link, as networkd does, also
+ * when netd does not take advertisements there, so the two never install the
+ * same routes at different metrics. Failure leaves advertisements off on
+ * this link and never fails it.
+ */
+static void link_sync_ndisc(Link *l, const Network *nw) {
+        int r;
+
+        if (netd_ipv6_supported() && !(l->flags & IFF_LOOPBACK) && !l->ra_accept_ra_done) {
+                r = link_sysctl_ipv6_write(l, "accept_ra", "0\n");
+                if (r < 0)
+                        pico_log(PICO_LOG_WARNING,
+                                 "netd: %s: cannot turn off the kernel's router advertisement handling: %s",
+                                 l->ifname,
+                                 strerror(-r));
+                l->ra_accept_ra_done = true;
+        }
+
+        if (!link_ndisc_wanted(l, nw)) {
+                link_stop_ndisc(l);
+                return;
+        }
+
+        if (!l->ndisc) {
+                r = ndisc_link_new(l->netd, l->ifindex, l->ifname, link_ndisc_notify, l, &l->ndisc);
+                if (r < 0) {
+                        pico_log(PICO_LOG_WARNING,
+                                 "netd: %s: router advertisements: %s",
+                                 l->ifname,
+                                 strerror(-r));
+                        return;
+                }
+        }
+
+        r = ndisc_link_start(l->ndisc, l->hw_addr, l->hw_addr_len);
+        if (r < 0) {
+                pico_log(PICO_LOG_WARNING,
+                         "netd: %s: router advertisements: cannot start: %s",
+                         l->ifname,
+                         strerror(-r));
+                link_stop_ndisc(l);
+                return;
+        }
+
+        link_ndisc_update_state(l);
+        link_converge_ndisc(l);
+}
+
 int link_deconfigure(Link *l) {
         if (!l)
                 return -EINVAL;
@@ -2257,6 +2918,7 @@ int link_deconfigure(Link *l) {
         link_stop_dhcp_client(l);
         link_stop_dhcp_server(l);
         link_stop_lldp(l);
+        link_stop_ndisc(l);
 
         return link_teardown_kernel_state(l);
 }

@@ -29,12 +29,18 @@ typedef struct Netd Netd;
  * generous. */
 #define NETD_RESOLV_MAX_NAMESERVERS 3
 
+/* Older glibc reads at most six search domains (MAXDNSRCH). */
+#define NETD_RESOLV_MAX_DOMAINS 6
+
 /*
  * Rebuild the file from every configured link's static DNS= plus, where
- * UseDNS= allows, its lease's option 6 -- in link order, deduplicated, capped
+ * [DHCPv4] UseDNS= allows, its lease's option 6, and, where [IPv6AcceptRA]
+ * UseDNS= allows, its routers' RDNSS -- in link order, deduplicated, capped
  * at NETD_RESOLV_MAX_NAMESERVERS. IPv4 and IPv6 servers share the cap, and a
  * link-local IPv6 server is written with its interface, `fe80::1%eth0`. The
- * lease's domain name (option 15) becomes a `search` line.
+ * first lease's domain name (option 15), then the routers' DNSSL where
+ * UseDomains= allows, make the `search` line, at most
+ * NETD_RESOLV_MAX_DOMAINS long.
  *
  * Called after any change to any link's DNS state, not incrementally: the
  * file is small, and a full rebuild cannot drift out of sync with the link
