@@ -18,10 +18,13 @@
 
 #pragma once
 
+#include <net/if.h>
 #include <netinet/in.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+
+#include "netd-addr.h"
 
 typedef struct Netd Netd;
 typedef struct Network Network;
@@ -68,11 +71,35 @@ typedef enum NetworkEmitLldp {
         NETWORK_EMIT_LLDP_CUSTOMER_BRIDGE,
 } NetworkEmitLldp;
 
-/* One Address= entry: a CIDR literal, split. */
+/*
+ * One address, from an [Address] section or an Address= line in [Network].
+ * What an entry means is decided when the file is parsed: network_parse_file()
+ * drops the entries networkd drops and fills in the scope and DAD defaults, so
+ * a Network holds only entries that can be applied. The IPv6 check is not made
+ * there: whether the kernel has IPv6 is for the link code, so a parse is the
+ * same on every host.
+ */
 typedef struct NetworkAddress {
-        struct in_addr address;
+        uint8_t family; /* AF_INET or AF_INET6; 0 until Address= is seen */
+        uint8_t peer_family;
         unsigned char prefixlen;
+        uint8_t scope; /* RT_SCOPE_* */
+        bool scope_set;
+        bool peer_set;
+        bool deprecated; /* PreferredLifetime=0 */
+        bool dad;        /* IPv6 duplicate address detection; off sends IFA_F_NODAD */
+        bool dad_set;
+        bool no_prefix_route; /* AddPrefixRoute=no */
+        NetdInAddr address;
+        NetdInAddr peer;
+        uint32_t route_metric; /* of the prefix route, IFA_RT_PRIORITY */
+        char label[IFNAMSIZ];  /* IPv4 only; empty for none */
+        unsigned line;
 } NetworkAddress;
+
+/* At most this many address entries per file: each costs one netlink write per
+ * change and some memory on every link; more is a mistake on these boards. */
+#define NETWORK_ADDRESS_MAX 16
 
 struct Network {
         /*
@@ -95,7 +122,12 @@ struct Network {
         /* --- [Network] --- */
         NetworkDHCP dhcp;
 
-        /* Address= accumulates rather than overriding, matching networkd. */
+        /*
+         * [Address] sections and Address= lines in [Network], in file order,
+         * both families, at most NETWORK_ADDRESS_MAX. A later duplicate
+         * replaces the earlier entry, and an empty Address= in [Network]
+         * clears every entry collected so far, as in networkd.
+         */
         NetworkAddress *addresses;
         size_t n_addresses;
 
@@ -174,6 +206,10 @@ bool network_matches(const Network *nw, const char *ifname);
  * match wins, which is why the lexicographic sort above is part of the
  * contract and not an implementation detail. */
 Network *network_find(Netd *n, const char *ifname);
+
+/* The first IPv4 entry of nw->addresses, or NULL: the address the DHCP server
+ * serves from. */
+const NetworkAddress *network_first_address_v4(const Network *nw);
 
 /* True when this file should arm the DHCPv4 client. Folded into one helper
  * so no caller has to remember that YES and IPV4 both count and IPV6 does
