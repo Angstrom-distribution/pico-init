@@ -188,6 +188,19 @@ Daemon guidelines that follow from the implementation:
 - Exiting does not close the socket: PID 1 keeps its own copy, so queued
   connections survive a service restart.
 
+## Stdout of the logd socket's own service
+
+PID 1 connects the stdout and stderr of every service command to
+`/run/logd/stdout` (see [LOGD.md](LOGD.md)). The service that is the
+activation target of the socket unit bound at that path reads the socket, so
+it does not get it: every command of that service, `ExecStartPre=` and the
+others included, has `/dev/null` on fd 1 and 2. This holds whatever the
+service is called, with `StandardOutput=journal` and without a
+`StandardOutput=` line. `StandardInput=tty*` and `StandardInput=socket` keep
+the terminal or the connection on fd 1 and 2. The match is on the pairing of
+the socket unit with the service and on the path as written in `Listen*=`; a
+`.socket` unit with `Accept=yes` never matches.
+
 ## Accept=yes
 
 With `Accept=yes`, PID 1 calls `accept4()` itself, once per wakeup, and starts

@@ -235,6 +235,10 @@ is a load failure (below).
   [CGROUP_DELEGATION.md](CGROUP_DELEGATION.md).
 - **`StandardOutput=syslog`, `journal+console` and `syslog+console`** all
   behave as `journal`; there is no console copy.
+- **The service that reads `/run/logd/stdout`**, the activation target of
+  the socket unit bound at that path, always has `/dev/null` on stdout and
+  stderr; an explicit `StandardOutput=journal` or `StandardError=journal`
+  on that service is not honoured.
 - **`Restart=on-watchdog`** parses and never fires, because there is no
   per-service watchdog. `Restart=on-abnormal` also restarts on pico-init's
   own setup failures (exit codes 200 to 222, for example a missing
