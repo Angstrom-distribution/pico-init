@@ -756,6 +756,8 @@ logd_tests = [
   'test-picolog',
   # logd's options and the refused log namespace argument.
   'test-logd-opts',
+  # logd's own stdout and stderr: a full queue must not block startup.
+  'test-logd-stdio',
 ]
 
 foreach t : logd_tests
