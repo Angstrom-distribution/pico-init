@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <linux/if_addr.h>
+#include <linux/rtnetlink.h>
 #include <net/if_arp.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -101,24 +102,59 @@ static int address_del_idempotent(
         return (r == -EADDRNOTAVAIL || r == -ENOENT) ? 0 : r;
 }
 
-static int route_add_default_idempotent(NetdRtnl *rtnl, int ifindex, const struct in_addr *gw, uint32_t metric) {
-        int r = netd_rtnl_route_add_default(rtnl, ifindex, gw, metric);
+/* The default route through `gw`, or the link-scope host route to it. */
+static void route_v4(NetdRtnlRoute *rt, int ifindex, const struct in_addr *gw, bool host, uint32_t metric) {
+        memset(rt, 0, sizeof(*rt));
+        rt->ifindex = ifindex;
+        rt->family = AF_INET;
+        rt->metric = metric;
+
+        if (host) {
+                rt->dst.in = *gw;
+                rt->dst_len = 32;
+                rt->scope = RT_SCOPE_LINK;
+        } else {
+                rt->gw.in = *gw;
+                rt->has_gw = true;
+        }
+}
+
+static int route_add_idempotent(NetdRtnl *rtnl, const NetdRtnlRoute *rt) {
+        int r = netd_rtnl_route_add(rtnl, rt);
         return r == -EEXIST ? 0 : r;
+}
+
+static int route_del_idempotent(NetdRtnl *rtnl, const NetdRtnlRoute *rt) {
+        int r = netd_rtnl_route_del(rtnl, rt);
+        return (r == -ESRCH || r == -ENOENT) ? 0 : r;
+}
+
+static int route_add_default_idempotent(NetdRtnl *rtnl, int ifindex, const struct in_addr *gw, uint32_t metric) {
+        NetdRtnlRoute rt;
+
+        route_v4(&rt, ifindex, gw, false, metric);
+        return route_add_idempotent(rtnl, &rt);
 }
 
 static int route_del_default_idempotent(NetdRtnl *rtnl, int ifindex, const struct in_addr *gw, uint32_t metric) {
-        int r = netd_rtnl_route_del(rtnl, ifindex, NULL, 0, gw, metric);
-        return (r == -ESRCH || r == -ENOENT) ? 0 : r;
+        NetdRtnlRoute rt;
+
+        route_v4(&rt, ifindex, gw, false, metric);
+        return route_del_idempotent(rtnl, &rt);
 }
 
 static int route_add_host_idempotent(NetdRtnl *rtnl, int ifindex, const struct in_addr *dst, uint32_t metric) {
-        int r = netd_rtnl_route_add(rtnl, ifindex, dst, 32, NULL, metric);
-        return r == -EEXIST ? 0 : r;
+        NetdRtnlRoute rt;
+
+        route_v4(&rt, ifindex, dst, true, metric);
+        return route_add_idempotent(rtnl, &rt);
 }
 
 static int route_del_host_idempotent(NetdRtnl *rtnl, int ifindex, const struct in_addr *dst, uint32_t metric) {
-        int r = netd_rtnl_route_del(rtnl, ifindex, dst, 32, NULL, metric);
-        return (r == -ESRCH || r == -ENOENT) ? 0 : r;
+        NetdRtnlRoute rt;
+
+        route_v4(&rt, ifindex, dst, true, metric);
+        return route_del_idempotent(rtnl, &rt);
 }
 
 /* True when `a`/`a_pfx` and `b`/`b_pfx` name the same connected-route

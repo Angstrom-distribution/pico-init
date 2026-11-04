@@ -634,19 +634,15 @@ int netd_rtnl_address_del(NetdRtnl *rtnl, const NetdRtnlAddress *a) {
         return rtnl_execute(rtnl, &req);
 }
 
-static int
-                build_route(struct nl_request *req,
-                            uint16_t type,
-                            uint16_t flags,
-                            int ifindex,
-                            const struct in_addr *destination,
-                            unsigned char prefixlen,
-                            const struct in_addr *gateway,
-                            uint32_t metric) {
-
+static int build_route(struct nl_request *req, uint16_t type, uint16_t flags, const NetdRtnlRoute *rt) {
+        size_t size = rt->family == AF_INET ? sizeof(struct in_addr) : sizeof(struct in6_addr);
         struct nlmsghdr *nlh;
         struct rtmsg *rtm;
         int r;
+
+        if (rt->ifindex <= 0 || (rt->family != AF_INET && rt->family != AF_INET6) ||
+            rt->dst_len > (rt->family == AF_INET ? 32 : 128))
+                return -EINVAL;
 
         nlh = nl_req_init(req, type, flags);
         if (!nlh)
@@ -656,91 +652,66 @@ static int
         if (!rtm)
                 return -ENOBUFS;
 
-        rtm->rtm_family = AF_INET;
-        rtm->rtm_dst_len = prefixlen;
+        rtm->rtm_family = rt->family;
+        rtm->rtm_dst_len = rt->dst_len;
         rtm->rtm_src_len = 0;
         rtm->rtm_tos = 0;
         rtm->rtm_table = RT_TABLE_MAIN;
-        rtm->rtm_protocol = RTPROT_STATIC;
-        rtm->rtm_scope = gateway ? RT_SCOPE_UNIVERSE : RT_SCOPE_LINK;
+        rtm->rtm_protocol = rt->protocol ? rt->protocol : RTPROT_STATIC;
+        rtm->rtm_scope = rt->family == AF_INET ? rt->scope : RT_SCOPE_UNIVERSE;
         rtm->rtm_type = RTN_UNICAST;
-        rtm->rtm_flags = 0;
+        rtm->rtm_flags = rt->flags;
 
-        /* prefixlen 0 is the default route: no RTA_DST at all, matching the
-         * kernel's own convention (see netd_rtnl_route_add_default()). */
-        if (prefixlen > 0) {
-                r = nl_add_attr(req, RTA_DST, destination, sizeof(*destination));
+        /* dst_len 0 is the default route: no RTA_DST at all, the kernel's own
+         * convention. */
+        if (rt->dst_len > 0) {
+                r = nl_add_attr(req, RTA_DST, rt->dst.bytes, size);
                 if (r < 0)
                         return r;
         }
 
-        if (gateway) {
-                r = nl_add_attr(req, RTA_GATEWAY, gateway, sizeof(*gateway));
+        if (rt->has_gw) {
+                r = nl_add_attr(req, RTA_GATEWAY, rt->gw.bytes, size);
                 if (r < 0)
                         return r;
         }
 
-        r = nl_add_attr(req, RTA_OIF, &ifindex, sizeof(ifindex));
+        r = nl_add_attr(req, RTA_OIF, &rt->ifindex, sizeof(rt->ifindex));
         if (r < 0)
                 return r;
 
-        return nl_add_attr(req, RTA_PRIORITY, &metric, sizeof(metric));
+        r = nl_add_attr(req, RTA_PRIORITY, &rt->metric, sizeof(rt->metric));
+        if (r < 0)
+                return r;
+
+        if (rt->has_prefsrc)
+                return nl_add_attr(req, RTA_PREFSRC, rt->prefsrc.bytes, size);
+
+        return 0;
 }
 
-int netd_rtnl_route_add(
-                NetdRtnl *rtnl,
-                int ifindex,
-                const struct in_addr *destination,
-                unsigned char prefixlen,
-                const struct in_addr *gateway,
-                uint32_t metric) {
-
+int netd_rtnl_route_add(NetdRtnl *rtnl, const NetdRtnlRoute *route) {
         struct nl_request req;
         int r;
 
-        if (!rtnl || ifindex <= 0 || prefixlen > 32 || (!destination && prefixlen != 0))
+        if (!rtnl || !route)
                 return -EINVAL;
 
-        r = build_route(&req,
-                        RTM_NEWROUTE,
-                        NLM_F_REQUEST | NLM_F_CREATE | NLM_F_APPEND | NLM_F_ACK,
-                        ifindex,
-                        destination,
-                        prefixlen,
-                        gateway,
-                        metric);
+        r = build_route(&req, RTM_NEWROUTE, NLM_F_REQUEST | NLM_F_CREATE | NLM_F_APPEND | NLM_F_ACK, route);
         if (r < 0)
                 return r;
 
         return rtnl_execute(rtnl, &req);
 }
 
-int netd_rtnl_route_add_default(NetdRtnl *rtnl, int ifindex, const struct in_addr *gateway, uint32_t metric) {
-        return netd_rtnl_route_add(rtnl, ifindex, NULL, 0, gateway, metric);
-}
-
-int netd_rtnl_route_del(
-                NetdRtnl *rtnl,
-                int ifindex,
-                const struct in_addr *destination,
-                unsigned char prefixlen,
-                const struct in_addr *gateway,
-                uint32_t metric) {
-
+int netd_rtnl_route_del(NetdRtnl *rtnl, const NetdRtnlRoute *route) {
         struct nl_request req;
         int r;
 
-        if (!rtnl || ifindex <= 0 || prefixlen > 32 || (!destination && prefixlen != 0))
+        if (!rtnl || !route)
                 return -EINVAL;
 
-        r = build_route(&req,
-                        RTM_DELROUTE,
-                        NLM_F_REQUEST | NLM_F_ACK,
-                        ifindex,
-                        destination,
-                        prefixlen,
-                        gateway,
-                        metric);
+        r = build_route(&req, RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, route);
         if (r < 0)
                 return r;
 

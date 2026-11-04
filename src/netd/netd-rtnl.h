@@ -218,13 +218,33 @@ int netd_rtnl_address_add(NetdRtnl *rtnl, const NetdRtnlAddress *address);
 int netd_rtnl_address_del(NetdRtnl *rtnl, const NetdRtnlAddress *address);
 
 /*
- * RTM_NEWROUTE, RTN_UNICAST / RT_TABLE_MAIN / RT_SCOPE_UNIVERSE (or LINK when
- * there is no gateway), NLM_F_REQUEST|NLM_F_CREATE|NLM_F_APPEND|NLM_F_ACK.
- *
- * `destination` NULL with prefixlen 0 is the default route, which is the case
- * that actually matters and which netd_rtnl_route_add_default() exists to
- * make unmistakable at the call site. `gateway` NULL means an on-link route.
- * `metric` goes into RTA_PRIORITY, and the kernel prefers the lowest.
+ * One unicast route in the main table, as RTM_NEWROUTE/RTM_DELROUTE carries
+ * it. `dst_len` 0 is a default route and sends no RTA_DST. `has_gw` sends
+ * RTA_GATEWAY; RTA_OIF is always sent, because an IPv6 link-local gateway is
+ * meaningless without it. `metric` goes into RTA_PRIORITY and the kernel
+ * prefers the lowest; the kernel gives an IPv6 route at 0 the priority 1024,
+ * so callers that record a route use 1024 for it. `scope` is rtm_scope for
+ * IPv4 (RT_SCOPE_UNIVERSE is 0) and always universe for IPv6. `flags` holds
+ * RTNH_F_*, in practice RTNH_F_ONLINK. `protocol` 0 is RTPROT_STATIC.
+ */
+typedef struct NetdRtnlRoute {
+        int ifindex;
+        uint8_t family; /* AF_INET or AF_INET6 */
+        uint8_t dst_len;
+        uint8_t scope;
+        uint8_t protocol;
+        NetdInAddr dst;
+        NetdInAddr gw;
+        NetdInAddr prefsrc;
+        bool has_gw;
+        bool has_prefsrc;
+        uint32_t flags;
+        uint32_t metric;
+} NetdRtnlRoute;
+
+/*
+ * RTM_NEWROUTE, RTN_UNICAST, RT_TABLE_MAIN,
+ * NLM_F_REQUEST|NLM_F_CREATE|NLM_F_APPEND|NLM_F_ACK.
  *
  * CREATE|APPEND is what systemd-networkd sends for every route: routes that
  * differ only in output interface or gateway coexist at one metric, the one
@@ -232,26 +252,11 @@ int netd_rtnl_address_del(NetdRtnl *rtnl, const NetdRtnlAddress *address);
  * rather than replacing anything.
  *
  * netd_rtnl_route_del() sends the same attributes, and the kernel matches a
- * delete on the output interface, gateway, protocol and priority, so it
- * removes only the caller's own route. A priority of 0 matches any priority
- * on that interface and gateway, the lowest first.
+ * delete on the output interface, gateway, protocol, scope and priority, so it
+ * removes only the caller's own route. An IPv4 priority of 0 matches any
+ * priority on that interface and gateway, the lowest first.
  */
-int netd_rtnl_route_add(
-                NetdRtnl *rtnl,
-                int ifindex,
-                const struct in_addr *destination,
-                unsigned char prefixlen,
-                const struct in_addr *gateway,
-                uint32_t metric);
-
-int netd_rtnl_route_add_default(NetdRtnl *rtnl, int ifindex, const struct in_addr *gateway, uint32_t metric);
-
-int netd_rtnl_route_del(
-                NetdRtnl *rtnl,
-                int ifindex,
-                const struct in_addr *destination,
-                unsigned char prefixlen,
-                const struct in_addr *gateway,
-                uint32_t metric);
+int netd_rtnl_route_add(NetdRtnl *rtnl, const NetdRtnlRoute *route);
+int netd_rtnl_route_del(NetdRtnl *rtnl, const NetdRtnlRoute *route);
 
 const char *netd_rtnl_link_event_to_string(NetdRtnlLinkEvent e);
