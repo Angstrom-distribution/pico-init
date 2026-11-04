@@ -80,6 +80,17 @@ void network_free_all(Netd *n) {
         n->n_networks = 0;
 }
 
+const NetworkAddress *network_first_address_v4(const Network *nw) {
+        if (!nw)
+                return NULL;
+
+        for (size_t i = 0; i < nw->n_addresses; i++)
+                if (nw->addresses[i].family == AF_INET)
+                        return &nw->addresses[i];
+
+        return NULL;
+}
+
 bool network_dhcp4_enabled(const Network *nw) {
         if (!nw)
                 return false;
@@ -110,38 +121,6 @@ static int network_parse_bool(const char *v, bool *ret) {
         }
 
         return -EINVAL;
-}
-
-/* "a.b.c.d/nn": split and validate. 0 or -EINVAL -- Address= is documented as
- * a CIDR literal (netd-network.h), so a bare address with no prefix is
- * rejected rather than guessed at. */
-static int parse_cidr(const char *s, NetworkAddress *ret) {
-        char *copy, *slash, *end;
-        unsigned long v;
-        int r = -EINVAL;
-
-        copy = pico_strdup(s);
-        if (!copy)
-                return -ENOMEM;
-
-        slash = strchr(copy, '/');
-        if (!slash)
-                goto out;
-        *slash = '\0';
-
-        v = strtoul(slash + 1, &end, 10);
-        if (end == slash + 1 || *end != '\0' || v > 32)
-                goto out;
-
-        if (inet_pton(AF_INET, copy, &ret->address) != 1)
-                goto out;
-
-        ret->prefixlen = (unsigned char) v;
-        r = 0;
-
-out:
-        free(copy);
-        return r;
 }
 
 /* --- [Match] --- */
@@ -191,25 +170,6 @@ static int config_parse_dhcp(
         }
 
         nw->dhcp = d;
-        return 0;
-}
-
-static int config_parse_address(
-                Network *nw, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
-        NetworkAddress addr, *grown;
-        (void) lvalue;
-
-        if (parse_cidr(rvalue, &addr) < 0) {
-                pico_log(PICO_LOG_WARNING, "%s:%u: invalid Address= value '%s', ignoring", path, line, rvalue);
-                return 0;
-        }
-
-        grown = realloc(nw->addresses, (nw->n_addresses + 1) * sizeof(*grown));
-        if (!grown)
-                return -ENOMEM;
-
-        nw->addresses = grown;
-        nw->addresses[nw->n_addresses++] = addr;
         return 0;
 }
 
@@ -391,6 +351,402 @@ static int parse_route_metric(const char *s, uint32_t *ret) {
         return 0;
 }
 
+/* --- [Address] and Address= --- */
+
+/*
+ * Parse state that lives only while one file is scanned. `cur` is the entry
+ * the open [Address] section fills, -1 when there is none or the file is over
+ * NETWORK_ADDRESS_MAX, whose entries are then ignored.
+ */
+typedef struct NetworkParser {
+        Network *nw;
+        ssize_t cur;
+        bool warned_cap;
+} NetworkParser;
+
+typedef int (*NetworkAddressParseFn)(
+                NetworkAddress *a, const char *path, unsigned line, const char *lvalue, const char *rvalue);
+
+typedef struct NetworkAddressConfigItem {
+        const char *lvalue;
+        NetworkAddressParseFn parse;
+} NetworkAddressConfigItem;
+
+/* Appends a zeroed entry, or returns -1 with one warning per file when the
+ * cap is reached. -ENOMEM on allocation failure. */
+static ssize_t network_address_append(NetworkParser *p, const char *path, unsigned line) {
+        Network *nw = p->nw;
+        NetworkAddress *grown;
+
+        if (nw->n_addresses >= NETWORK_ADDRESS_MAX) {
+                if (!p->warned_cap)
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s:%u: more than %d addresses, ignoring the rest",
+                                 path,
+                                 line,
+                                 NETWORK_ADDRESS_MAX);
+                p->warned_cap = true;
+                return -1;
+        }
+
+        grown = realloc(nw->addresses, (nw->n_addresses + 1) * sizeof(*grown));
+        if (!grown)
+                return -ENOMEM;
+
+        nw->addresses = grown;
+        memset(&grown[nw->n_addresses], 0, sizeof(*grown));
+        grown[nw->n_addresses].line = line;
+        return (ssize_t) nw->n_addresses++;
+}
+
+static int network_section_handler(const char *path, unsigned line, const char *section, void *userdata) {
+        NetworkParser *p = userdata;
+
+        p->cur = -1;
+
+        if (strcmp(section, "Address") == 0) {
+                ssize_t i = network_address_append(p, path, line);
+
+                if (i == -ENOMEM)
+                        return -ENOMEM;
+                p->cur = i;
+        }
+
+        return 0;
+}
+
+/* [Network] Address=: its own entry per line; empty clears every entry so far. */
+static int config_parse_network_address(
+                NetworkParser *p, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        NetworkAddress *a;
+        NetdInAddr addr;
+        unsigned char plen;
+        ssize_t i;
+        int family, r;
+        (void) lvalue;
+
+        if (*rvalue == '\0') {
+                p->nw->n_addresses = 0;
+                return 0;
+        }
+
+        r = netd_prefix_parse(rvalue, &family, &addr, &plen);
+        if (r < 0) {
+                pico_log(PICO_LOG_WARNING, "%s:%u: invalid Address= value '%s', ignoring", path, line, rvalue);
+                return 0;
+        }
+
+        i = network_address_append(p, path, line);
+        if (i < 0)
+                return i == -ENOMEM ? -ENOMEM : 0;
+
+        a = &p->nw->addresses[i];
+        a->family = (uint8_t) family;
+        a->prefixlen = plen;
+        a->address = addr;
+        return 0;
+}
+
+static int config_parse_section_address(
+                NetworkAddress *a, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        NetdInAddr addr;
+        unsigned char plen;
+        int family;
+        (void) lvalue;
+
+        /* An empty assignment clears both Address= and Peer=, as in networkd. */
+        if (*rvalue == '\0') {
+                a->family = 0;
+                a->peer_family = 0;
+                a->peer_set = false;
+                a->prefixlen = 0;
+                memset(&a->address, 0, sizeof(a->address));
+                memset(&a->peer, 0, sizeof(a->peer));
+                return 0;
+        }
+
+        if (netd_prefix_parse(rvalue, &family, &addr, &plen) < 0) {
+                pico_log(PICO_LOG_WARNING, "%s:%u: invalid Address= value '%s', ignoring", path, line, rvalue);
+                return 0;
+        }
+
+        a->family = (uint8_t) family;
+        a->prefixlen = plen;
+        a->address = addr;
+        return 0;
+}
+
+/* Only the address of Peer= is used; the prefix length is Address='s. */
+static int config_parse_section_peer(
+                NetworkAddress *a, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        char buf[INET6_ADDRSTRLEN + 8];
+        const char *slash = strchr(rvalue, '/');
+        NetdInAddr addr;
+        size_t len = slash ? (size_t) (slash - rvalue) : strlen(rvalue);
+        int family;
+        (void) lvalue;
+
+        if (*rvalue == '\0') {
+                a->peer_set = false;
+                a->peer_family = 0;
+                return 0;
+        }
+
+        if (len >= sizeof(buf)) {
+                pico_log(PICO_LOG_WARNING, "%s:%u: invalid Peer= value '%s', ignoring", path, line, rvalue);
+                return 0;
+        }
+        memcpy(buf, rvalue, len);
+        buf[len] = '\0';
+
+        if (netd_addr_parse(buf, &family, &addr) < 0) {
+                pico_log(PICO_LOG_WARNING, "%s:%u: invalid Peer= value '%s', ignoring", path, line, rvalue);
+                return 0;
+        }
+
+        if (slash)
+                pico_log(PICO_LOG_DEBUG,
+                         "%s:%u: Peer= prefix length in '%s' is ignored, Address= sets it",
+                         path,
+                         line,
+                         rvalue);
+
+        a->peer_family = (uint8_t) family;
+        a->peer = addr;
+        a->peer_set = true;
+        return 0;
+}
+
+static int config_parse_section_label(
+                NetworkAddress *a, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        (void) lvalue;
+
+        if (strlen(rvalue) >= sizeof(a->label)) {
+                pico_log(PICO_LOG_WARNING, "%s:%u: Label= value '%s' is too long, ignoring", path, line, rvalue);
+                return 0;
+        }
+
+        memcpy(a->label, rvalue, strlen(rvalue) + 1);
+        return 0;
+}
+
+static int config_parse_section_route_metric(
+                NetworkAddress *a, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        uint32_t v = 0;
+
+        if (*rvalue != '\0' && parse_route_metric(rvalue, &v) < 0) {
+                pico_log(PICO_LOG_WARNING, "%s:%u: invalid %s= value '%s', ignoring", path, line, lvalue, rvalue);
+                return 0;
+        }
+
+        a->route_metric = v;
+        return 0;
+}
+
+/* networkd takes forever, infinity, empty and 0 only. */
+static int config_parse_section_preferred_lifetime(
+                NetworkAddress *a, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        if (*rvalue == '\0' || strcmp(rvalue, "forever") == 0 || strcmp(rvalue, "infinity") == 0)
+                a->deprecated = false;
+        else if (strcmp(rvalue, "0") == 0)
+                a->deprecated = true;
+        else
+                pico_log(PICO_LOG_WARNING, "%s:%u: invalid %s= value '%s', ignoring", path, line, lvalue, rvalue);
+
+        return 0;
+}
+
+static int config_parse_section_scope(
+                NetworkAddress *a, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        static const struct {
+                const char *name;
+                uint8_t scope;
+        } names[] = {
+                {  "global",   0 },
+                {    "site", 200 },
+                {    "link", 253 },
+                {    "host", 254 },
+                { "nowhere", 255 },
+        };
+        unsigned long v = 256;
+
+        if (*rvalue == '\0') {
+                a->scope_set = false;
+                return 0;
+        }
+
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+                if (strcmp(rvalue, names[i].name) == 0) {
+                        a->scope = names[i].scope;
+                        a->scope_set = true;
+                        return 0;
+                }
+
+        if (strlen(rvalue) <= 3 && strspn(rvalue, "0123456789") == strlen(rvalue))
+                v = strtoul(rvalue, NULL, 10);
+        if (v > 255) {
+                pico_log(PICO_LOG_WARNING, "%s:%u: invalid %s= value '%s', ignoring", path, line, lvalue, rvalue);
+                return 0;
+        }
+
+        a->scope = (uint8_t) v;
+        a->scope_set = true;
+        return 0;
+}
+
+/* Only the IPv6 half has an effect: there is no IPv4 address conflict
+ * detection to run. The boolean spellings keep networkd's historical meaning,
+ * where yes turns detection off. */
+static int config_parse_section_dad(
+                NetworkAddress *a, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        bool b;
+
+        if (*rvalue == '\0') {
+                a->dad_set = false;
+                return 0;
+        }
+
+        if (network_parse_bool(rvalue, &b) == 0) {
+                pico_log(PICO_LOG_WARNING,
+                         "%s:%u: %s=%s means %s=%s, use 'both', 'ipv4', 'ipv6' or 'none'",
+                         path,
+                         line,
+                         lvalue,
+                         rvalue,
+                         lvalue,
+                         b ? "none" : "both");
+                a->dad = !b;
+        } else if (strcmp(rvalue, "both") == 0 || strcmp(rvalue, "ipv6") == 0)
+                a->dad = true;
+        else if (strcmp(rvalue, "none") == 0)
+                a->dad = false;
+        else if (strcmp(rvalue, "ipv4") == 0) {
+                pico_log(PICO_LOG_DEBUG,
+                         "%s:%u: %s=ipv4 has no effect, there is no IPv4 conflict detection",
+                         path,
+                         line,
+                         lvalue);
+                a->dad = false;
+        } else {
+                pico_log(PICO_LOG_WARNING, "%s:%u: invalid %s= value '%s', ignoring", path, line, lvalue, rvalue);
+                return 0;
+        }
+
+        a->dad_set = true;
+        return 0;
+}
+
+static int config_parse_section_add_prefix_route(
+                NetworkAddress *a, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        bool b;
+
+        if (network_parse_bool(rvalue, &b) < 0) {
+                pico_log(PICO_LOG_WARNING, "%s:%u: invalid %s= value '%s', ignoring", path, line, lvalue, rvalue);
+                return 0;
+        }
+
+        a->no_prefix_route = !b;
+        return 0;
+}
+
+static const NetworkAddressConfigItem address_config_items[] = {
+        {                   "Address",            config_parse_section_address },
+        {                      "Peer",               config_parse_section_peer },
+        {                     "Label",              config_parse_section_label },
+        {               "RouteMetric",       config_parse_section_route_metric },
+        {         "PreferredLifetime", config_parse_section_preferred_lifetime },
+        {                     "Scope",              config_parse_section_scope },
+        { "DuplicateAddressDetection",                config_parse_section_dad },
+        {            "AddPrefixRoute",   config_parse_section_add_prefix_route },
+};
+
+static bool network_address_same(const NetworkAddress *a, const NetworkAddress *b) {
+        if (a->family != b->family)
+                return false;
+
+        if (!netd_addr_eq(a->family, &a->address, &b->address))
+                return false;
+
+        /* An IPv6 address is one address whatever its prefix length. */
+        return a->family == AF_INET6 || a->prefixlen == b->prefixlen;
+}
+
+/*
+ * Drops what networkd drops and fills in the defaults, once the whole file is
+ * read, because the keys of a section come in any order. The later of two
+ * entries for one address wins, as in networkd.
+ */
+static void network_verify_addresses(Network *nw, const char *path) {
+        size_t n = 0;
+
+        for (size_t i = 0; i < nw->n_addresses; i++) {
+                NetworkAddress a = nw->addresses[i];
+                char buf[INET6_ADDRSTRLEN];
+                size_t k;
+
+                if (a.family == 0) {
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s:%u: [Address] section without Address=, ignoring",
+                                 path,
+                                 a.line);
+                        continue;
+                }
+
+                if (a.peer_set && a.peer_family != a.family) {
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s:%u: Peer= is not the same family as Address=, ignoring the address",
+                                 path,
+                                 a.line);
+                        continue;
+                }
+
+                if (netd_addr_is_null(a.family, &a.address)) {
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s:%u: a null Address= asks for an address pool, which is not supported, ignoring",
+                                 path,
+                                 a.line);
+                        continue;
+                }
+
+                if (a.family == AF_INET6 && a.label[0] != '\0') {
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s:%u: Label= has no effect on an IPv6 address, ignoring it",
+                                 path,
+                                 a.line);
+                        a.label[0] = '\0';
+                }
+
+                if (!a.scope_set) {
+                        if (netd_addr_is_loopback(a.family, &a.address))
+                                a.scope = 254; /* RT_SCOPE_HOST */
+                        else if (netd_addr_is_link_local(a.family, &a.address))
+                                a.scope = 253; /* RT_SCOPE_LINK */
+                }
+
+                if (!a.dad_set)
+                        a.dad = a.family == AF_INET6;
+
+                for (k = 0; k < n; k++)
+                        if (network_address_same(&nw->addresses[k], &a))
+                                break;
+
+                if (k < n) {
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s:%u: address %s is also set at line %u, using the later one",
+                                 path,
+                                 nw->addresses[k].line,
+                                 netd_addr_to_string(a.family, &a.address, buf),
+                                 a.line);
+                        memmove(&nw->addresses[k], &nw->addresses[k + 1], (n - k - 1) * sizeof(*nw->addresses));
+                        n--;
+                }
+
+                nw->addresses[n++] = a;
+        }
+
+        nw->n_addresses = n;
+}
+
 /* A rejected value, the empty one included, keeps any earlier value: networkd
  * logs and ignores it too, rather than resetting. */
 static int config_parse_dhcp4_route_metric(
@@ -439,7 +795,6 @@ typedef struct NetworkConfigItem {
 static const NetworkConfigItem network_config_items[] = {
         {   "Match",        "Name",               config_parse_match_name },
         { "Network",        "DHCP",                     config_parse_dhcp },
-        { "Network",     "Address",                  config_parse_address },
         { "Network",     "Gateway",                  config_parse_gateway },
         { "Network",         "DNS",                      config_parse_dns },
         { "Network",         "NTP",                      config_parse_ntp },
@@ -468,11 +823,33 @@ static int network_conf_handler(
                 const char *lvalue,
                 const char *rvalue,
                 void *userdata) {
-        Network *nw = userdata;
+        NetworkParser *p = userdata;
+        Network *nw = p->nw;
         size_t i;
 
         if (!section) {
                 pico_log(PICO_LOG_WARNING, "%s:%u: assignment outside any section, ignoring", path, line);
+                return 0;
+        }
+
+        if (strcmp(section, "Network") == 0 && strcmp(lvalue, "Address") == 0)
+                return config_parse_network_address(p, path, line, lvalue, rvalue);
+
+        if (strcmp(section, "Address") == 0) {
+                if (p->cur < 0)
+                        return 0;
+
+                for (i = 0; i < sizeof(address_config_items) / sizeof(address_config_items[0]); i++)
+                        if (strcmp(address_config_items[i].lvalue, lvalue) == 0)
+                                return address_config_items[i].parse(
+                                                &nw->addresses[p->cur], path, line, lvalue, rvalue);
+
+                pico_log(PICO_LOG_DEBUG,
+                         "%s:%u: unknown directive %s= in [%s], ignoring",
+                         path,
+                         line,
+                         lvalue,
+                         section);
                 return 0;
         }
 
@@ -492,6 +869,7 @@ static char *path_basename_dup(const char *path) {
 }
 
 int network_parse_file(const char *path, Network **ret) {
+        NetworkParser parser = { 0 };
         Network *nw = NULL;
         int r;
 
@@ -509,11 +887,16 @@ int network_parse_file(const char *path, Network **ret) {
                 return -ENOMEM;
         }
 
-        r = pico_conf_scan(path, network_conf_handler, nw);
+        parser.nw = nw;
+        parser.cur = -1;
+
+        r = pico_conf_scan_full(path, network_conf_handler, network_section_handler, &parser);
         if (r < 0) {
                 network_free(nw);
                 return r;
         }
+
+        network_verify_addresses(nw, path);
 
         *ret = nw;
         return 0;

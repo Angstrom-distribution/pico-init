@@ -17,10 +17,12 @@
  */
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "../test-util.h"
 #include "../util.h"
@@ -771,6 +773,381 @@ static void test_huge_line_does_not_crash(void) {
         free(dir);
 }
 
+/* --- [Address] and Address= --- */
+
+/* Warnings go to fd 2 (util.c); capture it to a file so a test can check what
+ * a parse said, then restore it. */
+typedef struct Capture {
+        int saved;
+        char path[PATH_MAX];
+} Capture;
+
+static void capture_begin(Capture *c, const char *dir) {
+        int fd;
+
+        snprintf(c->path, sizeof(c->path), "%s/stderr.log", dir);
+        fflush(stderr);
+        c->saved = dup(2);
+        ASSERT_TRUE(c->saved >= 0);
+        fd = open(c->path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        ASSERT_TRUE(fd >= 0);
+        ASSERT_TRUE(dup2(fd, 2) == 2);
+        close(fd);
+}
+
+/* Restores fd 2 and returns the number of lines containing `needle`. */
+static int capture_end(Capture *c, const char *needle) {
+        char line[1024];
+        int hits = 0;
+        FILE *f;
+
+        fflush(stderr);
+        ASSERT_TRUE(dup2(c->saved, 2) == 2);
+        close(c->saved);
+
+        f = fopen(c->path, "re");
+        ASSERT_TRUE(f != NULL);
+        while (fgets(line, sizeof(line), f))
+                if (strstr(line, needle))
+                        hits++;
+        fclose(f);
+        return hits;
+}
+
+static const char *addr_str(const NetworkAddress *a, char buf[INET6_ADDRSTRLEN]) {
+        return netd_addr_to_string(a->family, &a->address, buf);
+}
+
+/* Sections and [Network] lines interleave in file order, both families, and
+ * every key lands on its own entry. */
+static void test_address_sections(void) {
+        char *dir = test_tmpdir_new();
+        char buf[INET6_ADDRSTRLEN];
+        Network *nw;
+        const NetworkAddress *a;
+
+        ASSERT_TRUE(dir != NULL);
+        nw = parse_body(dir,
+                        "[Match]\n"
+                        "Name=net0\n"
+                        "[Network]\n"
+                        "Address=10.0.0.1/24\n"
+                        "[Address]\n"
+                        "Address=192.168.1.2/24\n"
+                        "RouteMetric=50\n"
+                        "Label=net0:lab\n"
+                        "PreferredLifetime=0\n"
+                        "Scope=link\n"
+                        "AddPrefixRoute=no\n"
+                        "[Address]\n"
+                        "Address=fd00::2/64\n"
+                        "DuplicateAddressDetection=none\n"
+                        "[Network]\n"
+                        "Address=10.0.0.9/16\n");
+
+        ASSERT_EQ_INT(nw->n_addresses, 4);
+
+        a = &nw->addresses[0];
+        ASSERT_EQ_INT(a->family, AF_INET);
+        ASSERT_STREQ(addr_str(a, buf), "10.0.0.1");
+        ASSERT_EQ_INT(a->prefixlen, 24);
+        ASSERT_EQ_INT(a->line, 4);
+        ASSERT_EQ_INT(a->route_metric, 0);
+        ASSERT_EQ_INT(a->scope, 0);
+        ASSERT_TRUE(!a->deprecated);
+        ASSERT_TRUE(!a->no_prefix_route);
+        ASSERT_STREQ(a->label, "");
+
+        a = &nw->addresses[1];
+        ASSERT_STREQ(addr_str(a, buf), "192.168.1.2");
+        ASSERT_EQ_INT(a->prefixlen, 24);
+        ASSERT_EQ_INT(a->line, 5);
+        ASSERT_EQ_INT(a->route_metric, 50);
+        ASSERT_STREQ(a->label, "net0:lab");
+        ASSERT_TRUE(a->deprecated);
+        ASSERT_EQ_INT(a->scope, 253);
+        ASSERT_TRUE(a->scope_set);
+        ASSERT_TRUE(a->no_prefix_route);
+
+        a = &nw->addresses[2];
+        ASSERT_EQ_INT(a->family, AF_INET6);
+        ASSERT_STREQ(addr_str(a, buf), "fd00::2");
+        ASSERT_EQ_INT(a->prefixlen, 64);
+        ASSERT_TRUE(a->dad_set);
+        ASSERT_TRUE(!a->dad);
+
+        a = &nw->addresses[3];
+        ASSERT_STREQ(addr_str(a, buf), "10.0.0.9");
+        ASSERT_EQ_INT(a->prefixlen, 16);
+        ASSERT_EQ_INT(a->line, 16);
+
+        ASSERT_TRUE(network_first_address_v4(nw) == &nw->addresses[0]);
+
+        network_free(nw);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+static void test_address_scope_and_dad_defaults(void) {
+        char *dir = test_tmpdir_new();
+        Network *nw;
+
+        ASSERT_TRUE(dir != NULL);
+        nw = parse_body(dir,
+                        "[Match]\n"
+                        "Name=net0\n"
+                        "[Network]\n"
+                        "Address=10.1.1.1/24\n"
+                        "Address=169.254.3.4/16\n"
+                        "Address=127.0.0.2/8\n"
+                        "Address=fe80::5/64\n"
+                        "Address=::1/128\n"
+                        "Address=fd00::7/64\n"
+                        "[Address]\n"
+                        "Address=fd00::8/64\n"
+                        "Scope=0\n"
+                        "[Address]\n"
+                        "Address=fd00::9/64\n"
+                        "DuplicateAddressDetection=ipv4\n"
+                        "[Address]\n"
+                        "Address=fd00::a/64\n"
+                        "DuplicateAddressDetection=both\n");
+
+        ASSERT_EQ_INT(nw->n_addresses, 9);
+        ASSERT_EQ_INT(nw->addresses[0].scope, 0);
+        ASSERT_EQ_INT(nw->addresses[1].scope, 253);
+        ASSERT_EQ_INT(nw->addresses[2].scope, 254);
+        ASSERT_EQ_INT(nw->addresses[3].scope, 253);
+        ASSERT_EQ_INT(nw->addresses[4].scope, 254);
+        ASSERT_EQ_INT(nw->addresses[5].scope, 0);
+        ASSERT_TRUE(nw->addresses[5].dad);
+        ASSERT_TRUE(!nw->addresses[5].dad_set);
+
+        /* an explicit scope beats the address-derived one */
+        ASSERT_EQ_INT(nw->addresses[6].scope, 0);
+        ASSERT_TRUE(nw->addresses[6].scope_set);
+
+        ASSERT_TRUE(!nw->addresses[7].dad);
+        ASSERT_TRUE(nw->addresses[8].dad);
+
+        network_free(nw);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* What networkd drops is dropped here, each with a warning naming its line. */
+static void test_address_entries_dropped(void) {
+        char *dir = test_tmpdir_new();
+        char buf[INET6_ADDRSTRLEN];
+        Capture cap;
+        Network *nw;
+        int hits;
+
+        ASSERT_TRUE(dir != NULL);
+        capture_begin(&cap, dir);
+        nw = parse_body(dir,
+                        "[Match]\n"
+                        "Name=net0\n"
+                        "[Address]\n"
+                        "RouteMetric=5\n"
+                        "[Address]\n"
+                        "Address=10.0.0.1/24\n"
+                        "Peer=fd00::1\n"
+                        "[Address]\n"
+                        "Address=0.0.0.0/8\n"
+                        "[Address]\n"
+                        "Address=::/64\n"
+                        "[Address]\n"
+                        "Address=10.0.0.5\n"
+                        "[Address]\n"
+                        "Address=not-an-address/24\n"
+                        "[Address]\n"
+                        "Address=fd00::5/64\n"
+                        "Label=lab0\n"
+                        "[Address]\n"
+                        "Address=10.0.0.7/24\n"
+                        "Peer=10.0.0.6/32\n");
+        hits = capture_end(&cap, "without Address=");
+        ASSERT_EQ_INT(hits, 3);
+
+        ASSERT_EQ_INT(nw->n_addresses, 2);
+        ASSERT_STREQ(addr_str(&nw->addresses[0], buf), "fd00::5");
+        ASSERT_STREQ(nw->addresses[0].label, "");
+        ASSERT_STREQ(addr_str(&nw->addresses[1], buf), "10.0.0.7");
+        ASSERT_TRUE(nw->addresses[1].peer_set);
+        ASSERT_EQ_INT(nw->addresses[1].peer.bytes[3], 6);
+
+        network_free(nw);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+static void test_address_duplicates_later_wins(void) {
+        char *dir = test_tmpdir_new();
+        char buf[INET6_ADDRSTRLEN];
+        Capture cap;
+        Network *nw;
+
+        ASSERT_TRUE(dir != NULL);
+        capture_begin(&cap, dir);
+        nw = parse_body(dir,
+                        "[Match]\n"
+                        "Name=net0\n"
+                        "[Network]\n"
+                        "Address=10.0.0.1/24\n"
+                        "Address=10.0.0.2/24\n"
+                        "Address=fd00::1/64\n"
+                        "[Address]\n"
+                        "Address=10.0.0.1/24\n"
+                        "RouteMetric=7\n"
+                        "[Address]\n"
+                        "Address=10.0.0.2/16\n"
+                        "[Address]\n"
+                        "Address=fd00::1/80\n");
+        ASSERT_EQ_INT(capture_end(&cap, "using the later one"), 2);
+
+        /* the earlier duplicate goes; the survivors keep file order */
+        ASSERT_EQ_INT(nw->n_addresses, 4);
+        ASSERT_STREQ(addr_str(&nw->addresses[0], buf), "10.0.0.2");
+        ASSERT_EQ_INT(nw->addresses[0].prefixlen, 24);
+        ASSERT_STREQ(addr_str(&nw->addresses[1], buf), "10.0.0.1");
+        ASSERT_EQ_INT(nw->addresses[1].route_metric, 7);
+        ASSERT_EQ_INT(nw->addresses[1].line, 7);
+        ASSERT_STREQ(addr_str(&nw->addresses[2], buf), "10.0.0.2");
+        ASSERT_EQ_INT(nw->addresses[2].prefixlen, 16);
+        ASSERT_STREQ(addr_str(&nw->addresses[3], buf), "fd00::1");
+        ASSERT_EQ_INT(nw->addresses[3].prefixlen, 80);
+
+        network_free(nw);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+static void test_address_empty_assignment_clears(void) {
+        char *dir = test_tmpdir_new();
+        char buf[INET6_ADDRSTRLEN];
+        Network *nw;
+
+        ASSERT_TRUE(dir != NULL);
+        nw = parse_body(dir,
+                        "[Match]\n"
+                        "Name=net0\n"
+                        "[Network]\n"
+                        "Address=10.0.0.1/24\n"
+                        "[Address]\n"
+                        "Address=10.0.0.2/24\n"
+                        "[Network]\n"
+                        "Address=\n"
+                        "Address=10.0.0.3/24\n"
+                        "[Address]\n"
+                        "Address=10.0.0.4/24\n"
+                        "Peer=10.0.0.5\n"
+                        "Address=\n"
+                        "[Address]\n"
+                        "Address=10.0.0.6/24\n"
+                        "Address=10.0.0.7/24\n");
+
+        /* the section whose Address= was emptied has none left and is dropped;
+         * Address= twice in one section keeps the second */
+        ASSERT_EQ_INT(nw->n_addresses, 2);
+        ASSERT_STREQ(addr_str(&nw->addresses[0], buf), "10.0.0.3");
+        ASSERT_STREQ(addr_str(&nw->addresses[1], buf), "10.0.0.7");
+        ASSERT_TRUE(!nw->addresses[1].peer_set);
+
+        network_free(nw);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+static void test_address_value_errors_keep_earlier_value(void) {
+        char *dir = test_tmpdir_new();
+        Network *nw;
+        const NetworkAddress *a;
+
+        ASSERT_TRUE(dir != NULL);
+        nw = parse_body(dir,
+                        "[Match]\n"
+                        "Name=net0\n"
+                        "[Address]\n"
+                        "Address=10.0.0.1/24\n"
+                        "RouteMetric=10\n"
+                        "RouteMetric=abc\n"
+                        "PreferredLifetime=0\n"
+                        "PreferredLifetime=5\n"
+                        "Scope=host\n"
+                        "Scope=bogus\n"
+                        "Scope=256\n"
+                        "Label=abcdefghijklmnop\n"
+                        "Label=ok0\n"
+                        "AddPrefixRoute=maybe\n"
+                        "Peer=banana\n"
+                        "Broadcast=10.0.0.255\n"
+                        "HomeAddress=yes\n"
+                        "ManageTemporaryAddress=yes\n"
+                        "[Address]\n"
+                        "Address=10.0.1.1/24\n"
+                        "Scope=7\n"
+                        "PreferredLifetime=forever\n"
+                        "RouteMetric=\n"
+                        "DuplicateAddressDetection=yes\n");
+
+        ASSERT_EQ_INT(nw->n_addresses, 2);
+        a = &nw->addresses[0];
+        ASSERT_EQ_INT(a->route_metric, 10);
+        ASSERT_TRUE(a->deprecated);
+        ASSERT_EQ_INT(a->scope, 254);
+        ASSERT_STREQ(a->label, "ok0");
+        ASSERT_TRUE(!a->no_prefix_route);
+        ASSERT_TRUE(!a->peer_set);
+
+        a = &nw->addresses[1];
+        ASSERT_EQ_INT(a->scope, 7);
+        ASSERT_TRUE(!a->deprecated);
+        ASSERT_EQ_INT(a->route_metric, 0);
+        /* networkd's historical meaning: yes turns detection off */
+        ASSERT_TRUE(a->dad_set);
+        ASSERT_TRUE(!a->dad);
+
+        network_free(nw);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/* Over the cap one warning is logged for the file; the entries up to it stay,
+ * and the keys of a section past it are skipped without effect. */
+static void test_address_cap(void) {
+        char *dir = test_tmpdir_new();
+        char body[4096], buf[INET6_ADDRSTRLEN];
+        size_t off;
+        Capture cap;
+        Network *nw;
+
+        ASSERT_TRUE(dir != NULL);
+        off = (size_t) snprintf(body, sizeof(body), "[Match]\nName=net0\n[Network]\n");
+        for (int i = 0; i < 12; i++)
+                off += (size_t) snprintf(body + off, sizeof(body) - off, "Address=10.0.%d.1/24\n", i);
+        for (int i = 12; i < 24; i++)
+                off += (size_t) snprintf(
+                                body + off,
+                                sizeof(body) - off,
+                                "[Address]\nAddress=10.0.%d.1/24\nRouteMetric=9\n",
+                                i);
+
+        capture_begin(&cap, dir);
+        nw = parse_body(dir, body);
+        ASSERT_EQ_INT(capture_end(&cap, "more than 16 addresses"), 1);
+
+        ASSERT_EQ_INT(nw->n_addresses, NETWORK_ADDRESS_MAX);
+        ASSERT_STREQ(addr_str(&nw->addresses[0], buf), "10.0.0.1");
+        ASSERT_STREQ(addr_str(&nw->addresses[15], buf), "10.0.15.1");
+        ASSERT_EQ_INT(nw->addresses[11].route_metric, 0);
+        ASSERT_EQ_INT(nw->addresses[12].route_metric, 9);
+
+        network_free(nw);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
         test_defaults();
         test_dhcp_spellings();
@@ -790,6 +1167,13 @@ int main(void) {
         test_search_path_shadowing_and_order();
         test_missing_search_dir_is_not_an_error();
         test_huge_line_does_not_crash();
+        test_address_sections();
+        test_address_scope_and_dad_defaults();
+        test_address_entries_dropped();
+        test_address_duplicates_later_wins();
+        test_address_empty_assignment_clears();
+        test_address_value_errors_keep_earlier_value();
+        test_address_cap();
 
         printf("test-netd-network: ok\n");
         return EXIT_SUCCESS;

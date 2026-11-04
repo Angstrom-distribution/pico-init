@@ -401,9 +401,9 @@ int netd_link_rtnl_handler(void *userdata, NetdRtnlLinkEvent event, const NetdRt
 /* --- static Address=/Gateway= convergence --- */
 
 static int apply_static_address(Link *l, const Network *nw) {
-        const NetworkAddress *want;
+        const NetworkAddress *want = network_first_address_v4(nw);
 
-        if (nw->n_addresses == 0) {
+        if (!want) {
                 if (!l->address_configured)
                         return 0;
 
@@ -420,25 +420,16 @@ static int apply_static_address(Link *l, const Network *nw) {
                 return link_address_del(l);
         }
 
-        if (nw->n_addresses > 1)
-                pico_log(PICO_LOG_DEBUG,
-                         "netd: %s: %s lists %zu Address= entries, only the first is applied",
-                         l->ifname,
-                         nw->basename,
-                         nw->n_addresses);
-
-        want = &nw->addresses[0];
-
         /* Already exactly right: leave it strictly alone. Reloading must not
          * bounce a working interface (netd-link.h on link_reconfigure()). A
          * held lease's address keeps its metric; once DHCP= is off it is
          * Address='s, at 0. */
-        if (l->address_configured && l->address.s_addr == want->address.s_addr &&
+        if (l->address_configured && l->address.s_addr == want->address.in.s_addr &&
             l->prefixlen == want->prefixlen &&
             (l->address_metric == 0 || (l->lease && network_dhcp4_enabled(nw))))
                 return 0;
 
-        return converge_address(l, &want->address, want->prefixlen, UINT32_MAX, 0);
+        return converge_address(l, &want->address.in, want->prefixlen, UINT32_MAX, 0);
 }
 
 /* Removes the default route and, if there is one, its host route. */
@@ -837,19 +828,20 @@ fail:
 static int link_start_dhcp_server(Link *l, const Network *nw) {
         Netd *n = l->netd;
         DhcpServer *server = NULL;
+        const NetworkAddress *served = network_first_address_v4(nw);
         struct in_addr address;
         unsigned char prefixlen;
         int r;
 
-        if (nw->n_addresses == 0) {
+        if (!served) {
                 pico_log(PICO_LOG_WARNING,
-                         "netd: %s: DHCPServer=yes but no Address= to derive the pool from",
+                         "netd: %s: DHCPServer=yes but no IPv4 Address= to derive the pool from",
                          l->ifname);
                 return -EINVAL;
         }
 
-        address = nw->addresses[0].address;
-        prefixlen = nw->addresses[0].prefixlen;
+        address = served->address.in;
+        prefixlen = served->prefixlen;
 
         r = dhcp_server_new(n, l->ifindex, l->ifname, &server);
         if (r < 0)
