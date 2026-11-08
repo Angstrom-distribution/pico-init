@@ -258,7 +258,7 @@ since nothing rebroadcasts without `udevd`.
 
 | Interface | Status |
 |-----------|--------|
-| `udev_queue_*` | The state of a system with no `udevd`: `/run/udev/control` and `/run/udev/queue` do not exist. |
+| `udev_queue_*` | `/run/udev/control` never exists, so `udev_queue_get_udev_is_active()` is 0. `/run/udev/queue` exists while `devd` has events in flight (see [DEVD.md](DEVD.md#queue-state-and-udevadm-settle)), so the queue-empty calls and `udev_queue_get_fd()` report it. The seqnum getters return 0. |
 | `udev_hwdb_new()` | NULL with `errno = ENOENT`. |
 | `udev_set_log_fn()` and the log priority calls | Accepted; the priority is stored, the function is never called. |
 
