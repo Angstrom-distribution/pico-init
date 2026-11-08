@@ -33,6 +33,7 @@ struct pico_cgroup_orphan {
 
 static const char * const default_unit_path[] = {
         PICO_UNIT_DIR,
+        PICO_RUNTIME_UNIT_DIR,
         PICO_PACKAGED_UNIT_DIR,
         NULL,
 };

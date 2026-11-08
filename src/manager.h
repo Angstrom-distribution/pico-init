@@ -52,10 +52,11 @@ enum {
         EVENT_PRIORITY_SOCKET_REAP = SD_EVENT_PRIORITY_IDLE + 3, /* last: frees units other sources name */
 };
 
-/* Assumes a usrmerged rootfs: /etc overrides admin-placed units, /usr/lib is
- * where packages install theirs -- same two-entry order real systemd
- * searches. */
+/* Assumes a usrmerged rootfs: /etc overrides admin-placed units, /run holds
+ * runtime ones, /usr/lib is where packages install theirs -- same order real
+ * systemd searches. */
 #define PICO_UNIT_DIR "/etc/systemd/system"
+#define PICO_RUNTIME_UNIT_DIR "/run/systemd/system"
 #define PICO_PACKAGED_UNIT_DIR "/usr/lib/systemd/system"
 
 /* Preset files, searched in the same override order. Presets are applied at

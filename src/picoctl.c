@@ -1782,7 +1782,7 @@ static void print_no_install_info_notice(void) {
 static int load_install_info(const char *unit_name, Manager **ret_m, Unit **ret_u) {
         Manager *m = NULL;
         Unit *u = NULL;
-        char updir[PATH_MAX], pkgdir[PATH_MAX];
+        char updir[PATH_MAX], rundir[PATH_MAX], pkgdir[PATH_MAX];
         char presetdir[PATH_MAX], pkgpresetdir[PATH_MAX];
         int r;
 
@@ -1791,6 +1791,7 @@ static int load_install_info(const char *unit_name, Manager **ret_m, Unit **ret_
                 return r;
 
         if (path_join(updir, sizeof(updir), PICO_UNIT_DIR) < 0 ||
+            path_join(rundir, sizeof(rundir), PICO_RUNTIME_UNIT_DIR) < 0 ||
             path_join(pkgdir, sizeof(pkgdir), PICO_PACKAGED_UNIT_DIR) < 0 ||
             path_join(presetdir, sizeof(presetdir), PICO_PRESET_DIR) < 0 ||
             path_join(pkgpresetdir, sizeof(pkgpresetdir), PICO_PACKAGED_PRESET_DIR) < 0) {
@@ -1799,7 +1800,7 @@ static int load_install_info(const char *unit_name, Manager **ret_m, Unit **ret_
         }
 
         {
-                const char * const up[] = { updir, pkgdir, NULL };
+                const char * const up[] = { updir, rundir, pkgdir, NULL };
                 const char * const pd[] = { presetdir, pkgpresetdir, NULL };
 
                 r = manager_set_unit_path(m, up);
@@ -2365,7 +2366,7 @@ static int unit_file_entry_cmp(const void *a, const void *b) {
         return strcmp(((const struct unit_file_entry *) a)->name, ((const struct unit_file_entry *) b)->name);
 }
 
-/* Both PICO_UNIT_DIR and PICO_PACKAGED_UNIT_DIR scanned, etc-over-lib
+/* PICO_UNIT_DIR, PICO_RUNTIME_UNIT_DIR and PICO_PACKAGED_UNIT_DIR scanned, etc-over-run-over-lib
  * dedup, same precedence manager_load_units_one_dir() (manager.c) gives
  * the real search path -- a name already recorded from a higher-priority
  * directory shadows the same name turning up in a lower one. Best-effort:
@@ -2492,7 +2493,7 @@ static const char *unit_file_state_of(const char *name, const char **ret_preset)
 }
 
 static int cmd_list_unit_files(int argc, char *argv[]) {
-        char updir[PATH_MAX], pkgdir[PATH_MAX];
+        char updir[PATH_MAX], rundir[PATH_MAX], pkgdir[PATH_MAX];
         struct unit_file_entry *entries = NULL;
         size_t n = 0, cap = 0, i, listed = 0;
         struct json_out j;
@@ -2502,6 +2503,8 @@ static int cmd_list_unit_files(int argc, char *argv[]) {
 
         if (path_join(updir, sizeof(updir), PICO_UNIT_DIR) == 0)
                 collect_unit_files_from(updir, &entries, &n, &cap);
+        if (path_join(rundir, sizeof(rundir), PICO_RUNTIME_UNIT_DIR) == 0)
+                collect_unit_files_from(rundir, &entries, &n, &cap);
         if (path_join(pkgdir, sizeof(pkgdir), PICO_PACKAGED_UNIT_DIR) == 0)
                 collect_unit_files_from(pkgdir, &entries, &n, &cap);
 
@@ -2562,7 +2565,7 @@ static int cmd_list_unit_files(int argc, char *argv[]) {
 
 /* preset-all: every unit file through the preset rules, as `preset` would. */
 static int cmd_preset_all(int argc, char *argv[]) {
-        char updir[PATH_MAX], pkgdir[PATH_MAX];
+        char updir[PATH_MAX], rundir[PATH_MAX], pkgdir[PATH_MAX];
         struct unit_file_entry *entries = NULL;
         size_t n = 0, cap = 0, i;
         int status = 0;
@@ -2575,6 +2578,8 @@ static int cmd_preset_all(int argc, char *argv[]) {
 
         if (path_join(updir, sizeof(updir), PICO_UNIT_DIR) == 0)
                 collect_unit_files_from(updir, &entries, &n, &cap);
+        if (path_join(rundir, sizeof(rundir), PICO_RUNTIME_UNIT_DIR) == 0)
+                collect_unit_files_from(rundir, &entries, &n, &cap);
         if (path_join(pkgdir, sizeof(pkgdir), PICO_PACKAGED_UNIT_DIR) == 0)
                 collect_unit_files_from(pkgdir, &entries, &n, &cap);
         if (entries && n > 1)
