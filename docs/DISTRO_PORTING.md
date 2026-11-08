@@ -128,7 +128,8 @@ rather than followed.
 PID 1 searches, in this order:
 
 1. `/etc/systemd/system`
-2. `/usr/lib/systemd/system`
+2. `/run/systemd/system`
+3. `/usr/lib/systemd/system`
 
 and presets in `/etc/systemd/system-preset` and
 `/usr/lib/systemd/system-preset`. The layout assumes a merged `/usr`;
@@ -139,6 +140,23 @@ ask pkg-config install there.
 A literal instance unit wins over the template across all directories, so
 `serial-getty@ttyGS0.service` in `/etc/systemd/system` beats
 `serial-getty@.service` in `/usr/lib/systemd/system`.
+
+### Changing a packaged unit
+
+An image changes a setting of a packaged unit with a drop-in file instead of
+patching the unit at build time. A drop-in is read after the unit file, from
+`<unit>.d/` in any of the three directories, and an empty assignment resets a
+list such as `ExecStart=`. To run `logd` with its output discarded:
+
+```sh
+install -d ${IMAGE_ROOTFS}/etc/systemd/system/logd.service.d
+printf '[Service]\nStandardOutput=null\n' \
+        > ${IMAGE_ROOTFS}/etc/systemd/system/logd.service.d/10-stdout.conf
+```
+
+The directories that are read, the order the files are applied in and the
+differences from systemd are in
+[INCOMPATIBILITIES.md](INCOMPATIBILITIES.md#drop-in-files).
 
 ## Presets
 

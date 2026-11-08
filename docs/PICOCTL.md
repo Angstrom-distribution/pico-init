@@ -38,7 +38,7 @@ A verb that systemctl does not have either is `Unknown command verb`.
 | `list-unit-files [PATTERN...]` | unit files | |
 | `list-jobs [PATTERN...]` | state files | A job is `running` once its unit is activating, deactivating or reloading, `waiting` before that |
 | `list-timers`, `list-paths`, `list-automounts` | none | Always empty: those unit types do not exist |
-| `status`, `show`, `cat` | state files, unit files | `show` without a unit prints the manager's properties |
+| `status`, `show`, `cat` | state files, unit files | `show` without a unit prints the manager's properties. `status` lists the applied drop-ins in a `Drop-In:` block, `show` as `DropInPaths=`, and `cat` prints them after the unit file |
 | `is-active`, `is-failed`, `is-enabled`, `is-system-running` | state files, symlinks | `is-active` accepts `reloading` as well as `active`; `is-system-running --wait` polls while the state is `starting` |
 | `get-default` | state files | The default target is fixed at boot |
 | `whoami [PID...]` | `/proc/PID/cgroup` | The unit a process belongs to |

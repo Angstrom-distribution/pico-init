@@ -29,16 +29,72 @@ A `[Service]` directive in a non-service unit, or a `[Socket]` directive in a
 non-socket unit, is logged as misplaced and ignored. It is not recorded as
 degraded.
 
-Drop-in directories (`foo.service.d/*.conf`) are not read. A unit is exactly
-one fragment, found by name in `/etc/systemd/system` and then
-`/usr/lib/systemd/system`; the first directory that has the name decides.
-Overrides have to replace the whole file.
+A unit file is found by name in `/etc/systemd/system`,
+`/run/systemd/system` and `/usr/lib/systemd/system`; the first directory that
+has the name decides. [Drop-in files](#drop-in-files) change a unit without
+replacing its file.
 
 Masking works as in systemd: a symlink to `/dev/null` (or any device node)
 or an empty regular file masks the unit and shadows a fragment in a later
 directory. A symlink to a differently named unit of the same type is an
 alias. An instance without a fragment of its own, such as
 `serial-getty@ttyUSB0.service`, loads through its template.
+
+## Drop-in files
+
+A drop-in is a `.conf` file in a directory named after the unit with `.d`
+appended. It is parsed after the unit file by the same parser, so it takes
+the sections and directives the unit file takes, and a bad line is reported
+with the drop-in's file name and line number. A drop-in is how an image or an
+administrator changes one setting of a packaged unit. For example, this runs
+`logd` with its output discarded without a patched copy of its unit:
+
+```
+# /etc/systemd/system/logd.service.d/10-stdout.conf
+[Service]
+StandardOutput=null
+```
+
+For `foo-bar.service` the directories read are `foo-bar.service.d`, the
+dash-truncated `foo-.service.d` and the type-level `service.d`. An instance
+such as `foo-bar@x.service` also reads its template's directory
+(`foo-bar@.service.d`) and the truncated names of both (`foo-.service.d`,
+`foo-@x.service.d`, `foo-@.service.d`). Each is looked for in
+`/etc/systemd/system`, `/run/systemd/system` and `/usr/lib/systemd/system`.
+
+- Only files ending in `.conf` are read; names starting with a dot are
+  skipped.
+- A file name that occurs in several directories is read from one of them
+  only. The earliest of the three search directories wins; within one search
+  directory the unit's own directory wins over its template's and the
+  truncated ones; every `service.d` loses to all of those. An empty file or
+  a link to `/dev/null` under a name therefore cancels the file of that
+  name in a later directory.
+- The files that remain are applied sorted by file name, whichever
+  directory they are in, so `10-a.conf` from `/usr/lib` is applied before
+  `20-b.conf` from `/etc`. A directive set by several files takes the last
+  value; a list directive collects every line.
+- An empty assignment resets a list directive: `ExecStart=` before a new
+  `ExecStart=` replaces the command, and `ExecStartPre=`, `ExecStop=`,
+  `ExecStopPost=`, `ExecReload=`, `Environment=`, `EnvironmentFile=` and
+  the `Condition*=` lines are cleared the same way. An empty `Requires=`,
+  `Wants=`, `Before=`, `After=` or `Conflicts=` removes nothing: those
+  edges are never taken back (see [Reload of the manager](#reload-of-the-manager)).
+- Without a unit file there is no unit. A service, socket or target whose
+  directory exists but whose file does not stays not found, as in systemd,
+  and its drop-ins are not read. A masked unit stays masked.
+- The directories of a unit's other names are not read: `default.target` is
+  an alias of the target it links to, and only that target's own name counts.
+- A drop-in that cannot be opened is skipped with a warning and the unit
+  still loads.
+
+Each search directory is listed once per load or reload, and only
+directories that exist are opened, so the cost on a small board is a few
+`readdir()` calls at boot. `picoctl daemon-reload` and `SIGHUP` read the
+drop-ins again. `picoctl status` shows them in the `Drop-In:` block, `picoctl
+show` as `DropInPaths=` and `picoctl cat` prints them after the unit file.
+`pico-unit-lint` applies the drop-ins found in the trees it is given.
+`picoctl edit` and `picoctl revert` are refused: drop-ins are plain files.
 
 ## How an unsupported directive is handled
 
@@ -128,7 +184,7 @@ logged and skipped.
 | Directive               | Values and notes                                |
 |-------------------------|-------------------------------------------------|
 | `Type=`                 | `simple`, `exec`, `oneshot`, `forking`, `notify`; `dbus`, `idle` and `notify-reload` degrade. |
-| `ExecStart=`            | One command. A second line replaces the first.  |
+| `ExecStart=`            | One command. A second line replaces the first; an empty value clears it. |
 | `ExecStartPre=`         | List; each line appends, an empty value resets. |
 | `ExecCondition=`        | List.                                           |
 | `ExecStop=`             | List.                                           |
@@ -252,8 +308,7 @@ is a load failure (below).
 - **`Exec*=` command lines** take only the `-` prefix, and it must be glued
   to the path: `ExecStart=- /bin/true` is rejected. A bare executable name
   without a slash is accepted and searched at start time; a relative path
-  containing a slash is rejected. An empty `ExecStart=` is logged and
-  ignored; it does not reset the command.
+  containing a slash is rejected.
 - **`ExecCondition=`** exit status 1 to 254 skips the start cleanly and does
   not trigger `Restart=`; 255, a signal or a setup failure fails the unit.
 - **`ListenStream=`/`ListenDatagram=`** take a path or a decimal port from 1
@@ -299,15 +354,15 @@ state; `pico-unit-lint` reports them as `FAILED TO LOAD`.
 
 ### Reload of the manager
 
-`picoctl daemon-reload` and `SIGHUP` re-read the fragments of loaded units
-and find new unit files and new `.wants`/`.requires` symlinks. They do not
+`picoctl daemon-reload` and `SIGHUP` re-read the fragments and drop-ins of
+loaded units and find new unit files and new `.wants`/`.requires` symlinks. They do not
 start anything, and they skip:
 
 - socket units;
 - a unit with a job or a control process in flight, which picks the change
   up at the next reload;
 - the `Requires=`, `Wants=`, `Before=`, `After=` and `Conflicts=` lines of a
-  changed unit, whose edges stay as loaded;
+  changed unit or drop-in, whose edges stay as loaded;
 - a unit whose file is now gone, masked or invalid, which keeps its current
   configuration and logs a warning.
 

@@ -315,10 +315,13 @@ After `manager_new()`:
    verbs, or `sd_notify()` its listener, but never the boot. They are set up
    before any unit is loaded so the first state change is already published.
 3. **Load units.** Every fragment in the search path becomes a node:
-   `/etc/systemd/system` first, then `/usr/lib/systemd/system`. Only files
+   `/etc/systemd/system` first, then `/run/systemd/system`, then
+   `/usr/lib/systemd/system`. Only files
    whose suffix names a unit type are loaded; `.wants`, `.requires` and drop-in
    `.d` directories are not units. Dependency resolution may queue more
-   units, which are loaded in the next step.
+   units, which are loaded in the next step. Each unit file is followed by
+   its drop-in files, see
+   [INCOMPATIBILITIES.md](INCOMPATIBILITIES.md#drop-in-files).
 4. **Drain the load queue.**
 5. **Enablement by symlink.** For each loaded unit the `.wants/` and
    `.requires/` directories are scanned.
