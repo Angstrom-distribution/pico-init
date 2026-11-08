@@ -1,5 +1,9 @@
 # CHANGES WITH 0.5.0 in spe:
 
+        devd can stand in for udevd under dracut's shell /init: it ships a
+        udevadm for the commands the initramfs scripts call, and publishes
+        the state `udevadm settle` waits on.
+
 ##        PID 1 and unit files:
 
         * TimeoutSec= is read and sets TimeoutStartSec= and TimeoutStopSec=
@@ -61,6 +65,55 @@
           least one key, as in networkd); no tuning key is read. A root with
           a handle other than the kernel default's or netd's own is never
           replaced or removed. A kernel without the qdisc gets a warning.
+
+##        devd:
+
+        * New udevadm in bindir with settle, trigger, control and info,
+          following udevadm v262's options and exit statuses. settle waits
+          until devd has handled every event the kernel had sent when it
+          started; trigger writes the action to the matching uevent files;
+          control --exit stops devd and waits for it; info prints a
+          device's sysfs properties, devd's udev database entry, its
+          /dev links and, for a block device, ID_FS_TYPE, ID_FS_UUID and
+          ID_FS_LABEL read off the node. Commands devd cannot back fail
+          with a message. docs/DEVD.md has the details.
+
+        * A disk without a GPT now gets links too: MBR partitions appear as
+          /dev/disk/by-partuuid/<signature>-<nn>, so root=PARTUUID= resolves,
+          and a whole-disk ext filesystem (a virtual machine's /dev/vda)
+          gets by-uuid and by-label links. Nothing on such a disk is
+          mounted.
+
+        * devd publishes its queue state: /run/devd/pid, /run/devd/seqnum
+          (a value of /sys/kernel/uevent_seqnum up to which every event has
+          been handled, written whenever devd is idle) and /run/udev/queue
+          while it is busy. libudev's udev_queue_* calls now see real queue
+          state through the last.
+
+        * devd --daemon returns only once the child has finished its
+          coldplug walk, and exits 1 if the child fails to start, so a
+          trigger right after it is not lost. The service, which does not
+          use --daemon, is unchanged.
+
+        * devd is installed as lib/udev/udevd as well, the name dracut's
+          udev-rules module looks for.
+
+        * In an initramfs (/etc/initrd-release or /usr/lib/initrd-release
+          exists) devd mounts nothing under /media, since such a mount
+          would stay across switch_root.
+
+##        Build and tests:
+
+        * New meson option udev-compat (default true) installs udevadm and
+          the udevd link. Turn it off where real udev provides them.
+
+        * test-devd-queue covers the state files; test-udevadm runs
+          trigger, info, settle and the command lines against a fixture
+          sysfs and /dev.
+
+##        Contributions from:
+
+        Koen Kooi
 
 # CHANGES WITH 0.4.0:
 
