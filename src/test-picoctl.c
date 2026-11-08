@@ -61,62 +61,97 @@ static int sibling_binary_path(const char *name, char *out, size_t out_size) {
 
 struct run_result {
         char out[16384];
+        char err[4096];
         int exit_code;
 };
 
 /*
  * Fork/exec `path` with `args` (NULL-terminated, args[0] reused as argv[0]),
- * *stdout only* captured into res->out, exit code decoded from waitpid().
- * stderr is deliberately left inherited (not captured): picoctl's own
- * pico_log() diagnostics go there (see util.c's pico_log_internal()), and
- * mixing them into res->out would make every golden-output comparison
- * fragile against log wording rather than against the real stdout contract
- * -- exactly the split real systemctl itself keeps between its state-word
- * stdout and its diagnostic stderr. Inheriting stderr rather than
- * discarding it also means a failing assertion's context is visible in the
- * test's own output when this runs under `meson test -v`.
+ * stdout captured into res->out and stderr into res->err, exit code decoded
+ * from waitpid(). The two streams stay apart because they are separate
+ * contracts: real systemctl keeps its state words on stdout and its
+ * diagnostics on stderr, and golden-output comparisons of stdout must not
+ * depend on diagnostic wording. The captured stderr is replayed to this
+ * process's own stderr, so a failing assertion's context is still visible
+ * under `meson test -v`.
  */
 static int run_binary(const char *path, char * const args[], struct run_result *res) {
-        int pipefd[2];
+        int outfd[2], errfd[2];
         pid_t pid;
         int status;
-        size_t total = 0;
+        size_t out_total = 0, err_total = 0;
+        bool out_open = true, err_open = true;
 
         res->out[0] = '\0';
+        res->err[0] = '\0';
         res->exit_code = -1;
 
-        if (pipe(pipefd) < 0)
+        if (pipe(outfd) < 0)
                 return -errno;
+        if (pipe(errfd) < 0) {
+                close(outfd[0]);
+                close(outfd[1]);
+                return -errno;
+        }
 
         pid = fork();
         if (pid < 0) {
-                close(pipefd[0]);
-                close(pipefd[1]);
+                close(outfd[0]);
+                close(outfd[1]);
+                close(errfd[0]);
+                close(errfd[1]);
                 return -errno;
         }
 
         if (pid == 0) {
-                close(pipefd[0]);
-                dup2(pipefd[1], STDOUT_FILENO);
-                close(pipefd[1]);
+                close(outfd[0]);
+                close(errfd[0]);
+                dup2(outfd[1], STDOUT_FILENO);
+                dup2(errfd[1], STDERR_FILENO);
+                close(outfd[1]);
+                close(errfd[1]);
                 execv(path, args);
                 _exit(127);
         }
 
-        close(pipefd[1]);
-        for (;;) {
+        close(outfd[1]);
+        close(errfd[1]);
+        while (out_open || err_open) {
+                struct pollfd pfd[2] = {
+                        { .fd = out_open ? outfd[0] : -1, .events = POLLIN },
+                        { .fd = err_open ? errfd[0] : -1, .events = POLLIN },
+                };
                 char buf[1024];
-                ssize_t r = read(pipefd[0], buf, sizeof(buf));
+                ssize_t r;
 
-                if (r <= 0)
+                if (poll(pfd, 2, -1) < 0 && errno != EINTR)
                         break;
-                if (total + (size_t) r < sizeof(res->out) - 1) {
-                        memcpy(res->out + total, buf, (size_t) r);
-                        total += (size_t) r;
+
+                if (out_open && pfd[0].revents) {
+                        r = read(outfd[0], buf, sizeof(buf));
+                        if (r <= 0)
+                                out_open = false;
+                        else if (out_total + (size_t) r < sizeof(res->out) - 1) {
+                                memcpy(res->out + out_total, buf, (size_t) r);
+                                out_total += (size_t) r;
+                        }
+                }
+                if (err_open && pfd[1].revents) {
+                        r = read(errfd[0], buf, sizeof(buf));
+                        if (r <= 0)
+                                err_open = false;
+                        else if (err_total + (size_t) r < sizeof(res->err) - 1) {
+                                memcpy(res->err + err_total, buf, (size_t) r);
+                                err_total += (size_t) r;
+                        }
                 }
         }
-        res->out[total] = '\0';
-        close(pipefd[0]);
+        res->out[out_total] = '\0';
+        res->err[err_total] = '\0';
+        close(outfd[0]);
+        close(errfd[0]);
+        if (err_total > 0)
+                fputs(res->err, stderr);
 
         if (waitpid(pid, &status, 0) < 0)
                 return -errno;
@@ -2194,7 +2229,7 @@ static void test_reload_replies_from_new_pid1(void) {
                 {            "ok done\n",                "reload",                "reload", 0 },
                 {          "ok queued\n",     "reload-or-restart",     "reload-or-restart", 0 },
                 {         "err failed\n",     "reload-or-restart",     "reload-or-restart", 1 },
-                {   "err no-such-unit\n",                "reload",                "reload", 1 },
+                {   "err no-such-unit\n",                "reload",                "reload", 5 },
                 {   "err no-such-unit\n", "try-reload-or-restart", "try-reload-or-restart", 0 },
                 {   "err no-such-unit\n",            "condreload", "try-reload-or-restart", 0 },
         };
@@ -2239,6 +2274,140 @@ static void test_is_active_accepts_reloading(void) {
         free(root);
 }
 
+/*
+ * A unit that does not exist, verb by verb, against systemctl's text, stream
+ * and status: status prints only the "could not be found" line on stderr and
+ * exits 4, the job verbs exit 5 (EXIT_NOTINSTALLED), is-active and
+ * is-enabled keep their word on stdout and exit 4, show is not an error.
+ */
+static void test_unknown_unit(void) {
+        static const char * const job_verbs[] = { "start", "stop", "restart", "reload" };
+        char *root = test_tmpdir_new();
+        struct run_result res;
+        size_t i;
+        pid_t server;
+
+        ASSERT_TRUE(root != NULL);
+        make_fixture_root(root);
+        fixture_unit_state(root, "up.service", "ActiveState=active\nSubState=running\nLoadState=loaded\n");
+        fixture_unit_state(root, "down.service", "ActiveState=inactive\nSubState=dead\nLoadState=loaded\n");
+
+        RUN_PICOCTL(&res, "--root", root, "status", "nosuch.service");
+        ASSERT_STREQ(res.out, "");
+        ASSERT_STREQ(res.err, "Unit nosuch.service could not be found.\n");
+        ASSERT_EQ_INT(res.exit_code, 4);
+
+        /* a bare name is a .service, in the message too */
+        RUN_PICOCTL(&res, "--root", root, "status", "nosuch");
+        ASSERT_STREQ(res.out, "");
+        ASSERT_STREQ(res.err, "Unit nosuch.service could not be found.\n");
+        ASSERT_EQ_INT(res.exit_code, 4);
+
+        /* no blank separator for the missing unit, and the first non-zero
+         * status wins, as in verb_show() */
+        RUN_PICOCTL(&res, "--root", root, "status", "nosuch.service", "up.service");
+        ASSERT_TRUE(strncmp(res.out, "up.service\n", 11) == 0);
+        ASSERT_STREQ(res.err, "Unit nosuch.service could not be found.\n");
+        ASSERT_EQ_INT(res.exit_code, 4);
+
+        RUN_PICOCTL(&res, "--root", root, "status", "down.service", "nosuch.service", "up.service");
+        ASSERT_TRUE(strstr(res.out, "\n\n\n") == NULL);
+        ASSERT_TRUE(strstr(res.out, "\n\nup.service\n") != NULL);
+        ASSERT_STREQ(res.err, "Unit nosuch.service could not be found.\n");
+        ASSERT_EQ_INT(res.exit_code, 3);
+
+        RUN_PICOCTL(&res, "--root", root, "is-active", "nosuch.service");
+        ASSERT_STREQ(res.out, "inactive\n");
+        ASSERT_STREQ(res.err, "");
+        ASSERT_EQ_INT(res.exit_code, 4);
+
+        RUN_PICOCTL(&res, "-q", "--root", root, "is-active", "nosuch.service");
+        ASSERT_STREQ(res.out, "");
+        ASSERT_EQ_INT(res.exit_code, 4);
+
+        RUN_PICOCTL(&res, "--root", root, "is-failed", "nosuch.service");
+        ASSERT_STREQ(res.out, "inactive\n");
+        ASSERT_EQ_INT(res.exit_code, 4);
+
+        RUN_PICOCTL(&res, "--root", root, "is-enabled", "nosuch.service");
+        ASSERT_STREQ(res.out, "not-found\n");
+        ASSERT_STREQ(res.err, "");
+        ASSERT_EQ_INT(res.exit_code, 4);
+
+        RUN_PICOCTL(&res, "-q", "--root", root, "is-enabled", "nosuch.service");
+        ASSERT_STREQ(res.out, "");
+        ASSERT_EQ_INT(res.exit_code, 4);
+
+        /* show logs the missing unit at debug level only */
+        RUN_PICOCTL(&res, "--root", root, "show", "nosuch.service");
+        ASSERT_TRUE(strstr(res.out, "Id=nosuch.service\n") != NULL);
+        ASSERT_TRUE(strstr(res.out, "LoadState=not-found\n") != NULL);
+        ASSERT_TRUE(strstr(res.out, "ActiveState=inactive\n") != NULL);
+        ASSERT_STREQ(res.err, "");
+        ASSERT_EQ_INT(res.exit_code, 0);
+
+        RUN_PICOCTL(&res, "--root", root, "enable", "nosuch.service");
+        ASSERT_STREQ(res.out, "");
+        ASSERT_STREQ(res.err, "Failed to enable unit: Unit nosuch.service does not exist\n");
+        ASSERT_EQ_INT(res.exit_code, 1);
+
+        RUN_PICOCTL(&res, "--root", root, "reenable", "nosuch.service");
+        ASSERT_STREQ(res.err, "Failed to reenable unit: Unit nosuch.service does not exist\n");
+        ASSERT_EQ_INT(res.exit_code, 1);
+
+        RUN_PICOCTL(&res, "--root", root, "disable", "nosuch.service");
+        ASSERT_STREQ(res.out, "");
+        ASSERT_STREQ(res.err, "Failed to disable unit: Unit nosuch.service does not exist\n");
+        ASSERT_EQ_INT(res.exit_code, 1);
+
+        RUN_PICOCTL(&res, "--root", root, "preset", "nosuch.service");
+        ASSERT_STREQ(res.err, "Failed to preset unit: Unit nosuch.service does not exist\n");
+        ASSERT_EQ_INT(res.exit_code, 1);
+
+        server = fake_ctrl_start(root, "err no-such-unit\n", "err no-such-unit\n");
+        for (i = 0; i < sizeof(job_verbs) / sizeof(job_verbs[0]); i++) {
+                char want[128];
+
+                RUN_PICOCTL(&res, "--root", root, (char *) job_verbs[i], "nosuch");
+                ASSERT_STREQ(res.out, "");
+                snprintf(want,
+                         sizeof(want),
+                         "Failed to %s nosuch.service: Unit nosuch.service %s.\n",
+                         job_verbs[i],
+                         strcmp(job_verbs[i], "stop") == 0 ? "not loaded" : "not found");
+                ASSERT_STREQ(res.err, want);
+                ASSERT_EQ_INT(res.exit_code, 5);
+                snprintf(want, sizeof(want), "PICO1 %s nosuch.service\n", job_verbs[i]);
+                assert_requests(root, want);
+        }
+
+        RUN_PICOCTL(&res, "--root", root, "reset-failed", "nosuch");
+        ASSERT_STREQ(res.out, "");
+        ASSERT_STREQ(res.err,
+                     "Failed to reset failed state of unit nosuch.service: Unit nosuch.service not loaded.\n");
+        ASSERT_EQ_INT(res.exit_code, 1);
+        assert_requests(root, "PICO1 reset-failed nosuch.service\n");
+
+        /* every unit is tried, the status is the first failure's */
+        RUN_PICOCTL(&res, "--root", root, "start", "one.service", "two.service");
+        ASSERT_STREQ(res.err,
+                     "Failed to start one.service: Unit one.service not found.\n"
+                     "Failed to start two.service: Unit two.service not found.\n");
+        ASSERT_EQ_INT(res.exit_code, 5);
+        assert_requests(root, "PICO1 start one.service\nPICO1 start two.service\n");
+        fake_ctrl_stop(server);
+
+        /* a refusal that is not "no such unit" stays status 1 */
+        server = fake_ctrl_start(root, "err shutting-down\n", "err shutting-down\n");
+        RUN_PICOCTL(&res, "--root", root, "start", "up.service");
+        ASSERT_STREQ(res.err, "Failed to start up.service: shutting-down\n");
+        ASSERT_EQ_INT(res.exit_code, 1);
+        fake_ctrl_stop(server);
+
+        test_rm_rf(root);
+        free(root);
+}
+
 int main(void) {
         test_enable_disable_is_enabled();
         test_preset();
@@ -2272,6 +2441,7 @@ int main(void) {
         test_ctrl_compat_with_old_pid1();
         test_reload_replies_from_new_pid1();
         test_is_active_accepts_reloading();
+        test_unknown_unit();
         /* Last: it exit(77)s on a host without systemctl, and a SKIP must not
          * hide the in-process checks above. */
         test_oracle_symlinks_byte_identical();

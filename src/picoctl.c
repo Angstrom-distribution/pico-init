@@ -102,6 +102,9 @@ static void picoctl_notice(const char *fmt, ...) {
  * overrides it, see the getopt_long table below). */
 #define PICOCTL_STATUS_LOG_LINES 10
 
+/* EXIT_NOTINSTALLED (src/shared/exit-status.h) */
+#define PICOCTL_EXIT_NOTINSTALLED 5
+
 /* --- global options ---
  *
  * One getopt_long() pass over the whole command line, in main(), fills
@@ -1615,7 +1618,8 @@ static void print_system_status(void) {
 }
 
 static int cmd_status(int argc, char *argv[]) {
-        int i, worst = 0;
+        int i, ret = 0;
+        bool new_line = false;
 
         /* real verb_show()'s own argc<=1 dispatch (systemctl-show.c):
          * no unit name inspects the manager itself, it is not an error. */
@@ -1627,27 +1631,20 @@ static int cmd_status(int argc, char *argv[]) {
         for (i = 0; i < argc; i++) {
                 struct unit_state st;
 
-                if (i > 0)
-                        printf("\n");
-
                 read_unit_state(argv[i], &st);
 
+                /* show_one() (systemctl-show.c) logs this and returns before
+                 * it prints the blank separator or any status line. */
                 if (!st.found) {
-                        const char *load_on, *load_off, *active_on, *active_off;
-
-                        load_state_colors("not-found", &load_on, &load_off);
-                        active_state_colors(st.active_state, &active_on, &active_off);
-
-                        printf("%s\n", argv[i]);
-                        printf("     Loaded: %snot-found%s\n", load_on, load_off);
-                        /* real print_status_info() still runs the full path for a
-                         * not-found unit and prints Active: too (systemctl-show.c). */
-                        printf("     Active: %s%s (%s)%s\n", active_on, st.active_state, st.sub_state, active_off);
                         picoctl_error("Unit %s could not be found.", argv[i]);
-                        if (worst < 4)
-                                worst = 4;
+                        if (ret == 0)
+                                ret = 4;
                         continue;
                 }
+
+                if (new_line)
+                        printf("\n");
+                new_line = true;
 
                 /* real systemctl only adds "- description" when it differs from
                  * the unit id itself (systemctl-show.c print_description()). */
@@ -1713,12 +1710,12 @@ static int cmd_status(int argc, char *argv[]) {
                 print_log_tail(argv[i]);
 
                 if (strcmp(st.active_state, "active") != 0 && strcmp(st.active_state, "reloading") != 0) {
-                        if (worst < 3)
-                                worst = 3;
+                        if (ret == 0)
+                                ret = 3;
                 }
         }
 
-        return worst;
+        return ret;
 }
 
 /* --- symlink verbs: enable/disable/is-enabled/preset/mask/unmask/cat/list-unit-files --- */
@@ -1957,7 +1954,7 @@ static int cmd_enable(int argc, char *argv[]) {
                 int r = load_install_info(argv[i], &m, &u);
 
                 if (r < 0) {
-                        picoctl_error("Failed to enable unit, unit %s does not exist.", argv[i]);
+                        picoctl_error("Failed to enable unit: Unit %s does not exist", argv[i]);
                         status = 1;
                         continue;
                 }
@@ -1998,7 +1995,7 @@ static int cmd_reenable(int argc, char *argv[]) {
                 int r = load_install_info(argv[i], &m, &u);
 
                 if (r < 0) {
-                        picoctl_error("Failed to enable unit, unit %s does not exist.", argv[i]);
+                        picoctl_error("Failed to reenable unit: Unit %s does not exist", argv[i]);
                         status = 1;
                         continue;
                 }
@@ -2032,7 +2029,7 @@ static int cmd_disable(int argc, char *argv[]) {
                 int r = load_install_info(argv[i], &m, &u);
 
                 if (r < 0) {
-                        picoctl_error("Failed to disable unit, unit %s does not exist.", argv[i]);
+                        picoctl_error("Failed to disable unit: Unit %s does not exist", argv[i]);
                         status = 1;
                         continue;
                 }
@@ -2108,7 +2105,8 @@ static int cmd_is_enabled(int argc, char *argv[]) {
         for (i = 0; i < argc; i++) {
                 const char *state = compute_unit_file_state(argv[i]);
 
-                printf("%s\n", state);
+                if (!arg_quiet)
+                        printf("%s\n", state);
 
                 if (strcmp(state, "not-found") != 0)
                         not_found = false;
@@ -2142,7 +2140,7 @@ static int preset_unit(const char *name, bool *ret_enable, bool *ret_ignored) {
         bool enable;
 
         if (r < 0) {
-                picoctl_error("Failed to preset unit, unit %s does not exist.", name);
+                picoctl_error("Failed to preset unit: Unit %s does not exist", name);
                 return 1;
         }
 
@@ -3043,7 +3041,12 @@ static void print_job_failed(const char *unit) {
  */
 static void print_verb_failure(const char *verb, const char *unit, const char *reason) {
         if (strcmp(reason, "no-such-unit") == 0)
-                picoctl_error("Failed to %s %s: Unit %s not found.", verb, unit, unit);
+                /* a stop of a unit with a load error is refused in unit_queue_job_check_and_mangle_type() */
+                picoctl_error("Failed to %s %s: Unit %s %s.",
+                              verb,
+                              unit,
+                              unit,
+                              strcmp(verb, "stop") == 0 ? "not loaded" : "not found");
         else
                 picoctl_error("Failed to %s %s: %s", verb, unit, reason);
 }
@@ -3071,7 +3074,10 @@ static bool unit_state_is_up(const char *unit) {
                         strcmp(st.active_state, "reloading") == 0;
 }
 
-/* One unit's round trip and its error text; 0 or 1, the exit status. */
+/* One unit's round trip and its error text; the exit status: 0, 1, or 5
+ * (EXIT_NOTINSTALLED) for a unit that does not exist, as
+ * translate_bus_error_to_exit_status() (systemctl-util.c) maps
+ * BUS_ERROR_NO_SUCH_UNIT. */
 static int verb_one(const char *wire_verb, const char *display_verb, const char *unit, VerbFallback fallback) {
         char reply[PICOCTL_CTRL_REPLY_MAX];
         char *nl;
@@ -3127,7 +3133,7 @@ static int verb_one(const char *wire_verb, const char *display_verb, const char 
         else
                 print_verb_failure(display_verb, unit, reason);
 
-        return 1;
+        return strcmp(reason, "no-such-unit") == 0 ? PICOCTL_EXIT_NOTINSTALLED : 1;
 }
 
 static int cmd_verb_generic_full(
@@ -3142,9 +3148,13 @@ static int cmd_verb_generic_full(
                 return 1;
         }
 
-        for (i = 0; i < argc; i++)
-                if (verb_one(wire_verb, display_verb, argv[i], fallback) != 0)
-                        status = 1;
+        /* The first failure sets the status, as verb_start() does. */
+        for (i = 0; i < argc; i++) {
+                int r = verb_one(wire_verb, display_verb, argv[i], fallback);
+
+                if (status == 0)
+                        status = r;
+        }
 
         return status;
 }
@@ -3269,6 +3279,7 @@ static int cmd_reset_failed(int argc, char *argv[]) {
         for (i = 0; i < argc; i++) {
                 char reply[PICOCTL_CTRL_REPLY_MAX];
                 char *nl;
+                const char *reason;
                 int r = ctrl_roundtrip("reset-failed", argv[i], false, reply, sizeof(reply));
 
                 if (r < 0) {
@@ -3283,9 +3294,14 @@ static int cmd_reset_failed(int argc, char *argv[]) {
                 nl = strchr(reply, '\n');
                 if (nl)
                         *nl = '\0';
-                picoctl_error("Failed to reset failed state of unit %s: %s",
-                              argv[i],
-                              strncmp(reply, "err ", 4) == 0 ? reply + 4 : reply);
+                reason = strncmp(reply, "err ", 4) == 0 ? reply + 4 : reply;
+                if (strcmp(reason, "no-such-unit") == 0)
+                        /* method_generic_unit_operation() with flags 0, bus_get_unit_by_name() */
+                        picoctl_error("Failed to reset failed state of unit %s: Unit %s not loaded.",
+                                      argv[i],
+                                      argv[i]);
+                else
+                        picoctl_error("Failed to reset failed state of unit %s: %s", argv[i], reason);
                 status = 1;
         }
 
