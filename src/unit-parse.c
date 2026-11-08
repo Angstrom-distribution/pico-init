@@ -722,6 +722,24 @@ static int parse_boolean_value(const char *v, bool *ret) {
         return -EINVAL;
 }
 
+static int config_parse_default_dependencies(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        bool b;
+        (void) lvalue;
+
+        if (parse_boolean_value(rvalue, &b) < 0) {
+                pico_log(PICO_LOG_WARNING,
+                         "%s:%u: invalid DefaultDependencies= value '%s', ignoring",
+                         path,
+                         line,
+                         rvalue);
+                return 0;
+        }
+
+        u->default_dependencies = b;
+        return 0;
+}
+
 static int config_parse_remain_after_exit(
                 Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
         Service *s = unit_to_service(u, path, line);
@@ -1876,6 +1894,7 @@ static const ConfigItem config_items[] = {
         {    SECTION_UNIT,                   "Before",                      config_parse_before },
         {    SECTION_UNIT,                    "After",                       config_parse_after },
         {    SECTION_UNIT,                "Conflicts",                   config_parse_conflicts },
+        {    SECTION_UNIT,      "DefaultDependencies",        config_parse_default_dependencies },
         {    SECTION_UNIT,      "ConditionPathExists",       config_parse_condition_path_exists },
         {    SECTION_UNIT, "ConditionPathIsDirectory", config_parse_condition_path_is_directory },
         { SECTION_SERVICE,                     "Type",                        config_parse_type },

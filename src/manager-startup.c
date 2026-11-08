@@ -27,11 +27,13 @@
  * would mean nothing.
  *
  * This is pico-init's equivalent of upstream's DefaultDependencies=, narrowed
- * to the one rule that makes targets order the boot. An explicit Before= in a
- * unit file still wins, because unit_add_dependency() deduplicates and the
- * ordering graph is checked for cycles afterwards -- a unit that genuinely
- * must start after its own target simply says so and the cycle check reports
- * it rather than this silently forcing the other order.
+ * to the one rule that makes targets order the boot. As upstream does, it is
+ * skipped when either the target or the pulled unit has DefaultDependencies=no.
+ * An explicit Before= in a unit file still wins, because
+ * unit_add_dependency() deduplicates and the ordering graph is checked for
+ * cycles afterwards -- a unit that genuinely must start after its own target
+ * simply says so and the cycle check reports it rather than this silently
+ * forcing the other order.
  */
 static void manager_add_target_default_ordering(Manager *m) {
         size_t i;
@@ -41,7 +43,7 @@ static void manager_add_target_default_ordering(Manager *m) {
                 UnitDependency deps[2] = { UNIT_WANTS, UNIT_REQUIRES };
                 size_t d;
 
-                if (t->type != UNIT_TARGET || t->load_state != UNIT_LOADED)
+                if (t->type != UNIT_TARGET || t->load_state != UNIT_LOADED || !t->default_dependencies)
                         continue;
 
                 for (d = 0; d < 2; d++) {
@@ -50,6 +52,9 @@ static void manager_add_target_default_ordering(Manager *m) {
                         for (k = 0; k < t->n_dependencies[deps[d]]; k++) {
                                 Unit *pulled = t->dependencies[deps[d]][k];
                                 int r;
+
+                                if (!pulled->default_dependencies)
+                                        continue;
 
                                 /* Skip if the unit file already ordered these
                                  * two in either direction -- an explicit
@@ -83,7 +88,8 @@ static void manager_add_target_default_ordering(Manager *m) {
  * Services only, never a Socket (which must start before
  * the target it is pulled into, not after) and never a Target (which would
  * order sockets.target after itself and close a cycle). An explicit ordering
- * in the unit file still wins, exactly as above.
+ * in the unit file still wins, exactly as above, and so does
+ * DefaultDependencies=no.
  */
 static void manager_add_socket_default_ordering(Manager *m) {
         Unit *sockets;
@@ -97,7 +103,7 @@ static void manager_add_socket_default_ordering(Manager *m) {
                 Unit *u = m->units[i];
                 int r;
 
-                if (u->type != UNIT_SERVICE || u->load_state != UNIT_LOADED)
+                if (u->type != UNIT_SERVICE || u->load_state != UNIT_LOADED || !u->default_dependencies)
                         continue;
 
                 if (unit_has_dependency(u, UNIT_AFTER, sockets) ||

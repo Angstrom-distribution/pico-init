@@ -141,6 +141,11 @@ struct Unit {
         char **condition_path_is_directory;  /* ConditionPathIsDirectory=, owned, may be NULL */
         bool *condition_path_is_directory_negated; /* parallel to condition_path_is_directory, owned, may be NULL */
 
+        /* [Unit] DefaultDependencies=, true unless the unit file says no. False
+         * keeps manager-startup.c from adding implicit After= edges to or onto
+         * this unit. Read at startup only. */
+        bool default_dependencies;
+
         /* Result of the last unit_start() condition check. False means the
          * unit was left inactive on purpose, which is what job.c reads to
          * decide the unit gets no "Started ..." console line. */

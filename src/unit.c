@@ -67,6 +67,7 @@ int unit_new(Manager *m, UnitType type, const char *id, Unit **ret) {
         /* Explicitly, not by relying on calloc: a unit with no conditions at
          * all must read as having passed them. */
         u->condition_result = true;
+        u->default_dependencies = true;
 
         u->id = pico_strdup(id);
         if (!u->id) {

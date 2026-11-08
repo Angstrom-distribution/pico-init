@@ -1931,6 +1931,74 @@ static void test_status_console_condition_skip_prints_nothing(void) {
         free(dir);
 }
 
+/*
+ * The implicit orderings manager_startup() adds -- services after
+ * sockets.target, targets after what they pull in -- are skipped by
+ * DefaultDependencies=no on the unit that would receive them, and a target's
+ * ordering is also skipped for a pulled unit that has it.
+ */
+static void test_default_dependencies_ordering(void) {
+        char cgroup_root[PATH_MAX];
+        Unit *sockets, *dflt, *plain, *off, *wanted, *off_target;
+        char *dir, *rt;
+        Manager *m = NULL;
+
+        dir = test_tmpdir_new();
+        rt = test_tmpdir_new();
+        ASSERT_TRUE(dir && rt);
+
+        ASSERT_EQ_INT(test_write_file(dir, "sockets.target", "[Unit]\nDescription=Sockets\n"), 0);
+        ASSERT_EQ_INT(test_write_file(dir, "default.target", "[Unit]\nWants=plain.service off.service\n"), 0);
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "off.target",
+                                      "[Unit]\nDefaultDependencies=no\nWants=wanted.service\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir, "plain.service", "[Service]\nType=oneshot\nExecStart=/bin/true\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "off.service",
+                                      "[Unit]\nDefaultDependencies=no\n"
+                                      "[Service]\nType=oneshot\nExecStart=/bin/true\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir, "wanted.service", "[Service]\nType=oneshot\nExecStart=/bin/true\n"),
+                      0);
+
+        ASSERT_EQ_INT(manager_new(&m), 0);
+        {
+                const char * const up[] = { dir, NULL };
+                const char * const pd[] = { NULL };
+
+                ASSERT_EQ_INT(manager_set_unit_path(m, up), 0);
+                ASSERT_EQ_INT(manager_set_preset_path(m, pd), 0);
+        }
+        ASSERT_EQ_INT(manager_set_runtime_dir(m, rt), 0);
+        use_private_cgroup_root(m, "default-deps", cgroup_root, sizeof(cgroup_root));
+        ASSERT_EQ_INT(manager_startup(m, NULL), 0);
+
+        sockets = manager_get_unit(m, "sockets.target");
+        dflt = manager_get_unit(m, "default.target");
+        plain = manager_get_unit(m, "plain.service");
+        off = manager_get_unit(m, "off.service");
+        off_target = manager_get_unit(m, "off.target");
+        wanted = manager_get_unit(m, "wanted.service");
+        ASSERT_TRUE(sockets && dflt && plain && off && off_target && wanted);
+
+        ASSERT_TRUE(unit_has_dependency(plain, UNIT_AFTER, sockets));
+        ASSERT_TRUE(!unit_has_dependency(off, UNIT_AFTER, sockets));
+        ASSERT_TRUE(unit_has_dependency(wanted, UNIT_AFTER, sockets));
+
+        ASSERT_TRUE(unit_has_dependency(dflt, UNIT_AFTER, plain));
+        ASSERT_TRUE(!unit_has_dependency(dflt, UNIT_AFTER, off));
+        ASSERT_TRUE(!unit_has_dependency(off_target, UNIT_AFTER, wanted));
+
+        manager_free(m);
+        free_private_cgroup_root(cgroup_root);
+        test_rm_rf(dir);
+        test_rm_rf(rt);
+        free(dir);
+        free(rt);
+}
+
 int main(void) {
         test_oneshot_start_job_finishes();
         test_alias_boot_runs_ordered_oneshot();
@@ -1964,6 +2032,7 @@ int main(void) {
         test_status_console_dependency_failure_prints_depend();
         test_status_console_stop_prints_ok();
         test_status_console_condition_skip_prints_nothing();
+        test_default_dependencies_ordering();
 
         printf("test-job: all checks passed\n");
         return 0;
