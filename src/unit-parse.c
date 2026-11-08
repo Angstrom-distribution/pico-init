@@ -2002,12 +2002,29 @@ static int unit_conf_handler(
 }
 
 int unit_parse_file(Unit *u, const char *path) {
+        return unit_parse_files(u, path, NULL);
+}
+
+int unit_parse_files(Unit *u, const char *path, char * const *dropins) {
         int r;
 
         if (!u || !path)
                 return -EINVAL;
 
         r = pico_conf_scan(path, unit_conf_handler, u);
+
+        /* Not part of r: a drop-in that is gone or unreadable costs that
+         * file, as systemd's config_parse() on a drop-in does. */
+        for (; r == 0 && dropins && *dropins; dropins++) {
+                int dr = pico_conf_scan(*dropins, unit_conf_handler, u);
+
+                if (dr < 0)
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s: failed to read drop-in '%s': %s",
+                                 u->id,
+                                 *dropins,
+                                 strerror(-dr));
+        }
 
         /* One WARNING per unit, not one per directive: the record itself
          * carries the names, and a unit like iiotool's drops twenty. */

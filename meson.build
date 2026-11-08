@@ -118,6 +118,8 @@ pico_init_core_sources = files(
   # %x-specifier substitution engine; knows nothing about Unit.
   'src/specifier.c',
   'src/unit-load.c',
+  # Drop-in directories (foo.service.d/*.conf): which files apply to a unit.
+  'src/unit-dropin.c',
   'src/conf-scan.c',
   'src/unit-parse.c',
   # daemon-reload (SIGHUP or the picoctl ctrl verb): re-parse each loaded
@@ -191,6 +193,7 @@ pico_tests = [
   'test-unit-name',
   'test-specifier',
   'test-unit-load',
+  'test-unit-dropin',
   'test-job',
   'test-boot-root',
   # First-boot detection and the /etc/machine-id fallback (read-only /etc,

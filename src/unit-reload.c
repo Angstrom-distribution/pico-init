@@ -7,6 +7,9 @@
  * stopping or signalling anything -- the new values apply from the unit's
  * next start, exactly as `systemctl daemon-reload` leaves a running service.
  *
+ * Drop-ins are looked up again for every unit, so one added, removed or
+ * edited since the last load or reload takes effect with the fragment.
+ *
  * All or nothing per unit. The fragment is parsed into a scratch Unit of the
  * same type and id, never into the live one: unit_parse_file() writes each
  * directive as it goes, so a file that fails validation halfway through
@@ -57,7 +60,6 @@
  *    list or Type= under a start or stop that is still walking the old one
  *    is how a reload restarts or kills something by accident; such a unit is
  *    skipped with a warning and picks the change up on the next reload.
- *  - Drop-in directories, which unit-load.c does not read yet either.
  *  - Load-state transitions on an already-loaded unit. A unit whose file is
  *    now gone, masked or invalid keeps its current configuration and gets a
  *    warning -- but a unit not loaded at all yet is exactly what step (2)
@@ -88,6 +90,7 @@
  * (condition_result, enabled, job, the queue links) and stays put.
  */
 static void unit_swap_directives(Unit *u, Unit *fresh) {
+        SWAP_FIELD(u->dropin_paths, fresh->dropin_paths);
         SWAP_FIELD(u->description, fresh->description);
         SWAP_FIELD(u->default_dependencies, fresh->default_dependencies);
         SWAP_FIELD(u->condition_path_exists, fresh->condition_path_exists);
@@ -156,6 +159,7 @@ static bool unit_reload_busy(Unit *u) {
 
 int unit_reload(Unit *u) {
         Unit *fresh = NULL;
+        char **dropins = NULL;
         struct stat st;
         int r;
 
@@ -195,13 +199,29 @@ int unit_reload(Unit *u) {
                 return -EBADF;
         }
 
+        if (u->manager) {
+                r = unit_find_dropins(u->manager, u->id, &dropins);
+                if (r < 0) {
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s: drop-ins: %s, keeping loaded configuration",
+                                 u->id,
+                                 strerror(-r));
+                        return r;
+                }
+        }
+
         r = unit_new(NULL, u->type, u->id, &fresh);
         if (r < 0) {
                 pico_log(PICO_LOG_WARNING, "%s: reload: %s, keeping loaded configuration", u->id, strerror(-r));
+                pico_strv_free(dropins);
                 return r;
         }
 
-        r = unit_parse_file(fresh, u->fragment_path);
+        /* fresh owns the list from here: swapped into u on success, freed
+         * with fresh otherwise. */
+        fresh->dropin_paths = dropins;
+
+        r = unit_parse_files(fresh, u->fragment_path, dropins);
         if (r < 0) {
                 pico_log(PICO_LOG_WARNING,
                          "%s: failed to re-parse '%s': %s, keeping loaded configuration",
@@ -232,6 +252,8 @@ int manager_reload(Manager *m) {
 
         if (!m)
                 return -EINVAL;
+
+        manager_dropin_pass_begin(m);
 
         /*
          * Indexing rather than a saved count: unit_reload() never loads or
@@ -275,5 +297,6 @@ int manager_reload(Manager *m) {
                  "Reloaded %d unit%s; dependencies and socket units unchanged until reboot",
                  n,
                  n == 1 ? "" : "s");
+        manager_dropin_pass_end(m);
         return n;
 }

@@ -181,6 +181,10 @@ int manager_startup(Manager *m, const char *default_target) {
                          "notify socket unavailable, sd_notify() will be a no-op: %s",
                          strerror(-r));
 
+        /* Steps 1 to 3 load every unit, so they share one listing of the
+         * drop-in directories. */
+        manager_dropin_pass_begin(m);
+
         /* 1. Every fragment in the search path becomes a graph node. */
         r = manager_load_units(m, NULL);
         if (r < 0)
@@ -207,6 +211,8 @@ int manager_startup(Manager *m, const char *default_target) {
                 if (r < 0)
                         pico_log(PICO_LOG_WARNING, "%s: scanning .wants/.requires: %s", u->id, strerror(-r));
         }
+
+        manager_dropin_pass_end(m);
 
         /*
          * 4. Presets decide whatever the symlinks did not -- but only on
