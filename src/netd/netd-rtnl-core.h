@@ -77,6 +77,15 @@ struct nlmsghdr *nl_req_init(struct nl_request *req, uint16_t type, uint16_t fla
 /* Append one rtattr, RTA_ALIGNed and zero-padded. -ENOBUFS on overflow. */
 int nl_add_attr(struct nl_request *req, unsigned short type, const void *data, size_t datalen);
 
+/*
+ * Open a nested attribute: the header is appended with a zero payload and
+ * returned, and nl_nest_end() sets its length once the members are appended.
+ * NULL on overflow. The request buffer never moves, so the pointer stays
+ * valid until the request is sent.
+ */
+struct rtattr *nl_nest_start(struct nl_request *req, unsigned short type);
+void nl_nest_end(struct nl_request *req, struct rtattr *nest);
+
 /* --- socket lifecycle --- */
 
 /*
