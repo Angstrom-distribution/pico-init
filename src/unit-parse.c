@@ -1166,6 +1166,14 @@ static int config_parse_exec_start(
         if (!s)
                 return 0;
 
+        /* The empty assignment that precedes a replacement command; it
+         * leaves the unit without one until another ExecStart= follows. */
+        if (rvalue[strspn(rvalue, " \t")] == '\0') {
+                s->exec_start = pico_strv_free(s->exec_start);
+                s->exec_start_ignore = false;
+                return 0;
+        }
+
         /* Non-fatal per directive, like every other handler here:
          * parse_exec_line() already logged why, so leave exec_start as it was.
          * A unit with no ExecStart= at all is caught by service_verify(). */
