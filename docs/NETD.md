@@ -29,7 +29,8 @@ Startup order:
 
 1. Write `net.core.default_qdisc` (the first of `fq_codel`, `fq`, `cake` the
    kernel accepts) and `net.ipv4.tcp_congestion_control` (`bbr`). A kernel
-   without them is not an error.
+   without them is not an error. The qdisc that was accepted is the one netd
+   puts on links that got mq, see [Root qdisc](#root-qdisc).
 2. Move `CLOCK_REALTIME` forward if it is earlier than the clock floor (see
    [Clock floor](#clock-floor)).
 3. Load every `.network` file.
@@ -42,7 +43,9 @@ A link that matches a `.network` file is brought up before anything else is
 applied. If its hardware address is random (`addr_assign_type` 1), the link
 is down, it is Ethernet, and `/etc/machine-id` holds a real ID, netd first
 sets a stable address derived from the machine ID and the interface name, the
-way `systemd-networkd` does for `MACAddressPolicy=persistent`.
+way `systemd-networkd` does for `MACAddressPolicy=persistent`. Once the link
+is up, netd sets its root qdisc where the rules in
+[Root qdisc](#root-qdisc) ask for one.
 
 | Signal | Effect |
 | --- | --- |
@@ -327,6 +330,66 @@ link, where `systemd-networkd` also hashes the SSID. Without a machine ID,
 `prefixstable` falls back to EUI-64 where the link has a 6 byte hardware
 address and makes no address otherwise.
 
+### Root qdisc
+
+The kernel applies `net.core.default_qdisc` as the root qdisc of a link with
+one tx queue only. A link with several tx queues gets `mq` as its root, with
+the default on the per-queue children below it, unless the device is flagged
+`IFF_NO_QUEUE` (veth, bonds, mac80211 Wi-Fi, bridges and similar): its root is
+`noqueue` whatever the queue count. When a link comes up, netd
+replaces the root with `RTM_NEWQDISC` (replace, `TCA_KIND` and an empty
+`TCA_OPTIONS`) in one of two cases:
+
+- The matching `.network` file has a `[FairQueueingControlledDelay]`,
+  `[FairQueueing]` or `[CAKE]` section. The kind is `fq_codel`, `fq` or
+  `cake`, on a link with any number of queues.
+- Otherwise, if the link has more than one tx queue and its root is the
+  kernel's `mq` (handle 0), the kind netd wrote to `net.core.default_qdisc`
+  at startup. Without such a kind nothing is done.
+
+A link without such a section keeps the root the kernel chose when it has one
+tx queue or a root other than `mq`, such as the `noqueue` of a Wi-Fi interface
+or a bond. A link that no `.network` file matches is never touched.
+
+| Section | Kind |
+| --- | --- |
+| `[FairQueueingControlledDelay]` | `fq_codel` |
+| `[FairQueueing]` | `fq` |
+| `[CAKE]` | `cake` |
+
+| Key | Default | Behaviour |
+| --- | --- | --- |
+| `Parent=` | `root` | Only `root` is installed. An empty value, `clsact`, `ingress` and a class or qdisc identifier drop the section with a warning. A later `Parent=` replaces an earlier one. |
+
+As in `systemd-networkd`, a section with no key installs nothing; any key
+of the section, such as `Parent=root`, makes it count. The kernel's defaults
+apply to the qdisc; no tuning key is read. A second section with
+`Parent=root` is dropped with a warning and the first in the file stays. A
+`[QDisc]` section is not read: in `systemd-networkd` it holds `clsact` and
+`ingress`.
+
+The kernel's own default root has handle 0 and a qdisc made through
+`RTM_NEWQDISC` gets a non-zero handle. netd replaces a root only when its
+handle is 0 or is the handle of the qdisc netd installed, which it reads back
+after installing. A root that something else set, with a different handle even
+when it has the same kind, stays, whether it was there before netd started or
+was set later. A reload and a link that stops matching remove only a qdisc netd
+installed, with `RTM_DELQDISC`, which gives the link the kernel's default
+again; on a link with several tx queues that default is `mq`, and the
+multi-queue rule is applied to it at once. What netd installed is remembered
+in memory, so after a restart of netd a root it installed earlier counts as
+set by something else and is left as it is.
+
+A kernel without the qdisc, or any other refusal, is logged as a warning and
+does not fail the link. The refused kind is not sent again for that link
+until a reload, so a link event such as a carrier change does not repeat the
+warning.
+
+`systemd-networkd` drops a section for good when a `Parent=` or a tuning
+value in it is invalid, and one with only unknown keys installs nothing.
+netd drops a section only for the `Parent=` value in force at the end of it;
+a tuning key is never read, so its value is never checked.
+
 ### Example
 
 ```ini
@@ -376,6 +439,9 @@ Everything not listed above. Notably:
   `ClientIdentifier=`.
 - DHCP server static leases, lease persistence across a netd restart, relay
   and DHCPINFORM.
+- Queueing disciplines other than the root `fq_codel`, `fq` and `cake`: the
+  other kind sections, `Handle=`, the tuning keys (`PacketLimit=`,
+  `Bandwidth=` and the rest), `clsact` and `ingress`, classes and filters.
 - `LinkLocalAddressing=` (the kernel makes the IPv6 link-local address),
   `IPv6DuplicateAddressDetection=`, `ConfigureWithoutCarrier=`,
   `ActivationPolicy=`.
@@ -805,7 +871,7 @@ them:
 | `Alternative Names` | rtnetlink. |
 | `Hardware Address` | sysfs. |
 | `MTU` | rtnetlink, with `min` and `max` when reported. |
-| `QDisc` | rtnetlink. |
+| `QDisc` | rtnetlink; the root qdisc as it is when `netctl` asks, which netd may have replaced, see [Root qdisc](#root-qdisc). |
 | `IPv6 Address Generation Mode` | rtnetlink. |
 | `Number of Queues (Tx/Rx)` | rtnetlink. |
 | `Address` | `getifaddrs(3)`, without prefix length. |

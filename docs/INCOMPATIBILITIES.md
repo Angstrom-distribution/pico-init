@@ -6,7 +6,8 @@ or the maintainer of a package that ships one: it lists the unit types
 pico-init has, every directive it honours, what happens to everything else,
 and the places where a directive it does honour behaves differently from
 systemd. The directive tables are taken from the handler table in
-`src/unit-parse.c`; a directive that is not in them is not implemented.
+`src/unit-parse.c`; a directive that is not in them is not implemented. The
+last section before the references covers `.network` files.
 
 ## Unit types
 
@@ -457,6 +458,30 @@ A unit with `User=` whose account exists in the passwd database gets `USER`,
 - `picoctl try-restart`, `condrestart` and `try-reload-or-restart` leave a
   unit that does not exist alone and exit 0; `systemctl` prints `Failed to
   try-restart X: Unit X not found.` and exits 5.
+
+## .network files
+
+netd reads `.network` files as `systemd-networkd` does; [NETD.md](NETD.md)
+lists the keys. The root qdisc is where the two differ in a way a file
+cannot show:
+
+- netd replaces the kernel's `mq` root of a link with more than one tx queue
+  by the qdisc it wrote to `net.core.default_qdisc`, with no section in the
+  file. A `noqueue` root, as on Wi-Fi interfaces and bonds, is left alone.
+  `systemd-networkd` leaves the root alone unless a section names a kind.
+- Of the qdisc sections, netd reads `[FairQueueingControlledDelay]`,
+  `[FairQueueing]` and `[CAKE]`, and in them only `Parent=root`; as in
+  `systemd-networkd` a section needs at least one key. The tuning keys and
+  `Handle=` are dropped, as are `[QDisc]` (`clsact` and `ingress`),
+  the other kinds, classes and filters.
+- When the file stops asking for a root qdisc, or the link stops matching,
+  netd removes the root it installed and the kernel's default returns.
+  `systemd-networkd` never sends `RTM_DELQDISC` and leaves the qdisc in place.
+  A root whose handle is not the kernel default's 0 or the one netd got is
+  left alone, where `systemd-networkd` replaces any root a section names.
+- A refused `RTM_NEWQDISC`, such as a kernel without `sch_cake`, is a warning
+  in netd and the link stays configured. `systemd-networkd` puts the link
+  into the failed state.
 
 ## See also
 

@@ -49,7 +49,7 @@ reuse lint
 
 - These are the three CI jobs in `.github/workflows/ci.yml` (`build`, `format`, `reuse`); all must pass before a merge. `werror=true` is a project default, so a new warning breaks the build.
 - List new sources and tests in `meson.build` (`pico_tests`, `netd_tests`, `devd_tests`, `logd_tests`, `tmpfiles_tests`); nothing is globbed. `docs/HACKING.md` says how to add a test with `src/test-util.h`.
-- Run one test with `meson test -C build <name> --print-errorlogs`, as a normal user and as root. A test that exits with 77 is a skip, not a pass: report it as one with its reason. The netd namespace tests exit 1, not 77, when the host refuses user namespaces.
+- Run one test with `meson test -C build <name> --print-errorlogs`, as a normal user and as root. A test that exits with 77 is a skip, not a pass: report it as one with its reason. The netd namespace tests exit 1, not 77, when the host refuses user namespaces; `test-netd-qdisc-link` and `test-netd-sntp-ipv6` are the exceptions and skip.
 - Tests build against fixtures in a temporary tree, never against the host's real configuration.
 - After a change to the symbols the compatibility libraries export, run `ninja -C build regen-libsystemd-sym regen-libudev-sym` and commit the regenerated version scripts.
 - Say whether a result came from the host or from a booted device.
