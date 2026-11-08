@@ -134,6 +134,19 @@ struct Link {
         uint32_t mtu;
         uint8_t hw_addr[NETD_HW_ADDR_MAX];
         size_t hw_addr_len;
+        uint32_t num_tx_queues;
+
+        /*
+         * The root qdisc netd put on this link, empty when it did not: its kind
+         * and the handle the kernel gave it. Only a root with this handle (or
+         * the kernel's own default, handle 0) is replaced or removed by a
+         * reload; any other one was set by something else and stays.
+         * qdisc_implicit says it came from the multi-queue rule, not a section.
+         */
+        char qdisc[IFNAMSIZ];
+        uint32_t qdisc_handle;
+        bool qdisc_implicit;
+        char qdisc_failed[IFNAMSIZ]; /* the kind whose last attempt failed, reported once until a reload */
 
         LinkState state;
 
@@ -309,6 +322,25 @@ int link_reconfigure(Link *l);
  * DHCPServer=. Without freeing the Link. 0 or -errno.
  */
 int link_deconfigure(Link *l);
+
+/*
+ * The root qdisc kind a link matching `nw` should have, or NULL for leaving
+ * what the kernel gave it. An explicit [FairQueueingControlledDelay],
+ * [FairQueueing] or [CAKE] section with Parent=root decides, on any link.
+ * Without one, `default_qdisc` (what netd wrote to net.core.default_qdisc;
+ * empty or NULL for none) is chosen only for a link with more than one tx
+ * queue whose root is the kernel's mq (`root_kind` "mq", `root_handle` 0): mq
+ * applies the default to its per-queue children only. A device flagged
+ * IFF_NO_QUEUE (veth, bonds, mac80211 Wi-Fi) has noqueue as its root whatever
+ * its queue count and keeps it, as does a link with a single tx queue or an
+ * unknown count (0) or a root that something else installed.
+ */
+const char *link_qdisc_choose(
+                const Network *nw,
+                uint32_t num_tx_queues,
+                const char *root_kind,
+                uint32_t root_handle,
+                const char *default_qdisc);
 
 /* --- lease application --- */
 

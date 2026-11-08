@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include <net/if.h>
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -125,6 +126,13 @@ struct Netd {
          */
         Link **links; /* owned */
         size_t n_links;
+
+        /*
+         * The qdisc netd_startup() wrote to net.core.default_qdisc, empty when
+         * the kernel took none. A link whose root is the kernel's mq gets it as
+         * its root qdisc (netd-link.h's link_qdisc_choose()).
+         */
+        char default_qdisc[IFNAMSIZ];
 
         /* --- time (netd-sntp.c / netd-time.c) --- */
         NetdSntp *sntp; /* owned; NULL until a server list exists */

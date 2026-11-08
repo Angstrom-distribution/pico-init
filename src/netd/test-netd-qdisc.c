@@ -3,9 +3,9 @@
 
 /*
  * Root qdisc support without a kernel: the RTM_NEWQDISC, RTM_DELQDISC and
- * RTM_GETQDISC messages against fixed bytes, the decoder for a kernel reply
- * and the qdisc sections of a .network file. test-netd-qdisc-link covers the
- * kernel side.
+ * RTM_GETQDISC messages against fixed bytes, the decoder for a kernel reply,
+ * the rule that picks the kind for a link, and the qdisc sections of a
+ * .network file. test-netd-qdisc-link covers the kernel side.
  */
 
 #include <endian.h>
@@ -19,6 +19,7 @@
 #include <string.h>
 
 #include "../test-util.h"
+#include "netd-link.h"
 #include "netd-network.h"
 #include "netd-rtnl-core.h"
 #include "netd-rtnl.h"
@@ -151,6 +152,50 @@ static void test_build_refuses_bad_input(void) {
         ASSERT_EQ_INT(netd_rtnl_qdisc_build(&req, RTM_NEWQDISC, 7, longkind), 0);
 }
 
+/* --- the multi-queue decision --- */
+
+static void test_choose(void) {
+        Network *nw = NULL;
+
+        ASSERT_EQ_INT(network_new(&nw), 0);
+
+        /* Without an explicit kind: only a link with several tx queues whose
+         * root is the kernel's own mq (handle 0), and only when the kernel
+         * took a default. */
+        ASSERT_STREQ(link_qdisc_choose(nw, 8, "mq", 0, "fq_codel"), "fq_codel");
+        ASSERT_STREQ(link_qdisc_choose(nw, 2, "mq", 0, "fq"), "fq");
+        ASSERT_TRUE(link_qdisc_choose(nw, 1, "mq", 0, "fq_codel") == NULL);
+        ASSERT_TRUE(link_qdisc_choose(nw, 0, "mq", 0, "fq_codel") == NULL);
+        ASSERT_TRUE(link_qdisc_choose(nw, 8, "mq", 0, "") == NULL);
+        ASSERT_TRUE(link_qdisc_choose(nw, 8, "mq", 0, NULL) == NULL);
+        ASSERT_TRUE(link_qdisc_choose(NULL, 8, "mq", 0, "fq_codel") == NULL);
+
+        /* Devices flagged IFF_NO_QUEUE (veth, bond, mac80211) have a noqueue
+         * root with handle 0 whatever their queue count: left alone. */
+        ASSERT_TRUE(link_qdisc_choose(nw, 4, "noqueue", 0, "fq_codel") == NULL);
+        ASSERT_TRUE(link_qdisc_choose(nw, 16, "noqueue", 0, "fq_codel") == NULL);
+
+        /* Single-queue defaults and roots something else installed. */
+        ASSERT_TRUE(link_qdisc_choose(nw, 4, "pfifo_fast", 0, "fq_codel") == NULL);
+        ASSERT_TRUE(link_qdisc_choose(nw, 4, "mq", 0x8010u << 16, "fq_codel") == NULL);
+        ASSERT_TRUE(link_qdisc_choose(nw, 4, "fq", 0x800fu << 16, "fq_codel") == NULL);
+        ASSERT_TRUE(link_qdisc_choose(nw, 4, NULL, 0, "fq_codel") == NULL);
+
+        /* An explicit kind wins, on any link and any root, with no default. */
+        nw->qdisc = NETWORK_QDISC_CAKE;
+        ASSERT_STREQ(link_qdisc_choose(nw, 8, "mq", 0, "fq_codel"), "cake");
+        ASSERT_STREQ(link_qdisc_choose(nw, 1, "noqueue", 0, "fq_codel"), "cake");
+        ASSERT_STREQ(link_qdisc_choose(nw, 0, "mq", 0, NULL), "cake");
+        ASSERT_STREQ(link_qdisc_choose(nw, 4, NULL, 0, NULL), "cake");
+
+        nw->qdisc = NETWORK_QDISC_FQ;
+        ASSERT_STREQ(link_qdisc_choose(nw, 1, "noqueue", 0, NULL), "fq");
+        nw->qdisc = NETWORK_QDISC_FQ_CODEL;
+        ASSERT_STREQ(link_qdisc_choose(nw, 1, "noqueue", 0, NULL), "fq_codel");
+
+        network_free(nw);
+}
+
 static void test_kind_names(void) {
         ASSERT_TRUE(network_qdisc_to_string(NETWORK_QDISC_NONE) == NULL);
         ASSERT_STREQ(network_qdisc_to_string(NETWORK_QDISC_FQ_CODEL), "fq_codel");
@@ -241,6 +286,7 @@ int main(void) {
         fprintf(stderr, "test-netd-qdisc: the message fixtures are little endian, skipping them\n");
 #endif
         test_build_refuses_bad_input();
+        test_choose();
         test_kind_names();
         test_sections();
 
