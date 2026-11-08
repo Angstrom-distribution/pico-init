@@ -23,6 +23,10 @@
  *    old value. unit_load() below logs using fragment_path's value before
  *    freeing it on the error path, not after.
  *
+ * Drop-ins (the .conf files of foo.service.d and the dash-truncated and type-level
+ * directories, see unit-dropin.c) are parsed after the fragment, so a unit
+ * with no fragment, or a masked one, applies none.
+ *
  * Template fallback: an instance with no fragment of its own (e.g.
  * "serial-getty@ttyUSB0.service", never shipped by any package) loads
  * through its template's file instead, quarried from v30's own template
@@ -221,6 +225,7 @@ int unit_resolve_alias(Manager *m, const char *name, char **ret) {
 
 int unit_load(Unit *u) {
         char *fragment_path = NULL;
+        char **dropins = NULL;
         bool masked = false;
         int r;
 
@@ -273,16 +278,25 @@ int unit_load(Unit *u) {
                 return -ENOENT;
         }
 
-        r = unit_parse_file(u, fragment_path);
+        r = unit_find_dropins(u->manager, u->id, &dropins);
         if (r < 0) {
-                /* baa162cec: log the path before freeing it, not after */
-                pico_log(PICO_LOG_WARNING, "%s: failed to parse '%s': %s", u->id, fragment_path, strerror(-r));
                 free(fragment_path);
                 u->load_state = UNIT_ERROR;
                 return r;
         }
 
+        r = unit_parse_files(u, fragment_path, dropins);
+        if (r < 0) {
+                /* baa162cec: log the path before freeing it, not after */
+                pico_log(PICO_LOG_WARNING, "%s: failed to parse '%s': %s", u->id, fragment_path, strerror(-r));
+                free(fragment_path);
+                pico_strv_free(dropins);
+                u->load_state = UNIT_ERROR;
+                return r;
+        }
+
         u->fragment_path = fragment_path; /* ownership transferred */
+        u->dropin_paths = dropins;
         u->load_state = UNIT_LOADED;
         return 0;
 }

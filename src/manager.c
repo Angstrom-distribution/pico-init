@@ -311,6 +311,7 @@ Manager *manager_free(Manager *m) {
         m->runtime_dir = pico_mfree(m->runtime_dir);
         m->watchdog_device = pico_mfree(m->watchdog_device);
         m->default_target = pico_mfree(m->default_target);
+        manager_dropin_cache_free(m);
 
         /*
          * Every manager-owned source holds its own ref on m->event (the
@@ -812,6 +813,8 @@ int manager_load_units(Manager *m, const char *dir) {
         if (!m)
                 return -EINVAL;
 
+        manager_dropin_pass_begin(m);
+
         if (dir)
                 ret = manager_load_units_one_dir(m, dir);
         else {
@@ -828,6 +831,7 @@ int manager_load_units(Manager *m, const char *dir) {
         if (r < 0 && ret == 0)
                 ret = r;
 
+        manager_dropin_pass_end(m);
         return ret;
 }
 

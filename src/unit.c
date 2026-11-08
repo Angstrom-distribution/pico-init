@@ -157,6 +157,7 @@ Unit *unit_free(Unit *u) {
         u->instance = pico_mfree(u->instance);
         u->description = pico_mfree(u->description);
         u->fragment_path = pico_mfree(u->fragment_path);
+        u->dropin_paths = pico_strv_free(u->dropin_paths);
 
         for (i = 0; i < _UNIT_DEPENDENCY_MAX; i++) {
                 /* the arrays are owned; the Unit* inside them are borrowed */

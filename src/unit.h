@@ -122,6 +122,7 @@ struct Unit {
                               * without re-parsing the name. */
         char *description;   /* [Unit] Description=, may be NULL */
         char *fragment_path; /* absolute path of the parsed file, NULL until found */
+        char **dropin_paths; /* drop-in files applied after it, in the order applied, owned, may be NULL */
         UnitLoadState load_state;
 
         /* dependency graph: per-relation NULL-terminated arrays of borrowed Unit* */
@@ -290,9 +291,26 @@ int unit_load(Unit *u);
  * name (owned) with 1. 0 when name is its own unit, -ENOMEM. */
 int unit_resolve_alias(Manager *m, const char *name, char **ret);
 
+/* --- unit-dropin.c --- */
+/*
+ * The drop-in files for unit `id` in m's search path (the .conf files of foo.service.d,
+ * the dash-truncated and type-level directories), in the order they apply.
+ * *ret is an owned strv, NULL when there are none. 1 when there are some,
+ * 0 when not, -errno.
+ */
+int unit_find_dropins(Manager *m, const char *id, char ***ret);
+
 /* --- unit-parse.c --- */
 /* Parse one INI fragment (sections, escapes, line continuations) into u. 0 or -errno. */
 int unit_parse_file(Unit *u, const char *path);
+
+/*
+ * As unit_parse_file(), then the NULL-terminated `dropins` (may be NULL)
+ * through the same handlers in order, and only then the checks that need the
+ * whole unit. A drop-in that cannot be read or has bad lines is warned about
+ * and skipped; it never fails the unit. 0 or -errno.
+ */
+int unit_parse_files(Unit *u, const char *path, char * const *dropins);
 
 /* --- unit-reload.c --- */
 /*

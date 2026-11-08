@@ -142,6 +142,11 @@ struct Manager {
         struct pico_manager_notify *notify;
         struct pico_manager_watchdog *watchdog;
 
+        /* Listing of the ".d" entries of every search-path entry, shared by
+         * the unit loads of one pass; see unit-dropin.c. */
+        struct pico_dropin_cache *dropin_cache;
+        unsigned dropin_pass_depth;
+
         /* units waiting for unit_load(), linked via unit->load_queue_next */
         Unit *load_queue;
         bool dispatching_load_queue; /* re-entrancy guard, see manager_load_unit() */
@@ -233,6 +238,15 @@ void manager_set_first_boot(Manager *m, bool first_boot);
 /* Scan every unit_path entry (or just `dir` when non-NULL) for files whose
  * suffix names a known unit type, creating and loading each. 0 or -errno. */
 int manager_load_units(Manager *m, const char *dir);
+
+/*
+ * Bracket a batch of unit loads or reloads so the search directories are
+ * listed once for all of them instead of once per unit. Calls nest. Drop-ins
+ * are found without a bracket too, at the cost of a listing per unit.
+ */
+void manager_dropin_pass_begin(Manager *m);
+void manager_dropin_pass_end(Manager *m);
+void manager_dropin_cache_free(Manager *m); /* for manager_free() */
 
 /* Look up a unit by id, NULL if not present. */
 Unit *manager_get_unit(Manager *m, const char *id);
