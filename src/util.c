@@ -24,6 +24,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -77,50 +79,134 @@ void pico_log_set_max_level(PicoLogLevel max) {
         log_max_level = max;
 }
 
-/* Where pico_log() writes: stderr until a daemon opts into /dev/kmsg; see
- * pico_log_to_kmsg() in util.h. */
-static int log_fd = STDERR_FILENO;
-static bool log_fd_is_kmsg = false;
+/*
+ * Where pico_log() writes: stderr until a daemon opts in with
+ * pico_log_to_journal_or_kmsg(); then logd's /dev/log socket while the
+ * manager reports logd as running, /dev/kmsg otherwise. See util.h.
+ */
+static bool log_journal_or_kmsg = false;
+static bool log_journal_running = false;
+static char log_syslog_path[108]; /* sizeof(sun_path) */
+static int log_syslog_fd = -1;
+static int log_kmsg_fd = -1;
 
-void pico_log_to_kmsg(void) {
+static int log_syslog_connect(void) {
+        struct sockaddr_un sa = { .sun_family = AF_UNIX };
         int fd;
 
-        if (log_fd_is_kmsg)
+        if (strlen(log_syslog_path) >= sizeof(sa.sun_path))
+                return -ENAMETOOLONG;
+        strcpy(sa.sun_path, log_syslog_path);
+
+        fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        if (fd < 0)
+                return -errno;
+
+        /* Fails with ENOENT when the socket file is missing and ECONNREFUSED
+         * on a leftover file nobody listens on. */
+        if (connect(fd, (struct sockaddr *) &sa, sizeof(sa)) < 0) {
+                int r = -errno;
+
+                (void) close(fd);
+                return r;
+        }
+
+        return fd;
+}
+
+void pico_log_to_journal_or_kmsg_at(const char *syslog_path, const char *kmsg_path) {
+        if (log_syslog_fd >= 0)
+                (void) close(log_syslog_fd);
+        if (log_kmsg_fd >= 0)
+                (void) close(log_kmsg_fd);
+        log_syslog_fd = -1;
+        log_kmsg_fd = -1;
+        log_syslog_path[0] = '\0';
+        log_journal_running = false;
+
+        if (syslog_path && strlen(syslog_path) < sizeof(log_syslog_path))
+                strcpy(log_syslog_path, syslog_path);
+
+        /* Best-effort: without it the fallback is stderr, the old behaviour. */
+        if (kmsg_path)
+                log_kmsg_fd = open(kmsg_path, O_WRONLY | O_CLOEXEC);
+
+        log_journal_or_kmsg = true;
+}
+
+void pico_log_to_journal_or_kmsg(void) {
+        pico_log_to_journal_or_kmsg_at("/dev/log", "/dev/kmsg");
+}
+
+void pico_log_set_journal_running(bool running) {
+        if (running == log_journal_running)
                 return;
 
-        fd = open("/dev/kmsg", O_WRONLY | O_CLOEXEC);
-        if (fd < 0)
-                return; /* stay on stderr: always safe, and the old behaviour */
+        log_journal_running = running;
 
-        log_fd = fd;
-        log_fd_is_kmsg = true;
+        /* The next record connects afresh: the socket unit may have been
+         * restarted in between and so have a new inode at the same path. */
+        if (!running && log_syslog_fd >= 0) {
+                (void) close(log_syslog_fd);
+                log_syslog_fd = -1;
+        }
+}
+
+/*
+ * Offered to logd first while the manager reports it running, as systemd's
+ * journal-or-kmsg target does with the journal. A failed send drops the
+ * connection so the next record reconnects. A full queue (logd stuck) falls
+ * back for that one record and keeps the connection.
+ */
+static bool log_send_to_syslog(const char *buf, size_t len) {
+        if (!log_journal_running || !log_syslog_path[0])
+                return false;
+
+        if (log_syslog_fd < 0) {
+                int fd = log_syslog_connect();
+
+                if (fd < 0)
+                        return false;
+                log_syslog_fd = fd;
+        }
+
+        if (send(log_syslog_fd, buf, len, MSG_DONTWAIT | MSG_NOSIGNAL) >= 0)
+                return true;
+
+        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != ENOBUFS) {
+                (void) close(log_syslog_fd);
+                log_syslog_fd = -1;
+        }
+
+        return false;
 }
 
 /*
  * One buffer, one write(), not several. A line-oriented destination (kmsg,
  * logd's stdout capture) would otherwise see one line as several records.
+ * The "<N>" syslog priority prefix leads the buffer; both /dev/log and
+ * /dev/kmsg parse it, stderr gets the text after it.
  */
 void pico_log_internal(PicoLogLevel level, const char *format, ...) {
         char buf[1024];
         int prefix_len, msg_len, total;
+        size_t skip;
         va_list ap;
 
         if (level > log_max_level)
                 return;
 
-        if (log_fd_is_kmsg)
-                prefix_len = snprintf(
-                                buf,
-                                sizeof(buf),
-                                "<%d>pico-init[%s]: ",
-                                log_level_syslog_priority(level),
-                                log_level_prefix(level));
-        else
-                prefix_len = snprintf(buf, sizeof(buf), "pico-init[%s]: ", log_level_prefix(level));
+        prefix_len = snprintf(
+                        buf,
+                        sizeof(buf),
+                        "<%d>pico-init[%s]: ",
+                        log_level_syslog_priority(level),
+                        log_level_prefix(level));
         if (prefix_len < 0)
                 prefix_len = 0;
         if ((size_t) prefix_len >= sizeof(buf))
                 prefix_len = (int) sizeof(buf) - 1;
+        skip = 3; /* "<N>": log_level_syslog_priority() is a single digit */
 
         va_start(ap, format);
         msg_len = vsnprintf(buf + prefix_len, sizeof(buf) - (size_t) prefix_len, format, ap);
@@ -134,10 +220,20 @@ void pico_log_internal(PicoLogLevel level, const char *format, ...) {
         buf[total] = '\n';
         total += 1;
 
+        if (log_journal_or_kmsg) {
+                /* A syslog datagram is one record, without the newline kmsg and stderr want. */
+                if (log_send_to_syslog(buf, (size_t) total - 1))
+                        return;
+                if (log_kmsg_fd >= 0) {
+                        if (write(log_kmsg_fd, buf, (size_t) total) >= 0)
+                                return;
+                }
+        }
+
         /* Not `(void) write(...)`: a void cast does not suppress
          * warn_unused_result in GCC, and glibc marks write() __wur under
          * _FORTIFY_SOURCE, which -O0 host builds do not enable. */
-        if (write(log_fd, buf, (size_t) total) < 0) {
+        if (write(STDERR_FILENO, buf + skip, (size_t) total - skip) < 0) {
                 /* Nothing useful to do here: this is the logger. */
         }
 }

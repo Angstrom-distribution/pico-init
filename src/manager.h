@@ -265,6 +265,25 @@ void manager_log_degradation_summary(Manager *m);
  */
 int manager_load_unit(Manager *m, const char *id, Unit **ret);
 
+/*
+ * The log sink's gate, after systemd's manager_journal_is_running() and
+ * manager_recheck_journal(). PID 1 sends its own log records to logd
+ * (pico_log_to_journal_or_kmsg() in util.h) only while logd.socket is RUNNING
+ * and logd.service is active or reloading. A live main process stands in for
+ * systemd's SERVICE_EXITED check: the exit of that process closes the gate
+ * before the exit is logged.
+ * Anything else -- logd not started, stopping, failed, between restarts --
+ * sends to /dev/kmsg: PID 1 itself holds logd.socket, so a datagram sent
+ * then would queue unread, be drained and dropped by the re-armed socket, or
+ * socket-activate logd from PID 1's own log line.
+ *
+ * Called from unit_notify() for a state change of either unit, before that
+ * transition is logged, and when logd's main process was reaped; a no-op for
+ * any other unit. unit_free() of either unit closes the gate.
+ */
+void manager_recheck_journal(Unit *changed);
+bool manager_unit_is_journal(const Unit *u);
+
 /* Append u to the unit table (ownership transfers to the manager). 0 or -errno. */
 int manager_add_unit(Manager *m, Unit *u);
 

@@ -14,6 +14,7 @@
 
 #include "job.h"
 #include "manager-state.h"
+#include "manager.h"
 #include "specifier.h"
 #include "unit-name.h"
 #include "unit.h"
@@ -134,6 +135,11 @@ Unit *unit_free(Unit *u) {
          */
         if (u->job)
                 job_finish_full(u->job, JOB_CANCELED, false);
+
+        /* Only a live unit: the scratch unit of a reload has no manager and
+         * shares logd's id. */
+        if (u->manager && manager_unit_is_journal(u))
+                pico_log_set_journal_running(false);
 
         /*
          * Per-type teardown next: only the concrete type knows what it owns
@@ -364,6 +370,10 @@ void unit_notify(Unit *u, UnitActiveState old_state, UnitActiveState new_state, 
 
         if (!u || old_state == new_state)
                 return;
+
+        /* First, so the record of logd's own transition takes the route the
+         * new state allows. */
+        manager_recheck_journal(u);
 
         pico_log(PICO_LOG_DEBUG,
                  "%s: %s -> %s",

@@ -1497,6 +1497,11 @@ void service_sigchld_event(Service *s, pid_t pid, int code, int status) {
          * follows the stored result rather than the local f, to agree with
          * the result= this line prints: under the write-once rule an earlier
          * failure survives a later clean exit. */
+        /* Before the line below: logd is dead, so a record sent to its
+         * socket would queue unread and re-activate it. */
+        if (is_main && manager_unit_is_journal(UNIT(s)))
+                pico_log_set_journal_running(false);
+
         format_exit_status(statusbuf, sizeof statusbuf, code, status);
         pico_log(service_result_is_failure(*shown) ? PICO_LOG_WARNING : PICO_LOG_DEBUG,
                  "%s: %s process exited, code=%s, status=%s, result=%s",
@@ -1677,6 +1682,9 @@ void service_sigchld_event(Service *s, pid_t pid, int code, int status) {
                  * then sees main_pid gone, as upstream waits for it. */
                 break;
         }
+
+        /* An exit that leaves the state alone reaches no unit_notify(). */
+        manager_recheck_journal(UNIT(s));
 }
 
 void service_cgroup_empty_event(Service *s) {
