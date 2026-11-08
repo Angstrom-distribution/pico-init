@@ -491,6 +491,14 @@ typedef struct NetworkParser {
         ssize_t cur_route;
         bool warned_cap;
         bool warned_route_cap;
+
+        /* The open qdisc kind section, committed when the next section or the
+         * end of the file closes it: Parent= may come after other keys. */
+        NetworkQdisc sec_qdisc;
+        const char *sec_qdisc_name;
+        unsigned sec_qdisc_line;
+        bool sec_qdisc_root;
+        bool sec_qdisc_keys;
 } NetworkParser;
 
 typedef int (*NetworkAddressParseFn)(
@@ -554,9 +562,87 @@ static ssize_t network_route_append(NetworkParser *p, const char *path, unsigned
         return (ssize_t) nw->n_routes++;
 }
 
+/* [QDisc] is not read: in networkd it holds only clsact and ingress, which
+ * netd does not install. */
+static const struct {
+        const char *section;
+        NetworkQdisc kind;
+} network_qdisc_sections[] = {
+        { "FairQueueingControlledDelay", NETWORK_QDISC_FQ_CODEL },
+        {                "FairQueueing",       NETWORK_QDISC_FQ },
+        {                        "CAKE",     NETWORK_QDISC_CAKE },
+};
+
+static const char * const network_qdisc_names[_NETWORK_QDISC_MAX] = {
+        [NETWORK_QDISC_FQ_CODEL] = "fq_codel",
+        [NETWORK_QDISC_FQ] = "fq",
+        [NETWORK_QDISC_CAKE] = "cake",
+};
+
+const char *network_qdisc_to_string(NetworkQdisc q) {
+        if (q <= NETWORK_QDISC_NONE || q >= _NETWORK_QDISC_MAX)
+                return NULL;
+
+        return network_qdisc_names[q];
+}
+
+static void network_qdisc_commit(NetworkParser *p, const char *path) {
+        /* networkd creates the qdisc when a key of the section is parsed, so
+         * a header alone installs nothing. */
+        if (p->sec_qdisc == NETWORK_QDISC_NONE || !p->sec_qdisc_root || !p->sec_qdisc_keys)
+                return;
+
+        if (p->nw->qdisc != NETWORK_QDISC_NONE)
+                pico_log(PICO_LOG_WARNING,
+                         "%s:%u: more than one root qdisc section is defined, ignoring the [%s] section",
+                         path,
+                         p->sec_qdisc_line,
+                         p->sec_qdisc_name);
+        else
+                p->nw->qdisc = p->sec_qdisc;
+
+        p->sec_qdisc = NETWORK_QDISC_NONE;
+}
+
+/* [FairQueueing] and friends, Parent=: root, the default, is the only parent
+ * netd installs on. */
+static int config_parse_qdisc_parent(NetworkParser *p, const char *path, unsigned line, const char *rvalue) {
+        if (*rvalue == '\0') {
+                pico_log(PICO_LOG_WARNING,
+                         "%s:%u: invalid Parent= value '', ignoring the [%s] section",
+                         path,
+                         line,
+                         p->sec_qdisc_name);
+                p->sec_qdisc_root = false;
+                return 0;
+        }
+
+        p->sec_qdisc_root = strcmp(rvalue, "root") == 0;
+        if (!p->sec_qdisc_root)
+                pico_log(PICO_LOG_WARNING,
+                         "%s:%u: Parent=%s is not supported, ignoring the [%s] section",
+                         path,
+                         line,
+                         rvalue,
+                         p->sec_qdisc_name);
+        return 0;
+}
+
 static int network_section_handler(const char *path, unsigned line, const char *section, void *userdata) {
         NetworkParser *p = userdata;
         ssize_t i;
+
+        network_qdisc_commit(p, path);
+        p->sec_qdisc = NETWORK_QDISC_NONE;
+
+        for (size_t k = 0; k < sizeof(network_qdisc_sections) / sizeof(network_qdisc_sections[0]); k++)
+                if (strcmp(section, network_qdisc_sections[k].section) == 0) {
+                        p->sec_qdisc = network_qdisc_sections[k].kind;
+                        p->sec_qdisc_name = network_qdisc_sections[k].section;
+                        p->sec_qdisc_line = line;
+                        p->sec_qdisc_root = true;
+                        p->sec_qdisc_keys = false;
+                }
 
         p->cur = -1;
         p->cur_route = -1;
@@ -1469,6 +1555,12 @@ static int network_conf_handler(
         if (strcmp(section, "Network") == 0 && strcmp(lvalue, "Address") == 0)
                 return config_parse_network_address(p, path, line, lvalue, rvalue);
 
+        if (p->sec_qdisc != NETWORK_QDISC_NONE) {
+                p->sec_qdisc_keys = true;
+                if (strcmp(lvalue, "Parent") == 0)
+                        return config_parse_qdisc_parent(p, path, line, rvalue);
+        }
+
         if (strcmp(section, "Address") == 0) {
                 if (p->cur < 0)
                         return 0;
@@ -1549,6 +1641,7 @@ int network_parse_file(const char *path, Network **ret) {
                 return r;
         }
 
+        network_qdisc_commit(&parser, path);
         network_verify_addresses(nw, path);
         network_verify_routes(nw, path);
 

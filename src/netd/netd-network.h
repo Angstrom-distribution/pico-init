@@ -81,6 +81,19 @@ typedef enum NetworkRaToken {
         NETWORK_RA_TOKEN_PREFIXSTABLE,
 } NetworkRaToken;
 
+/*
+ * The root qdisc kind a .network file asks for with a [FairQueueingControlledDelay],
+ * [FairQueueing] or [CAKE] section whose Parent= is root. NONE leaves the choice
+ * to the multi-queue rule in netd-link.h.
+ */
+typedef enum NetworkQdisc {
+        NETWORK_QDISC_NONE,
+        NETWORK_QDISC_FQ_CODEL,
+        NETWORK_QDISC_FQ,
+        NETWORK_QDISC_CAKE,
+        _NETWORK_QDISC_MAX,
+} NetworkQdisc;
+
 /* networkd's [IPv6AcceptRA] RouteMetric= defaults, high:medium:low. */
 #define NETWORK_RA_METRIC_HIGH 512
 #define NETWORK_RA_METRIC_MEDIUM 1024
@@ -215,6 +228,10 @@ struct Network {
         NetworkLldp lldp;          /* LLDP= */
         NetworkEmitLldp emit_lldp; /* EmitLLDP= */
 
+        /* The first kind section with Parent=root; a later one is dropped, as
+         * networkd drops a second root qdisc section. */
+        NetworkQdisc qdisc;
+
         /* --- [DHCPv4] --- */
         bool dhcp_use_dns; /* UseDNS=, default yes */
         bool dhcp_use_ntp; /* UseNTP=, default yes */
@@ -299,6 +316,9 @@ const NetworkAddress *network_first_address_v4(const Network *nw);
  * so no caller has to remember that YES and IPV4 both count and IPV6 does
  * not. */
 bool network_dhcp4_enabled(const Network *nw);
+
+/* The TCA_KIND name ("fq_codel", "fq", "cake"), NULL for NONE. */
+const char *network_qdisc_to_string(NetworkQdisc q);
 
 const char *network_dhcp_to_string(NetworkDHCP d);
 NetworkDHCP network_dhcp_from_string(const char *s);

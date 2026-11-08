@@ -465,7 +465,8 @@ netd_tests = [
   # IPv4/IPv6 literal parsing, masking and formatting (netd-addr.c).
   'test-netd-addr',
   'test-netd-rtnl',
-  # Root qdisc messages against fixed bytes and a decoded kernel reply.
+  # Root qdisc messages against fixed bytes, a decoded kernel reply and the
+  # qdisc sections of a .network file.
   'test-netd-qdisc',
   'test-netd-codec',
   'test-netd-dhcp',
