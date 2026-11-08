@@ -88,6 +88,10 @@ than skip". What each group needs, as read from the tests:
 - `test-netd-rtnl`, `test-netd-dhcp` and `test-netd-lldp-link` use veth pairs
   in a network namespace made with `unshare(CLONE_NEWUSER|CLONE_NEWNET)`.
   They exit 1 if the namespace cannot be created; see below.
+- `test-netd-qdisc-link` uses veth pairs in the same kind of namespace and is
+  an exception to the exit-1 rule: it exits 77 when the namespace or its id
+  maps cannot be created, when `ip` or `tc` is not installed, when `ip` cannot
+  create a veth pair, and when the kernel has no `fq_codel` or `fq` qdisc.
 - `test-netd-ra` uses the same namespace. Its checks that need the kernel's
   own router advertisement handling off run only where `accept_ra` under
   `/proc/sys/net/ipv6/conf` can be written, and its `Token=prefixstable` case
@@ -102,9 +106,10 @@ than skip". What each group needs, as read from the tests:
 - `test-tmpfiles-create` skips its ownership assertions unless
   `geteuid() == 0`.
 
-The netd namespace tests do not skip when the namespace cannot be created:
-each prints that it cannot prove isolation and exits 1. The `test-netd-dhcp`
-and `test-netd-rtnl` source headers explain that a bare
+Apart from `test-netd-qdisc-link` and `test-netd-sntp-ipv6`, the netd
+namespace tests do not skip when the namespace cannot be created: each
+prints that it cannot prove isolation and exits 1. The `test-netd-dhcp` and
+`test-netd-rtnl` source headers explain that a bare
 `unshare(CLONE_NEWNET)` fails with `EPERM` without `CAP_SYS_ADMIN`, while a
 fresh user namespace that creates the network namespace in the same call owns
 it and so holds `CAP_NET_ADMIN` inside it. The tests use that form. If the
