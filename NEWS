@@ -14,6 +14,12 @@
           it pulls in (also skipped when the pulled unit has it), and a
           service after sockets.target. See docs/INCOMPATIBILITIES.md.
 
+        * PID 1 logs to logd instead of /dev/kmsg while logd.socket is running
+          and logd.service is active, like systemd's journal-or-kmsg target.
+          The records written before that, while logd stops or has failed,
+          and when a send to logd fails, go to the kernel ring, which logd
+          imports at start. Service state changes no longer fill dmesg.
+
 ##        picoctl:
 
         * A unit that does not exist is reported as systemctl reports it.
