@@ -120,6 +120,8 @@ pico_init_core_sources = files(
   'src/unit-load.c',
   # Drop-in directories (foo.service.d/*.conf): which files apply to a unit.
   'src/unit-dropin.c',
+  # The directory half of drop-ins, shared with netd's .network drop-ins.
+  'src/dropin-files.c',
   'src/conf-scan.c',
   'src/unit-parse.c',
   # daemon-reload (SIGHUP or the picoctl ctrl verb): re-parse each loaded
