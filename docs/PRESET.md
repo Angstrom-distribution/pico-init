@@ -139,9 +139,10 @@ same unit parser and preset reader as PID 1.
 `enable`, `disable`, `reenable` and `preset` on a unit without `WantedBy=`
 or `RequiredBy=` create and remove nothing, print a notice that the unit is
 not meant to be enabled with `picoctl`, and exit 0. A unit that cannot be
-found or does not parse makes them fail with `unit UNIT does not exist` and
-exit 1. `[Install]` `Alias=`, `Also=` and `DefaultInstance=` are not
-implemented, so `enable` does not create alias or companion symlinks.
+found or does not parse makes them fail with `Failed to VERB unit: Unit UNIT
+does not exist` on stderr and exit 1. `[Install]` `Alias=`, `Also=` and
+`DefaultInstance=` are not implemented, so `enable` does not create alias or
+companion symlinks.
 
 None of these verbs starts or stops anything. `picoctl enable` does not
 imply `--now`; use `picoctl start` for that.
