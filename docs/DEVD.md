@@ -113,10 +113,10 @@ symlinks of the form `../../<name>`:
 
 | Directory | Source | Applies to |
 | --- | --- | --- |
-| `by-partuuid` | GPT partition GUID | partitions |
-| `by-partlabel` | GPT partition name | partitions |
-| `by-uuid` | ext superblock UUID | partitions with an ext filesystem |
-| `by-label` | ext superblock label | partitions with an ext filesystem |
+| `by-partuuid` | GPT partition GUID, or the MBR disk signature and partition number | partitions |
+| `by-partlabel` | GPT partition name | partitions on a GPT disk |
+| `by-uuid` | ext superblock UUID | partitions, and disks without partitions, with an ext filesystem |
+| `by-label` | ext superblock label | partitions, and disks without partitions, with an ext filesystem |
 | `by-id` | bus identity plus `-partN` | disks and partitions |
 
 The `by-id` stem is built from sysfs by walking up from the block device to
@@ -136,10 +136,17 @@ away, devd removes every `by-*` link pointing at it by scanning the
 directory, not from memory, so links left behind by an earlier devd are
 removed too.
 
-Partition links come from the GPT entry, so a partition on a disk without a
-GPT gets none; only the whole-disk `by-id` link is created for such a disk.
-Not provided: `by-path`, MBR and FAT identities (the ext superblock and GPT
-are the only sources). Virtual block devices (`/devices/virtual/`: ramdisks,
+On a disk without a GPT, a partition of a DOS partition table gets a
+`by-partuuid` link spelled as the kernel spells it for `root=PARTUUID=`,
+`<disk signature>-<partition number>` in hex (`1234abcd-01`, logical
+partitions from `-05`), plus the ext links. The sector is used only when it
+ends in `0x55aa`, every boot indicator is `0x00` or `0x80` and no entry is a
+GPT protective one, the kernel's own tests. A disk with no partitions at all
+is read for an ext filesystem of its own, which gives a whole-disk root (a
+virtual machine's `/dev/vda`) its `by-uuid` and `by-label` links. Neither
+kind is ever mounted under `/media`. Not provided: `by-path` and FAT
+identities (the ext superblock, the GPT and the MBR signature are the only
+sources). Virtual block devices (`/devices/virtual/`: ramdisks,
 loop, device-mapper) are not tracked at all, so they get no links. MTD flash
 (`/mtd/` in the sysfs path) is tracked but never read, so it gets no links
 either.
@@ -418,7 +425,8 @@ skipped them.
 | `ATTR{}=` (sysfs writes) | skipped |
 | `e"..."` strings, backward `GOTO`, labels across files | not supported |
 | `by-path` links | not created |
-| MBR and FAT/exFAT filesystems | not identified, not mounted |
+| FAT/exFAT filesystems | not identified, not mounted |
+| MBR partitions, whole-disk filesystems | named (`by-partuuid` for MBR, ext `by-uuid`/`by-label`), never mounted |
 | tags (`G:`, `Q:`), device link priorities (`L:`), inotify watches (`W:`) | not recorded |
 | rules reload on change | none; restart the unit |
 
