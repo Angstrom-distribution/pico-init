@@ -14,11 +14,14 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
+#include "manager-state.h"
 #include "manager.h"
 #include "service.h"
 #include "test-util.h"
@@ -480,6 +483,42 @@ static void test_reload_sees_added_and_removed_dropins(void) {
         tree_free(&t);
 }
 
+/* The published state names the drop-ins (picoctl status reads it). */
+static void test_state_file_lists_dropins(void) {
+        struct tree t;
+        char rtdir[PATH_MAX], file[PATH_MAX + 32], line[2048];
+        char want[2 * PATH_MAX];
+        FILE *f;
+        bool found = false;
+
+        tree_new(&t);
+        snprintf(rtdir, sizeof(rtdir), "%s/rt", t.root);
+        ASSERT_EQ_INT(mkdir(rtdir, 0755), 0);
+        ASSERT_EQ_INT(manager_set_runtime_dir(t.m, rtdir), 0);
+        ASSERT_EQ_INT(manager_state_setup(t.m), 0);
+
+        put(&t, "lib", "a.service", SERVICE_FILE);
+        mkd(&t, "etc", "a.service.d");
+        put(&t, "etc", "a.service.d/10-x.conf", "[Unit]\nDescription=x\n");
+        put(&t, "etc", "a.service.d/20-y.conf", "[Unit]\nDescription=y\n");
+        (void) load(&t, "a.service");
+
+        snprintf(file, sizeof(file), "%s/units/a.service", rtdir);
+        f = fopen(file, "re");
+        ASSERT_TRUE(f != NULL);
+        snprintf(want,
+                 sizeof(want),
+                 "DropInPaths=%s/etc/a.service.d/10-x.conf %s/etc/a.service.d/20-y.conf\n",
+                 t.root,
+                 t.root);
+        while (fgets(line, sizeof(line), f))
+                if (strcmp(line, want) == 0)
+                        found = true;
+        fclose(f);
+        ASSERT_TRUE(found);
+        tree_free(&t);
+}
+
 int main(void) {
         test_precedence_between_directories();
         test_same_name_masks_lower_directory();
@@ -491,6 +530,7 @@ int main(void) {
         test_bad_line_names_file_and_line();
         test_verification_sees_the_dropins();
         test_reload_sees_added_and_removed_dropins();
+        test_state_file_lists_dropins();
 
         printf("test-unit-dropin: all checks passed\n");
         return 0;

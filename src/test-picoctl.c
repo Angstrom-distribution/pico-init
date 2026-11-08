@@ -1310,6 +1310,70 @@ static void test_status_no_argument_system_overview(void) {
 #define TEST_ANSI_HIGHLIGHT_GREEN "\x1B[0;1;32m"
 
 /*
+ * status prints the applied drop-ins as systemctl's Drop-In: block between
+ * Loaded: and Active:, files grouped by directory; a unit without any prints
+ * no such block. The same text as systemctl-show.c print_status_info().
+ */
+static void test_status_dropins(void) {
+        static const char * const GLYPH = "\xe2\x94\x94\xe2\x94\x80";
+        char *root;
+        char rtdir[PATH_MAX], unitsdir[PATH_MAX + 16], want[1024];
+        struct run_result res;
+
+        root = test_tmpdir_new();
+        ASSERT_TRUE(root != NULL);
+
+        snprintf(rtdir, sizeof(rtdir), "%s%s", root, PICO_RUNTIME_DIR);
+        snprintf(unitsdir, sizeof(unitsdir), "%s/units", rtdir);
+        ASSERT_EQ_INT(fixture_mkdir_p(unitsdir), 0);
+
+        ASSERT_EQ_INT(test_write_file(unitsdir,
+                                      "a.service",
+                                      "ActiveState=active\nSubState=running\nLoadState=loaded\n"
+                                      "FragmentPath=/usr/lib/systemd/system/a.service\n"
+                                      "DropInPaths=/etc/systemd/system/a.service.d/10-a.conf "
+                                      "/etc/systemd/system/a.service.d/20-b.conf "
+                                      "/usr/lib/systemd/system/service.d/30-c.conf "
+                                      "/etc/systemd/system/a.service.d/40-d.conf\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(unitsdir,
+                                      "b.service",
+                                      "ActiveState=active\nSubState=running\nLoadState=loaded\n"
+                                      "DropInPaths=\n"),
+                      0);
+
+        snprintf(want,
+                 sizeof(want),
+                 "    Drop-In: /etc/systemd/system/a.service.d\n"
+                 "             %s10-a.conf, 20-b.conf\n"
+                 "             /usr/lib/systemd/system/service.d\n"
+                 "             %s30-c.conf\n"
+                 "             /etc/systemd/system/a.service.d\n"
+                 "             %s40-d.conf\n"
+                 "     Active: active (running)\n",
+                 GLYPH,
+                 GLYPH,
+                 GLYPH);
+
+        RUN_PICOCTL(&res, "--root", root, "status", "a.service");
+        ASSERT_EQ_INT(res.exit_code, 0);
+        ASSERT_TRUE(strstr(res.out, "     Loaded: loaded (/usr/lib/systemd/system/a.service; n/a)\n") != NULL);
+        ASSERT_TRUE(strstr(res.out, want) != NULL);
+
+        RUN_PICOCTL(&res, "--root", root, "status", "b.service");
+        ASSERT_EQ_INT(res.exit_code, 0);
+        ASSERT_TRUE(strstr(res.out, "Drop-In:") == NULL);
+
+        RUN_PICOCTL(&res, "--root", root, "show", "-p", "DropInPaths", "a.service");
+        ASSERT_TRUE(strstr(res.out,
+                           "DropInPaths=/etc/systemd/system/a.service.d/10-a.conf "
+                           "/etc/systemd/system/a.service.d/20-b.conf ") != NULL);
+
+        test_rm_rf(root);
+        free(root);
+}
+
+/*
  * status <unit>: active (green Active: line), failed (red Active: line,
  * with the Result parenthetical left outside -- hence plain -- the colour),
  * and inactive (format_active_state()'s own "else" case: no colour for
@@ -2421,6 +2485,7 @@ int main(void) {
         test_cli_option_parsing();
         test_show_unit_file_state_live();
         test_status_no_argument_system_overview();
+        test_status_dropins();
         test_status_colors();
         test_list_units_colors();
         test_list_units_filters_and_legend();

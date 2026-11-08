@@ -314,6 +314,7 @@ struct unit_state {
         char sub_state[32];
         char load_state[16];
         char fragment_path[PATH_MAX];
+        char dropin_paths[2048]; /* space-separated, as DropInPaths= */
         char description[256];
         char unit_file_state[16];
         int main_pid;
@@ -336,7 +337,7 @@ static void unit_state_set(char *field, size_t field_size, const char *value) {
 static int read_unit_state(const char *unit_id, struct unit_state *st) {
         char rt[PATH_MAX];
         char path[PATH_MAX];
-        char line[1024];
+        char line[4096]; /* DropInPaths= can be long */
         FILE *f;
         int n;
 
@@ -380,6 +381,8 @@ static int read_unit_state(const char *unit_id, struct unit_state *st) {
                         unit_state_set(st->load_state, sizeof(st->load_state), val);
                 else if (strcmp(key, "FragmentPath") == 0)
                         unit_state_set(st->fragment_path, sizeof(st->fragment_path), val);
+                else if (strcmp(key, "DropInPaths") == 0)
+                        unit_state_set(st->dropin_paths, sizeof(st->dropin_paths), val);
                 else if (strcmp(key, "Description") == 0)
                         unit_state_set(st->description, sizeof(st->description), val);
                 else if (strcmp(key, "UnitFileState") == 0)
@@ -500,7 +503,7 @@ static int cmd_show(int argc, char *argv[]) {
                          * the file only reflects the enablement state as
                          * of this unit's *load* time, and a later `picoctl
                          * disable`/enable never rewrites it. */
-                        char line[1024];
+                        char line[4096];
 
                         while (fgets(line, sizeof(line), f)) {
                                 if (strncmp(line, "UnitFileState=", 14) == 0)
@@ -1617,6 +1620,40 @@ static void print_system_status(void) {
         }
 }
 
+/*
+ * The Drop-In: block of print_status_info() (systemctl-show.c): files grouped
+ * under the directory they came from, the next group starting when the next
+ * file is not below the current directory.
+ */
+static void print_dropins(const char *joined) {
+        char list[2048], dir[PATH_MAX] = "";
+        char *paths[64];
+        size_t n = 0, i;
+        char *save = NULL, *tok;
+        bool last = false;
+
+        snprintf(list, sizeof(list), "%s", joined);
+        for (tok = strtok_r(list, " ", &save); tok && n < sizeof(paths) / sizeof(paths[0]);
+             tok = strtok_r(NULL, " ", &save))
+                paths[n++] = tok;
+
+        for (i = 0; i < n; i++) {
+                const char *slash = strrchr(paths[i], '/');
+
+                if (!slash)
+                        break;
+
+                if (!dir[0] || last) {
+                        printf(dir[0] ? "             " : "    Drop-In: ");
+                        snprintf(dir, sizeof(dir), "%.*s", (int) (slash - paths[i]), paths[i]);
+                        printf("%s\n             \xe2\x94\x94\xe2\x94\x80", dir);
+                }
+
+                last = !(i + 1 < n && strncmp(paths[i + 1], dir, strlen(dir)) == 0);
+                printf("%s%s", slash + 1, last ? "\n" : ", ");
+        }
+}
+
 static int cmd_status(int argc, char *argv[]) {
         int i, ret = 0;
         bool new_line = false;
@@ -1668,6 +1705,9 @@ static int cmd_status(int argc, char *argv[]) {
                                ufs,
                                enable_off);
                 }
+
+                if (st.dropin_paths[0])
+                        print_dropins(st.dropin_paths);
 
                 /* Result folds onto the Active: line itself upstream, never a
                  * separate field (systemctl-show.c print_status_info()). */
@@ -2295,7 +2335,7 @@ static int cmd_unmask(int argc, char *argv[]) {
  * print.c -- ansi_highlight_blue()/ansi_normal() are both empty off a tty,
  * which picoctl always is) followed by the fragment verbatim. A masked
  * unit gets upstream's own "# <path> is a mask." line instead of trying to
- * cat /dev/null as a unit file. pico-init has no drop-ins to also cat.
+ * cat /dev/null as a unit file. Drop-ins are not printed.
  *
  * Known gap: load_install_info() requires a fragment that actually parsed
  * (UNIT_LOADED), so `cat` on a syntactically-broken unit file reports
@@ -4496,8 +4536,8 @@ static const struct {
         {                 "cancel",                   "queued jobs cannot be cancelled" },
         {             "clear-jobs",                   "queued jobs cannot be cancelled" },
         {         "enqueue-marked",                "units cannot be marked for restart" },
-        {                   "edit",                     "there are no drop-ins to edit" },
-        {                 "revert",                   "there are no drop-ins to revert" },
+        {                   "edit",                "drop-ins are edited as plain files" },
+        {                 "revert",               "drop-ins are removed as plain files" },
         {                   "help",               "there are no manual pages for units" },
         {       "show-environment",            "the manager environment is not exposed" },
         {        "set-environment",            "the manager environment is not exposed" },
