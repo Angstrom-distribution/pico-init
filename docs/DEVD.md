@@ -11,7 +11,11 @@ daemon and does not talk to PID 1.
 ## Running devd
 
 devd has no configuration file. Its command line is udevd's; see
-[Command line](#command-line). The shipped unit is:
+[Command line](#command-line). It is also installed as
+`$prefix/lib/udev/udevd`, the name dracut's `udev-rules` module looks for, so
+an initramfs that runs dracut's shell `/init` starts it as
+`systemd-udevd --daemon --resolve-names=never` and drives it with
+[udevadm](#udevadm). The shipped unit is:
 
 ```ini
 [Unit]
@@ -37,7 +41,7 @@ The options of systemd-udevd v262:
 
 | Option | Effect |
 |--------|--------|
-| `-d`, `--daemon` | Real: fork, `setsid()`, `chdir("/")`, stdio to `/dev/null`, then run. |
+| `-d`, `--daemon` | Real: fork, `setsid()`, `chdir("/")`, stdio to `/dev/null`, then run. The parent exits 0 once the child has finished its coldplug walk, or 1 if the child fails to start. |
 | `-h`, `--help`; `-V`, `--version` | Print and exit 0. |
 | `-D`, `--debug` | Accepted, no effect: every record is already written. |
 | `-c`, `--children-max=` | Accepted, no effect: events run in the one loop. |
@@ -452,9 +456,11 @@ network namespace, or events lost when the socket overran and devd re-walked
 checks every 10 ms until `/run/devd/seqnum` has reached that value and
 `/run/udev/queue` does not exist, the `--exit-if-exists` file appears, or
 the timeout passes (120 s by default, `--timeout=0` checks once). As with
-udevd, a devd that is not running (no `/run/devd/pid`, or the pid is gone, a
-zombie, or not named `devd`, `udevd` or `systemd-udevd`) means there is
-nothing to wait for, and settle exits 0.
+udevd for root, a devd that is not running (no `/run/devd/pid`, or the pid
+is gone, a zombie, or not named `devd`, `udevd` or `systemd-udevd`) means
+there is nothing to wait for, and settle exits 0. For any other caller
+udevd's settle fails with "systemd-udevd is not running." when
+`/run/udev/control` is missing. devd's settle exits 0 for every caller.
 
 A `RUN+=` program that does not exit keeps devd busy, and settle then waits
 for its timeout. udevd kills such a program after its event timeout; devd
@@ -463,11 +469,66 @@ does not.
 `/run/udev/queue` is also what libudev's `udev_queue_*` calls read, see
 [COMPATIBILITY_LIBRARIES.md](COMPATIBILITY_LIBRARIES.md).
 
+## udevadm
+
+`/usr/bin/udevadm` covers the parts of udevadm v262 that scripts call on a
+running system, in particular dracut's shell `/init`, `dracut-lib.sh`,
+`dracut-initqueue.sh` and `fs-lib.sh`. `udevadm --version` prints `262`, the
+udev version whose command line it follows, because scripts compare that
+number.
+
+| Command | With devd |
+| --- | --- |
+| `settle [-t SEC] [-E FILE]` | as described [above](#queue-state-and-udevadm-settle); `-s`, `-e` and `-q` are refused as in v262 |
+| `trigger` | writes the action (default `change`) to the `uevent` file of each matching device, sorted so a parent comes before its children. `--type=devices` lists `/sys/bus/*/devices/*` and `/sys/class/*/*`; `--type=subsystems` lists `/sys/module/*`, `/sys/bus/*` and `/sys/bus/*/drivers/*` as the subsystems `module`, `subsystem` and `drivers`. Filters: `--subsystem-match`, `--subsystem-nomatch`, `--sysname-match`, `--attr-match`, `--attr-nomatch`, `--property-match` (the `uevent` file and `SUBSYSTEM`), `--parent-match`, `--name-match` and device arguments. Also `--verbose`, `--dry-run`, `--quiet`, `--settle` (120 s timeout), `--wait-daemon`; `--prioritized-subsystem` is accepted and ignored |
+| `control --exit` | sends devd `SIGTERM` and waits (60 s, `--timeout`) until that process has exited or is a zombie, so `switch_root` never races a live devd; exits 0 if devd was not running (see below) |
+| `control --ping` | exits 0 if devd is running, 1 otherwise |
+| `control` (other commands) | `--reload`, `--property`, `--log-level`, `--children-max`, `--stop-exec-queue`, `--start-exec-queue`, `--trace`, `--revert` and `--load-credentials` are checked and have no effect: devd loads its rules once, at startup, and has no global properties, workers or log level |
+| `info` | `--query=property\|name\|symlink\|path\|all` (default `all`) for `--name`, `--path` or device arguments, with `--root`, `--export`, `--export-prefix`, `--property` and `--value`. `--cleanup-db`, `--export-db` and `--wait-for-initialization` are accepted and do nothing |
+
+`info` builds the properties from what is there to read: `DEVPATH`, the
+device's `uevent` file (with `DEVNAME` made absolute), `SUBSYSTEM`, devd's
+`/run/udev/data` entry (`USEC_INITIALIZED` and the `E:` records), `DEVLINKS`
+from the symlinks under `/dev` (three levels deep) that resolve to the node,
+and for a block device the filesystem identity read off the node with the
+same readers PID 1 uses for fstab: `ID_FS_TYPE`, `ID_FS_USAGE`,
+`ID_FS_UUID`, `ID_FS_UUID_ENC`, `ID_FS_LABEL` and `ID_FS_LABEL_ENC`. ext2,
+ext3 and ext4 all report `ID_FS_TYPE=ext4`; the reader cannot tell them
+apart and the ext4 driver mounts all three. Reading the node needs root;
+without it the `ID_FS_*` properties are left out.
+
+With no devd running, `control --exit` and the commands that have no effect
+exit 0, where v262 fails because it cannot reach udevd. This is deliberate:
+devd not running is the state `--exit` asks for, and dracut's scripts
+tolerate either status. `control --ping` still exits 1.
+
+Refused, because devd records nothing to answer them with or because
+ignoring them would widen what is triggered: `trigger --tag-match`,
+`--include-parents`, `--initialized-match`, `--initialized-nomatch` and
+`--uuid`; `info --attribute-walk`, `--tree`, `--device-id-of-file`, `--json`
+and the `info` match options. The commands `monitor`, `test`,
+`test-builtin`, `hwdb`, `wait`, `lock`, `cat` and `verify` exit 1 with a
+message, as does an unknown command.
+
+Under dracut's shell `/init` the sequence is: `udevd --daemon` returns once
+devd has opened its socket and walked `/sys`; `trigger --type=subsystems`
+and `--type=devices` replay every device through devd's rules, block
+handling and module loading; `settle` and the initqueue's `settle
+--timeout=0` wait on the state above; `control --exit` stops devd before
+`switch_root`. Rules that `pre-udev` hooks write (dracut's
+`/etc/udev/rules.d/99-root.rules`) are loaded because devd starts after
+those hooks; rules written later, in `pre-trigger`, are not, since
+`control --reload` does nothing.
+
+The meson option `udev-compat` (default `true`) installs `udevadm` and the
+`udevd` link; turn it off where real udev provides them.
+
 ## Not implemented compared to udev
 
 | udev feature | devd |
 | --- | --- |
-| `udevadm`, `udevd` control socket, `/run/udev/control` | none |
+| `udevd` control socket, `/run/udev/control` | none; [udevadm](#udevadm) works from files devd publishes |
+| `udevadm monitor`, `test`, `hwdb`, `wait`, `lock`, `cat`, `verify` | not provided |
 | libudev monitor events (group 2) | not produced and not read |
 | `PROGRAM`, `IMPORT{...}`, builtins (`blkid`, `usb_id`, `path_id`, `net_id`, `kmod`, ...) | skipped; the `by-id` and input logic are native C |
 | `TEST`, `TAG`, `TAGS`, `OPTIONS`, `NAME`, `DRIVER`, `DRIVERS`, `SUBSYSTEMS`, `KERNELS`, `SECLABEL` | skipped |
@@ -477,7 +538,7 @@ does not.
 | FAT/exFAT filesystems | not identified, not mounted |
 | MBR partitions, whole-disk filesystems | named (`by-partuuid` for MBR, ext `by-uuid`/`by-label`), never mounted |
 | tags (`G:`, `Q:`), device link priorities (`L:`), inotify watches (`W:`) | not recorded |
-| rules reload on change | none; restart the unit |
+| rules reload on change, `udevadm control --reload` | none; restart the unit |
 
 Limits are fixed in the source: 32 properties per device, 32 tracked mounts,
 32 tracked rule-created links, 32 disks, 16 partitions per disk. Exceeding a

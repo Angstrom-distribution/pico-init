@@ -19,11 +19,13 @@ ninja -C build
 DESTDIR=/path/to/image meson install -C build
 ```
 
-`meson.build` defines no project options of its own. Install paths come from
-the standard meson directory options (`prefix`, `bindir`, `sbindir`,
-`libdir`, `includedir`, `sysconfdir`). The version string comes from
-`git describe` at build time (`vcs_tag()`), with the fallback `unknown` for
-a source tree without `.git`, such as a release tarball.
+The one project option is `udev-compat` (default `true`), which installs
+`udevadm` and the `udevd` link; turn it off where real udev provides them.
+Install paths come from the standard meson directory options (`prefix`,
+`bindir`, `sbindir`, `libdir`, `includedir`, `sysconfdir`). The version
+string comes from `git describe` at build time (`vcs_tag()`), with the
+fallback `unknown` for a source tree without `.git`, such as a release
+tarball.
 
 The test suite is part of the meson project. Run it as root, as CI does:
 tests that need cgroups, mounts or network namespaces skip (exit status 77)
@@ -46,6 +48,7 @@ so a multilib layout keeps them in `/usr/lib`.
 | `picolog` | `bindir` | `journalctl` equivalent |
 | `pico-tmpfiles` | `bindir` | `systemd-tmpfiles` equivalent |
 | `pico-unit-lint` | `bindir` | build-time unit checker |
+| `udevadm` | `bindir` | `udevadm` for `devd`; with `-Dudev-compat=true`, the default |
 | `libsystemd.so.0.45.0`, `libsystemd.so.0` | `libdir` | compatibility library |
 | `libudev.so.1.7.15`, `libudev.so.1` | `libdir` | compatibility library |
 | `systemd/*.h`, `libudev.h` | `includedir` | public headers |
@@ -55,6 +58,7 @@ so a multilib layout keeps them in `/usr/lib`.
 | `devd.service` | `$prefix/lib/systemd/system` | |
 | `pico-tmpfiles.service` | `$prefix/lib/systemd/system` | |
 | `60-pico-serial.rules` | `$prefix/lib/udev/rules.d` | read by `devd` |
+| `udevd` | `$prefix/lib/udev` | link to `devd`, the name dracut looks for; with `-Dudev-compat=true` |
 
 The build installs no `/sbin/init` link. The kernel starts `/sbin/init`, so
 the layer must provide it, for example as a symlink to `pico-init`.
@@ -76,7 +80,7 @@ separate processes supervised by PID 1 rather than parts of it:
 | `pico-init` | `pico-init`, `picoctl`, `pico-tmpfiles`, `pico-tmpfiles.service` | libc |
 | `pico-init-netd` | `netd`, `netctl`, `netd.service`, `network.target` | libc |
 | `pico-init-logd` | `logd`, `picolog`, `logd.service`, `logd.socket` | libc |
-| `pico-init-devd` | `devd`, `devd.service`, `60-pico-serial.rules` | libc |
+| `pico-init-devd` | `devd`, `devd.service`, `60-pico-serial.rules`, `udevadm`, the `udevd` link | libc |
 | libsystemd, libudev | the two `.so` files | libc |
 | `-dev` | headers and `.pc` files | |
 | `pico-unit-lint` | `pico-unit-lint` | libc |
