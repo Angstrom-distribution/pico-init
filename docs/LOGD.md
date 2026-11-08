@@ -98,9 +98,8 @@ The default is chosen by `StandardInput=` and `StandardOutput=`:
 | logd socket cannot be created or connected | `/dev/console` |
 
 `StandardOutput=kmsg` and other values are not implemented and are recorded
-as dropped directives by the unit parser. PID 1's own output is not sent
-to `logd`; it goes to `/dev/kmsg`, which `logd` reads, or to stderr when
-`/dev/kmsg` cannot be opened.
+as dropped directives by the unit parser. PID 1's own log records do not
+use this input; see [PID 1's own records](#pid-1s-own-records).
 
 All records from this input get `PRIORITY=6` and `_TRANSPORT=stdout`. The
 socket has no handshake, so a service cannot choose a priority or
@@ -188,6 +187,35 @@ Per record:
 
 If `/dev/kmsg` cannot be opened (missing node, no `CAP_SYSLOG`), `logd`
 logs a warning and runs without the kernel transport.
+
+### PID 1's own records
+
+PID 1 follows systemd's journal-or-kmsg log target. It writes its records
+to `/dev/kmsg`, and the start-up drain above imports them, so `logd` holds
+every record PID 1 emitted before it existed.
+
+While `logd.socket` is running and `logd.service` is active (or reloading),
+every record goes to the `/dev/log` socket as a `<N>pico-init[level]: `
+datagram and no longer to the kernel ring, so `dmesg` holds only kernel
+messages and what PID 1 logged outside that window. The record arrives as a
+`syslog` transport entry with `SYSLOG_IDENTIFIER=pico-init` and the priority
+of the level (3, 4, 6, 7).
+
+The gate is the state of the two units, not whether a connection to
+`/dev/log` succeeds: PID 1 holds `logd.socket` itself, so a connection
+succeeds before `logd` is started, while it stops and after it has failed.
+A datagram sent then would socket-activate `logd` from PID 1's own log line,
+be dropped by the re-armed socket during a stop, or sit unread in the queue
+of a failed `logd`. PID 1 rechecks the gate on every state change of either
+unit, before logging that change, so the record that `logd` became active
+goes to `logd`, while those about it starting, stopping or failing go to
+`/dev/kmsg`.
+
+When a send fails while the gate is open, the record goes to `/dev/kmsg`
+instead and the connection is dropped: a refused connection or a removed
+socket file (the socket unit was restarted) is retried with the next record;
+a full receive queue only diverts the records that do not fit. With neither
+destination available the records go to stderr.
 
 ## Attribution
 

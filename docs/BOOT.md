@@ -21,7 +21,7 @@ are listed under [Failure handling](#failure-handling).
 | 3    | Hostname                                        | `hostname-setup.c`   |
 | 4    | Clock restore                                   | `clock-persist.c`    |
 | 5    | Sysctl                                          | `mount-setup.c`      |
-| 6    | Log to `/dev/kmsg`, version/arch/hostname lines | `main.c`             |
+| 6    | Log sink, version/arch/hostname lines           | `main.c`             |
 | 7    | Console greeting                                | `status.c`           |
 | 8    | Read `/etc/fstab`, check and remount root       | `root-check.c`       |
 | 9    | Mount the rest of `/etc/fstab`, activate swap   | `fstab-mount.c`      |
@@ -123,9 +123,11 @@ at warning level.
 
 Two output channels exist and are independent (`src/status.h`).
 
-`pico_log_to_kmsg()` redirects PID 1's own log records to `/dev/kmsg`. logd,
-when it starts, reads the ring from the beginning and so also holds every
-record emitted before it existed. The first record is
+`pico_log_to_journal_or_kmsg()` sends PID 1's own log records to `/dev/kmsg`,
+except while `logd.socket` is running and `logd.service` is active, when they
+go to logd's `/dev/log` socket. A failed send falls back to `/dev/kmsg`.
+logd, when it starts, reads the ring from the beginning and so also holds
+every record emitted before it existed. The first record is
 `pico-init <version> (<git description>) running as PID 1`. It is followed by
 the two lines systemd prints at the same point, in its words:
 `Detected architecture <arch>.`, where `<arch>` is systemd's name for the
