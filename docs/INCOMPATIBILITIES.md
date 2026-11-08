@@ -113,6 +113,7 @@ or resource-control directive leaves the service unconfined.
 | `Requires=`, `Wants=`       | Whitespace-separated names.                     |
 | `Before=`, `After=`         |                                                 |
 | `Conflicts=`                |                                                 |
+| `DefaultDependencies=`      | Boolean. See [Default dependencies](#default-dependencies). |
 | `ConditionPathExists=`      | See [Conditions](#conditions).                  |
 | `ConditionPathIsDirectory=` | See [Conditions](#conditions).                  |
 | `StartLimitIntervalSec=`, `StartLimitBurst=` | See [Start limit](#start-limit). `StartLimitInterval=` is accepted as the old spelling. |
@@ -209,8 +210,9 @@ A `StandardInput=` degradation has one further effect: a socket with
 console on stdin instead of the connection.
 
 Some invalid values are logged and ignored without being recorded:
-`KillMode=`, `KillSignal=`, `SendSIGHUP=`, `SendSIGKILL=`, `RemainAfterExit=`,
-`GuessMainPID=`, `Delegate=`, `DelegateSubgroup=`, `User=`, `Group=`, a
+`DefaultDependencies=`, `KillMode=`, `KillSignal=`, `SendSIGHUP=`,
+`SendSIGKILL=`, `RemainAfterExit=`, `GuessMainPID=`, `Delegate=`,
+`DelegateSubgroup=`, `User=`, `Group=`, a
 `ConditionPath*=` that is not absolute, a socket `Service=`, `Accept=`,
 `SocketMode=`, `Backlog=`, `MaxConnections=`, a `ListenStream=` or
 `ListenDatagram=` that is neither a path nor a port, an
@@ -377,6 +379,30 @@ longer than the default, such as `StartLimitIntervalSec=60` with
   system keeps running.
 - On a unit that is not a service the settings are recorded as dropped.
 
+### Default dependencies
+
+Pico-init adds two implicit orderings at boot, after the unit files are
+loaded and before the ordering graph is checked for cycles:
+
+- A target gets `After=` on every unit it pulls in with `Wants=` or
+  `Requires=`.
+- A service gets `After=sockets.target`, when that target exists.
+
+`DefaultDependencies=no` skips the ordering: for a service on the service
+itself, for a target on either the target or the unit it pulls in (so a target
+does not wait for a `DefaultDependencies=no` unit it pulls in). `yes` (the
+default) keeps it. The directive takes the usual boolean spellings; an invalid
+value is logged and ignored. An `After=` or `Before=` written in a unit file
+between the same two units is kept and the default is not added.
+
+Systemd's other default dependencies are not added whatever the setting:
+`Requires=` and `After=` on `sysinit.target`, `After=` on `basic.target`,
+`Before=` and `Conflicts=` on `shutdown.target`, and the socket, timer and
+mount rules. A unit that needs an ordering against those targets states it.
+The directive therefore never removes an ordering a unit file wrote. On a
+socket unit it only stops the target that pulls it in, such as
+`sockets.target`, from waiting for it.
+
 ### Presets
 
 Presets from `/etc/systemd/system-preset` and
@@ -422,8 +448,7 @@ A unit with `User=` whose account exists in the passwd database gets `USER`,
   degrades as above.
 - Only `Requires=`, `Wants=`, `Before=`, `After=` and `Conflicts=` are
   dependency directives. `Requisite=`, `BindsTo=`, `PartOf=`, `Upholds=`,
-  `OnFailure=`, `OnSuccess=`, `PropagatesStopTo=` and `DefaultDependencies=`
-  are recorded as dropped.
+  `OnFailure=`, `OnSuccess=` and `PropagatesStopTo=` are recorded as dropped.
 
 ## See also
 
