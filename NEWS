@@ -1,8 +1,11 @@
-# CHANGES WITH 0.5.0 in spe:
+# CHANGES WITH 0.5.0:
 
-        devd can stand in for udevd under dracut's shell /init: it ships a
-        udevadm for the commands the initramfs scripts call, and publishes
-        the state `udevadm settle` waits on.
+        Unit files and .network files can be changed with drop-in files, as
+        in systemd. TimeoutSec= and DefaultDependencies= are read, netd sets
+        the root qdisc of multi-queue links, PID 1 writes its own log lines
+        to logd instead of the kernel ring, picoctl reports an unknown unit
+        the way systemctl does, and devd can stand in for udevd under
+        dracut's shell /init.
 
 ##        PID 1 and unit files:
 
@@ -98,7 +101,7 @@
           (a value of /sys/kernel/uevent_seqnum up to which every event has
           been handled, written whenever devd is idle) and /run/udev/queue
           while it is busy. libudev's udev_queue_* calls now see real queue
-          state through the last.
+          state through /run/udev/queue.
 
         * devd --daemon returns only once the child has finished its
           coldplug walk, and exits 1 if the child fails to start, so a
