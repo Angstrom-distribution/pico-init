@@ -794,7 +794,7 @@ static void print_network_dropin(const char *path, bool last) {
 }
 
 static void iface_print_network_dropins(const char *ifname) {
-        char path[128], line[PATH_MAX + 32], held[PATH_MAX];
+        char path[128], line[PATH_MAX + 32], held[sizeof line];
         unsigned idx = if_nametoindex(ifname);
         const char key[] = "NETWORK_DROPIN=";
         bool have = false;
