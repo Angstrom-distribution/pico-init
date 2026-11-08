@@ -165,6 +165,10 @@ and dropped.
 For each partition devd creates the links above, then mounts it if all of
 these hold:
 
+- devd is not running in an initramfs: neither `/etc/initrd-release` nor
+  `/usr/lib/initrd-release` existed when it started. A mount made there
+  would stay across `switch_root` and could hold a partition of the root
+  disk, which is not yet the boot disk;
 - the disk is not the boot disk;
 - the GPT entry does not have the "no auto" attribute;
 - the partition type is Linux filesystem data
