@@ -113,6 +113,14 @@ int devd_new(Devd **ret) {
         if (r < 0)
                 goto fail;
 
+        r = set_string(&d->run_root, DEVD_RUN_ROOT);
+        if (r < 0)
+                goto fail;
+
+        r = set_string(&d->udev_run_root, DEVD_UDEV_RUN_ROOT);
+        if (r < 0)
+                goto fail;
+
         r = pico_signal_new(&d->signal);
         if (r < 0)
                 goto fail;
@@ -145,6 +153,17 @@ Devd *devd_free(Devd *d) {
 
         if (d->settle_event)
                 (void) pico_timer_cancel(d->timer, d->settle_event);
+        if (d->queue_event)
+                (void) pico_timer_cancel(d->timer, d->queue_event);
+
+        /* A stopped devd handles nothing, so settle must not take its last
+         * word as current. `udevadm control --exit` waits on the process
+         * itself, not on these files. Only what this devd wrote is removed. */
+        if (d->pid_published) {
+                (void) devd_queue_remove(d->run_root, DEVD_QUEUE_SEQNUM_FILE);
+                (void) devd_queue_set_flag(d->udev_run_root, DEVD_QUEUE_FLAG_FILE, false);
+                (void) devd_queue_remove(d->run_root, DEVD_QUEUE_PID_FILE);
+        }
 
         (void) devd_loop_remove_io(d, &d->uevent_tag);
         if (d->uevent_fd >= 0)
@@ -170,6 +189,8 @@ Devd *devd_free(Devd *d) {
         free(d->dev_root);
         free(d->media_root);
         free(d->udev_db_root);
+        free(d->run_root);
+        free(d->udev_run_root);
 
         free(d);
         return NULL;
@@ -189,6 +210,14 @@ int devd_set_media_root(Devd *d, const char *path) {
 
 int devd_set_udev_db_root(Devd *d, const char *path) {
         return d ? set_string(&d->udev_db_root, path) : -EINVAL;
+}
+
+int devd_set_run_root(Devd *d, const char *path) {
+        return d ? set_string(&d->run_root, path) : -EINVAL;
+}
+
+int devd_set_udev_run_root(Devd *d, const char *path) {
+        return d ? set_string(&d->udev_run_root, path) : -EINVAL;
 }
 
 /* --- the mount table --- */
@@ -1047,6 +1076,23 @@ int devd_startup(Devd *d) {
         devd_find_boot_disk(d);
 
         /*
+         * Busy until the first devd_queue_update() below says otherwise. A
+         * seqnum file left by an earlier devd is dropped first: no events may
+         * have happened since, and settle would then believe a coldplug this
+         * devd has not done yet.
+         */
+        d->pid_published = true;
+        (void) devd_queue_remove(d->run_root, DEVD_QUEUE_SEQNUM_FILE);
+        r = devd_queue_set_flag(d->udev_run_root, DEVD_QUEUE_FLAG_FILE, true);
+        if (r < 0)
+                pico_log(PICO_LOG_DEBUG, "devd: cannot raise the udev queue flag: %s", strerror(-r));
+        else
+                d->queue_busy = true;
+        r = devd_queue_write_u64(d->run_root, DEVD_QUEUE_PID_FILE, (uint64_t) getpid());
+        if (r < 0)
+                pico_log(PICO_LOG_WARNING, "devd: cannot write %s/pid: %s", d->run_root, strerror(-r));
+
+        /*
          * Rules before the socket, so a failure loading them happens before
          * events start buffering. Zero rules is not a failure; devd still runs
          * the block core.
@@ -1074,7 +1120,12 @@ int devd_startup(Devd *d) {
         if (r < 0)
                 return r;
 
-        return devd_coldplug(d);
+        r = devd_coldplug(d);
+        if (r < 0)
+                return r;
+
+        devd_queue_update(d);
+        return 0;
 }
 
 /* --- the epoll loop --- */
@@ -1141,6 +1192,75 @@ static int dispatch_uevent_source(Devd *d, struct devd_epoll_tag *tag, uint32_t 
          * loop would cancel and re-add the same timer for every partition. */
         devd_arm_settle(d);
         return 0;
+}
+
+/* --- queue state --- */
+
+/* Nothing to do here: firing is the point, devd_loop_run() calls
+ * devd_queue_update() after every iteration. */
+static void devd_queue_recheck(void *userdata, usec_t now) {
+        (void) userdata;
+        (void) now;
+}
+
+void devd_queue_update(Devd *d) {
+        char path[PATH_MAX];
+        uint64_t before, after;
+        bool busy;
+        int r;
+
+        if (!d)
+                return;
+
+        if ((size_t) snprintf(path, sizeof(path), "%s/%s", d->sys_root, DEVD_KERNEL_SEQNUM_FILE) >=
+            sizeof(path))
+                return;
+
+        /*
+         * The counter first, then the drain: every event numbered up to
+         * `before` was in the socket when it was read, so once the drain hits
+         * EAGAIN all of them have been handled.
+         */
+        if (devd_queue_read_u64(path, &before) < 0)
+                return;
+
+        if (d->uevent_tag.registered)
+                (void) dispatch_uevent_source(d, &d->uevent_tag, EPOLLIN);
+
+        busy = devd_block_next_settle(&d->block) != USEC_INFINITY || devd_run_pending(&d->run) > 0;
+
+        if (busy) {
+                if (!d->queue_busy && devd_queue_set_flag(d->udev_run_root, DEVD_QUEUE_FLAG_FILE, true) == 0)
+                        d->queue_busy = true;
+                return;
+        }
+
+        if (!d->queue_published || d->queue_seqnum != before) {
+                r = devd_queue_write_u64(d->run_root, DEVD_QUEUE_SEQNUM_FILE, before);
+                if (r < 0) {
+                        pico_log(PICO_LOG_DEBUG, "devd: cannot publish the queue state: %s", strerror(-r));
+                        return;
+                }
+
+                d->queue_seqnum = before;
+                d->queue_published = true;
+        }
+
+        if (d->queue_busy && devd_queue_set_flag(d->udev_run_root, DEVD_QUEUE_FLAG_FILE, false) == 0)
+                d->queue_busy = false;
+
+        /*
+         * An event that arrived during the drain was handled by it and will
+         * not wake the loop again, so the value just written would stay behind
+         * the kernel's for good. Come round once more through the timer
+         * rather than looping here, so a steady stream of events cannot keep
+         * signals and the settle timer waiting.
+         */
+        if (devd_queue_read_u64(path, &after) == 0 && after != before && !d->queue_event) {
+                r = pico_timer_add(d->timer, now_monotonic(), devd_queue_recheck, d, &d->queue_event);
+                if (r < 0)
+                        pico_log(PICO_LOG_DEBUG, "devd: cannot arm the queue recheck: %s", strerror(-r));
+        }
 }
 
 int devd_loop_setup(Devd *d) {
@@ -1284,6 +1404,9 @@ int devd_loop_run(Devd *d) {
                                          devd_epoll_source_to_string(tag->source),
                                          strerror(-r));
                 }
+
+                if (d->objective == DEVD_RUNNING)
+                        devd_queue_update(d);
         }
 
         return 0;

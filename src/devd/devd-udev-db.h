@@ -20,9 +20,9 @@
  * (src/compat/libsystemd/device-db.c) as upstream does.
  *
  * Absent, each being a record type devd has nothing to put in: `S:` (devlinks -- the compat layer scans /dev
- * for those), `L:` (link priority), `G:`/`Q:` (tags; devd has no TAG+=), `W:` (watch). And never any of
- * /run/udev/control, /run/udev/queue or /run/udev/tags/: software takes `control` to mean a udevd is
- * running, and libudev-queue.c answers that question from it on purpose.
+ * for those), `L:` (link priority), `G:`/`Q:` (tags; devd has no TAG+=), `W:` (watch). And never
+ * /run/udev/control or /run/udev/tags/: software takes `control` to mean a udevd is running, and
+ * libudev-queue.c answers that question from it on purpose. /run/udev/queue is devd-queue.h's.
  */
 
 #pragma once

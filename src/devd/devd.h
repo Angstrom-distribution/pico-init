@@ -40,14 +40,16 @@
  * the links rules name), devd-media.c (the mount policy), devd-rules.c (the
  * rules parser), devd-match.c (what a rule means), devd-run.c (the RUN+=
  * child), devd-modalias.c (module autoloading), devd-input-id.c (input
- * classification) and devd-udev-db.c (the udev database entry that
- * classification is published through).
+ * classification), devd-udev-db.c (the udev database entry that
+ * classification is published through) and devd-queue.c (the queue state
+ * `udevadm settle` waits on).
  */
 
 #pragma once
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "../signal.h"
 #include "../timer.h"
@@ -55,6 +57,7 @@
 #include "devd-block.h"
 #include "devd-loop.h"
 #include "devd-match.h"
+#include "devd-queue.h"
 #include "devd-rules.h"
 #include "devd-run.h"
 #include "devd-udev-db.h"
@@ -169,11 +172,27 @@ struct Devd {
          */
         char boot_disk[DEVD_NAME_MAX];
 
+
+        /*
+         * --- the queue state `udevadm settle` reads (devd-queue.h) ---
+         *
+         * queue_event re-runs the idle check when an event arrived while the
+         * check itself was draining the socket; its handle slot lives here for
+         * the reason settle_event's does.
+         */
+        PicoTimerEvent *queue_event;
+        uint64_t queue_seqnum; /* last value written to the seqnum file */
+        bool queue_published;  /* queue_seqnum has been written at least once */
+        bool queue_busy;       /* the udev queue flag file exists */
+        bool pid_published;    /* this devd wrote the pid file, so removes it */
+
         /* --- paths, all owned and all settable --- */
         char *sys_root;
         char *dev_root;
         char *media_root;
         char *udev_db_root;
+        char *run_root;      /* DEVD_RUN_ROOT: pid and seqnum */
+        char *udev_run_root; /* DEVD_UDEV_RUN_ROOT: the queue flag */
 
         DevdObjective objective;
 };
@@ -187,6 +206,17 @@ int devd_set_sys_root(Devd *d, const char *path);
 int devd_set_dev_root(Devd *d, const char *path);
 int devd_set_media_root(Devd *d, const char *path);
 int devd_set_udev_db_root(Devd *d, const char *path);
+int devd_set_run_root(Devd *d, const char *path);
+int devd_set_udev_run_root(Devd *d, const char *path);
+
+/*
+ * Publish the queue state: read the kernel's event counter, drain the uevent
+ * socket, and if nothing is left in flight write the counter to the seqnum
+ * file and drop the busy flag; otherwise raise the flag. Called after every
+ * loop iteration and at the end of startup. Best-effort: a failure to write
+ * leaves settle waiting for its timeout, never stops devd.
+ */
+void devd_queue_update(Devd *d);
 
 /*
  * Subscribe first, then walk. The ordering is netd's own stated convention
