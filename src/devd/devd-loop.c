@@ -634,11 +634,15 @@ static void react_disk(Devd *d, const char *disk, const char *only_part) {
                 (void) devd_symlink_create(d->dev_root, part, &l);
 
                 /*
-                 * Mount policy, and the three things that stop it. The boot
-                 * disk belongs to PID 1 (devd-media.h); a no-auto partition
+                 * Mount policy, and the four things that stop it. An initramfs
+                 * mounts nothing (devd.h); the boot disk belongs to PID 1
+                 * (devd-media.h); a no-auto partition
                  * said not to (the DPS attribute bit, honoured here as well as
                  * in gpt_scan()); a non-data type is somebody else's job.
                  */
+                if (d->media_disabled)
+                        continue;
+
                 if (strcmp(disk, d->boot_disk) == 0)
                         continue;
 
@@ -1074,6 +1078,11 @@ int devd_startup(Devd *d) {
         };
 
         devd_find_boot_disk(d);
+
+        d->media_disabled = access("/etc/initrd-release", F_OK) == 0 ||
+                        access("/usr/lib/initrd-release", F_OK) == 0;
+        if (d->media_disabled)
+                pico_log(PICO_LOG_DEBUG, "devd: running in an initramfs, nothing will be mounted");
 
         /*
          * Busy until the first devd_queue_update() below says otherwise. A
