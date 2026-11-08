@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: 2026 Koen Kooi
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+option(
+  'udev-compat',
+  type: 'boolean',
+  value: true,
+  description: 'Install udevadm and the ${prefix}/lib/udev/udevd alias for devd; turn off when real udev provides them',
+)
