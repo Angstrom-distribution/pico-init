@@ -7,6 +7,13 @@
           half and a later TimeoutSec= overrides both. 0 and infinity mean no
           timeout.
 
+        * DefaultDependencies= is read from [Unit] instead of being logged as
+          an unknown directive and recorded as dropped, so units such as
+          zram-swap.service load without a warning. DefaultDependencies=no
+          skips the orderings pico-init adds on its own: a target after what
+          it pulls in (also skipped when the pulled unit has it), and a
+          service after sockets.target. See docs/INCOMPATIBILITIES.md.
+
 # CHANGES WITH 0.4.0:
 
         netd reads [Address], [Route] and [IPv6AcceptRA] sections and takes
