@@ -263,8 +263,9 @@ deletes the file instead of writing an empty one.
 
 Records devd does not write: `S:` (devlinks, the compatibility library scans
 `/dev` instead), `L:`, `G:`, `Q:` and `W:`. devd also never creates
-`/run/udev/control`, `/run/udev/queue` or `/run/udev/tags/`, since software
-treats `control` as proof that udevd is running.
+`/run/udev/control` or `/run/udev/tags/`, since software treats `control` as
+proof that udevd is running. `/run/udev/queue` is described under
+[Queue state](#queue-state-and-udevadm-settle).
 
 ## Rules
 
@@ -413,6 +414,50 @@ Each skipped rule is logged once at load, for the first 16, followed by a
 summary of loaded and skipped counts. A skipped rule that contained a `GOTO`
 no longer jumps, so the rules after it are reached where udev would have
 skipped them.
+
+## Queue state and udevadm settle
+
+`udevadm settle` has to wait until devd has handled every event the kernel
+had sent when settle started, including the ones `udevadm trigger` has just
+caused. A flag file alone cannot say that: trigger returns as soon as the
+kernel has queued the events on devd's socket, before devd has read them. So
+devd publishes the kernel's own event counter as well:
+
+| File | Content | Written |
+| --- | --- | --- |
+| `/run/devd/pid` | devd's pid | at startup; removed at exit |
+| `/run/devd/seqnum` | a value of `/sys/kernel/uevent_seqnum` | when devd is idle; removed at startup and at exit |
+| `/run/udev/queue` | empty | exists while devd is busy, udev's own flag |
+
+After every pass of its event loop, and at the end of startup, devd reads
+`/sys/kernel/uevent_seqnum`, then reads its socket until it is empty. If no
+settle window is open and no `RUN+=` or `modprobe` child is still running,
+it writes the counter it read to `/run/devd/seqnum` (replacing the file
+atomically) and removes `/run/udev/queue`; otherwise it creates
+`/run/udev/queue`. Every event numbered up to the published value has
+therefore been handled. If the counter moved while the socket was being
+read, devd arms its timer to look again at once, because an event handled in
+that read does not wake the loop a second time.
+
+The counter devd publishes is the kernel's, not the `SEQNUM` of the last
+event devd received. Events devd never receives (for devices in another
+network namespace, or events lost when the socket overran and devd re-walked
+`/sys`) still advance the counter, and the next idle moment covers them.
+
+`udevadm settle` reads `/sys/kernel/uevent_seqnum` once when it starts, then
+checks every 10 ms until `/run/devd/seqnum` has reached that value and
+`/run/udev/queue` does not exist, the `--exit-if-exists` file appears, or
+the timeout passes (120 s by default, `--timeout=0` checks once). As with
+udevd, a devd that is not running (no `/run/devd/pid`, or the pid is gone, a
+zombie, or not named `devd`, `udevd` or `systemd-udevd`) means there is
+nothing to wait for, and settle exits 0.
+
+A `RUN+=` program that does not exit keeps devd busy, and settle then waits
+for its timeout. udevd kills such a program after its event timeout; devd
+does not.
+
+`/run/udev/queue` is also what libudev's `udev_queue_*` calls read, see
+[COMPATIBILITY_LIBRARIES.md](COMPATIBILITY_LIBRARIES.md).
 
 ## Not implemented compared to udev
 
