@@ -382,6 +382,67 @@ static void test_degradation_record_covers_deps_and_timeouts(void) {
 }
 
 /*
+ * TimeoutSec= sets both halves; whichever of TimeoutSec=, TimeoutStartSec=
+ * and TimeoutStopSec= comes later in the unit wins for the half it covers.
+ */
+static void check_timeouts(const char *body, usec_t start, usec_t stop, const char *degraded) {
+        Manager *m;
+        char *dir;
+        char *joined;
+        Unit *u;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir, "t.service", body), 0);
+
+        m = manager_for(dir);
+        u = load_one(m, "t.service");
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        ASSERT_TRUE(((Service *) u)->timeout_start_usec == start);
+        ASSERT_TRUE(((Service *) u)->timeout_stop_usec == stop);
+
+        joined = unit_degraded_directives_string(u);
+        ASSERT_STREQ(joined, degraded);
+        free(joined);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+static void test_timeout_sec(void) {
+        const usec_t def = 90 * USEC_PER_SEC;
+
+        check_timeouts("[Service]\nExecStart=/bin/true\nTimeoutSec=30\n",
+                       30 * USEC_PER_SEC,
+                       30 * USEC_PER_SEC,
+                       "");
+        check_timeouts("[Service]\nExecStart=/bin/true\nTimeoutSec=0\n", USEC_INFINITY, USEC_INFINITY, "");
+        check_timeouts("[Service]\nExecStart=/bin/true\nTimeoutSec=infinity\n", USEC_INFINITY, USEC_INFINITY, "");
+        /* Later halves override TimeoutSec=. */
+        check_timeouts("[Service]\nExecStart=/bin/true\nTimeoutSec=30\nTimeoutStartSec=5\n",
+                       5 * USEC_PER_SEC,
+                       30 * USEC_PER_SEC,
+                       "");
+        check_timeouts("[Service]\nExecStart=/bin/true\nTimeoutSec=30\nTimeoutStopSec=0\n",
+                       30 * USEC_PER_SEC,
+                       USEC_INFINITY,
+                       "");
+        /* Earlier halves are overridden by a later TimeoutSec=. */
+        check_timeouts("[Service]\nExecStart=/bin/true\nTimeoutStartSec=5\nTimeoutStopSec=7\nTimeoutSec=30\n",
+                       30 * USEC_PER_SEC,
+                       30 * USEC_PER_SEC,
+                       "");
+        /* A bad value keeps the default, or the value set before it. */
+        check_timeouts("[Service]\nExecStart=/bin/true\nTimeoutSec=bogus\n", def, def, "TimeoutSec=");
+        check_timeouts("[Service]\nExecStart=/bin/true\nTimeoutSec=30\nTimeoutSec=bogus\n",
+                       30 * USEC_PER_SEC,
+                       30 * USEC_PER_SEC,
+                       "TimeoutSec=");
+}
+
+/*
  * A second, independently-valid ExecStart= line replaces the first, and
  * the replacement is visible in the degradation record --
  * config_parse_exec_start() mirrors config_parse_exec_start_pre()'s
@@ -2651,6 +2712,7 @@ int main(void) {
         test_unknown_directives_are_tolerated();
         test_degradation_record();
         test_degradation_record_covers_deps_and_timeouts();
+        test_timeout_sec();
         test_repeated_exec_start_is_recorded();
         test_environment_directives();
         test_malformed_line_skips_only_that_line();

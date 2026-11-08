@@ -1,3 +1,12 @@
+# CHANGES WITH 0.5.0 in spe:
+
+##        PID 1 and unit files:
+
+        * TimeoutSec= is read and sets TimeoutStartSec= and TimeoutStopSec=
+          together. A later TimeoutStartSec= or TimeoutStopSec= overrides its
+          half and a later TimeoutSec= overrides both. 0 and infinity mean no
+          timeout.
+
 # CHANGES WITH 0.4.0:
 
         netd reads [Address], [Route] and [IPv6AcceptRA] sections and takes
