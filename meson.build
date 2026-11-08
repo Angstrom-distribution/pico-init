@@ -592,6 +592,8 @@ devd_core_sources = files(
   # published through for the compat libsystemd to overlay.
   'src/devd/devd-input-id.c',
   'src/devd/devd-udev-db.c',
+  # The queue state `udevadm settle` waits on; udevadm links it too.
+  'src/devd/devd-queue.c',
   # The MBR disk signature behind by-partuuid on a disk without a GPT.
   'src/devd/devd-mbr.c',
 )
@@ -643,6 +645,8 @@ devd_tests = [
   'test-devd-udev-db',
   # The udevd-compatible command line and udev.* kernel parameters.
   'test-devd-opts',
+  # The queue state files, and udevadm against a fixture sysfs and /dev.
+  'test-devd-queue',
   # The MBR signature checks and the PARTUUID spelling.
   'test-devd-mbr',
 ]

@@ -4,9 +4,9 @@
 /*
  * udev_queue: upstream's own definition of these answers is the presence
  * of /run/udev/control (a udevd is running) and /run/udev/queue (events
- * are pending). devd creates neither, so a consumer asking gets the true
- * state -- no udevd, nothing queued -- which is also what real libudev
- * reports on any system where udevd is not running.
+ * are pending). devd never creates control, so a consumer is told no udevd
+ * is running, which is true. devd does create queue while it has events in
+ * flight (devd-queue.h), so the "is the queue empty" answers here are real.
  */
 
 #include "libudev.h"
