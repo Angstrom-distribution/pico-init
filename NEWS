@@ -1,3 +1,25 @@
+# CHANGES WITH 0.5.1:
+
+        0.5.0 did not build with --buildtype=minsize (-Os), which the
+        OpenEmbedded recipe uses. This release fixes that and makes CI build
+        that configuration too. Nothing else changed.
+
+##        netd:
+
+        * netctl status copied a drop-in path into a buffer one line shorter
+          than its source, which the compiler rejects at -Os. The buffer now
+          fits the whole line.
+
+##        Build and tests:
+
+        * CI also configures with --buildtype=minsize, builds and runs the
+          tests, since a warning that only appears at -Os went unnoticed in
+          0.5.0.
+
+##        Contributions from:
+
+        Koen Kooi
+
 # CHANGES WITH 0.5.0:
 
         Unit files and .network files can be changed with drop-in files, as
