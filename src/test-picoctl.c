@@ -597,6 +597,26 @@ static void test_mask_unmask(void) {
         ASSERT_TRUE(strstr(res.out, "ExecStart=/bin/sleep 100") != NULL);
         ASSERT_EQ_INT(res.exit_code, 0);
 
+        /* with drop-ins: each one after the unit file, behind its own header */
+        {
+                char dropdir[PATH_MAX], mark[2 * PATH_MAX];
+
+                snprintf(dropdir, sizeof(dropdir), "%s%s/foo.service.d", root, PICO_UNIT_DIR);
+                ASSERT_EQ_INT(mkdir(dropdir, 0755), 0);
+                ASSERT_EQ_INT(test_write_file(dropdir, "20-b.conf", "[Service]\nEnvironment=B=2\n"), 0);
+                ASSERT_EQ_INT(test_write_file(dropdir, "10-a.conf", "[Service]\nEnvironment=A=1\n"), 0);
+
+                RUN_PICOCTL(&res, "--root", root, "cat", "foo.service");
+                ASSERT_EQ_INT(res.exit_code, 0);
+                snprintf(mark, sizeof(mark), "\n\n# %s/10-a.conf\n[Service]\nEnvironment=A=1\n", dropdir);
+                ASSERT_TRUE(strstr(res.out, mark) != NULL);
+                snprintf(mark,
+                         sizeof(mark),
+                         "Environment=A=1\n\n# %s/20-b.conf\n[Service]\nEnvironment=B=2\n",
+                         dropdir);
+                ASSERT_TRUE(strstr(res.out, mark) != NULL);
+        }
+
         test_rm_rf(root);
         free(root);
 }

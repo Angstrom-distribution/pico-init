@@ -2330,12 +2330,26 @@ static int cmd_unmask(int argc, char *argv[]) {
         return status;
 }
 
+static void cat_file_contents(const char *path) {
+        FILE *f = fopen(path, "re");
+        char buf[4096];
+        size_t got;
+
+        if (!f)
+                return;
+
+        while ((got = fread(buf, 1, sizeof(buf), f)) > 0)
+                fwrite(buf, 1, got, stdout);
+        fclose(f);
+}
+
 /*
  * cat: upstream's exact "# /path\n" header (cat_file(), src/shared/pretty-
  * print.c -- ansi_highlight_blue()/ansi_normal() are both empty off a tty,
  * which picoctl always is) followed by the fragment verbatim. A masked
  * unit gets upstream's own "# <path> is a mask." line instead of trying to
- * cat /dev/null as a unit file. Drop-ins are not printed.
+ * cat /dev/null as a unit file. Each applied drop-in follows, after a blank
+ * line and its own "# path" header, in the order they apply.
  *
  * Known gap: load_install_info() requires a fragment that actually parsed
  * (UNIT_LOADED), so `cat` on a syntactically-broken unit file reports
@@ -2378,16 +2392,10 @@ static int cmd_cat(int argc, char *argv[]) {
                 }
 
                 printf("# %s\n", u->fragment_path);
-                {
-                        FILE *f = fopen(u->fragment_path, "re");
-                        char buf[4096];
-                        size_t got;
-
-                        if (f) {
-                                while ((got = fread(buf, 1, sizeof(buf), f)) > 0)
-                                        fwrite(buf, 1, got, stdout);
-                                fclose(f);
-                        }
+                cat_file_contents(u->fragment_path);
+                for (char **d = u->dropin_paths; d && *d; d++) {
+                        printf("\n# %s\n", *d);
+                        cat_file_contents(*d);
                 }
 
                 manager_free(m);
