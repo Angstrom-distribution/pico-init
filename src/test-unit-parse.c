@@ -531,6 +531,54 @@ static void test_repeated_exec_start_is_recorded(void) {
 }
 
 /*
+ * An empty ExecStart= forgets the command, so ExecStart= followed by a new
+ * ExecStart= replaces it without being recorded as a repeated directive. On
+ * its own it leaves a service without a command, which does not load.
+ */
+static void test_empty_exec_start_resets(void) {
+        Manager *m;
+        char *dir;
+        Unit *u;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "swap.service",
+                                      "[Service]\n"
+                                      "ExecStart=-/bin/true one\n"
+                                      "ExecStart=\n"
+                                      "ExecStart=/bin/true two\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "none.service",
+                                      "[Service]\n"
+                                      "ExecStart=/bin/true one\n"
+                                      "ExecStart=\n"),
+                      0);
+
+        m = manager_for(dir);
+        (void) manager_load_units(m, NULL); /* none.service fails, by design */
+
+        u = manager_get_unit(m, "swap.service");
+        ASSERT_TRUE(u != NULL);
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        ASSERT_STREQ(((Service *) u)->exec_start[0], "/bin/true");
+        ASSERT_STREQ(((Service *) u)->exec_start[1], "two");
+        ASSERT_TRUE(((Service *) u)->exec_start[2] == NULL);
+        ASSERT_EQ_INT(((Service *) u)->exec_start_ignore, false);
+        ASSERT_EQ_INT(u->n_degraded_directives, 0);
+
+        u = manager_get_unit(m, "none.service");
+        ASSERT_TRUE(u != NULL);
+        ASSERT_EQ_INT(u->load_state, UNIT_ERROR);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
+/*
  * Environment=/EnvironmentFile= are parsed and stored, not degraded.
  * Quoting matches ExecStart= (pico_extract_first_word()), each word is
  * %-expanded individually, an empty rvalue resets the accumulated list, and
@@ -2775,6 +2823,7 @@ int main(void) {
         test_backslash_pairs_do_not_continue();
         test_section_header_and_key_validation();
         test_section_handler_reports_headers();
+        test_empty_exec_start_resets();
         test_exec_start_pre_list_and_reset();
         test_standard_output_and_error();
         test_invalid_dependency_names_are_rejected();
