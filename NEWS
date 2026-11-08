@@ -14,6 +14,20 @@
           it pulls in (also skipped when the pulled unit has it), and a
           service after sockets.target. See docs/INCOMPATIBILITIES.md.
 
+##        picoctl:
+
+        * A unit that does not exist is reported as systemctl reports it.
+          status prints only "Unit foo.service could not be found." on
+          stderr, without the Loaded: and Active: lines, and exits 4. start,
+          restart and reload print "Failed to start foo.service: Unit
+          foo.service not found." and exit 5; stop prints "Failed to stop
+          foo.service: Unit foo.service not loaded." and exits 5. enable,
+          reenable, disable and preset print "Failed to enable unit: Unit
+          foo.service does not exist". is-enabled -q prints nothing, and
+          picoctl no longer prints debug messages on stderr. With several
+          units status and the job verbs exit with the status of the first
+          failure.
+
 # CHANGES WITH 0.4.0:
 
         netd reads [Address], [Route] and [IPv6AcceptRA] sections and takes

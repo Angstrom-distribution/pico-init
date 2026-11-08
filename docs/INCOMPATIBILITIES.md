@@ -449,6 +449,14 @@ A unit with `User=` whose account exists in the passwd database gets `USER`,
 - Only `Requires=`, `Wants=`, `Before=`, `After=` and `Conflicts=` are
   dependency directives. `Requisite=`, `BindsTo=`, `PartOf=`, `Upholds=`,
   `OnFailure=`, `OnSuccess=` and `PropagatesStopTo=` are recorded as dropped.
+- `picoctl start A B` sends one job per unit. When one of them does not
+  exist, the others are still started and one `Failed to start X: ...` line
+  is printed per unit; `systemctl` enqueues the units as a single
+  transaction, starts none of them and prints one `Failed to enqueue jobs:
+  Unit X not found.` line. The exit status is 5 in both.
+- `picoctl try-restart`, `condrestart` and `try-reload-or-restart` leave a
+  unit that does not exist alone and exit 0; `systemctl` prints `Failed to
+  try-restart X: Unit X not found.` and exits 5.
 
 ## See also
 

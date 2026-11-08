@@ -127,7 +127,28 @@ minute.
 ## Exit status
 
 The statuses follow `systemctl`: `is-active` returns 0, 3 or 4 and
-`is-failed` 0, 1 or 4, as the LSB init scripts do, `status` returns 3 for a unit that is not active
-and 4 for one that is unknown, `is-enabled` returns 4 for an unknown unit, and
-`is-system-running` returns 0 only for `running`. Everything refused returns
-1.
+`is-failed` 0, 1 or 4, as the LSB init scripts do, `status` returns 3 for a
+unit that is not active and 4 for one that is unknown, `is-enabled` returns 4
+for an unknown unit, and `is-system-running` returns 0 only for `running`.
+With several units `status` returns the first non-zero status and the job
+verbs the status of the first failure. Everything else refused returns 1.
+
+### Unknown units
+
+A unit name without a type gets `.service`. A unit that does not exist is
+reported as `systemctl` reports it:
+
+| Verb | stdout | stderr | Status |
+|------|--------|--------|--------|
+| `status` | nothing | `Unit foo.service could not be found.` | 4 |
+| `is-active`, `is-failed` | `inactive` | nothing | 4 |
+| `is-enabled` | `not-found` | nothing | 4 |
+| `show` | `Id=`, `LoadState=not-found`, `ActiveState=inactive`, `SubState=dead` | nothing | 0 |
+| `start`, `restart`, `reload`, `reload-or-restart` | nothing | `Failed to VERB foo.service: Unit foo.service not found.` | 5 |
+| `stop`, `condstop` | nothing | `Failed to stop foo.service: Unit foo.service not loaded.` | 5 |
+| `reset-failed` | nothing | `Failed to reset failed state of unit foo.service: Unit foo.service not loaded.` | 1 |
+| `kill` | nothing | `Failed to kill unit foo.service: Unit foo.service not loaded.` | 1 |
+| `enable`, `reenable`, `disable`, `preset` | nothing | `Failed to VERB unit: Unit foo.service does not exist` | 1 |
+
+`-q` silences `is-active`, `is-failed` and `is-enabled` and keeps the status.
+The `try-` verbs differ; see [INCOMPATIBILITIES.md](INCOMPATIBILITIES.md).
