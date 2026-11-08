@@ -144,6 +144,7 @@ logged and skipped.
 | `RemainAfterExit=`      | Boolean.                                        |
 | `TimeoutStartSec=`      | Time span or `infinity`.                        |
 | `TimeoutStopSec=`       | Time span or `infinity`.                        |
+| `TimeoutSec=`           | Time span or `infinity`. Sets `TimeoutStartSec=` and `TimeoutStopSec=`; a later assignment of either overrides its half. |
 | `StandardInput=`        | `socket`, `tty`, `tty-force`, `tty-fail`.       |
 | `StandardOutput=`, `StandardError=` | `inherit`, `journal`, `syslog`, `null`, and the `+console` spellings. |
 | `TTYPath=`              | Absolute path; full specifiers.                 |
@@ -196,7 +197,7 @@ degradation record.
 | `StandardInput=` other than the four above (`null`, `file:`, `data`, ...) | Ignored. | `StandardInput` |
 | `StandardOutput=`, `StandardError=` with another value (`console`, `tty`, `kmsg`, `file:`, `socket`, ...) | Ignored. | the directive name |
 | `TTYPath=` not absolute    | Ignored.                                        | `TTYPath` |
-| `RestartSec=`, `TimeoutStartSec=`, `TimeoutStopSec=`, `StartLimitIntervalSec=`, `StartLimitBurst=` that do not parse | Ignored, the previous value is kept. | the directive name followed by `=` |
+| `RestartSec=`, `TimeoutStartSec=`, `TimeoutStopSec=`, `TimeoutSec=`, `StartLimitIntervalSec=`, `StartLimitBurst=` that do not parse | Ignored, the previous value is kept. | the directive name followed by `=` |
 | A second `ExecStart=`      | Replaces the first.                             | `ExecStart=multiple` |
 | `Exec*=` with a `@`, `+`, `!` or `:` prefix | The whole line is ignored.      | `ExecStart=@` (and so on, with the directive and prefix) |
 | `Condition*=|...`          | Triggering conditions are dropped.              | `ConditionPathExists=|` |
@@ -225,7 +226,7 @@ is a load failure (below).
   `min`, `m` or `h`, or `infinity`. A plain number is seconds. Compound
   spans such as `1min 30s` and other unit names such as `sec` or `d` are
   not accepted and trip the degradation above.
-- **`TimeoutStartSec=0` and `TimeoutStopSec=0`** mean `infinity`, as in
+- **`TimeoutStartSec=0`, `TimeoutStopSec=0` and `TimeoutSec=0`** mean `infinity`, as in
   systemd. `RestartSec=0` means restart immediately.
 - **Defaults** are 90 seconds for both timeouts, 100 ms for `RestartSec=`,
   and 5 starts in 10 seconds for the start limit. There is no
