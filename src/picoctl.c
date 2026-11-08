@@ -4552,6 +4552,8 @@ int main(int argc, char *argv[]) {
         int argi, rc_opts;
         size_t i;
 
+        pico_log_set_max_level(PICO_LOG_INFO);
+
         /* argv[0] dispatch, before any option/verb parsing: a real reboot(8)/
          * poweroff(8)/halt(8)/shutdown(8) invocation never passes a verb. */
         prog0 = strrchr(argv[0], '/');

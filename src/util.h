@@ -53,6 +53,13 @@ void pico_log_internal(PicoLogLevel level, const char *format, ...) __attribute_
  */
 void pico_log_to_kmsg(void);
 
+/*
+ * Drop pico_log() messages less severe than `max`. The default keeps every
+ * level, as the daemons want; picoctl lowers it to INFO because systemctl
+ * prints nothing at debug level.
+ */
+void pico_log_set_max_level(PicoLogLevel max);
+
 #define pico_log(level, ...) pico_log_internal((level), __VA_ARGS__)
 
 /* strdup returning NULL on OOM (plain strdup, named to avoid confusion later) */

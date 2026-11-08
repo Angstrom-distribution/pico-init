@@ -71,6 +71,12 @@ static int log_level_syslog_priority(PicoLogLevel level) {
         return 6;
 }
 
+static PicoLogLevel log_max_level = PICO_LOG_DEBUG;
+
+void pico_log_set_max_level(PicoLogLevel max) {
+        log_max_level = max;
+}
+
 /* Where pico_log() writes: stderr until a daemon opts into /dev/kmsg; see
  * pico_log_to_kmsg() in util.h. */
 static int log_fd = STDERR_FILENO;
@@ -98,6 +104,9 @@ void pico_log_internal(PicoLogLevel level, const char *format, ...) {
         char buf[1024];
         int prefix_len, msg_len, total;
         va_list ap;
+
+        if (level > log_max_level)
+                return;
 
         if (log_fd_is_kmsg)
                 prefix_len = snprintf(
