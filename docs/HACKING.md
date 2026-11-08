@@ -11,9 +11,9 @@ running system see [DEBUGGING.md](DEBUGGING.md).
 
 Pico-init is a meson project written in C (`gnu17`). `warning_level=3` and
 `werror=true` are the project defaults, so a new warning breaks the build.
-The minimum meson version is 0.62.0. `meson.build` defines no project options
-of its own; the usual built-in options (`--prefix`, `--libdir`, `--buildtype`
-and so on) apply.
+The minimum meson version is 0.62.0. The one project option is `udev-compat`
+(see `meson_options.txt`); the usual built-in options (`--prefix`, `--libdir`,
+`--buildtype` and so on) apply.
 
 ```
 meson setup build
@@ -37,7 +37,9 @@ without `python3` the pkg-config template tests are not defined. The
 - `pico-init` (PID 1), `picoctl` (control client), `netd`, `devd` and
   `logd` install to `sbindir`.
 - `pico-unit-lint` (runs the unit parser over an installed tree), `netctl`,
-  `picolog` and `pico-tmpfiles` install to `bindir`.
+  `picolog`, `pico-tmpfiles` and `udevadm` (devd's) install to `bindir`;
+  `udevadm` and the `$prefix/lib/udev/udevd` link to `devd` only with the
+  `udev-compat` option, which is on by default.
 - `libsystemd.so` and `libudev.so` install to `libdir`; see
   [COMPATIBILITY_LIBRARIES.md](COMPATIBILITY_LIBRARIES.md).
 - Daemon details are in [NETD.md](NETD.md), [DEVD.md](DEVD.md) and
@@ -242,7 +244,7 @@ Everything is under `src/`.
 - `src/picoctl.c`, `src/pico-unit-lint.c`: client tools.
 - `src/netd/`: network daemon, `netctl`, `lldp/`, and `dhcp/` (code lifted
   from systemd).
-- `src/devd/`: device daemon and its udev-rule engine.
+- `src/devd/`: device daemon, its udev-rule engine, and `udevadm`.
 - `src/logd/`: log daemon and `picolog`.
 - `src/tmpfiles/`: `pico-tmpfiles`.
 - `src/compat/libsystemd/`, `src/compat/libudev/`: compatibility libraries

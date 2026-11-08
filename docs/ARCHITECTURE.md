@@ -20,6 +20,7 @@ talk to each other and the data structures inside PID 1.
 | `logd`         | `sbin`       | Log daemon, replaces journald              |
 | `picolog`      | `bin`        | `journalctl` equivalent, reads the log ring|
 | `devd`         | `sbin`       | Device hotplug daemon, replaces udevd      |
+| `udevadm`      | `bin`        | `udevadm` subset for `devd`                |
 | `pico-tmpfiles`| `bin`        | `systemd-tmpfiles --create/--clean/--remove`|
 | `pico-unit-lint`| `bin`       | Reports directives PID 1 would drop        |
 | `libsystemd.so.0` | `libdir`  | Compatibility library, systemd's ABI       |
