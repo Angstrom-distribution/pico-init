@@ -538,6 +538,30 @@ cannot show:
   in netd and the link stays configured. `systemd-networkd` puts the link
   into the failed state.
 
+`foo.network.d` drop-ins hide, sort and reset as unit drop-ins do (see
+[Drop-in files](#drop-in-files)), but only the file's own `foo.network.d` is
+read in each search directory, as in `systemd-networkd`: there is no
+`network.d` and no dash-truncated name. The differences from
+`systemd-networkd`:
+
+- The search path is `/etc/systemd/network`, `/run/systemd/network` and
+  `/usr/lib/systemd/network`; `/usr/local/lib/systemd/network` is not read.
+- A drop-in that is a link to `/dev/null` or is empty hides the same name in
+  a later directory and adds nothing. `systemd-networkd` hides the name too,
+  but refuses to open a `/dev/null` drop-in and then does not load the
+  `.network` file at all.
+- A `.network` file that is itself a link to one of its drop-ins is read
+  twice here; `systemd-networkd` reads it once, as a drop-in.
+- A drop-in that cannot be read, such as an unreadable file (`EACCES`), costs
+  that file with a warning; the `.network` file still loads.
+  `systemd-networkd` fails to load the `.network` file at all when opening a
+  listed drop-in fails for any reason but a missing file. An entry that
+  cannot be resolved at all, such as a link loop, is dropped by networkd with
+  a warning while listing, so it does not hide a drop-in of the same name in a
+  later directory; netd lists names first, so there it does hide it.
+- `netctl cat` prints the `.network` file without its drop-ins, where
+  `networkctl cat` prints both. `netctl status` lists them.
+
 ## See also
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) for the unit model and the job engine.
