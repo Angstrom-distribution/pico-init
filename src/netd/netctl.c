@@ -783,6 +783,46 @@ static void print_field_plain(const char *label, const char *value) {
         printf("%s%*s:%s %s\n", field_label_color(), LABEL_WIDTH, label, pico_ansi_normal(), value);
 }
 
+/* networkctl draws the drop-ins as a tree under the file; a line is held back
+ * until the next one shows whether it is the last. */
+static void print_network_dropin(const char *path, bool last) {
+        printf("%*s  %s%s\n",
+               LABEL_WIDTH,
+               "",
+               last ? "\xe2\x94\x94\xe2\x94\x80" : "\xe2\x94\x9c\xe2\x94\x80",
+               path);
+}
+
+static void iface_print_network_dropins(const char *ifname) {
+        char path[128], line[PATH_MAX + 32], held[PATH_MAX];
+        unsigned idx = if_nametoindex(ifname);
+        const char key[] = "NETWORK_DROPIN=";
+        bool have = false;
+        FILE *f;
+
+        if (idx == 0)
+                return;
+
+        netd_link_file_path(idx, path, sizeof path);
+        f = fopen(path, "re");
+        if (!f)
+                return;
+
+        while (fgets(line, sizeof line, f)) {
+                line[strcspn(line, "\n")] = '\0';
+                if (strncmp(line, key, sizeof key - 1) != 0)
+                        continue;
+                if (have)
+                        print_network_dropin(held, false);
+                snprintf(held, sizeof held, "%s", line + sizeof key - 1);
+                have = true;
+        }
+        fclose(f);
+
+        if (have)
+                print_network_dropin(held, true);
+}
+
 typedef struct {
         char v[FIELD_MAX][FIELD_VAL_LEN];
         int n;
@@ -968,8 +1008,10 @@ static void status_one(const char *ifname) {
 
                 printf("%s\xe2\x97\x8f%s %u: %s\n", on_op, off_op, idx, ifname); /* U+25CF BLACK CIRCLE */
 
-                if (iface_network_file(ifname, buf, sizeof buf))
+                if (iface_network_file(ifname, buf, sizeof buf)) {
                         print_field_plain("Network File", buf);
+                        iface_print_network_dropins(ifname);
+                }
 
                 printf("%s%*s:%s %s%s%s (%s%s%s)\n",
                        field_label_color(),
