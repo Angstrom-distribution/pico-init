@@ -89,6 +89,7 @@
  */
 static void unit_swap_directives(Unit *u, Unit *fresh) {
         SWAP_FIELD(u->description, fresh->description);
+        SWAP_FIELD(u->default_dependencies, fresh->default_dependencies);
         SWAP_FIELD(u->condition_path_exists, fresh->condition_path_exists);
         SWAP_FIELD(u->condition_path_exists_negated, fresh->condition_path_exists_negated);
         SWAP_FIELD(u->condition_path_is_directory, fresh->condition_path_is_directory);

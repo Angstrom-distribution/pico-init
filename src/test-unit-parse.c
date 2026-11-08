@@ -411,6 +411,57 @@ static void check_timeouts(const char *body, usec_t start, usec_t stop, const ch
         free(dir);
 }
 
+/*
+ * DefaultDependencies= is a boolean on every unit type: it defaults to yes,
+ * takes systemd's spellings, keeps the previous value on an invalid one and is
+ * not recorded as dropped.
+ */
+static void test_default_dependencies(void) {
+        Manager *m;
+        char *dir;
+
+        dir = test_tmpdir_new();
+        ASSERT_TRUE(dir != NULL);
+
+        ASSERT_EQ_INT(test_write_file(dir, "plain.service", "[Service]\nExecStart=/bin/true\n"), 0);
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "off.service",
+                                      "[Unit]\nDefaultDependencies=no\n[Service]\nExecStart=/bin/true\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "on.service",
+                                      "[Unit]\nDefaultDependencies=no\nDefaultDependencies=YES\n"
+                                      "[Service]\nExecStart=/bin/true\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "bad.service",
+                                      "[Unit]\nDefaultDependencies=no\nDefaultDependencies=maybe\n"
+                                      "[Service]\nExecStart=/bin/true\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir, "off.target", "[Unit]\nDefaultDependencies=false\n"), 0);
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "off.socket",
+                                      "[Unit]\nDefaultDependencies=0\n[Socket]\nListenStream=/run/x\n"),
+                      0);
+
+        m = manager_for(dir);
+        ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+
+        ASSERT_TRUE(manager_get_unit(m, "plain.service")->default_dependencies);
+        ASSERT_TRUE(!manager_get_unit(m, "off.service")->default_dependencies);
+        ASSERT_TRUE(manager_get_unit(m, "on.service")->default_dependencies);
+        ASSERT_TRUE(!manager_get_unit(m, "bad.service")->default_dependencies);
+        ASSERT_TRUE(!manager_get_unit(m, "off.target")->default_dependencies);
+        ASSERT_TRUE(!manager_get_unit(m, "off.socket")->default_dependencies);
+
+        ASSERT_EQ_INT(manager_get_unit(m, "off.service")->n_degraded_directives, 0);
+        ASSERT_EQ_INT(manager_count_degraded_units(m), 0);
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 static void test_timeout_sec(void) {
         const usec_t def = 90 * USEC_PER_SEC;
 
@@ -2754,6 +2805,7 @@ int main(void) {
         test_relative_exec_path_with_slash_is_rejected();
         test_supplementary_groups_parsed();
         test_shipped_seatd_and_picowl_units_load();
+        test_default_dependencies();
 
         printf("test-unit-parse: all checks passed\n");
         return 0;

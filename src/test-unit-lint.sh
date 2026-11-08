@@ -117,9 +117,9 @@ expect() {
 }
 
 expect "iiotool.service: 14 dropped: DynamicUser NoNewPrivileges PrivateTmp PrivateDevices ProtectSystem ProtectHome ProtectKernelTunables ProtectControlGroups RestrictAddressFamilies RestrictNamespaces SystemCallFilter MemoryHigh MemoryMax TasksMax"
-expect "volatile-binds@.service: 3 dropped: DefaultDependencies RequiresMountsFor ConditionPathIsReadWrite"
+expect "volatile-binds@.service: 2 dropped: RequiresMountsFor ConditionPathIsReadWrite"
 expect "refused.service: FAILED TO LOAD"
-expect "pico-unit-lint: 6 units in tree, 2 degraded (17 directives dropped), 1 failed to load"
+expect "pico-unit-lint: 6 units in tree, 2 degraded (16 directives dropped), 1 failed to load"
 
 # network.target and multi-user.target were referenced, never in the tree,
 # and must not be reported as anything.
@@ -173,10 +173,10 @@ printf '%s\n' "$qout" | grep -q '^pico-unit-lint:' && { echo "-q printed the sum
 printf '%s\n' "$qout" | grep -qxF "refused.service: FAILED TO LOAD" || { echo "-q dropped a finding" >&2; exit 1; }
 
 rout=$("$lint" --warn-only --root="$tree" system 2>/dev/null)
-printf '%s\n' "$rout" | grep -qxF "pico-unit-lint: 6 units in tree, 2 degraded (17 directives dropped), 1 failed to load" ||
+printf '%s\n' "$rout" | grep -qxF "pico-unit-lint: 6 units in tree, 2 degraded (16 directives dropped), 1 failed to load" ||
         { echo "--root= did not resolve DIR: $rout" >&2; exit 1; }
 
-"$lint" --warn-only --instance=other "$tree/system" 2>/dev/null | grep -qxF "volatile-binds@.service: 3 dropped: DefaultDependencies RequiresMountsFor ConditionPathIsReadWrite" ||
+"$lint" --warn-only --instance=other "$tree/system" 2>/dev/null | grep -qxF "volatile-binds@.service: 2 dropped: RequiresMountsFor ConditionPathIsReadWrite" ||
         { echo "--instance= broke template reporting" >&2; exit 1; }
 "$lint" --instance='a/b' "$tree/clean" >/dev/null 2>&1 && { echo "bad instance must fail" >&2; exit 1; }
 
