@@ -28,6 +28,22 @@ jobs:
       - name: Test
         run: sudo -E meson test -C build --print-errorlogs
 
+  # The OpenEmbedded recipe builds with --buildtype=minsize (-Os). GCC's
+  # -Wformat-truncation only fires at -Os here, so a default build does not
+  # catch what a shipped build rejects under -Werror.
+  build-minsize:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install meson and ninja
+        run: sudo apt-get update && sudo apt-get install -y meson ninja-build
+      - name: Configure
+        run: meson setup build --buildtype=minsize
+      - name: Build
+        run: ninja -C build
+      - name: Test
+        run: sudo -E meson test -C build --print-errorlogs
+
   format:
     runs-on: ubuntu-24.04
     steps:
