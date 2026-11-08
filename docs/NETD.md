@@ -74,7 +74,45 @@ higher-priority directory shadows the same name in a lower one; the shadowed
 file is never opened. The surviving files are sorted lexicographically by
 file name, and the first file whose `[Match]` matches an interface is the one
 used for it. Hence the usual `10-`, `15-` numeric prefixes keep their meaning.
-Drop-in directories (`foo.network.d/`) are not read.
+
+### Drop-ins
+
+The `.conf` files of `foo.network.d` are applied after `foo.network`, through
+the same parser, so they take the sections and keys the file takes. For
+example, this changes the DNS servers of a packaged file without copying it:
+
+```
+# /etc/systemd/network/10-eth0.network.d/10-dns.conf
+[Network]
+DNS=
+DNS=192.0.2.53
+```
+
+- The directory is `foo.network.d` in each of the three directories above,
+  whichever of them holds `foo.network`. networkd reads no other directory
+  for a `.network` file, so neither does netd: `network.d` and
+  dash-truncated names such as `10-.network.d` are not read.
+- Only names ending in `.conf` are read; names starting with a dot are
+  skipped. A name found in a higher-priority directory hides the same name
+  in a lower one, so an empty file or a link to `/dev/null` in
+  `/etc/systemd/network/foo.network.d` cancels a packaged drop-in.
+- The remaining files are applied sorted by file name, whichever directory
+  they are in. A key set by several files takes the last value, and an empty
+  assignment resets a list key (`Address=`, `DNS=`, `NTP=`, `Name=` in
+  `[Match]`) before the lines that follow it.
+- A section does not continue from one file into the next: the first
+  assignment of a drop-in needs its own section header, and an `[Address]` or
+  `[Route]` in a drop-in is a new entry.
+- A warning names the file and line it comes from, drop-in or not. A drop-in
+  that cannot be read is skipped with a warning and the rest still apply.
+- Without a `foo.network` there is nothing to apply the drop-ins to, so a
+  `foo.network.d` alone does nothing. An empty `foo.network` or a link to
+  `/dev/null` is a mask: the file and its drop-ins are skipped.
+
+`SIGHUP` and `netctl reload` read the directories again, so added, edited and
+removed drop-ins take effect. Each search directory is listed once per load,
+and only drop-in directories that exist are opened. `netctl status` lists the
+drop-ins of a link under `Network File`.
 
 ### Syntax
 
@@ -712,9 +750,11 @@ state files.
 IFNAME=usb0
 STATE=configured
 NETWORK=/etc/systemd/network/15-usb0.network
+NETWORK_DROPIN=/etc/systemd/network/15-usb0.network.d/10-dns.conf
 ```
 
-`STATE` is one of the following. `NETWORK` is omitted when no file matched.
+`STATE` is one of the following. `NETWORK` is omitted when no file matched;
+`NETWORK_DROPIN` appears once for each drop-in applied, in the order applied.
 
 | STATE | Meaning |
 | --- | --- |
@@ -821,8 +861,8 @@ file and run `reload` instead.
 
 `cat` with no argument fails: netd has no `networkd.conf`. `cat` searches
 `/etc/systemd/network`, `/run/systemd/network` and `/usr/lib/systemd/network`
-in that order, skips a masked file, and has no drop-in handling because netd
-reads none. `@DEVICE` prints the `.network` file netd matched (`NETWORK` in
+in that order and skips a masked file. It prints the file only, not its
+drop-ins. `@DEVICE` prints the `.network` file netd matched (`NETWORK` in
 `links/<ifindex>`); `@DEVICE:link` and `@DEVICE:netdev` are errors because netd
 reads neither. `mask` and `unmask` accept `.network`, `.netdev` and `.link`
 names, refuse to mask over a real file in `/etc` (or in `/run` with
@@ -861,7 +901,7 @@ them:
 
 | Row | Source |
 | --- | --- |
-| `Network File` | `NETWORK` from `links/<ifindex>`. |
+| `Network File` | `NETWORK` from `links/<ifindex>`, then one line per drop-in (`NETWORK_DROPIN`, in the order applied) drawn as a tree below it, as `networkctl status` does. |
 | `State` | Operational state and, in parentheses, the setup state. |
 | `Online state` | Always `unknown`. |
 | `Type` | `bridge` (sysfs), otherwise from the ARPHRD value. |
