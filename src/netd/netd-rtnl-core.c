@@ -86,6 +86,19 @@ int nl_add_attr(struct nl_request *req, unsigned short type, const void *data, s
         return 0;
 }
 
+struct rtattr *nl_nest_start(struct nl_request *req, unsigned short type) {
+        struct rtattr *nest = (struct rtattr *) (req->buf + req->len);
+
+        if (nl_add_attr(req, type, NULL, 0) < 0)
+                return NULL;
+
+        return nest;
+}
+
+void nl_nest_end(struct nl_request *req, struct rtattr *nest) {
+        nest->rta_len = (unsigned short) ((req->buf + req->len) - (uint8_t *) nest);
+}
+
 /* --- socket lifecycle --- */
 
 int nl_sock_open(NlSock *sock, bool subscribe_link_group) {

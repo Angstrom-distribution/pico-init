@@ -18,9 +18,10 @@
  *
  * The whole operation set is below and it is short by design: enumerate and
  * match links, subscribe to RTM_NEWLINK/RTM_DELLINK, bring a link up, add an
- * address, add a route including the default route. Nothing else. Everything
- * networkd's netlink surface additionally covers -- tunnels, bonding, bridge
- * and VLAN attributes, MACsec, WireGuard, tc, policy routing -- is out of
+ * address, add a route including the default route, replace or delete the
+ * root qdisc. Nothing else. Everything networkd's netlink surface
+ * additionally covers -- tunnels, bonding, bridge and VLAN attributes,
+ * MACsec, WireGuard, tc classes and filters, policy routing -- is out of
  * scope, and it was most of that type table.
  *
  * TWO SOCKETS. `event_fd` is subscribed to RTNLGRP_LINK and
@@ -54,6 +55,8 @@
 #include "netd-addr.h"
 
 typedef struct NetdRtnl NetdRtnl;
+struct nl_request;
+struct nlmsghdr;
 
 /* The maximum hardware address netd stores. 6 covers ether and the CDC-Subset
  * gadget; InfiniBand's 20 is not supported. */
@@ -74,6 +77,8 @@ typedef struct NetdRtnlLink {
 
         uint8_t hw_addr[NETD_HW_ADDR_MAX];
         size_t hw_addr_len; /* 0 when the link has no hardware address */
+
+        uint32_t num_tx_queues; /* IFLA_NUM_TX_QUEUES; 0 when the kernel did not say */
 } NetdRtnlLink;
 
 typedef enum NetdRtnlLinkEvent {
@@ -303,5 +308,37 @@ typedef struct NetdRtnlRoute {
  */
 int netd_rtnl_route_add(NetdRtnl *rtnl, const NetdRtnlRoute *route);
 int netd_rtnl_route_del(NetdRtnl *rtnl, const NetdRtnlRoute *route);
+
+/*
+ * The root queueing discipline of a link, by its TCA_KIND name ("fq_codel",
+ * "mq", "noqueue"). `kind` must fit IFNAMSIZ, the kernel's own limit.
+ *
+ * netd_rtnl_qdisc_replace_root() is RTM_NEWQDISC with parent TC_H_ROOT,
+ * NLM_F_CREATE|NLM_F_REPLACE and an empty TCA_OPTIONS, as systemd-networkd
+ * sends a qdisc with no options set: the kernel installs the kind with its own
+ * defaults, replacing whatever the root was. A kernel without the kind's
+ * module answers -ENOENT or -EINVAL.
+ *
+ * netd_rtnl_qdisc_delete_root() is RTM_DELQDISC for the root, which gives the
+ * link back the kernel's default. TCA_KIND is sent so that the kernel refuses
+ * (-EINVAL) when the root is no longer `kind`.
+ *
+ * netd_rtnl_qdisc_get_root() is RTM_GETQDISC for the root and returns its
+ * kind and, in `ret_handle` if not NULL, its handle. The kernel's own default
+ * root has handle 0; a qdisc made through RTM_NEWQDISC gets a non-zero one.
+ * -ENOENT when the link has none, -EBADMSG for a reply without a kind.
+ */
+int netd_rtnl_qdisc_replace_root(NetdRtnl *rtnl, int ifindex, const char *kind);
+int netd_rtnl_qdisc_delete_root(NetdRtnl *rtnl, int ifindex, const char *kind);
+int netd_rtnl_qdisc_get_root(NetdRtnl *rtnl, int ifindex, char *kind, size_t kind_len, uint32_t *ret_handle);
+
+/* The message builder and the reply decoder behind them, exposed so a test can
+ * check the bytes. `type` is RTM_NEWQDISC, RTM_DELQDISC or RTM_GETQDISC;
+ * `kind` may be NULL for RTM_GETQDISC. The decoder takes a message that has
+ * passed NLMSG_OK and returns -EBADMSG for anything that is not an
+ * RTM_NEWQDISC carrying a kind. 0 or -errno. */
+int netd_rtnl_qdisc_build(struct nl_request *req, uint16_t type, int ifindex, const char *kind);
+int netd_rtnl_qdisc_parse(
+                const struct nlmsghdr *nlh, int *ret_ifindex, char *kind, size_t kind_len, uint32_t *ret_handle);
 
 const char *netd_rtnl_link_event_to_string(NetdRtnlLinkEvent e);

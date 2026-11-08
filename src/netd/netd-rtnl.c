@@ -10,7 +10,8 @@
  * Link enumerate/match, RTM_NEWLINK/DELLINK subscription, IPv6 address
  * events and enumeration, link up/down,
  * RTM_NEWADDR/DELADDR, RTM_NEWROUTE/DELROUTE including a default route, and
- * netd_rtnl_link_set_hwaddr() for persistent-MAC generation.
+ * netd_rtnl_link_set_hwaddr() for persistent-MAC generation, and the root
+ * qdisc (RTM_NEWQDISC/DELQDISC/GETQDISC with TCA_KIND).
  *
  * The low-level socket/message plumbing (request construction, send/recv,
  * NLMSG_ERROR decoding, the generic rtattr_get_* and rtattr_enter() getters)
@@ -48,6 +49,7 @@
 #include <linux/if_addr.h>
 #include <linux/if_link.h>
 #include <linux/netlink.h>
+#include <linux/pkt_sched.h>
 #include <linux/rtnetlink.h>
 #include <net/if.h>
 #include <stdbool.h>
@@ -138,6 +140,7 @@ static int nl_parse_link(const struct nlmsghdr *nlh, NetdRtnlLink *out) {
 
         (void) rtattr_get_string(rta, rem, IFLA_IFNAME, out->ifname, sizeof(out->ifname));
         (void) rtattr_get_u32(rta, rem, IFLA_MTU, &out->mtu);
+        (void) rtattr_get_u32(rta, rem, IFLA_NUM_TX_QUEUES, &out->num_tx_queues);
 
         addr_rta = rtattr_find(rta, rem, IFLA_ADDRESS);
         if (addr_rta) {
@@ -848,6 +851,162 @@ int netd_rtnl_route_del(NetdRtnl *rtnl, const NetdRtnlRoute *route) {
                 return r;
 
         return rtnl_execute(rtnl, &req);
+}
+
+/* --- queueing disciplines --- */
+
+int netd_rtnl_qdisc_build(struct nl_request *req, uint16_t type, int ifindex, const char *kind) {
+        struct nlmsghdr *nlh;
+        struct tcmsg *tcm;
+        uint16_t flags = NLM_F_REQUEST | NLM_F_ACK;
+        int r;
+
+        if (!req || ifindex <= 0)
+                return -EINVAL;
+
+        if (type != RTM_NEWQDISC && type != RTM_DELQDISC && type != RTM_GETQDISC)
+                return -EINVAL;
+
+        if (kind ? (kind[0] == '\0' || strlen(kind) >= IFNAMSIZ) : type == RTM_NEWQDISC)
+                return -EINVAL;
+
+        /* Newer kernels answer a get only to a requester that asks for the
+         * echo or listens to the group, and without the ACK a missing answer
+         * would block the read for good. */
+        if (type == RTM_GETQDISC)
+                flags |= NLM_F_ECHO;
+        if (type == RTM_NEWQDISC)
+                flags |= NLM_F_CREATE | NLM_F_REPLACE;
+
+        nlh = nl_req_init(req, type, flags);
+        if (!nlh)
+                return -ENOBUFS;
+
+        tcm = nl_reserve(req, sizeof(*tcm));
+        if (!tcm)
+                return -ENOBUFS;
+
+        tcm->tcm_family = AF_UNSPEC;
+        tcm->tcm_ifindex = ifindex;
+        tcm->tcm_parent = TC_H_ROOT;
+
+        if (kind) {
+                r = nl_add_attr(req, TCA_KIND, kind, strlen(kind) + 1);
+                if (r < 0)
+                        return r;
+        }
+
+        if (type == RTM_NEWQDISC) {
+                struct rtattr *options = nl_nest_start(req, TCA_OPTIONS);
+
+                if (!options)
+                        return -ENOBUFS;
+                nl_nest_end(req, options);
+        }
+
+        return 0;
+}
+
+int netd_rtnl_qdisc_parse(
+                const struct nlmsghdr *nlh, int *ret_ifindex, char *kind, size_t kind_len, uint32_t *ret_handle) {
+        const struct tcmsg *tcm;
+        const struct rtattr *rta;
+        int rem;
+
+        if (nlh->nlmsg_type != RTM_NEWQDISC || nlh->nlmsg_len < NLMSG_LENGTH(sizeof(*tcm)))
+                return -EBADMSG;
+
+        tcm = (const struct tcmsg *) NLMSG_DATA(nlh);
+        rem = (int) (nlh->nlmsg_len - NLMSG_LENGTH(sizeof(*tcm)));
+        rta = (const struct rtattr *) ((const uint8_t *) tcm + NLMSG_ALIGN(sizeof(*tcm)));
+
+        if (!rtattr_get_string(rta, rem, TCA_KIND, kind, kind_len))
+                return -EBADMSG;
+
+        if (ret_ifindex)
+                *ret_ifindex = tcm->tcm_ifindex;
+        if (ret_handle)
+                *ret_handle = tcm->tcm_handle;
+        return 0;
+}
+
+int netd_rtnl_qdisc_replace_root(NetdRtnl *rtnl, int ifindex, const char *kind) {
+        struct nl_request req;
+        int r;
+
+        if (!rtnl || !kind)
+                return -EINVAL;
+
+        r = netd_rtnl_qdisc_build(&req, RTM_NEWQDISC, ifindex, kind);
+        if (r < 0)
+                return r;
+
+        return rtnl_execute(rtnl, &req);
+}
+
+int netd_rtnl_qdisc_delete_root(NetdRtnl *rtnl, int ifindex, const char *kind) {
+        struct nl_request req;
+        int r;
+
+        if (!rtnl || !kind)
+                return -EINVAL;
+
+        r = netd_rtnl_qdisc_build(&req, RTM_DELQDISC, ifindex, kind);
+        if (r < 0)
+                return r;
+
+        return rtnl_execute(rtnl, &req);
+}
+
+int netd_rtnl_qdisc_get_root(NetdRtnl *rtnl, int ifindex, char *kind, size_t kind_len, uint32_t *ret_handle) {
+        struct nl_request req;
+        uint32_t seq;
+        bool got = false;
+        int r, got_r = 0;
+
+        if (!rtnl || !kind || kind_len == 0)
+                return -EINVAL;
+
+        r = netd_rtnl_qdisc_build(&req, RTM_GETQDISC, ifindex, NULL);
+        if (r < 0)
+                return r;
+
+        r = nl_finish_and_send(&rtnl->req, &req, &seq);
+        if (r < 0)
+                return r;
+
+        for (;;) {
+                union nl_recv_buf rb;
+                ssize_t len;
+                struct nlmsghdr *m;
+                int rem;
+
+                len = rtnl_recv(rtnl->req.fd, false, &rb);
+                if (len < 0)
+                        return (int) len;
+                if (len == 0)
+                        return -EIO;
+
+                m = (struct nlmsghdr *) rb.buf;
+                rem = (int) len;
+
+                for (; NLMSG_OK(m, rem); m = NLMSG_NEXT(m, rem)) {
+                        if (m->nlmsg_seq != seq)
+                                continue;
+
+                        if (m->nlmsg_type == NLMSG_ERROR) {
+                                r = nl_parse_error(m, NULL, 0);
+                                if (r < 0)
+                                        return r;
+                                return got ? got_r : -ENOENT;
+                        }
+
+                        if (!got) {
+                                got_r = netd_rtnl_qdisc_parse(m, NULL, kind, kind_len, ret_handle);
+                                got = true;
+                        }
+                }
+        }
 }
 
 static const char * const netd_rtnl_link_event_table[_NETD_RTNL_LINK_EVENT_MAX] = {
