@@ -20,6 +20,19 @@
           and when a send to logd fails, go to the kernel ring, which logd
           imports at start. Service state changes no longer fill dmesg.
 
+        * Drop-in files are read. For foo-bar.service, the .conf files of
+          foo-bar.service.d, the truncated foo-.service.d and the type-level
+          service.d (and, for an instance, its template's directories) are
+          parsed after the unit file, from /etc/systemd/system,
+          /run/systemd/system and /usr/lib/systemd/system, as systemd does:
+          the same name in an earlier directory hides the later file, files
+          apply sorted by name, an empty assignment resets a list directive
+          and a bad line is reported with the drop-in's file and line. A
+          drop-in does not make a unit exist. daemon-reload reads them again.
+          Units are now also searched in /run/systemd/system, and an empty
+          ExecStart= clears the command instead of being rejected. See
+          docs/INCOMPATIBILITIES.md.
+
 ##        picoctl:
 
         * A unit that does not exist is reported as systemctl reports it.
@@ -33,6 +46,9 @@
           picoctl no longer prints debug messages on stderr. With several
           units status and the job verbs exit with the status of the first
           failure.
+
+        * The applied drop-ins show in status as systemctl's Drop-In: block,
+          in show as DropInPaths=, and cat prints them after the unit file.
 
 ##        netd:
 
