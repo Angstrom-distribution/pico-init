@@ -172,6 +172,12 @@ struct Devd {
          */
         char boot_disk[DEVD_NAME_MAX];
 
+        /*
+         * Set in an initramfs (an initrd-release file exists): nothing is
+         * mounted under /media, since those mounts would outlive switch_root
+         * and pin the root disk.
+         */
+        bool media_disabled;
 
         /*
          * --- the queue state `udevadm settle` reads (devd-queue.h) ---
