@@ -28,6 +28,18 @@
           units status and the job verbs exit with the status of the first
           failure.
 
+##        netd:
+
+        * The root qdisc of a link that matches a .network file is set when
+          the link comes up. A link with more than one tx queue whose root
+          is the kernel's mq gets the qdisc netd wrote to
+          net.core.default_qdisc; noqueue roots, as on Wi-Fi and bonds,
+          stay. [FairQueueingControlledDelay], [FairQueueing] and [CAKE]
+          with Parent=root name the kind for any link (a section needs at
+          least one key, as in networkd); no tuning key is read. A root with
+          a handle other than the kernel default's or netd's own is never
+          replaced or removed. A kernel without the qdisc gets a warning.
+
 # CHANGES WITH 0.4.0:
 
         netd reads [Address], [Route] and [IPv6AcceptRA] sections and takes
