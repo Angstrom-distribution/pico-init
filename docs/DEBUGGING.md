@@ -13,14 +13,13 @@ PID 1 has two output channels.
 | Channel | Destination | Content |
 |---------|-------------|---------|
 | Console status | `/dev/console` (stdout if it cannot be opened) | The greeting and per-unit progress lines |
-| Log records | `/dev/kmsg` once PID 1 has set it up, stderr before that | Everything written with `pico_log()` |
+| Log records | `logd` while `logd.socket` is running and `logd.service` is active, `/dev/kmsg` before, after and when a send to `logd` fails, stderr before PID 1 has set it up | Everything written with `pico_log()` |
 
 Log records carry a prefix of the form `pico-init[LEVEL]: `, where LEVEL is
-one of `err`, `warning`, `info`, `debug`. On `/dev/kmsg` the record also
-carries the matching syslog priority (3, 4, 6, 7), so the kernel ring keeps
-the level. The first records PID 1 logs after switching to `/dev/kmsg` are
-the version line, then the architecture and hostname lines in systemd's
-wording:
+one of `err`, `warning`, `info`, `debug`. On `/dev/kmsg` and `/dev/log` the
+record also carries the matching syslog priority (3, 4, 6, 7), so the level is
+kept. The first records PID 1 logs after switching are the version line, then
+the architecture and hostname lines in systemd's wording:
 
 ```
 pico-init[info]: pico-init <version> (<git description>) running as PID 1
@@ -33,18 +32,20 @@ and `Watchdog running with a hardware timeout of` lines a little later.
 
 There is no log-level setting. `pico_log()` has no runtime filter:
 `--log-level=`, `systemd.log_level=` and `debug` are accepted and change
-nothing. Every record is written; `debug` records appear in the ring along
+nothing. Every record is written; `debug` records appear in the log along
 with the rest. To see only the important ones, filter when
 reading (`picolog -p warning`, below).
 
-Only PID 1 redirects to `/dev/kmsg`. `logd` and `netd` are supervised
+Only PID 1 uses this sink. `logd` and `netd` are supervised
 services; their stdout is connected to `logd`, so their records arrive with
 the unit name attached. `picoctl`, `picolog` and `pico-unit-lint` log to the
 caller's stderr.
 
 Because `logd` reads `/dev/kmsg` from the start of the ring, everything PID 1
-logged before `logd` started is in the log once `logd` is up. Before that,
-read it on the console or with `dmesg`.
+logged before `logd` ran is in the log once `logd` is up. While `logd` runs
+PID 1's records are not in `dmesg`; read them with `picolog`. The records
+written while `logd` is starting, stopping or has failed stay in the kernel
+ring, so a `logd` that does not start can be debugged with `dmesg`.
 
 ### Kernel command line and options
 

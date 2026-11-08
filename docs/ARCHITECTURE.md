@@ -399,7 +399,9 @@ priority source in the loop. There is no per-service watchdog.
 
 ## Logging
 
-PID 1 writes its own log output to `/dev/kmsg`. `logd` is the log daemon and
+PID 1 writes its own log output to `/dev/kmsg`, except while `logd.socket`
+is running and `logd.service` is active, when it goes to `logd`. `/dev/kmsg`
+is also the fallback when a send fails. `logd` is the log daemon and
 is itself socket-activated by PID 1: `logd.socket` holds
 `/run/logd/stdout` and `/dev/log`, so a `logd` crash neither loses queued
 output nor disconnects a service's stdout. `logd` also reads `/dev/kmsg`,
