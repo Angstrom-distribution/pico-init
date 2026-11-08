@@ -1479,61 +1479,55 @@ static int config_parse_restart_sec(
         return 0;
 }
 
+/*
+ * Parses into a local first so a bad value leaves the previous one alone.
+ * 92c1622e14/36c16a7cdd: 0 means "never time out", the opposite of
+ * RestartSec=0 ("restart immediately") -- do not reuse this for RestartSec=.
+ */
+static int parse_timeout_usec(
+                Unit *u, const char *path, unsigned line, const char *name, const char *rvalue, usec_t *ret) {
+        usec_t t;
+        int r;
+
+        r = parse_usec(rvalue, &t);
+        if (r < 0) {
+                pico_log(PICO_LOG_WARNING, "%s:%u: invalid %s= value '%s', ignoring", path, line, name, rvalue);
+                (void) unit_add_degradation(u, name);
+                return r;
+        }
+
+        *ret = t == 0 ? USEC_INFINITY : t;
+        return 0;
+}
+
 static int config_parse_timeout_start_sec(
                 Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
         Service *s = unit_to_service(u, path, line);
-        int r;
         (void) lvalue;
 
-        if (!s)
-                return 0;
-
-        r = parse_usec(rvalue, &s->timeout_start_usec);
-        if (r < 0) {
-                pico_log(PICO_LOG_WARNING,
-                         "%s:%u: invalid TimeoutStartSec= value '%s', ignoring",
-                         path,
-                         line,
-                         rvalue);
-                (void) unit_add_degradation(u, "TimeoutStartSec=");
-                return 0;
-        }
-
-        /*
-         * 92c1622e14/36c16a7cdd: TimeoutStartSec=0 means "never time out",
-         * the opposite of RestartSec=0 ("restart immediately") -- do not
-         * reuse this translation there.
-         */
-        if (s->timeout_start_usec == 0)
-                s->timeout_start_usec = USEC_INFINITY;
-
+        if (s)
+                (void) parse_timeout_usec(u, path, line, "TimeoutStartSec=", rvalue, &s->timeout_start_usec);
         return 0;
 }
 
 static int config_parse_timeout_stop_sec(
                 Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
         Service *s = unit_to_service(u, path, line);
-        int r;
         (void) lvalue;
 
-        if (!s)
-                return 0;
+        if (s)
+                (void) parse_timeout_usec(u, path, line, "TimeoutStopSec=", rvalue, &s->timeout_stop_usec);
+        return 0;
+}
 
-        r = parse_usec(rvalue, &s->timeout_stop_usec);
-        if (r < 0) {
-                pico_log(PICO_LOG_WARNING,
-                         "%s:%u: invalid TimeoutStopSec= value '%s', ignoring",
-                         path,
-                         line,
-                         rvalue);
-                (void) unit_add_degradation(u, "TimeoutStopSec=");
-                return 0;
-        }
+static int config_parse_timeout_sec(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        Service *s = unit_to_service(u, path, line);
+        usec_t t;
+        (void) lvalue;
 
-        /* 92c1622e14/36c16a7cdd: same zero-means-never translation as TimeoutStartSec= above */
-        if (s->timeout_stop_usec == 0)
-                s->timeout_stop_usec = USEC_INFINITY;
-
+        if (s && parse_timeout_usec(u, path, line, "TimeoutSec=", rvalue, &t) >= 0)
+                s->timeout_start_usec = s->timeout_stop_usec = t;
         return 0;
 }
 
@@ -1914,6 +1908,7 @@ static const ConfigItem config_items[] = {
         { SECTION_SERVICE,         "DelegateSubgroup",           config_parse_delegate_subgroup },
         { SECTION_SERVICE,          "TimeoutStartSec",           config_parse_timeout_start_sec },
         { SECTION_SERVICE,           "TimeoutStopSec",            config_parse_timeout_stop_sec },
+        { SECTION_SERVICE,               "TimeoutSec",                 config_parse_timeout_sec },
         { SECTION_SERVICE,                     "User",                  config_parse_user_group },
         { SECTION_SERVICE,                    "Group",                  config_parse_user_group },
         { SECTION_SERVICE,      "SupplementaryGroups",        config_parse_supplementary_groups },
