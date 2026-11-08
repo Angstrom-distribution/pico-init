@@ -449,11 +449,12 @@ void netd_static_ntp_links_changed(Netd *n) {
 
 /*
  * net.core.default_qdisc / net.ipv4.tcp_congestion_control: applied once,
- * system-wide, rather than per-link -- the kernel's own dev_init_scheduler()
- * reads net.core.default_qdisc for every interface at creation time,
- * including one a DHCP lease or a bnep PAN connection creates long after
- * boot, so this needs no per-link rtnetlink work (netd-rtnl.c has no
- * TCA_QDISC support).
+ * system-wide. The kernel reads net.core.default_qdisc for every interface at
+ * creation time, including one a DHCP lease or a bnep PAN connection creates
+ * long after boot, but it only becomes the root of a single-queue device; a
+ * multi-queue one gets mq as its root. The qdisc that was accepted is kept in
+ * n->default_qdisc so that netd-link.c can install it as the root of the
+ * links it manages that got mq.
  *
  * Each list is tried in order and the first value the kernel actually
  * accepts wins; a value failing just means that qdisc/congestion-control
@@ -461,7 +462,7 @@ void netd_static_ntp_links_changed(Netd *n) {
  * level: a better qdisc or congestion control is never worth failing boot
  * over.
  */
-static void netd_set_default_qdisc_and_congestion_control(void) {
+static void netd_set_default_qdisc_and_congestion_control(Netd *n) {
         static const char * const qdiscs[] = { "fq_codel", "fq", "cake" };
         static const char * const congestion_control[] = { "bbr" };
         size_t i;
@@ -476,6 +477,7 @@ static void netd_set_default_qdisc_and_congestion_control(void) {
 
                 if (write(fd, qdiscs[i], strlen(qdiscs[i])) == (ssize_t) strlen(qdiscs[i])) {
                         close(fd);
+                        snprintf(n->default_qdisc, sizeof(n->default_qdisc), "%s", qdiscs[i]);
                         pico_log(PICO_LOG_INFO, "netd: default_qdisc: %s", qdiscs[i]);
                         break;
                 }
@@ -510,7 +512,7 @@ int netd_startup(Netd *n) {
 
         /* 0. System-wide, not per-link -- see the function's own comment for
          * why this needs no rtnetlink work. Best-effort, logged either way. */
-        netd_set_default_qdisc_and_congestion_control();
+        netd_set_default_qdisc_and_congestion_control(n);
 
         /*
          * 1. Clock floor, before anything timestamps anything (netd.h). Never

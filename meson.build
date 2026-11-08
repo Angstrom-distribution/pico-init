@@ -465,9 +465,11 @@ netd_tests = [
   # IPv4/IPv6 literal parsing, masking and formatting (netd-addr.c).
   'test-netd-addr',
   'test-netd-rtnl',
-  # Root qdisc messages against fixed bytes, a decoded kernel reply and the
-  # qdisc sections of a .network file.
+  # Root qdiscs: message bytes, the multi-queue rule and the qdisc sections,
+  # then a veth pair with several tx queues in a private network namespace
+  # (exits 77 without the namespace, `ip`, `tc` or the fq_codel and fq modules).
   'test-netd-qdisc',
+  'test-netd-qdisc-link',
   'test-netd-codec',
   'test-netd-dhcp',
   'test-netd-sntp',

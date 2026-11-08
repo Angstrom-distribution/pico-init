@@ -639,6 +639,7 @@ int link_new(Netd *n, const NetdRtnlLink *rl, Link **ret) {
         l->flags = rl->flags;
         l->arp_type = rl->arp_type;
         l->mtu = rl->mtu;
+        l->num_tx_queues = rl->num_tx_queues;
         l->hw_addr_len = rl->hw_addr_len;
         memcpy(l->hw_addr, rl->hw_addr, sizeof(l->hw_addr));
 
@@ -730,6 +731,7 @@ static void link_update_snapshot(Link *l, const NetdRtnlLink *rl) {
         l->flags = rl->flags;
         l->arp_type = rl->arp_type;
         l->mtu = rl->mtu;
+        l->num_tx_queues = rl->num_tx_queues;
         l->hw_addr_len = rl->hw_addr_len;
         memcpy(l->hw_addr, rl->hw_addr, sizeof(l->hw_addr));
         memcpy(l->ifname, rl->ifname, sizeof(l->ifname) - 1);
@@ -1888,6 +1890,151 @@ static void link_apply_persistent_mac(Link *l) {
                          strerror(-r));
 }
 
+/* --- root qdisc --- */
+
+const char *link_qdisc_choose(
+                const Network *nw,
+                uint32_t num_tx_queues,
+                const char *root_kind,
+                uint32_t root_handle,
+                const char *default_qdisc) {
+        if (!nw)
+                return NULL;
+
+        if (nw->qdisc != NETWORK_QDISC_NONE)
+                return network_qdisc_to_string(nw->qdisc);
+
+        /* Only the kernel's mq leaves the default to the per-queue children;
+         * a device flagged IFF_NO_QUEUE gets noqueue whatever its queue count. */
+        if (num_tx_queues > 1 && root_kind && strcmp(root_kind, "mq") == 0 && root_handle == 0 &&
+            default_qdisc && default_qdisc[0] != '\0')
+                return default_qdisc;
+
+        return NULL;
+}
+
+static void link_qdisc_failed(Link *l, const char *kind, const char *what, int r) {
+        if (strcmp(l->qdisc_failed, kind) == 0)
+                return;
+
+        pico_log(PICO_LOG_WARNING, "netd: %s: cannot %s %s: %s", l->ifname, what, kind, strerror(-r));
+        snprintf(l->qdisc_failed, sizeof(l->qdisc_failed), "%s", kind);
+}
+
+static void link_qdisc_forget(Link *l) {
+        l->qdisc[0] = '\0';
+        l->qdisc_handle = 0;
+        l->qdisc_implicit = false;
+}
+
+/*
+ * Brings the root qdisc in line with the file. The kernel's own default root
+ * has handle 0 and a qdisc made through RTM_NEWQDISC a non-zero one, so only a
+ * root with handle 0 or the handle netd got from its own install is ever
+ * replaced or removed; any other root was put there by something else. A
+ * failure, usually a kernel without the module, is reported once and never
+ * fails the link. It runs on every change event of a matched link, which
+ * costs one RTM_GETQDISC each, and that is also what re-evaluates the
+ * multi-queue rule after a reload.
+ */
+static void link_sync_qdisc(Link *l, const Network *nw) {
+        Netd *n = l->netd;
+        char root[IFNAMSIZ], back[IFNAMSIZ];
+        uint32_t handle = 0, back_handle = 0;
+        const char *want, *base_kind;
+        uint32_t base_handle;
+        bool owned;
+        int r;
+
+        if (l->qdisc[0] == '\0' && !(nw && nw->qdisc != NETWORK_QDISC_NONE) &&
+            !(nw && l->num_tx_queues > 1 && n->default_qdisc[0] != '\0'))
+                return;
+
+        r = netd_rtnl_qdisc_get_root(n->rtnl, l->ifindex, root, sizeof(root), &handle);
+        if (r < 0) {
+                const char *wanted = link_qdisc_choose(nw, l->num_tx_queues, "mq", 0, n->default_qdisc);
+
+                if (wanted)
+                        link_qdisc_failed(l, wanted, "read the root qdisc before setting", r);
+                else
+                        link_qdisc_forget(l);
+                return;
+        }
+
+        owned = l->qdisc[0] != '\0' && handle != 0 && handle == l->qdisc_handle && strcmp(root, l->qdisc) == 0;
+
+        if (handle != 0 && !owned) {
+                if (l->qdisc[0] != '\0')
+                        pico_log(PICO_LOG_DEBUG,
+                                 "netd: %s: root qdisc %s is not the %s netd set, leaving it",
+                                 l->ifname,
+                                 root,
+                                 l->qdisc);
+                link_qdisc_forget(l);
+                return;
+        }
+
+        /* What the kernel had before netd replaced it decides the implicit
+         * rule, so the choice stays the same across reloads. */
+        base_kind = owned && l->qdisc_implicit ? "mq" : root;
+        base_handle = owned && l->qdisc_implicit ? 0 : handle;
+        want = link_qdisc_choose(nw, l->num_tx_queues, base_kind, base_handle, n->default_qdisc);
+
+        if (!want) {
+                if (owned) {
+                        r = netd_rtnl_qdisc_delete_root(n->rtnl, l->ifindex, l->qdisc);
+                        if (r < 0)
+                                pico_log(PICO_LOG_WARNING,
+                                         "netd: %s: cannot remove root qdisc %s: %s",
+                                         l->ifname,
+                                         l->qdisc,
+                                         strerror(-r));
+                        else
+                                pico_log(PICO_LOG_INFO, "netd: %s: root qdisc %s removed", l->ifname, l->qdisc);
+                }
+                link_qdisc_forget(l);
+
+                /* The kernel puts its own root back, and on a multi-queue
+                 * link that is mq, which the default may apply to. */
+                if (owned && r >= 0)
+                        link_sync_qdisc(l, nw);
+                return;
+        }
+
+        if (owned && strcmp(root, want) == 0)
+                return;
+
+        /* The kernel default already is the kind asked for. */
+        if (!owned && strcmp(root, want) == 0)
+                return;
+
+        /* A refused kind is not sent again until a reload clears the record;
+         * every carrier or MTU event of the link would repeat the refusal. */
+        if (strcmp(l->qdisc_failed, want) == 0)
+                return;
+
+        r = netd_rtnl_qdisc_replace_root(n->rtnl, l->ifindex, want);
+        if (r < 0) {
+                link_qdisc_failed(l, want, "set the root qdisc to", r);
+                return;
+        }
+
+        pico_log(PICO_LOG_INFO, "netd: %s: root qdisc: %s (was %s)", l->ifname, want, root);
+        l->qdisc_failed[0] = '\0';
+
+        /* The handle is read back because the kernel picks it. Without it the
+         * qdisc stays unowned and later reloads leave it alone. */
+        if (netd_rtnl_qdisc_get_root(n->rtnl, l->ifindex, back, sizeof(back), &back_handle) < 0 ||
+            strcmp(back, want) != 0 || back_handle == 0) {
+                link_qdisc_forget(l);
+                return;
+        }
+
+        snprintf(l->qdisc, sizeof(l->qdisc), "%s", want);
+        l->qdisc_handle = back_handle;
+        l->qdisc_implicit = nw->qdisc == NETWORK_QDISC_NONE;
+}
+
 /* --- the state machine --- */
 
 static int link_configure_impl(Link *l) {
@@ -1921,6 +2068,7 @@ static int link_configure_impl(Link *l) {
 
         if (!nw) {
                 if (l->state == LINK_CONFIGURING || l->state == LINK_CONFIGURED || l->state == LINK_FAILED) {
+                        link_sync_qdisc(l, NULL);
                         r = link_deconfigure(l);
                         if (r < 0)
                                 pico_log(PICO_LOG_WARNING,
@@ -1963,6 +2111,8 @@ static int link_configure_impl(Link *l) {
                 l->state = LINK_FAILED;
                 return r;
         }
+
+        link_sync_qdisc(l, nw);
 
         r = link_drop_lease_address(l, nw);
         if (r < 0) {
@@ -2095,6 +2245,7 @@ int link_reconfigure(Link *l) {
          * branch in apply_static_address()/apply_static_gateway() and is left
          * alone, so this is safe to call for every link on every reload.
          */
+        l->qdisc_failed[0] = '\0';
         return link_configure(l);
 }
 
