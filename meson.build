@@ -627,6 +627,37 @@ install_data(
   install_dir: get_option('prefix') / 'lib' / 'udev' / 'rules.d',
 )
 
+# udevadm for devd (settle, trigger, control, info), and devd under the name
+# dracut's udev-rules module looks for, ${udevdir}/udevd. bindir, where udev
+# installs udevadm. It links pico-init-core for fsid.c (the ID_FS_* that info
+# reports) and util.c, nothing of devd but the queue state reader.
+udev_compat = get_option('udev-compat')
+
+udevadm_exe = executable(
+  'udevadm',
+  ['src/devd/udevadm.c', 'src/devd/devd-queue.c'],
+  include_directories: devd_includes,
+  link_with: pico_init_core,
+  install: udev_compat,
+  install_dir: get_option('bindir'),
+)
+
+# Relative when sbindir is under the prefix, so the link resolves inside an
+# image root as well as on the running system.
+if get_option('sbindir').startswith('/')
+  udevd_target = get_option('sbindir') / 'devd'
+else
+  udevd_target = '..' / '..' / get_option('sbindir') / 'devd'
+endif
+
+if udev_compat
+  install_symlink(
+    'udevd',
+    install_dir: get_option('prefix') / 'lib' / 'udev',
+    pointing_to: udevd_target,
+  )
+endif
+
 # Covered: uevent parsing, the debounce state machine, GPT/ext4 field
 # extraction, the symlink create/remove/reconcile lifecycle, the rules
 # tokenizer (against excerpts of the real usb-modeswitch rules file), the
@@ -647,6 +678,7 @@ devd_tests = [
   'test-devd-opts',
   # The queue state files, and udevadm against a fixture sysfs and /dev.
   'test-devd-queue',
+  'test-udevadm',
   # The MBR signature checks and the PARTUUID spelling.
   'test-devd-mbr',
 ]

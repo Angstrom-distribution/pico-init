@@ -223,16 +223,53 @@ static void devd_cmdline_load(void) {
         fclose(f);
 }
 
-/* fork(), setsid() and stdio to /dev/null: what udevd -d does, minus the
- * pidfile it does not write either. Before any fd or timer exists. */
-static int devd_daemonize(void) {
-        pid_t pid = fork();
-        int fd;
+/*
+ * fork(), setsid() and stdio to /dev/null, before any fd or timer exists. The
+ * parent does not exit until the child reports its coldplug walk done (one
+ * byte down the pipe whose write end comes back in *ret_ready) or dies: dracut
+ * runs `udevadm trigger` and `settle` right after `udevd --daemon` returns,
+ * and a trigger written before the uevent socket is open is lost.
+ */
+static int devd_daemonize(int *ret_ready) {
+        int ready[2], fd;
+        pid_t pid;
 
-        if (pid < 0)
+        if (pipe(ready) < 0)
                 return -errno;
-        if (pid > 0)
-                _exit(EXIT_SUCCESS);
+
+        /* Not inherited by RUN+= children, or the parent would wait on them. */
+        if (fcntl(ready[1], F_SETFD, FD_CLOEXEC) < 0) {
+                int e = errno;
+
+                close(ready[0]);
+                close(ready[1]);
+                return -e;
+        }
+
+        pid = fork();
+        if (pid < 0) {
+                int e = errno;
+
+                close(ready[0]);
+                close(ready[1]);
+                return -e;
+        }
+
+        if (pid > 0) {
+                char c;
+                ssize_t n;
+
+                close(ready[1]);
+                for (;;) {
+                        n = read(ready[0], &c, 1);
+                        if (n >= 0 || errno != EINTR)
+                                break;
+                }
+                _exit(n == 1 ? EXIT_SUCCESS : EXIT_FAILURE);
+        }
+
+        close(ready[0]);
+        *ret_ready = ready[1];
 
         if (setsid() < 0)
                 return -errno;
@@ -256,7 +293,7 @@ static int devd_daemonize(void) {
 int main(int argc, char *argv[]) {
         Devd *d = NULL;
         DevdOpts opts = { 0 };
-        int r;
+        int ready = -1, r;
 
         r = devd_parse_argv(argc, argv, &opts);
         if (r < 0)
@@ -267,7 +304,7 @@ int main(int argc, char *argv[]) {
         devd_cmdline_load();
 
         if (opts.daemonize) {
-                r = devd_daemonize();
+                r = devd_daemonize(&ready);
                 if (r < 0) {
                         pico_log(PICO_LOG_ERR, "devd: failed to daemonize: %s", strerror(-r));
                         return EXIT_FAILURE;
@@ -285,6 +322,13 @@ int main(int argc, char *argv[]) {
                 pico_log(PICO_LOG_ERR, "devd: startup failed: %s", strerror(-r));
                 devd_free(d);
                 return EXIT_FAILURE;
+        }
+
+        /* The parent's EOF on a failed start above is its failure signal. */
+        if (ready >= 0) {
+                if (write(ready, "", 1) != 1)
+                        pico_log(PICO_LOG_WARNING, "devd: cannot report readiness: %s", strerror(errno));
+                close(ready);
         }
 
         r = devd_loop_run(d);
