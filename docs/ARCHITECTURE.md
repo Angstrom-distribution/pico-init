@@ -92,7 +92,9 @@ in order, before any unit exists:
    for it.
 
 Unit files are looked up in `/etc/systemd/system`, then
-`/usr/lib/systemd/system`. A unit file that is a symlink to a differently
+`/run/systemd/system`, then `/usr/lib/systemd/system`. The drop-in files of
+the unit (`foo.service.d/*.conf` and the truncated and type-level
+directories) are parsed after it. A unit file that is a symlink to a differently
 named unit becomes an alias of that unit; a symlink to a device node (or an
 empty file) yields a masked unit. An instance such as `getty@tty1.service`
 with no file of its own loads through its template. Enablement is read from

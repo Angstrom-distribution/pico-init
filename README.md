@@ -59,11 +59,12 @@ the DHCP and SNTP code in `netd` is lifted from current systemd.
 
 ## systemd compatibility
 
-Unit files are read unmodified from `/etc/systemd/system` and
-`/usr/lib/systemd/system`; presets from the matching `system-preset`
-directories are applied on first boot. Service, socket and target units are
-supported, with templates, the `%n %N %p %i %I` specifiers, aliases,
-masking, and `.wants`/`.requires` directories.
+Unit files are read unmodified from `/etc/systemd/system`,
+`/run/systemd/system` and `/usr/lib/systemd/system`; presets from the
+matching `system-preset` directories are applied on first boot. Service,
+socket and target units are supported, with templates, the `%n %N %p %i %I`
+specifiers, aliases, masking, drop-in files and `.wants`/`.requires`
+directories.
 
 Directives that are honoured:
 
