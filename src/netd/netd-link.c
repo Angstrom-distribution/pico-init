@@ -3441,8 +3441,11 @@ int link_write_state_file(Link *l) {
 
         fprintf(f, "IFNAME=%s\n", l->ifname);
         fprintf(f, "STATE=%s\n", link_state_to_string(l->state));
-        if (l->network && l->network->filename)
+        if (l->network && l->network->filename) {
                 fprintf(f, "NETWORK=%s\n", l->network->filename);
+                for (char * const *d = l->network->dropins; d && *d; d++)
+                        fprintf(f, "NETWORK_DROPIN=%s\n", *d);
+        }
 
         if (fflush(f) != 0 || ferror(f)) {
                 r = -EIO;

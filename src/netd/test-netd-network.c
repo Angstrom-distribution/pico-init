@@ -28,6 +28,7 @@
 
 #include "../test-util.h"
 #include "../util.h"
+#include "netd-link.h"
 #include "netd-network.h"
 #include "netd.h"
 
@@ -2141,6 +2142,62 @@ static void test_dropin_reload(void) {
         fixture_free(&f);
 }
 
+/* The link state file lists the applied drop-ins, one NETWORK_DROPIN= line
+ * each, for netctl status. */
+static void test_dropin_link_state_file(void) {
+        DropinFixture f;
+        Link l;
+        char *run, *path;
+        char text[1024];
+        FILE *fp;
+        size_t len;
+
+        fixture_new(&f);
+        ASSERT_EQ_INT(test_write_file(f.dir[ETC], "10-a.network", "[Match]\nName=net0\n"), 0);
+        put(&f, ETC, "10-a.network.d", "10.conf", "[Network]\n");
+        put(&f, USR, "10-a.network.d", "20.conf", "[Network]\n");
+        ASSERT_EQ_INT(network_load_all(&f.n), 1);
+
+        run = test_tmpdir_new();
+        ASSERT_TRUE(run != NULL);
+        f.n.runtime_dir = run;
+        memset(&l, 0, sizeof(l));
+        l.netd = &f.n;
+        l.ifindex = 7;
+        snprintf(l.ifname, sizeof(l.ifname), "net0");
+        l.state = LINK_CONFIGURED;
+        l.network = network_find(&f.n, "net0");
+        ASSERT_TRUE(l.network != NULL);
+
+        ASSERT_EQ_INT(link_write_state_file(&l), 0);
+        path = join_path(run, "links/7");
+        fp = fopen(path, "re");
+        ASSERT_TRUE(fp != NULL);
+        len = fread(text, 1, sizeof(text) - 1, fp);
+        text[len] = '\0';
+        fclose(fp);
+        free(path);
+
+        {
+                char want[1024];
+
+                snprintf(want,
+                         sizeof(want),
+                         "IFNAME=net0\nSTATE=configured\nNETWORK=%s/10-a.network\n"
+                         "NETWORK_DROPIN=%s/10-a.network.d/10.conf\n"
+                         "NETWORK_DROPIN=%s/10-a.network.d/20.conf\n",
+                         f.dir[ETC],
+                         f.dir[ETC],
+                         f.dir[USR]);
+                ASSERT_STREQ(text, want);
+        }
+
+        f.n.runtime_dir = NULL;
+        test_rm_rf(run);
+        free(run);
+        fixture_free(&f);
+}
+
 int main(void) {
         test_defaults();
         test_dhcp_spellings();
@@ -2189,6 +2246,7 @@ int main(void) {
         test_dropin_unreadable();
         test_dropin_masking();
         test_dropin_reload();
+        test_dropin_link_state_file();
 
         printf("test-netd-network: ok\n");
         return EXIT_SUCCESS;
