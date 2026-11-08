@@ -66,6 +66,16 @@
           a handle other than the kernel default's or netd's own is never
           replaced or removed. A kernel without the qdisc gets a warning.
 
+        * Drop-in files are read for .network files. The .conf files of
+          foo.network.d in /etc/systemd/network, /run/systemd/network and
+          /usr/lib/systemd/network are applied after foo.network, sorted by
+          name, as networkd reads them: only the file's own directory, the
+          same name in an earlier directory hides the later one, an empty
+          assignment resets a list key and a bad line is reported with the
+          drop-in's file and line. A reload reads them again and netctl
+          status lists them under Network File. An empty or /dev/null
+          .network file masks its drop-ins too. See docs/INCOMPATIBILITIES.md.
+
 ##        devd:
 
         * New udevadm in bindir with settle, trigger, control and info,
