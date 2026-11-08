@@ -37,6 +37,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "dropin-files.h"
 #include "manager.h"
 #include "unit-name.h"
 #include "unit.h"
@@ -46,47 +47,24 @@
  * so a valid name cannot get near this; it bounds the recursion regardless. */
 #define DROPIN_MAX_DEPTH 130
 
-typedef struct DropinDirList {
-        char **names; /* entries ending in ".d" that are not plain files, sorted */
-        size_t n;
-} DropinDirList;
-
 struct pico_dropin_cache {
-        DropinDirList *lists; /* parallel to Manager.unit_path */
+        PicoDropinDirList *lists; /* parallel to Manager.unit_path */
         size_t n;
 };
 
-typedef struct DropinFile {
-        char *name; /* borrowed from path */
-        char *path; /* owned */
-} DropinFile;
-
-static int dropin_name_cmp(const void *a, const void *b) {
-        return strcmp(*(char * const *) a, *(char * const *) b);
-}
-
-static int dropin_file_cmp(const void *a, const void *b) {
-        return strcmp(((const DropinFile *) a)->name, ((const DropinFile *) b)->name);
-}
-
 static void dropin_cache_free(struct pico_dropin_cache *c) {
-        size_t i, j;
-
         if (!c)
                 return;
 
-        for (i = 0; i < c->n; i++) {
-                for (j = 0; j < c->lists[i].n; j++)
-                        free(c->lists[i].names[j]);
-                free(c->lists[i].names);
-        }
+        for (size_t i = 0; i < c->n; i++)
+                pico_dropin_dirlist_clear(&c->lists[i]);
         free(c->lists);
         free(c);
 }
 
 /* Best effort: a directory that cannot be listed or an allocation that fails
  * leaves that entry without drop-ins rather than failing the load. */
-static void dropin_list_dir(const char *dir, DropinDirList *l) {
+static void dropin_list_dir(const char *dir, PicoDropinDirList *l) {
         struct dirent *de;
         DIR *d = opendir(dir);
 
@@ -96,27 +74,12 @@ static void dropin_list_dir(const char *dir, DropinDirList *l) {
                 return;
         }
 
-        while ((de = readdir(d))) {
-                size_t len = strlen(de->d_name);
-                char **grown;
-                char *copy;
-
-                if (len < 3 || strcmp(de->d_name + len - 2, ".d") != 0 || de->d_type == DT_REG)
-                        continue;
-
-                copy = pico_strdup(de->d_name);
-                grown = copy ? realloc(l->names, (l->n + 1) * sizeof(char *)) : NULL;
-                if (!grown) {
-                        free(copy);
+        while ((de = readdir(d)))
+                if (pico_dropin_dirlist_add(l, de, ".d") < 0)
                         break;
-                }
-                l->names = grown;
-                l->names[l->n++] = copy;
-        }
         closedir(d);
 
-        if (l->n > 1)
-                qsort(l->names, l->n, sizeof(char *), dropin_name_cmp);
+        pico_dropin_dirlist_sort(l);
 }
 
 static struct pico_dropin_cache *dropin_cache_new(Manager *m) {
@@ -126,7 +89,7 @@ static struct pico_dropin_cache *dropin_cache_new(Manager *m) {
         if (!c)
                 return NULL;
 
-        c->lists = calloc(n ? n : 1, sizeof(DropinDirList));
+        c->lists = calloc(n ? n : 1, sizeof(PicoDropinDirList));
         if (!c->lists) {
                 free(c);
                 return NULL;
@@ -140,9 +103,7 @@ static struct pico_dropin_cache *dropin_cache_new(Manager *m) {
 }
 
 static bool dropin_cache_has(const struct pico_dropin_cache *c, size_t i, const char *dirname) {
-        const DropinDirList *l = &c->lists[i];
-
-        return l->n > 0 && bsearch(&dirname, l->names, l->n, sizeof(char *), dropin_name_cmp) != NULL;
+        return pico_dropin_dirlist_has(&c->lists[i], dirname);
 }
 
 void manager_dropin_pass_begin(Manager *m) {
@@ -276,72 +237,9 @@ static int dropin_add_dirs(Manager *m, const struct pico_dropin_cache *c, char *
         return 0;
 }
 
-static void dropin_files_free(DropinFile *files, size_t n) {
-        for (size_t i = 0; i < n; i++)
-                free(files[i].path);
-        free(files);
-}
-
-/* Add the "*.conf" entries of `dir` whose name no earlier directory had. */
-static int dropin_read_dir(const char *dir, DropinFile **files, size_t *n) {
-        struct dirent *de;
-        DIR *d = opendir(dir);
-
-        if (!d) {
-                if (errno != ENOENT)
-                        pico_log(PICO_LOG_WARNING, "drop-ins: cannot list '%s': %s", dir, strerror(errno));
-                return 0;
-        }
-
-        while ((de = readdir(d))) {
-                size_t len = strlen(de->d_name), i;
-                DropinFile *grown;
-                char *path;
-                int w;
-
-                if (de->d_name[0] == '.' || len < 5 || strcmp(de->d_name + len - 5, ".conf") != 0)
-                        continue;
-
-                for (i = 0; i < *n; i++)
-                        if (strcmp((*files)[i].name, de->d_name) == 0)
-                                break;
-                if (i < *n)
-                        continue;
-
-                w = snprintf(NULL, 0, "%s/%s", dir, de->d_name);
-                if (w < 0 || w >= PATH_MAX) {
-                        pico_log(PICO_LOG_WARNING, "drop-ins: '%s/%s' too long, skipping", dir, de->d_name);
-                        continue;
-                }
-
-                path = malloc((size_t) w + 1);
-                if (!path) {
-                        closedir(d);
-                        return -ENOMEM;
-                }
-                snprintf(path, (size_t) w + 1, "%s/%s", dir, de->d_name);
-
-                grown = realloc(*files, (*n + 1) * sizeof(DropinFile));
-                if (!grown) {
-                        free(path);
-                        closedir(d);
-                        return -ENOMEM;
-                }
-                *files = grown;
-                (*files)[*n].path = path;
-                (*files)[*n].name = strrchr(path, '/') + 1;
-                (*n)++;
-        }
-
-        closedir(d);
-        return 0;
-}
-
 int unit_find_dropins(Manager *m, const char *id, char ***ret) {
         struct pico_dropin_cache *tmp = NULL, *c;
         char **names = NULL, **dirs = NULL, **paths = NULL;
-        DropinFile *files = NULL;
-        size_t n_files = 0;
         UnitType type;
         int r;
 
@@ -383,28 +281,16 @@ int unit_find_dropins(Manager *m, const char *id, char ***ret) {
                         goto out;
         }
 
-        for (char * const *dir = dirs; dirs && *dir; dir++) {
-                r = dropin_read_dir(*dir, &files, &n_files);
-                if (r < 0)
-                        goto out;
-        }
-
-        if (n_files > 1)
-                qsort(files, n_files, sizeof(DropinFile), dropin_file_cmp);
-
-        for (size_t i = 0; i < n_files; i++) {
-                r = pico_strv_extend(&paths, files[i].path);
-                if (r < 0)
-                        goto out;
-        }
+        r = pico_dropin_files(dirs, &paths);
+        if (r < 0)
+                goto out;
 
         *ret = paths;
         paths = NULL;
-        r = n_files > 0;
+        r = *ret != NULL;
 
 out:
         pico_strv_free(paths);
-        dropin_files_free(files, n_files);
         pico_strv_free(dirs);
         pico_strv_free(names);
         dropin_cache_free(tmp);
