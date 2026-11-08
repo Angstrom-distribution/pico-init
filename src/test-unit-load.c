@@ -689,7 +689,69 @@ static void test_alias_to_nonexistent_canonical_loads_as_error(void) {
         free(dir);
 }
 
+static void test_default_unit_path(void) {
+        Manager *m = NULL;
+
+        ASSERT_EQ_INT(manager_new(&m), 0);
+        ASSERT_TRUE(m->unit_path != NULL);
+        ASSERT_STREQ(m->unit_path[0], PICO_UNIT_DIR);
+        ASSERT_STREQ(m->unit_path[1], PICO_RUNTIME_UNIT_DIR);
+        ASSERT_STREQ(m->unit_path[2], PICO_PACKAGED_UNIT_DIR);
+        ASSERT_TRUE(m->unit_path[3] == NULL);
+
+        manager_free(m);
+}
+
+/* The runtime directory sits between /etc and /usr/lib: it overrides the
+ * packaged unit and is overridden by the admin one. */
+static void test_runtime_dir_precedence(void) {
+        static const char UNIT[] = "[Unit]\nDescription=%s\n\n[Service]\nExecStart=/bin/true\n";
+        static const char * const names[] = { "etc", "run", "lib" };
+        char *dir = test_tmpdir_new();
+        char dirs[3][PATH_MAX];
+        const char *path[4] = { dirs[0], dirs[1], dirs[2], NULL };
+        char body[128];
+        Manager *m = NULL;
+        Unit *u;
+        int i;
+
+        ASSERT_TRUE(dir != NULL);
+        for (i = 0; i < 3; i++) {
+                ASSERT_EQ_INT(test_mkdir(dir, names[i]), 0);
+                snprintf(dirs[i], sizeof(dirs[i]), "%s/%s", dir, names[i]);
+        }
+
+        snprintf(body, sizeof(body), UNIT, "run");
+        ASSERT_EQ_INT(test_write_file(dirs[1], "a.service", body), 0);
+        ASSERT_EQ_INT(test_write_file(dirs[1], "c.service", body), 0);
+        snprintf(body, sizeof(body), UNIT, "lib");
+        ASSERT_EQ_INT(test_write_file(dirs[2], "a.service", body), 0);
+        ASSERT_EQ_INT(test_write_file(dirs[2], "b.service", body), 0);
+        snprintf(body, sizeof(body), UNIT, "etc");
+        ASSERT_EQ_INT(test_write_file(dirs[0], "c.service", body), 0);
+
+        ASSERT_EQ_INT(manager_new(&m), 0);
+        ASSERT_EQ_INT(manager_set_unit_path(m, path), 0);
+        ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+
+        u = manager_get_unit(m, "a.service");
+        ASSERT_TRUE(u != NULL);
+        ASSERT_STREQ(u->description, "run");
+        u = manager_get_unit(m, "b.service");
+        ASSERT_TRUE(u != NULL);
+        ASSERT_STREQ(u->description, "lib");
+        u = manager_get_unit(m, "c.service");
+        ASSERT_TRUE(u != NULL);
+        ASSERT_STREQ(u->description, "etc");
+
+        manager_free(m);
+        test_rm_rf(dir);
+        free(dir);
+}
+
 int main(void) {
+        test_default_unit_path();
+        test_runtime_dir_precedence();
         test_symlink_alias_is_one_unit();
         test_non_alias_symlinks();
         test_literal_instance_loads();

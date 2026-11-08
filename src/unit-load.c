@@ -9,9 +9,10 @@
  * shape: search a path for "<id>", hand a found file to the INI parser,
  * resolve to UNIT_LOADED, UNIT_ERROR or UNIT_MASKED. The 2011 original searched
  * several directories (/etc, /run, /usr/lib) with per-directory drop-in
- * merging; this searches the manager's own unit path, which defaults to two
- * entries: PICO_UNIT_DIR (admin overrides) then PICO_PACKAGED_UNIT_DIR (where
- * packages install units on a usrmerged system).
+ * merging; this searches the manager's own unit path, which defaults to three
+ * entries: PICO_UNIT_DIR (admin overrides), PICO_RUNTIME_UNIT_DIR and
+ * PICO_PACKAGED_UNIT_DIR (where packages install units on a usrmerged
+ * system).
  *
  * The path lives on the Manager rather than in a file-static array so tests
  * can point unit loading at a temporary directory.
