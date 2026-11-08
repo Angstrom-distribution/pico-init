@@ -6,7 +6,8 @@
  *
  * Five families, three sources, one lifecycle:
  *
- *   by-partuuid, by-partlabel   the GPT entry gpt-scan.c already parsed
+ *   by-partuuid, by-partlabel   the GPT entry gpt-scan.c already parsed, or
+ *                               for by-partuuid the MBR signature (devd-mbr.h)
  *   by-uuid, by-label           the ext superblock ext-super.c reads
  *   by-id                       the sysfs bus walk devd-probe.c does
  *

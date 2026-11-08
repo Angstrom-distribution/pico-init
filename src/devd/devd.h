@@ -28,9 +28,10 @@
  * restart re-derives every missed event from what /sys says now. It does not
  * talk to PID 1 at all; mount(2) and symlink(2) are done directly.
  *
- * Not handled: MBR/FAT probing (only GPT-prepared media), by-path links, and
- * DPS swap activation, which stays in PID 1's boot-time dps_scan() because it
- * is scoped to the boot disk.
+ * Not handled: mounting anything but GPT data partitions (MBR partitions and
+ * whole-disk filesystems are named, never mounted), FAT probing, by-path
+ * links, and DPS swap activation, which stays in PID 1's boot-time dps_scan()
+ * because it is scoped to the boot disk.
  *
  * Implemented across devd.c (main), devd-loop.c (the object lifecycle, the
  * epoll loop, startup, coldplug and the reactions), devd-uevent.c (the netlink

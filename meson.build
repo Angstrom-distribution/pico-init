@@ -592,6 +592,8 @@ devd_core_sources = files(
   # published through for the compat libsystemd to overlay.
   'src/devd/devd-input-id.c',
   'src/devd/devd-udev-db.c',
+  # The MBR disk signature behind by-partuuid on a disk without a GPT.
+  'src/devd/devd-mbr.c',
 )
 
 devd_core = static_library(
@@ -641,6 +643,8 @@ devd_tests = [
   'test-devd-udev-db',
   # The udevd-compatible command line and udev.* kernel parameters.
   'test-devd-opts',
+  # The MBR signature checks and the PARTUUID spelling.
+  'test-devd-mbr',
 ]
 
 # PICO_SOURCE_DIR lets test-devd-match.c parse the rules file that is

@@ -32,6 +32,7 @@
 #include "../gpt-scan.h"
 #include "../util.h"
 #include "devd-input-id.h"
+#include "devd-mbr.h"
 #include "devd-media.h"
 #include "devd-modalias.h"
 #include "devd-probe.h"
@@ -435,6 +436,79 @@ static int part_number(const Devd *d, const char *part) {
 /* --- the reactions --- */
 
 /*
+ * Links for a disk with no GPT. Its MBR partitions get by-partuuid in the
+ * kernel's spelling (devd-mbr.h), which root=PARTUUID= matches, and
+ * by-uuid/by-label from an ext superblock; a disk with no partitions is read
+ * for a filesystem of its own, a whole-disk root being the usual case on a
+ * virtual machine. Nothing is mounted: the mount policy is GPT types only.
+ */
+static void react_disk_no_gpt(
+                Devd *d,
+                const char *disk,
+                const char *node,
+                const char *only_part,
+                const char *id_stem,
+                const char (*names)[DEVD_NAME_MAX],
+                size_t n_names) {
+
+        uint32_t signature = 0;
+        bool mbr;
+
+        if (n_names == 0) {
+                PicoExtInfo fs;
+                DevdLinks l;
+
+                if (only_part || ext_super_read(node, &fs) <= 0)
+                        return;
+
+                memset(&l, 0, sizeof(l));
+                (void) snprintf(l.fsuuid, sizeof(l.fsuuid), "%s", fs.uuid);
+                (void) snprintf(l.fslabel, sizeof(l.fslabel), "%s", fs.label);
+                if (id_stem)
+                        (void) snprintf(l.id, sizeof(l.id), "%s", id_stem);
+                (void) devd_symlink_create(d->dev_root, disk, &l);
+                return;
+        }
+
+        mbr = devd_mbr_read(node, &signature) > 0;
+        if (!mbr)
+                pico_log(PICO_LOG_DEBUG, "devd: %s has neither a GPT nor an MBR", node);
+
+        for (size_t i = 0; i < n_names; i++) {
+                const char *part = names[i];
+                char part_node[PATH_MAX];
+                PicoExtInfo fs;
+                DevdLinks l;
+                int nr;
+
+                if (only_part && strcmp(part, only_part) != 0)
+                        continue;
+
+                nr = part_number(d, part);
+                if (nr < 0)
+                        continue;
+
+                if ((size_t) snprintf(part_node, sizeof(part_node), "%s/%s", d->dev_root, part) >=
+                    sizeof(part_node))
+                        continue;
+
+                memset(&l, 0, sizeof(l));
+                if (mbr)
+                        (void) devd_mbr_partuuid(signature, (unsigned) nr, l.partuuid, sizeof(l.partuuid));
+
+                if (ext_super_read(part_node, &fs) > 0) {
+                        (void) snprintf(l.fsuuid, sizeof(l.fsuuid), "%s", fs.uuid);
+                        (void) snprintf(l.fslabel, sizeof(l.fslabel), "%s", fs.label);
+                }
+
+                if (id_stem)
+                        (void) snprintf(l.id, sizeof(l.id), "%s-part%d", id_stem, nr);
+
+                (void) devd_symlink_create(d->dev_root, part, &l);
+        }
+}
+
+/*
  * Name and, where policy says so, mount everything on one settled disk.
  *
  * `only_part` restricts it to a single partition, which is the late-arrival
@@ -480,14 +554,13 @@ static void react_disk(Devd *d, const char *disk, const char *only_part) {
                 return;
         }
 
-        if (r == 0)
-                /* No GPT. v1 is prepared media only, so there is nothing here
-                 * devd can name or mount -- said once, not once per partition,
-                 * and at debug because the coldplug walk says it for every
-                 * ordinary disk on the machine. */
-                pico_log(PICO_LOG_DEBUG, "devd: %s has no GPT, leaving it alone", node);
-
         n_names = devd_block_partitions(&d->block, disk, &names);
+
+        if (r == 0) {
+                react_disk_no_gpt(d, disk, node, only_part, have_id ? id_stem : NULL, names, n_names);
+                free(parts);
+                return;
+        }
 
         for (size_t i = 0; i < n_names; i++) {
                 const char *part = names[i];
