@@ -760,10 +760,10 @@ int main(int argc, char *argv[]) {
         /*
          * PID 1's own output has nowhere else to go: it is not a supervised
          * service, so nothing connects its stdout to logd, and the console it
-         * writes to otherwise is captured nowhere. /dev/kmsg is -- and a fresh
-         * reader sees the whole ring, so a logd started later in the boot
-         * backfills every line pico-init emitted before logd existed, with no
-         * persistent state involved.
+         * writes to otherwise is captured nowhere. Until logd is running
+         * the records go to /dev/kmsg, and a logd started later backfills
+         * them from the ring. While it runs they go to its /dev/log
+         * socket, with /dev/kmsg as the fallback if that send fails.
          *
          * PID 1 only, not every daemon. netd and logd are
          * supervised services whose stdout service-exec.c already connects
@@ -774,7 +774,7 @@ int main(int argc, char *argv[]) {
          * logd's case would have it ingesting its own output as kernel
          * records.
          */
-        pico_log_to_kmsg();
+        pico_log_to_journal_or_kmsg();
 
         /*
          * Who is running this machine, before it does anything to it. A log

@@ -42,16 +42,32 @@ typedef enum PicoLogLevel {
 void pico_log_internal(PicoLogLevel level, const char *format, ...) __attribute__((format(printf, 2, 3)));
 
 /*
- * Redirect pico_log() to /dev/kmsg, with a real syslog priority prefix so the
- * kernel ring carries the level rather than flattening it.
+ * Send pico_log() to logd while it is running and to /dev/kmsg otherwise,
+ * like systemd's journal-or-kmsg log target. "Running" is the manager's
+ * judgement (pico_log_set_journal_running()), not whether /dev/log accepts a
+ * connection: PID 1 holds logd.socket itself, so connect() succeeds long
+ * before logd exists, and a datagram sent then would queue unread, or
+ * socket-activate logd from PID 1's own log line. While logd is running each
+ * record goes to its /dev/log socket; if the datagram is not accepted it goes
+ * to /dev/kmsg, and a failed send drops the connection so the next record
+ * reconnects. The kernel ring holds no pico-init records of its own while
+ * logd runs; logd imports the earlier ones when it starts. Both destinations
+ * carry a real syslog priority.
  *
  * Opt-in at runtime: pico_log() is shared by the daemons and by the
  * interactive tools (picolog, picoctl), whose diagnostics belong on the
- * caller's terminal, not in the kernel ring.
+ * caller's terminal, not in the log.
  *
- * Best-effort: if /dev/kmsg cannot be opened the sink stays stderr.
+ * Best-effort: with neither destination available the sink stays stderr.
+ * The _at variant takes the two paths and may be called again to start over
+ * with logd not running; tests use it.
  */
-void pico_log_to_kmsg(void);
+void pico_log_to_journal_or_kmsg(void);
+void pico_log_to_journal_or_kmsg_at(const char *syslog_path, const char *kmsg_path);
+
+/* Tell the sink whether logd is up. Called by the manager when logd.socket or
+ * logd.service changes state; closing the window drops the connection. */
+void pico_log_set_journal_running(bool running);
 
 /*
  * Drop pico_log() messages less severe than `max`. The default keeps every

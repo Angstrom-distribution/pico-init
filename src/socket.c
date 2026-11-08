@@ -543,6 +543,10 @@ static void socket_set_state(Socket *s, SocketState state) {
         s->state = state;
         new_active = socket_active_state_of(s->state);
 
+        /* LISTENING -> RUNNING is no active-state change, so unit_notify()
+         * does not see it: a trigger while logd.service is already active,
+         * as after a restart of logd.socket, opens the gate here. */
+        manager_recheck_journal(SOCKET_UNIT(s));
         unit_notify(SOCKET_UNIT(s), old_active, new_active, true);
 }
 

@@ -81,7 +81,7 @@
 #define STATUS_COLOR_DEPENDENCY ANSI_HIGHLIGHT_YELLOW
 
 /*
- * Start writing to /dev/console. Opt-in, like pico_log_to_kmsg(): this code
+ * Start writing to /dev/console. Opt-in, like pico_log_to_journal_or_kmsg(): this code
  * is linked into every test binary and into picoctl, which must not write to
  * the machine's console. Until PID 1 calls this, every function below is a
  * no-op.

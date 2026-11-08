@@ -23,6 +23,7 @@
 #include "manager.h"
 #include "sd-event.h"
 #include "service.h"
+#include "socket.h"
 #include "unit-name.h"
 
 struct pico_cgroup_orphan {
@@ -228,6 +229,33 @@ int manager_new(Manager **ret) {
 fail:
         manager_free(m);
         return r;
+}
+
+#define JOURNAL_SOCKET "logd.socket"
+#define JOURNAL_SERVICE "logd.service"
+
+bool manager_unit_is_journal(const Unit *u) {
+        return u && u->id && (strcmp(u->id, JOURNAL_SOCKET) == 0 || strcmp(u->id, JOURNAL_SERVICE) == 0);
+}
+
+void manager_recheck_journal(Unit *changed) {
+        Unit *sock, *svc;
+        UnitActiveState st;
+
+        if (!manager_unit_is_journal(changed))
+                return;
+
+        sock = manager_get_unit(changed->manager, JOURNAL_SOCKET);
+        svc = manager_get_unit(changed->manager, JOURNAL_SERVICE);
+        if (!sock || !svc || sock->type != UNIT_SOCKET || svc->type != UNIT_SERVICE) {
+                pico_log_set_journal_running(false);
+                return;
+        }
+
+        st = unit_active_state(svc);
+        pico_log_set_journal_running(
+                        SOCKET(sock)->state == SOCKET_RUNNING &&
+                        (st == UNIT_ACTIVE || st == UNIT_RELOADING) && SERVICE(svc)->main_pid > 0);
 }
 
 Manager *manager_free(Manager *m) {

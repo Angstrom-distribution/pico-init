@@ -631,6 +631,15 @@ static void check_syslog_datagram(const char *payload, const char *ident, const 
         free(dir);
 }
 
+/* What PID 1's log sink sends (util.c): the level word sits where the pid would. */
+static void test_syslog_pico_init_record(void) {
+        check_syslog_datagram(
+                        "<4>pico-init[warning]: x.service: failed -> activating",
+                        "pico-init",
+                        NULL,
+                        "x.service: failed -> activating");
+}
+
 /* libc's syslog(3) puts an RFC 3164 stamp between the priority and the tag. */
 static void test_syslog_timestamp(void) {
         char longtag[300];
@@ -847,6 +856,7 @@ int main(void) {
         test_cgroup_unit_extraction_real_kernel();
         test_syslog_basic();
         test_syslog_timestamp();
+        test_syslog_pico_init_record();
         test_syslog_real_client();
         test_shutdown_flushes_pending_tail();
         test_bind_socket_sets_passcred();

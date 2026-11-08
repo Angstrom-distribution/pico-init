@@ -269,6 +269,11 @@ pico_tests = [
   # The wording of the early boot lines, and reading /etc/hostname.
   'test-boot-text',
   'test-hostname-setup',
+  # PID 1's log sink: logd while it runs, /dev/kmsg otherwise and as the fallback.
+  'test-log-sink',
+  # The manager's gate on that sink: logd's socket only while logd.socket is
+  # RUNNING and logd.service active, never while it stops or has failed.
+  'test-manager-log-sink',
 ]
 
 # manager.h includes sd-event.h, so every test that reaches it (through
