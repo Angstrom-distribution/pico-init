@@ -221,6 +221,27 @@ static void publish_unit_aliases(Unit *u, struct pico_manager_state *st) {
         }
 }
 
+/*
+ * DropInPaths= is systemctl show's property: the applied drop-in files
+ * separated by spaces. Whole paths only; those that do not fit are left out,
+ * as picoctl reads the file with a bounded line buffer.
+ */
+static void join_dropin_paths(char * const *paths, char *buf, size_t size) {
+        size_t off = 0;
+
+        buf[0] = '\0';
+        for (; paths && *paths; paths++) {
+                size_t len = strlen(*paths);
+
+                if (off + (off ? 1 : 0) + len + 1 > size)
+                        break;
+                if (off)
+                        buf[off++] = ' ';
+                memcpy(buf + off, *paths, len + 1);
+                off += len;
+        }
+}
+
 /* Write u's file to a fixed tmp name under units_dir, then rename() it into
  * place. Every failure is logged at DEBUG and swallowed -- see the file
  * header for why this must never propagate. */
@@ -230,6 +251,7 @@ static void publish_unit_file(Unit *u) {
         char final[PATH_MAX];
         char job_buf[80] = "";
         char notify_buf[192] = "";
+        char dropin_buf[2048];
         char *degraded;
         char delegate_buf[64];
         char kill_buf[128];
@@ -258,6 +280,8 @@ static void publish_unit_file(Unit *u) {
 
         if (u->type == UNIT_SERVICE)
                 s = SERVICE(u);
+
+        join_dropin_paths(u->dropin_paths, dropin_buf, sizeof(dropin_buf));
 
         if (u->job)
                 snprintf(job_buf,
@@ -318,6 +342,7 @@ static void publish_unit_file(Unit *u) {
                 "SubState=%s\n"
                 "LoadState=%s\n"
                 "FragmentPath=%s\n"
+                "DropInPaths=%s\n"
                 "Description=%s\n"
                 "UnitFileState=%s\n"
                 "MainPID=%d\n"
@@ -337,6 +362,7 @@ static void publish_unit_file(Unit *u) {
                 unit_substate(u),
                 unit_load_state_to_string(u->load_state),
                 u->fragment_path ? u->fragment_path : "",
+                dropin_buf,
                 u->description ? u->description : "",
                 unit_file_state(u),
                 /* exec_main_pid, not the live main_pid: it stays set after
