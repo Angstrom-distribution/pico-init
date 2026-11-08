@@ -1784,6 +1784,363 @@ static void test_ipv6_accept_ra_token(void) {
         free(dir);
 }
 
+/* --- drop-ins: the .conf files of foo.network.d --- */
+
+typedef struct DropinFixture {
+        char *dir[3];  /* the search path: etc, run, usr */
+        char *scratch; /* for captured warnings, outside the search path */
+        Netd n;
+} DropinFixture;
+
+static void fixture_new(DropinFixture *f) {
+        memset(f, 0, sizeof(*f));
+        f->scratch = test_tmpdir_new();
+        ASSERT_TRUE(f->scratch != NULL);
+
+        for (int i = 0; i < 3; i++) {
+                char *d = test_tmpdir_new();
+
+                ASSERT_TRUE(d != NULL);
+                f->dir[i] = d;
+                ASSERT_EQ_INT(pico_strv_extend(&f->n.network_path, d), 0);
+        }
+}
+
+static void fixture_free(DropinFixture *f) {
+        network_free_all(&f->n);
+        pico_strv_free(f->n.network_path);
+        for (int i = 0; i < 3; i++) {
+                test_rm_rf(f->dir[i]);
+                free(f->dir[i]);
+        }
+        test_rm_rf(f->scratch);
+        free(f->scratch);
+}
+
+enum { ETC, RUN, USR };
+
+/* Write `dir`/`sub`/`name`, making `sub` first. */
+static void put(const DropinFixture *f, int dir, const char *sub, const char *name, const char *content) {
+        char *d;
+
+        ASSERT_EQ_INT(test_mkdir(f->dir[dir], sub), 0);
+        d = join_path(f->dir[dir], sub);
+        ASSERT_EQ_INT(test_write_file(d, name, content), 0);
+        free(d);
+}
+
+static void expect_dns(const Network *nw, size_t i, const char *want) {
+        char buf[INET6_ADDRSTRLEN];
+
+        ASSERT_TRUE(i < nw->n_dns);
+        ASSERT_STREQ(netd_addr_to_string(nw->dns[i].family, &nw->dns[i].address, buf), want);
+}
+
+static void expect_dropin(const DropinFixture *f, const Network *nw, size_t i, int dir, const char *rel) {
+        char *want = join_path(f->dir[dir], rel);
+
+        ASSERT_TRUE(nw->dropins != NULL);
+        ASSERT_TRUE(i < pico_strv_length(nw->dropins));
+        ASSERT_STREQ(nw->dropins[i], want);
+        free(want);
+}
+
+/* The .network file is in the lowest-priority directory and its drop-ins are
+ * in all three. The applied files are sorted by name, not by directory; a name
+ * in an earlier directory hides the same name in a later one; hidden files and
+ * names not ending in .conf are not read. */
+static void test_dropin_precedence_and_order(void) {
+        DropinFixture f;
+        Network *nw;
+
+        fixture_new(&f);
+        ASSERT_EQ_INT(test_write_file(f.dir[USR],
+                                      "10-a.network",
+                                      "[Match]\nName=net0\n[Network]\nDNS=10.0.0.1\n"),
+                      0);
+
+        put(&f, RUN, "10-a.network.d", "40-late.conf", "[Network]\nDNS=10.40.0.1\n");
+        put(&f, RUN, "10-a.network.d", "05-first.conf", "[Network]\nDNS=10.5.0.1\n");
+        put(&f, ETC, "10-a.network.d", "20-b.conf", "[Network]\nDNS=10.20.0.1\n");
+        put(&f, USR, "10-a.network.d", "20-b.conf", "[Network]\nDNS=10.99.0.1\n");
+        put(&f, USR, "10-a.network.d", "30-c.conf", "[Network]\nDNS=10.30.0.1\n");
+        put(&f, ETC, "10-a.network.d", ".hidden.conf", "[Network]\nDNS=10.66.0.1\n");
+        put(&f, ETC, "10-a.network.d", "50-x.conf.bak", "[Network]\nDNS=10.66.0.2\n");
+        put(&f, ETC, "10-a.network.d", "60-y.txt", "[Network]\nDNS=10.66.0.3\n");
+
+        ASSERT_EQ_INT(network_load_all(&f.n), 1);
+        nw = network_find(&f.n, "net0");
+        ASSERT_TRUE(nw != NULL);
+
+        ASSERT_EQ_INT(pico_strv_length(nw->dropins), 4);
+        expect_dropin(&f, nw, 0, RUN, "10-a.network.d/05-first.conf");
+        expect_dropin(&f, nw, 1, ETC, "10-a.network.d/20-b.conf");
+        expect_dropin(&f, nw, 2, USR, "10-a.network.d/30-c.conf");
+        expect_dropin(&f, nw, 3, RUN, "10-a.network.d/40-late.conf");
+
+        ASSERT_EQ_INT(nw->n_dns, 5);
+        expect_dns(nw, 0, "10.0.0.1");
+        expect_dns(nw, 1, "10.5.0.1");
+        expect_dns(nw, 2, "10.20.0.1");
+        expect_dns(nw, 3, "10.30.0.1");
+        expect_dns(nw, 4, "10.40.0.1");
+
+        fixture_free(&f);
+}
+
+/* Only the file's own foo.network.d is read: not network.d, not the
+ * dash-truncated "10-.network.d", and a directory with no .network file
+ * behind it does nothing. */
+static void test_dropin_only_own_directory(void) {
+        DropinFixture f;
+        Network *nw;
+
+        fixture_new(&f);
+        ASSERT_EQ_INT(test_write_file(f.dir[ETC], "10-a.network", "[Match]\nName=net0\n"), 0);
+        put(&f, ETC, "network.d", "10.conf", "[Network]\nDNS=10.1.0.1\n");
+        put(&f, ETC, "10-.network.d", "10.conf", "[Network]\nDNS=10.2.0.1\n");
+        put(&f, ETC, "10-a.network.d", "10.conf", "[Network]\nDNS=10.3.0.1\n");
+        put(&f, ETC, "20-orphan.network.d", "10.conf", "[Match]\nName=net1\n");
+
+        ASSERT_EQ_INT(network_load_all(&f.n), 1);
+        ASSERT_EQ_INT(f.n.n_networks, 1);
+        ASSERT_TRUE(network_find(&f.n, "net1") == NULL);
+        nw = network_find(&f.n, "net0");
+        ASSERT_TRUE(nw != NULL);
+        ASSERT_EQ_INT(nw->n_dns, 1);
+        expect_dns(nw, 0, "10.3.0.1");
+
+        fixture_free(&f);
+}
+
+/* An empty assignment in a drop-in resets a list the .network file built, and
+ * what follows it starts the list again. */
+static void test_dropin_list_reset(void) {
+        DropinFixture f;
+        char buf[INET6_ADDRSTRLEN];
+        Network *nw;
+
+        fixture_new(&f);
+        ASSERT_EQ_INT(test_write_file(f.dir[ETC],
+                                      "10-a.network",
+                                      "[Match]\nName=net0\n"
+                                      "[Network]\nDNS=10.0.0.1\nDNS=10.0.0.2\nNTP=10.1.1.1\n"
+                                      "Address=10.0.0.5/24\nAddress=10.0.0.6/24\n"),
+                      0);
+        put(&f,
+            ETC,
+            "10-a.network.d",
+            "10.conf",
+            "[Match]\nName=\nName=eth7\n"
+            "[Network]\nDNS=\nDNS=10.9.0.1\nNTP=\nAddress=\nAddress=10.9.0.9/24\n");
+
+        ASSERT_EQ_INT(network_load_all(&f.n), 1);
+        ASSERT_TRUE(network_find(&f.n, "net0") == NULL);
+        nw = network_find(&f.n, "eth7");
+        ASSERT_TRUE(nw != NULL);
+        ASSERT_EQ_INT(nw->n_dns, 1);
+        expect_dns(nw, 0, "10.9.0.1");
+        ASSERT_EQ_INT(nw->n_ntp, 0);
+        ASSERT_EQ_INT(nw->n_addresses, 1);
+        ASSERT_STREQ(netd_addr_to_string(AF_INET, &nw->addresses[0].address, buf), "10.9.0.9");
+
+        fixture_free(&f);
+}
+
+/* A bad line in a drop-in is reported with the drop-in's path and line and
+ * costs that line only; a duplicate across the two files names both. */
+static void test_dropin_bad_line_reports_file_and_line(void) {
+        DropinFixture f;
+        char want[PATH_MAX + 128];
+        Capture cap;
+        Network *nw;
+
+        fixture_new(&f);
+        ASSERT_EQ_INT(test_write_file(f.dir[ETC],
+                                      "10-a.network",
+                                      "[Match]\nName=net0\n[Network]\nAddress=10.0.0.5/24\n"),
+                      0);
+        put(&f,
+            ETC,
+            "10-a.network.d",
+            "50-bad.conf",
+            "[Network]\nAddress=10.0.0.5/24\nnot an assignment\nDHCP=yes\nDNS=bogus\n");
+
+        capture_begin(&cap, f.scratch);
+        ASSERT_EQ_INT(network_load_all(&f.n), 1);
+        ASSERT_EQ_INT(capture_end(&cap, "10-a.network.d/50-bad.conf:3: no '=' found"), 1);
+
+        capture_begin(&cap, f.scratch);
+        ASSERT_EQ_INT(network_load_all(&f.n), 1);
+        ASSERT_EQ_INT(capture_end(&cap, "10-a.network.d/50-bad.conf:5:"), 1);
+
+        snprintf(want,
+                 sizeof(want),
+                 "10-a.network:4: address 10.0.0.5 is also set at %s/10-a.network.d/50-bad.conf:2",
+                 f.dir[ETC]);
+        capture_begin(&cap, f.scratch);
+        ASSERT_EQ_INT(network_load_all(&f.n), 1);
+        ASSERT_EQ_INT(capture_end(&cap, want), 1);
+
+        nw = network_find(&f.n, "net0");
+        ASSERT_TRUE(nw != NULL);
+        ASSERT_TRUE(network_dhcp4_enabled(nw));
+        ASSERT_EQ_INT(nw->n_addresses, 1);
+        ASSERT_TRUE(strstr(nw->addresses[0].file, "50-bad.conf") != NULL);
+        ASSERT_EQ_INT(nw->addresses[0].line, 2);
+
+        fixture_free(&f);
+}
+
+/* A section left open at the end of one file does not carry into the next: a
+ * key at the top of a drop-in is refused as outside any section. */
+static void test_dropin_sections_do_not_continue(void) {
+        DropinFixture f;
+        Capture cap;
+        Network *nw;
+
+        fixture_new(&f);
+        ASSERT_EQ_INT(test_write_file(f.dir[ETC],
+                                      "10-a.network",
+                                      "[Match]\nName=net0\n[Address]\nAddress=10.0.0.7/24\n"),
+                      0);
+        put(&f, ETC, "10-a.network.d", "10.conf", "Label=lab0\n");
+        put(&f, ETC, "10-a.network.d", "20.conf", "[Address]\nLabel=lab1\n");
+
+        capture_begin(&cap, f.scratch);
+        ASSERT_EQ_INT(network_load_all(&f.n), 1);
+        ASSERT_EQ_INT(capture_end(&cap, "10-a.network.d/20.conf:1: [Address] section without Address="), 1);
+
+        capture_begin(&cap, f.scratch);
+        ASSERT_EQ_INT(network_load_all(&f.n), 1);
+        ASSERT_EQ_INT(capture_end(&cap, "10.conf:1: assignment outside any section"), 1);
+
+        nw = network_find(&f.n, "net0");
+        ASSERT_TRUE(nw != NULL);
+        ASSERT_EQ_INT(nw->n_addresses, 1);
+        ASSERT_STREQ(nw->addresses[0].label, "");
+
+        fixture_free(&f);
+}
+
+/* A drop-in that cannot be read is a warning naming it, and the .network file
+ * and the other drop-ins still apply. */
+static void test_dropin_unreadable(void) {
+        DropinFixture f;
+        Capture cap;
+        Network *nw;
+        char *d;
+
+        fixture_new(&f);
+        ASSERT_EQ_INT(test_write_file(f.dir[ETC],
+                                      "10-a.network",
+                                      "[Match]\nName=net0\n[Network]\nDNS=10.0.0.1\n"),
+                      0);
+        put(&f, ETC, "10-a.network.d", "20.conf", "[Network]\nDNS=10.2.0.1\n");
+        d = join_path(f.dir[ETC], "10-a.network.d");
+        ASSERT_EQ_INT(test_symlink(d, "10.conf", "10.conf"), 0); /* ELOOP */
+        ASSERT_EQ_INT(test_symlink(d, "15.conf", "missing.conf"), 0);
+        free(d);
+
+        capture_begin(&cap, f.scratch);
+        ASSERT_EQ_INT(network_load_all(&f.n), 1);
+        ASSERT_EQ_INT(capture_end(&cap, "failed to read drop-in"), 2);
+
+        nw = network_find(&f.n, "net0");
+        ASSERT_TRUE(nw != NULL);
+        ASSERT_EQ_INT(nw->n_dns, 2);
+        expect_dns(nw, 1, "10.2.0.1");
+
+        fixture_free(&f);
+}
+
+/* A link to /dev/null or an empty file in an earlier directory hides the
+ * same name below it, and a masked .network file loads no drop-ins. */
+static void test_dropin_masking(void) {
+        DropinFixture f;
+        Network *nw;
+
+        fixture_new(&f);
+        ASSERT_EQ_INT(test_write_file(f.dir[USR], "10-a.network", "[Match]\nName=net0\n"), 0);
+        put(&f, USR, "10-a.network.d", "10.conf", "[Network]\nDNS=10.1.0.1\n");
+        put(&f, USR, "10-a.network.d", "20.conf", "[Network]\nDNS=10.2.0.1\n");
+        put(&f, USR, "10-a.network.d", "30.conf", "[Network]\nDNS=10.3.0.1\n");
+        ASSERT_EQ_INT(test_mkdir(f.dir[ETC], "10-a.network.d"), 0);
+        {
+                char *d = join_path(f.dir[ETC], "10-a.network.d");
+
+                ASSERT_EQ_INT(test_symlink(d, "10.conf", "/dev/null"), 0);
+                ASSERT_EQ_INT(test_write_file(d, "20.conf", ""), 0);
+                free(d);
+        }
+
+        ASSERT_EQ_INT(network_load_all(&f.n), 1);
+        nw = network_find(&f.n, "net0");
+        ASSERT_TRUE(nw != NULL);
+        ASSERT_EQ_INT(pico_strv_length(nw->dropins), 3);
+        ASSERT_EQ_INT(nw->n_dns, 1);
+        expect_dns(nw, 0, "10.3.0.1");
+
+        /* An empty file in /etc masks the whole network, drop-ins included. */
+        ASSERT_EQ_INT(test_write_file(f.dir[ETC], "10-a.network", ""), 0);
+        ASSERT_EQ_INT(network_load_all(&f.n), 0);
+        ASSERT_TRUE(network_find(&f.n, "net0") == NULL);
+
+        fixture_free(&f);
+}
+
+/* Each load reads the directories again: added, edited and removed drop-ins
+ * and a drop-in directory appearing in a higher-priority directory. */
+static void test_dropin_reload(void) {
+        DropinFixture f;
+        char *path;
+        Network *nw;
+
+        fixture_new(&f);
+        ASSERT_EQ_INT(test_write_file(f.dir[USR],
+                                      "10-a.network",
+                                      "[Match]\nName=net0\n[Network]\nDNS=10.0.0.1\n"),
+                      0);
+
+        ASSERT_EQ_INT(network_load_all(&f.n), 1);
+        nw = network_find(&f.n, "net0");
+        ASSERT_TRUE(nw != NULL);
+        ASSERT_TRUE(nw->dropins == NULL);
+        ASSERT_EQ_INT(nw->n_dns, 1);
+
+        put(&f, RUN, "10-a.network.d", "10.conf", "[Network]\nDNS=10.1.0.1\n");
+        ASSERT_EQ_INT(network_load_all(&f.n), 1);
+        nw = network_find(&f.n, "net0");
+        ASSERT_EQ_INT(nw->n_dns, 2);
+        expect_dns(nw, 1, "10.1.0.1");
+
+        put(&f, RUN, "10-a.network.d", "10.conf", "[Network]\nDNS=10.2.0.1\n");
+        ASSERT_EQ_INT(network_load_all(&f.n), 1);
+        nw = network_find(&f.n, "net0");
+        ASSERT_EQ_INT(nw->n_dns, 2);
+        expect_dns(nw, 1, "10.2.0.1");
+
+        put(&f, ETC, "10-a.network.d", "10.conf", "[Network]\nDNS=10.3.0.1\n");
+        ASSERT_EQ_INT(network_load_all(&f.n), 1);
+        nw = network_find(&f.n, "net0");
+        ASSERT_EQ_INT(pico_strv_length(nw->dropins), 1);
+        expect_dropin(&f, nw, 0, ETC, "10-a.network.d/10.conf");
+        expect_dns(nw, 1, "10.3.0.1");
+
+        path = join_path(f.dir[ETC], "10-a.network.d/10.conf");
+        ASSERT_EQ_INT(unlink(path), 0);
+        free(path);
+        path = join_path(f.dir[RUN], "10-a.network.d/10.conf");
+        ASSERT_EQ_INT(unlink(path), 0);
+        free(path);
+        ASSERT_EQ_INT(network_load_all(&f.n), 1);
+        nw = network_find(&f.n, "net0");
+        ASSERT_TRUE(nw->dropins == NULL);
+        ASSERT_EQ_INT(nw->n_dns, 1);
+
+        fixture_free(&f);
+}
+
 int main(void) {
         test_defaults();
         test_dhcp_spellings();
@@ -1824,6 +2181,14 @@ int main(void) {
         test_ipv6_accept_ra_keys();
         test_ipv6_accept_ra_route_metric();
         test_ipv6_accept_ra_token();
+        test_dropin_precedence_and_order();
+        test_dropin_only_own_directory();
+        test_dropin_list_reset();
+        test_dropin_bad_line_reports_file_and_line();
+        test_dropin_sections_do_not_continue();
+        test_dropin_unreadable();
+        test_dropin_masking();
+        test_dropin_reload();
 
         printf("test-netd-network: ok\n");
         return EXIT_SUCCESS;

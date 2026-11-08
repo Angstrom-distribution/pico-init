@@ -122,6 +122,7 @@ typedef struct NetworkAddress {
         NetdInAddr peer;
         uint32_t route_metric; /* of the prefix route, IFA_RT_PRIORITY */
         char label[IFNAMSIZ];  /* IPv4 only; empty for none */
+        const char *file;      /* where it was set: the Network's filename or one of its dropins */
         unsigned line;
 } NetworkAddress;
 
@@ -151,6 +152,7 @@ typedef struct NetworkRoute {
         NetdInAddr gw;
         NetdInAddr prefsrc;
         uint32_t metric;
+        const char *file; /* as NetworkAddress.file */
         unsigned line;
 } NetworkRoute;
 
@@ -182,6 +184,12 @@ struct Network {
          */
         char *filename;
         char *basename;
+
+        /*
+         * The drop-in files applied after it, in the order applied. NULL when
+         * there are none. Owned.
+         */
+        char **dropins;
 
         /*
          * [Match] Name= -- a space-separated list of fnmatch(3) globs, the
@@ -278,6 +286,12 @@ struct Network {
  * not an error. */
 int network_parse_file(const char *path, Network **ret);
 
+/* As network_parse_file(), then each of the NULL-terminated `dropins` (may be
+ * NULL) through the same parser, so a later assignment replaces an earlier one
+ * and an empty one resets a list. A drop-in that cannot be read is a warning
+ * and costs that file only. */
+int network_parse_files(const char *path, char * const *dropins, Network **ret);
+
 /* Allocate a Network with every default applied and nothing set. 0 or -errno. */
 int network_new(Network **ret);
 
@@ -289,7 +303,11 @@ Network *network_free(Network *nw); /* returns NULL */
  *   - files ending in .network are collected from all three directories;
  *   - a basename found in a higher-priority directory shadows the same
  *     basename in a lower one (the lower file is never even opened);
- *   - the surviving union is sorted lexicographically by basename.
+ *   - the surviving union is sorted lexicographically by basename;
+ *   - the files of foo.network.d in every directory are applied after each
+ *     foo.network, see network_parse_files(); an empty file or a link to
+ *     /dev/null is skipped with its drop-ins, and each directory is listed
+ *     once per call.
  *
  * The old set is replaced only once the new one is complete, so a reload that
  * fails leaves the running configuration alone. Number of files loaded, or

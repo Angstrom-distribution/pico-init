@@ -25,8 +25,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h> /* strcasecmp, for the boolean spellings */
+#include <sys/stat.h>
 
 #include "../conf-scan.h"
+#include "../dropin-files.h"
 #include "../util.h"
 #include "netd.h"
 
@@ -72,6 +74,7 @@ Network *network_free(Network *nw) {
         free(nw->filename);
         free(nw->basename);
         pico_strv_free(nw->match_name);
+        pico_strv_free(nw->dropins);
         free(nw->addresses);
         free(nw->routes);
         free(nw->dns);
@@ -533,6 +536,7 @@ static ssize_t network_address_append(NetworkParser *p, const char *path, unsign
         nw->addresses = grown;
         memset(&grown[nw->n_addresses], 0, sizeof(*grown));
         grown[nw->n_addresses].line = line;
+        grown[nw->n_addresses].file = path;
         return (ssize_t) nw->n_addresses++;
 }
 
@@ -559,6 +563,7 @@ static ssize_t network_route_append(NetworkParser *p, const char *path, unsigned
         nw->routes = grown;
         memset(&grown[nw->n_routes], 0, sizeof(*grown));
         grown[nw->n_routes].line = line;
+        grown[nw->n_routes].file = path;
         return (ssize_t) nw->n_routes++;
 }
 
@@ -930,23 +935,33 @@ static bool network_address_same(const NetworkAddress *a, const NetworkAddress *
         return a->family == AF_INET6 || a->prefixlen == b->prefixlen;
 }
 
+/* Where a later duplicate is: "line N" in the same file, else "file:N". */
+static const char *network_where(char *buf, size_t size, const char *first, const char *file, unsigned line) {
+        if (strcmp(first, file) == 0)
+                snprintf(buf, size, "line %u", line);
+        else
+                snprintf(buf, size, "%s:%u", file, line);
+        return buf;
+}
+
 /*
- * Drops what networkd drops and fills in the defaults, once the whole file is
+ * Drops what networkd drops and fills in the defaults, once every file is
  * read, because the keys of a section come in any order. The later of two
  * entries for one address wins, as in networkd.
  */
-static void network_verify_addresses(Network *nw, const char *path) {
+static void network_verify_addresses(Network *nw) {
         size_t n = 0;
 
         for (size_t i = 0; i < nw->n_addresses; i++) {
                 NetworkAddress a = nw->addresses[i];
                 char buf[INET6_ADDRSTRLEN];
+                char where[PATH_MAX + 16];
                 size_t k;
 
                 if (a.family == 0) {
                         pico_log(PICO_LOG_WARNING,
                                  "%s:%u: [Address] section without Address=, ignoring",
-                                 path,
+                                 a.file,
                                  a.line);
                         continue;
                 }
@@ -954,7 +969,7 @@ static void network_verify_addresses(Network *nw, const char *path) {
                 if (a.peer_set && a.peer_family != a.family) {
                         pico_log(PICO_LOG_WARNING,
                                  "%s:%u: Peer= is not the same family as Address=, ignoring the address",
-                                 path,
+                                 a.file,
                                  a.line);
                         continue;
                 }
@@ -962,7 +977,7 @@ static void network_verify_addresses(Network *nw, const char *path) {
                 if (netd_addr_is_null(a.family, &a.address)) {
                         pico_log(PICO_LOG_WARNING,
                                  "%s:%u: a null Address= asks for an address pool, which is not supported, ignoring",
-                                 path,
+                                 a.file,
                                  a.line);
                         continue;
                 }
@@ -970,7 +985,7 @@ static void network_verify_addresses(Network *nw, const char *path) {
                 if (a.family == AF_INET6 && a.label[0] != '\0') {
                         pico_log(PICO_LOG_WARNING,
                                  "%s:%u: Label= has no effect on an IPv6 address, ignoring it",
-                                 path,
+                                 a.file,
                                  a.line);
                         a.label[0] = '\0';
                 }
@@ -991,11 +1006,11 @@ static void network_verify_addresses(Network *nw, const char *path) {
 
                 if (k < n) {
                         pico_log(PICO_LOG_WARNING,
-                                 "%s:%u: address %s is also set at line %u, using the later one",
-                                 path,
+                                 "%s:%u: address %s is also set at %s, using the later one",
+                                 nw->addresses[k].file,
                                  nw->addresses[k].line,
                                  netd_addr_to_string(a.family, &a.address, buf),
-                                 a.line);
+                                 network_where(where, sizeof(where), nw->addresses[k].file, a.file, a.line));
                         memmove(&nw->addresses[k], &nw->addresses[k + 1], (n - k - 1) * sizeof(*nw->addresses));
                         n--;
                 }
@@ -1223,11 +1238,12 @@ static bool network_route_same(const NetworkRoute *a, const NetworkRoute *b) {
  * is a warned no-op and never a metric on some route. The later of two
  * identical routes wins.
  */
-static void network_verify_routes(Network *nw, const char *path) {
+static void network_verify_routes(Network *nw) {
         size_t n = 0;
 
         for (size_t i = 0; i < nw->n_routes; i++) {
                 NetworkRoute r = nw->routes[i];
+                char where[PATH_MAX + 16];
                 size_t k;
 
                 if (r.drop)
@@ -1237,7 +1253,7 @@ static void network_verify_routes(Network *nw, const char *path) {
                 if (r.family == 0) {
                         pico_log(PICO_LOG_WARNING,
                                  "%s:%u: [Route] section without Gateway=, Destination=, Source=, or PreferredSource= field configured, ignoring",
-                                 path,
+                                 r.file,
                                  r.line);
                         continue;
                 }
@@ -1246,7 +1262,7 @@ static void network_verify_routes(Network *nw, const char *path) {
                     (r.prefsrc_family && r.prefsrc_family != r.family)) {
                         pico_log(PICO_LOG_WARNING,
                                  "%s:%u: Destination=, Gateway= and PreferredSource= are not all IPv4 or all IPv6, ignoring the [Route] section",
-                                 path,
+                                 r.file,
                                  r.line);
                         continue;
                 }
@@ -1255,7 +1271,7 @@ static void network_verify_routes(Network *nw, const char *path) {
                         if (r.scope_set && r.scope != RT_SCOPE_UNIVERSE)
                                 pico_log(PICO_LOG_WARNING,
                                          "%s:%u: Scope= is specified for an IPv6 route, ignoring it",
-                                         path,
+                                         r.file,
                                          r.line);
 
                         r.scope = RT_SCOPE_UNIVERSE;
@@ -1269,7 +1285,7 @@ static void network_verify_routes(Network *nw, const char *path) {
                 if (!r.onlink_set && r.gw_family && nw->n_addresses == 0) {
                         pico_log(PICO_LOG_WARNING,
                                  "%s:%u: Gateway= without a static address configured, enabling GatewayOnLink=",
-                                 path,
+                                 r.file,
                                  r.line);
                         r.onlink = true;
                 }
@@ -1280,10 +1296,10 @@ static void network_verify_routes(Network *nw, const char *path) {
 
                 if (k < n) {
                         pico_log(PICO_LOG_WARNING,
-                                 "%s:%u: the same route is set at line %u, using the later one",
-                                 path,
+                                 "%s:%u: the same route is set at %s, using the later one",
+                                 nw->routes[k].file,
                                  nw->routes[k].line,
-                                 r.line);
+                                 network_where(where, sizeof(where), nw->routes[k].file, r.file, r.line));
                         memmove(&nw->routes[k], &nw->routes[k + 1], (n - k - 1) * sizeof(*nw->routes));
                         n--;
                 }
@@ -1612,17 +1628,35 @@ static char *path_basename_dup(const char *path) {
         return pico_strdup(slash ? slash + 1 : path);
 }
 
-int network_parse_file(const char *path, Network **ret) {
+/* Scan one file with the parser state of a fresh file. The resets are
+ * defensive: a key before the first section is refused before they matter. */
+static int network_scan_file(NetworkParser *parser, const char *path) {
+        int r;
+
+        parser->cur = -1;
+        parser->cur_route = -1;
+        parser->warned_cap = false;
+        parser->warned_route_cap = false;
+        parser->sec_qdisc = NETWORK_QDISC_NONE;
+
+        r = pico_conf_scan_full(path, network_conf_handler, network_section_handler, parser);
+        network_qdisc_commit(parser, path);
+        return r;
+}
+
+/* As network_parse_files(), taking ownership of `dropins` on success and failure. */
+static int network_parse_owned(const char *path, char **dropins, Network **ret) {
         NetworkParser parser = { 0 };
         Network *nw = NULL;
         int r;
 
-        if (!path || !ret)
-                return -EINVAL;
-
         r = network_new(&nw);
-        if (r < 0)
+        if (r < 0) {
+                pico_strv_free(dropins);
                 return r;
+        }
+
+        nw->dropins = dropins;
 
         nw->filename = pico_strdup(path);
         nw->basename = path_basename_dup(path);
@@ -1632,21 +1666,50 @@ int network_parse_file(const char *path, Network **ret) {
         }
 
         parser.nw = nw;
-        parser.cur = -1;
-        parser.cur_route = -1;
 
-        r = pico_conf_scan_full(path, network_conf_handler, network_section_handler, &parser);
+        r = network_scan_file(&parser, nw->filename);
         if (r < 0) {
                 network_free(nw);
                 return r;
         }
 
-        network_qdisc_commit(&parser, path);
-        network_verify_addresses(nw, path);
-        network_verify_routes(nw, path);
+        /* A drop-in that is gone or unreadable costs that file only, as for
+         * unit drop-ins. */
+        for (char * const *d = nw->dropins; d && *d; d++) {
+                int dr = network_scan_file(&parser, *d);
+
+                if (dr < 0)
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s: failed to read drop-in '%s': %s",
+                                 nw->filename,
+                                 *d,
+                                 strerror(-dr));
+        }
+
+        network_verify_addresses(nw);
+        network_verify_routes(nw);
 
         *ret = nw;
         return 0;
+}
+
+int network_parse_files(const char *path, char * const *dropins, Network **ret) {
+        char **copy = NULL;
+
+        if (!path || !ret)
+                return -EINVAL;
+
+        for (; dropins && *dropins; dropins++)
+                if (pico_strv_extend(&copy, *dropins) < 0) {
+                        pico_strv_free(copy);
+                        return -ENOMEM;
+                }
+
+        return network_parse_owned(path, copy, ret);
+}
+
+int network_parse_file(const char *path, Network **ret) {
+        return network_parse_files(path, NULL, ret);
 }
 
 /* --- discovery: search-path walk, shadowing, ordering --- */
@@ -1656,15 +1719,23 @@ int network_parse_file(const char *path, Network **ret) {
  * same shape as unit-enable.c's PresetEntry, for the same reason. */
 typedef struct NetworkEntry {
         char *basename;
-        char *path; /* dir/basename */
+        char *path;     /* dir/basename */
+        char **dropins; /* the drop-in files that apply, in order; NULL for none */
 } NetworkEntry;
 
 static void network_entries_free(NetworkEntry *entries, size_t n) {
         for (size_t i = 0; i < n; i++) {
                 free(entries[i].basename);
                 free(entries[i].path);
+                pico_strv_free(entries[i].dropins);
         }
         free(entries);
+}
+
+static void network_dirlists_free(PicoDropinDirList *lists, size_t n) {
+        for (size_t i = 0; i < n; i++)
+                pico_dropin_dirlist_clear(&lists[i]);
+        free(lists);
 }
 
 static int network_entry_cmp(const void *a, const void *b) {
@@ -1688,12 +1759,22 @@ static bool has_network_suffix(const char *name) {
  * earlier (higher-priority) directory shadows the same name turning up in a
  * later one, and the lower-priority file is never even opened. The caller
  * sorts the result by basename to get the real cross-directory file order.
+ *
+ * The same pass over each directory records its "*.network.d" directories in
+ * `*ret_dirs`, one list per search-path entry, so finding the drop-ins of a
+ * file needs no further listing.
  */
-static int collect_network_entries(Netd *n, NetworkEntry **ret, size_t *ret_n) {
+static int collect_network_entries(Netd *n, NetworkEntry **ret, size_t *ret_n, PicoDropinDirList **ret_dirs) {
+        PicoDropinDirList *dirs = NULL;
         NetworkEntry *entries = NULL;
         size_t n_alloc = 0;
         size_t n_entries = 0;
+        size_t n_dirs = n->network_path ? pico_strv_length(n->network_path) : 0;
         int rc = 0;
+
+        dirs = calloc(n_dirs ? n_dirs : 1, sizeof(*dirs));
+        if (!dirs)
+                return -ENOMEM;
 
         for (size_t i = 0; n->network_path && n->network_path[i]; i++) {
                 const char *dir = n->network_path[i];
@@ -1712,6 +1793,12 @@ static int collect_network_entries(Netd *n, NetworkEntry **ret, size_t *ret_n) {
                         char path[PATH_MAX];
                         bool shadowed = false;
                         int written;
+
+                        if (pico_dropin_dirlist_add(&dirs[i], de, NETWORK_FILE_SUFFIX ".d") < 0) {
+                                rc = -ENOMEM;
+                                closedir(d);
+                                goto fail;
+                        }
 
                         if (!has_network_suffix(de->d_name))
                                 continue;
@@ -1743,6 +1830,7 @@ static int collect_network_entries(Netd *n, NetworkEntry **ret, size_t *ret_n) {
                                 n_alloc = new_alloc;
                         }
 
+                        entries[n_entries].dropins = NULL;
                         entries[n_entries].basename = pico_strdup(de->d_name);
                         entries[n_entries].path = pico_strdup(path);
                         if (!entries[n_entries].basename || !entries[n_entries].path) {
@@ -1756,20 +1844,75 @@ static int collect_network_entries(Netd *n, NetworkEntry **ret, size_t *ret_n) {
                 }
 
                 closedir(d);
+                pico_dropin_dirlist_sort(&dirs[i]);
         }
 
         qsort(entries, n_entries, sizeof(*entries), network_entry_cmp);
 
         *ret = entries;
         *ret_n = n_entries;
+        *ret_dirs = dirs;
         return 0;
 
 fail:
         network_entries_free(entries, n_entries);
+        network_dirlists_free(dirs, n_dirs);
         return rc;
 }
 
+/*
+ * The drop-ins of "foo.network" are the files of "foo.network.d" in every
+ * search-path directory, as networkd reads them (network_load_one() in
+ * networkd-network.c): no type-level or dash-truncated directory, and a file
+ * name in an earlier directory hides the same name in a later one. They apply
+ * wherever the .network file itself was found.
+ */
+static int network_find_dropins(Netd *n, const PicoDropinDirList *lists, const char *basename, char ***ret) {
+        char **dirs = NULL;
+        char dirname[NAME_MAX + 1];
+        int r;
+
+        if (snprintf(dirname, sizeof(dirname), "%s.d", basename) >= (int) sizeof(dirname))
+                return 0;
+
+        for (size_t i = 0; n->network_path && n->network_path[i]; i++) {
+                char path[PATH_MAX];
+
+                if (!pico_dropin_dirlist_has(&lists[i], dirname))
+                        continue;
+                if (snprintf(path, sizeof(path), "%s/%s", n->network_path[i], dirname) >= (int) sizeof(path)) {
+                        pico_log(PICO_LOG_WARNING, "drop-ins: path of '%s' too long, skipping", dirname);
+                        continue;
+                }
+
+                r = pico_strv_extend(&dirs, path);
+                if (r < 0) {
+                        pico_strv_free(dirs);
+                        return r;
+                }
+        }
+
+        if (!dirs)
+                return 0;
+
+        r = pico_dropin_files(dirs, ret);
+        pico_strv_free(dirs);
+        return r;
+}
+
+/* Like networkd's null_or_empty(): any character device or an empty file. */
+static bool network_file_masked(const char *path) {
+        struct stat st;
+
+        if (stat(path, &st) < 0)
+                return false;
+
+        return S_ISCHR(st.st_mode) || (S_ISREG(st.st_mode) && st.st_size == 0);
+}
+
 int network_load_all(Netd *n) {
+        PicoDropinDirList *dirlists = NULL;
+        size_t n_dirs;
         NetworkEntry *entries = NULL;
         size_t n_entries = 0;
         Network **networks = NULL;
@@ -1780,7 +1923,9 @@ int network_load_all(Netd *n) {
         if (!n)
                 return -EINVAL;
 
-        r = collect_network_entries(n, &entries, &n_entries);
+        n_dirs = n->network_path ? pico_strv_length(n->network_path) : 0;
+
+        r = collect_network_entries(n, &entries, &n_entries, &dirlists);
         if (r < 0)
                 return r;
 
@@ -1788,13 +1933,28 @@ int network_load_all(Netd *n) {
                 Network *nw = NULL;
                 Network **grown;
 
+                if (network_file_masked(entries[i].path)) {
+                        pico_log(PICO_LOG_DEBUG, "%s: empty or masked, skipping", entries[i].path);
+                        continue;
+                }
+
+                r = network_find_dropins(n, dirlists, entries[i].basename, &entries[i].dropins);
+                if (r < 0) {
+                        pico_log(PICO_LOG_WARNING,
+                                 "%s: cannot list drop-ins (%s), skipping",
+                                 entries[i].path,
+                                 strerror(-r));
+                        continue;
+                }
+
                 /*
                  * A parse failure in one file does not abort the load: the
                  * running configuration is only replaced once the new set is
                  * complete (netd-network.h), and one malformed file must not
                  * cost every other interface its configuration.
                  */
-                r = network_parse_file(entries[i].path, &nw);
+                r = network_parse_owned(entries[i].path, entries[i].dropins, &nw);
+                entries[i].dropins = NULL;
                 if (r < 0) {
                         pico_log(PICO_LOG_WARNING,
                                  "%s: failed to parse (%s), skipping",
@@ -1810,6 +1970,7 @@ int network_load_all(Netd *n) {
                                 network_free(networks[j]);
                         free(networks);
                         network_entries_free(entries, n_entries);
+                        network_dirlists_free(dirlists, n_dirs);
                         return -ENOMEM;
                 }
                 networks = grown;
@@ -1818,6 +1979,7 @@ int network_load_all(Netd *n) {
         }
 
         network_entries_free(entries, n_entries);
+        network_dirlists_free(dirlists, n_dirs);
 
         /* replace only once the new set is complete */
         network_free_all(n);
