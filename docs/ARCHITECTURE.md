@@ -203,8 +203,9 @@ the unit was waiting for. A job result is one of `done`, `failed`,
 
 A restart job runs as a stop and is converted to a start only when the stop
 finishes, so ordering is preserved. A start job whose unit has an unmet
-`ConditionPathExists=` or `ConditionPathIsDirectory=` finishes as done and
-leaves the unit inactive.
+`Condition*=` (`ConditionPathExists=`, `ConditionPathIsDirectory=`,
+`ConditionDirectoryNotEmpty=` or `ConditionKernelCommandLine=`, evaluated in
+`src/condition.c`) finishes as done and leaves the unit inactive.
 
 A reload job runs the `ExecReload=` lines of an active service (see
 `service_reload()`): the unit is `reloading` while they run and goes back

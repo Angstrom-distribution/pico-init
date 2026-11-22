@@ -5,6 +5,12 @@
 
 ##        PID 1 and unit files:
 
+        * ConditionDirectoryNotEmpty= and ConditionKernelCommandLine= are
+          supported, and so is the | prefix (triggering conditions) on every
+          Condition*= directive that exists. An empty Condition*= now
+          clears the conditions of every directive, as in systemd, not
+          only its own. pico-unit-lint no longer reports them as dropped.
+
         * systemd-modules-load.service is shipped and runs the new
           pico-modules-load. It loads the modules named in the *.conf files
           of /etc/modules-load.d, /run/modules-load.d,
@@ -13,13 +19,18 @@
           the kernel command line, with one modprobe -b run per name. A file
           name in an earlier directory hides the same name in a later one.
           A module that fails to load is logged and the others are still
-          loaded. When nothing is named the program exits without running
-          modprobe.
+          loaded; one named in module_blacklist= on the kernel command line
+          is not counted as failed. The unit starts only when one of the
+          directories has an entry or the command line has modules_load or
+          rd.modules_load, as in systemd, and the program exits without
+          running modprobe when nothing is named.
 
 ##        Build and tests:
 
         * test-modules-load covers the directory order, comments, a module
-          that fails, and the command line, with a stand-in for modprobe.
+          that fails, and the command line, with stand-ins for kmod's and
+          busybox's modprobe and a dry run of the real kmod modprobe.
+          test-condition covers the Condition*= evaluation.
 
 # CHANGES WITH 0.5.1:
 

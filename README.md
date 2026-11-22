@@ -75,6 +75,7 @@ Directives that are honoured:
 
 - `[Unit]`: `Description=`, `Requires=`, `Wants=`, `Before=`, `After=`,
   `Conflicts=`, `ConditionPathExists=`, `ConditionPathIsDirectory=`,
+  `ConditionDirectoryNotEmpty=`, `ConditionKernelCommandLine=`,
   `StartLimitIntervalSec=`, `StartLimitBurst=`.
 - `[Service]`: `Type=` (`simple`, `exec`, `oneshot`, `forking`,
   `notify`), `ExecCondition=`, `ExecStartPre=`, `ExecStart=`, `ExecStop=`,

@@ -173,6 +173,8 @@ or resource-control directive leaves the service unconfined.
 | `DefaultDependencies=`      | Boolean. See [Default dependencies](#default-dependencies). |
 | `ConditionPathExists=`      | See [Conditions](#conditions).                  |
 | `ConditionPathIsDirectory=` | See [Conditions](#conditions).                  |
+| `ConditionDirectoryNotEmpty=` | See [Conditions](#conditions).                |
+| `ConditionKernelCommandLine=` | See [Conditions](#conditions).                |
 | `StartLimitIntervalSec=`, `StartLimitBurst=` | See [Start limit](#start-limit). `StartLimitInterval=` is accepted as the old spelling. |
 
 Dependency tokens are expanded with `%n %N %p %i` per token. `%I` is not
@@ -258,7 +260,6 @@ degradation record.
 | `RestartSec=`, `TimeoutStartSec=`, `TimeoutStopSec=`, `TimeoutSec=`, `StartLimitIntervalSec=`, `StartLimitBurst=` that do not parse | Ignored, the previous value is kept. | the directive name followed by `=` |
 | A second `ExecStart=`      | Replaces the first.                             | `ExecStart=multiple` |
 | `Exec*=` with a `@`, `+`, `!` or `:` prefix | The whole line is ignored.      | `ExecStart=@` (and so on, with the directive and prefix) |
-| `Condition*=|...`          | Triggering conditions are dropped.              | `ConditionPathExists=|` |
 | `Requires=`, `Wants=`, `Before=`, `After=`, `Conflicts=` naming an unsupported unit type | Dependency not followed. | `Wants=.mount` (and so on) |
 
 A `StandardInput=` degradation has one further effect: a socket with
@@ -270,7 +271,8 @@ Some invalid values are logged and ignored without being recorded:
 `DefaultDependencies=`, `KillMode=`, `KillSignal=`, `SendSIGHUP=`,
 `SendSIGKILL=`, `RemainAfterExit=`, `GuessMainPID=`, `Delegate=`,
 `DelegateSubgroup=`, `User=`, `Group=`, a
-`ConditionPath*=` that is not absolute, a socket `Service=`, `Accept=`,
+`ConditionPath*=` or `ConditionDirectoryNotEmpty=` that is not absolute, an
+empty `ConditionKernelCommandLine=`, a socket `Service=`, `Accept=`,
 `SocketMode=`, `Backlog=`, `MaxConnections=`, a `ListenStream=` or
 `ListenDatagram=` that is neither a path nor a port, an
 `EnvironmentFile=` that is not absolute, and an `Exec*=` path that is neither
@@ -324,13 +326,37 @@ is a load failure (below).
 
 ### Conditions
 
-Only `ConditionPathExists=` and `ConditionPathIsDirectory=` exist. Values
-are single absolute paths, not lists. A leading `!` negates one entry;
-repeated lines accumulate and all must hold; an empty value resets the list.
-They are evaluated when the unit is about to start, not when it is loaded,
-and a failed condition completes the start job successfully without running
-anything. Specifiers are not expanded in the path, so a template cannot use
-`ConditionPathExists=/dev/%I`.
+`ConditionPathExists=`, `ConditionPathIsDirectory=`,
+`ConditionDirectoryNotEmpty=` and `ConditionKernelCommandLine=` exist; every
+other `Condition*=` and every `Assert*=` is dropped. Each assignment is one
+value, not a list. A path value must be absolute. Repeated lines accumulate.
+A leading `|` makes a condition triggering and a `!` after it negates it, as
+in systemd: every non-triggering condition must hold, and when there are
+triggering ones at least one of them must hold too. An empty value resets all
+conditions of the unit, whatever the directive. They are evaluated when the
+unit is about to start, not when it is loaded, and a failed condition
+completes the start job successfully without running anything; units that
+require or are ordered after it still start. Specifiers are not expanded in the
+value, so a template cannot use `ConditionPathExists=/dev/%I`.
+
+- `ConditionDirectoryNotEmpty=` is true for a directory (or a link to one)
+  with at least one entry that is not hidden or a backup file: names starting
+  with `.` or ending in `~`, `lost+found`, `aquota.user`, `aquota.group` and
+  names ending in the suffixes `.ignore`, `.rpmnew`, `.rpmsave`, `.rpmorig`,
+  `.dpkg-*`, `.ucf-*`, `.swp`, `.bak`, `.old` and `.new` are ignored, as in
+  systemd's `dir_is_empty()`. A missing path or a path that is not a
+  directory is false; a directory that cannot be read counts as not empty,
+  as in systemd.
+- `ConditionKernelCommandLine=` takes a word or `key=value`. A word is true
+  when the command line has it as a key, with or without a value; `key=value`
+  is true only for that exact word. The file `/proc/cmdline` is read at each
+  evaluation and split like systemd splits it: white space separates, single
+  and double quotes group and are removed. A missing or unreadable file is an
+  empty command line, so a negated condition holds (systemd skips the unit
+  instead). `-` and `_` are different characters, as in systemd. Differences: a backslash escape inside a word is
+  decoded where systemd keeps it; an unterminated quote drops the rest of the
+  line where systemd takes it as one word; a container's `/proc/1/cmdline` is
+  not consulted.
 
 ## Behaviours that differ
 
@@ -502,9 +528,12 @@ A unit with `User=` whose account exists in the passwd database gets `USER`,
   `rd.modules_load=` is honoured on the real root as well as in an initrd;
   systemd ignores it outside the initrd. A module the kernel does not have
   fails the unit; systemd only warns about it.
-  The unit has no `ConditionDirectoryNotEmpty=`, `ConditionKernelCommandLine=`
-  or `ConditionCapability=` lines, because those are not implemented; the
-  program does nothing when there is nothing to load. The unit has an
+  The unit carries systemd's `ConditionDirectoryNotEmpty=|` and
+  `ConditionKernelCommandLine=|` lines but not `ConditionCapability=`, which
+  is not implemented; the program also does nothing when there is nothing to
+  load. A module named in `module_blacklist=` on the kernel command line that
+  modprobe fails to load is not counted as failed. The name is compared with `-`
+  and `_` alike; systemd compares the exact name and only on `-EPERM`. The unit has an
   `[Install]` section (`WantedBy=sysinit.target`) instead of systemd's static
   `sysinit.target.wants/` link, so it runs only when the preset enables it.
 - An unknown escape such as `\q` in `Exec*=` or `Environment=` is kept as
