@@ -47,6 +47,7 @@ so a multilib layout keeps them in `/usr/lib`.
 | `netctl` | `bindir` | `networkctl` equivalent |
 | `picolog` | `bindir` | `journalctl` equivalent |
 | `pico-tmpfiles` | `bindir` | `systemd-tmpfiles` equivalent |
+| `pico-modules-load` | `sbindir` | `systemd-modules-load` equivalent; see [MODULES_LOAD.md](MODULES_LOAD.md) |
 | `pico-unit-lint` | `bindir` | build-time unit checker |
 | `udevadm` | `bindir` | `udevadm` for `devd`; with `-Dudev-compat=true`, the default |
 | `libsystemd.so.0.45.0`, `libsystemd.so.0` | `libdir` | compatibility library |
@@ -57,6 +58,7 @@ so a multilib layout keeps them in `/usr/lib`.
 | `logd.service`, `logd.socket` | `$prefix/lib/systemd/system` | |
 | `devd.service` | `$prefix/lib/systemd/system` | |
 | `pico-tmpfiles.service` | `$prefix/lib/systemd/system` | |
+| `systemd-modules-load.service` | `$prefix/lib/systemd/system` | runs `pico-modules-load` |
 | `60-pico-serial.rules` | `$prefix/lib/udev/rules.d` | read by `devd` |
 | `udevd` | `$prefix/lib/udev` | link to `devd`, the name dracut looks for; with `-Dudev-compat=true` |
 
@@ -77,7 +79,7 @@ separate processes supervised by PID 1 rather than parts of it:
 
 | Group | Contents | Needs |
 |-------|----------|-------|
-| `pico-init` | `pico-init`, `picoctl`, `pico-tmpfiles`, `pico-tmpfiles.service` | libc |
+| `pico-init` | `pico-init`, `picoctl`, `pico-tmpfiles`, `pico-tmpfiles.service`, `pico-modules-load`, `systemd-modules-load.service` | libc, `modprobe` |
 | `pico-init-netd` | `netd`, `netctl`, `netd.service`, `network.target` | libc |
 | `pico-init-logd` | `logd`, `picolog`, `logd.service`, `logd.socket` | libc |
 | `pico-init-devd` | `devd`, `devd.service`, `60-pico-serial.rules`, `udevadm`, the `udevd` link | libc |
@@ -93,7 +95,7 @@ rely on the preset file to decide whether they run.
 
 ## Units the build ships and the image must provide
 
-The build ships four service units (`netd`, `logd`, `devd`, `pico-tmpfiles`),
+The build ships five service units (`netd`, `logd`, `devd`, `pico-tmpfiles`, `systemd-modules-load`),
 `logd.socket` and these targets:
 
 | Unit | Why |
@@ -101,7 +103,7 @@ The build ships four service units (`netd`, `logd`, `devd`, `pico-tmpfiles`),
 | `default.target` | A link to `multi-user.target`. Root of the boot transaction. If it cannot be loaded, startup fails; PID 1 still enters its event loop so the console stays usable. |
 | `multi-user.target` | Wants `sockets.target`, `sysinit.target` and `bluetooth.target` and runs after `sysinit.target`, in place of systemd's multi-user, basic, sysinit and sockets chain. |
 | `sockets.target` | `.socket` units install with `WantedBy=sockets.target`, and PID 1 adds `After=sockets.target` to every service when the target exists. |
-| `sysinit.target` | `pico-tmpfiles.service` installs `WantedBy=sysinit.target` and runs `Before=` it. |
+| `sysinit.target` | `pico-tmpfiles.service` and `systemd-modules-load.service` install `WantedBy=sysinit.target` and run `Before=` it. |
 | `bluetooth.target` | Units that are only `WantedBy=bluetooth.target` get their start job because `multi-user.target` wants it. |
 | `network.target` | Passive. `netd.service` orders itself before it; `network-online.target` is not provided. |
 
@@ -194,6 +196,7 @@ enable netd.service
 enable logd.service
 enable devd.service
 enable pico-tmpfiles.service
+enable systemd-modules-load.service
 disable *
 ```
 
@@ -252,7 +255,7 @@ Everything below is looked up by absolute path or `PATH` at run time.
 |------|----------|
 | `/usr/sbin/fsck.ext4` | Root filesystem check, only when the ext superblock reports errors. A missing checker still ends in a remount. |
 | `fsck.<type>` in `/usr/sbin` | `/etc/fstab` pass checks |
-| `/sbin/modprobe` | `devd` runs it for every `MODALIAS` |
+| `/sbin/modprobe` | `devd` runs it for every `MODALIAS`, `pico-modules-load` for every name in `modules-load.d` |
 | `/usr/share/zoneinfo` | `netd` sets `/etc/localtime` from DHCP option 101 when the zone file exists; install tzdata |
 | `/etc/hostname` | Applied with `sethostname(2)` by PID 1 |
 | `/etc/fstab` | Parsed by PID 1; `UUID=`, `LABEL=`, `PARTUUID=` and `PARTLABEL=` sources resolve through sysfs |

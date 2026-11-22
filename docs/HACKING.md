@@ -42,11 +42,13 @@ without `python3` the pkg-config template tests are not defined. The
   `udev-compat` option, which is on by default.
 - `libsystemd.so` and `libudev.so` install to `libdir`; see
   [COMPATIBILITY_LIBRARIES.md](COMPATIBILITY_LIBRARIES.md).
+- `pico-modules-load` installs to `sbindir`.
 - Daemon details are in [NETD.md](NETD.md), [DEVD.md](DEVD.md) and
   [LOGD.md](LOGD.md).
 
 The unit files for netd (`netd.service` and `network.target`), devd, logd
-(`logd.service` and `logd.socket`) and pico-tmpfiles are installed under
+(`logd.service` and `logd.socket`), pico-tmpfiles and pico-modules-load
+(`systemd-modules-load.service`) are installed under
 `$prefix/lib/systemd/system` (never `lib64`), and the devd udev rule under
 `$prefix/lib/udev/rules.d`. Public headers go to `includedir/systemd` and
 `libudev.h` to `includedir`, with the `libsystemd`, `systemd`, `libudev` and
@@ -140,6 +142,8 @@ the log before concluding that a run covered the code you changed.
 - logd: `src/logd/test-*.c`, for example `test-logd-recv` and `test-picolog`.
 - tmpfiles: `src/tmpfiles/test-*.c`, for example `test-tmpfiles-conf` and
   `test-tmpfiles-clean`.
+- modules-load: `src/modules-load/test-modules-load.c`, which replaces
+  modprobe with a script in a fixture tree.
 - Compatibility libraries: `src/compat/` holds `test-sd-*` and
   `test-libudev-*` programs plus the symbol-set and pkg-config checks.
 
@@ -247,6 +251,7 @@ Everything is under `src/`.
 - `src/devd/`: device daemon, its udev-rule engine, and `udevadm`.
 - `src/logd/`: log daemon and `picolog`.
 - `src/tmpfiles/`: `pico-tmpfiles`.
+- `src/modules-load/`: `pico-modules-load`.
 - `src/compat/libsystemd/`, `src/compat/libudev/`: compatibility libraries
   and their symbol files.
 - `tools/`: `gen-libsystemd-sym.py` and `check-pc.py`.
@@ -254,10 +259,11 @@ Everything is under `src/`.
 
 `meson.build` builds the code of each program, except its `main()`, into a
 static library (`pico-init-core`, `netd-core`, `devd-core`, `logd-core`,
-`tmpfiles-core`). The tests link those libraries, so they exercise the real
-code instead of copies. The executable links the library with `link_whole`
-so no object is dropped. Only `src/main.c` is outside `pico-init-core`,
-because a second `main()` would collide with every test's own.
+`tmpfiles-core`, `modules-load-core`). The tests link those libraries, so
+they exercise the real code instead of copies. The executable links the
+library with `link_whole` so no object is dropped. Only `src/main.c` is
+outside `pico-init-core`, because a second `main()` would collide with every
+test's own.
 
 `netd` is built with only `src/netd` on its include path because GCC
 searches `-I` directories for angle-bracket includes too, and `src/signal.h`

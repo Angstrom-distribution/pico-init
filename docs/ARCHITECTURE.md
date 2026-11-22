@@ -23,16 +23,18 @@ talk to each other and the data structures inside PID 1.
 | `udevadm`      | `bin`        | `udevadm` subset for `devd`                |
 | `pico-tmpfiles`| `bin`        | `systemd-tmpfiles --create/--clean/--remove`|
 | `pico-unit-lint`| `bin`       | Reports directives PID 1 would drop        |
+| `pico-modules-load`| `sbin`   | `systemd-modules-load` equivalent          |
 | `libsystemd.so.0` | `libdir`  | Compatibility library, systemd's ABI       |
 | `libudev.so.1` | `libdir`     | Compatibility library, thin layer over the above |
 
-Only `pico-init` is PID 1. `netd`, `logd`, `devd` and `pico-tmpfiles` are
-units: each ships a `.service` file under `/usr/lib/systemd/system` and is
-started, ordered and restarted like any other service. A crash in one of
-them costs a unit restart, not the machine. `netd` and `devd` do not talk to
-PID 1 at all. `logd` receives its sockets from PID 1 (see
-[Logging](#logging)). The service files carry `WantedBy=default.target`
-(`pico-tmpfiles.service` uses `sysinit.target`, `logd.socket` uses
+Only `pico-init` is PID 1. `netd`, `logd`, `devd`, `pico-tmpfiles` and
+`pico-modules-load` are units: each ships a `.service` file under
+`/usr/lib/systemd/system` and is started, ordered and restarted like any
+other service. A crash in one of them costs a unit restart, not the
+machine. `netd` and `devd` do not talk to PID 1 at all. `logd` receives its
+sockets from PID 1 (see [Logging](#logging)). The service files carry
+`WantedBy=default.target` (`pico-tmpfiles.service` and
+`systemd-modules-load.service` use `sysinit.target`, `logd.socket` uses
 `sockets.target`); whether they are enabled is decided by the preset files,
 see [PRESET.md](PRESET.md).
 

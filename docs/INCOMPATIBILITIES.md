@@ -496,6 +496,17 @@ A unit with `User=` whose account exists in the passwd database gets `USER`,
 
 ### Other differences
 
+- `systemd-modules-load.service` runs `pico-modules-load`, which reads the
+  same directories as systemd's program plus `/lib/modules-load.d`, and runs
+  `modprobe -b` once per module name; see [MODULES_LOAD](MODULES_LOAD.md).
+  `rd.modules_load=` is honoured on the real root as well as in an initrd;
+  systemd ignores it outside the initrd. A module the kernel does not have
+  fails the unit; systemd only warns about it.
+  The unit has no `ConditionDirectoryNotEmpty=`, `ConditionKernelCommandLine=`
+  or `ConditionCapability=` lines, because those are not implemented; the
+  program does nothing when there is nothing to load. The unit has an
+  `[Install]` section (`WantedBy=sysinit.target`) instead of systemd's static
+  `sysinit.target.wants/` link, so it runs only when the preset enables it.
 - An unknown escape such as `\q` in `Exec*=` or `Environment=` is kept as
   written; systemd refuses `Environment=` with one.
 - A line in a unit file has no length limit; systemd refuses a line over
