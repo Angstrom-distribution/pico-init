@@ -25,6 +25,16 @@ echo "$out"
 [ "$rc" = 0 ] || { echo "pico-unit-lint exited $rc"; exit 1; }
 echo "$out" | grep -q ', 0 failed to load$' || { echo "a shipped unit failed to load"; exit 1; }
 
+# The modules-load unit's triggering conditions are parsed, not dropped, and
+# name the five directories and the four spellings systemd's unit does.
+mod="$src/src/modules-load/systemd-modules-load.service"
+for d in /lib /usr/lib /usr/local/lib /etc /run; do
+	grep -qxF "ConditionDirectoryNotEmpty=|$d/modules-load.d" "$mod" || { echo "modules-load: no condition for $d"; exit 1; }
+done
+for w in modules-load modules_load rd.modules-load rd.modules_load; do
+	grep -qxF "ConditionKernelCommandLine=|$w" "$mod" || { echo "modules-load: no condition for $w"; exit 1; }
+done
+
 for t in sockets.target sysinit.target bluetooth.target; do
 	grep -q "^Wants=$t$" "$src/units/multi-user.target" || { echo "multi-user.target does not want $t"; exit 1; }
 done

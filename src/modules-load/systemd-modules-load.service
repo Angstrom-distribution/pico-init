@@ -1,17 +1,26 @@
 # SPDX-FileCopyrightText: 2026 Koen Kooi
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
-# systemd-modules-load.service's name and ordering, so After= on it in other
-# units keeps working. No Condition lines: pico-modules-load exits at once
-# when no modules-load.d file and no modules_load= argument names a module.
-# A failing module fails the unit, not the boot. Enablement follows the preset
-# flow like every other unit.
+# systemd-modules-load.service's name, ordering and Condition lines, so After=
+# on it in other units keeps working. ConditionCapability=CAP_SYS_MODULE is
+# left out, pico-init has no such condition. pico-modules-load also exits at
+# once when nothing names a module. A failing module fails the unit, not the
+# boot. Enablement follows the preset flow like every other unit.
 
 [Unit]
 Description=Load Kernel Modules
 DefaultDependencies=no
 Conflicts=shutdown.target
 Before=sysinit.target shutdown.target
+ConditionDirectoryNotEmpty=|/lib/modules-load.d
+ConditionDirectoryNotEmpty=|/usr/lib/modules-load.d
+ConditionDirectoryNotEmpty=|/usr/local/lib/modules-load.d
+ConditionDirectoryNotEmpty=|/etc/modules-load.d
+ConditionDirectoryNotEmpty=|/run/modules-load.d
+ConditionKernelCommandLine=|modules-load
+ConditionKernelCommandLine=|modules_load
+ConditionKernelCommandLine=|rd.modules-load
+ConditionKernelCommandLine=|rd.modules_load
 
 [Service]
 Type=oneshot
