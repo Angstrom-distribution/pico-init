@@ -14,6 +14,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+#include "condition.h"
+
 typedef struct Unit Unit;
 
 /* forward declarations; full definitions in manager.h / job.h */
@@ -130,17 +132,14 @@ struct Unit {
         size_t n_dependencies[_UNIT_DEPENDENCY_MAX];
 
         /*
-         * [Unit] Condition* checks, each an owned list of absolute paths that
-         * must all pass. A leading '!' negates that one entry's result; the
-         * negation flags are a parallel array, one bool per path, index-
-         * matched. Triggering ('|') is not implemented, and unit-parse.c
-         * drops a value using it rather than mistaking it for a literal path
-         * that can never exist.
+         * [Unit] Condition*= checks in file order, one entry per assignment.
+         * Evaluated by condition_test_list() at start time: every
+         * non-triggering entry must hold, and at least one triggering ('|')
+         * entry when there is any. An empty assignment of any Condition*=
+         * clears the whole list, as in systemd.
          */
-        char **condition_path_exists;        /* ConditionPathExists=, owned, may be NULL */
-        bool *condition_path_exists_negated; /* parallel to condition_path_exists, owned, may be NULL */
-        char **condition_path_is_directory;  /* ConditionPathIsDirectory=, owned, may be NULL */
-        bool *condition_path_is_directory_negated; /* parallel to condition_path_is_directory, owned, may be NULL */
+        Condition *conditions; /* owned, may be NULL */
+        size_t n_conditions;
 
         /* [Unit] DefaultDependencies=, true unless the unit file says no. False
          * keeps manager-startup.c from adding implicit After= edges to or onto

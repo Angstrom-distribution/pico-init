@@ -10,7 +10,6 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 
 #include "job.h"
 #include "manager-state.h"
@@ -169,10 +168,8 @@ Unit *unit_free(Unit *u) {
         u->wanted_by = pico_strv_free(u->wanted_by);
         u->required_by = pico_strv_free(u->required_by);
 
-        u->condition_path_exists = pico_strv_free(u->condition_path_exists);
-        u->condition_path_exists_negated = pico_mfree(u->condition_path_exists_negated);
-        u->condition_path_is_directory = pico_strv_free(u->condition_path_is_directory);
-        u->condition_path_is_directory_negated = pico_mfree(u->condition_path_is_directory_negated);
+        u->conditions = condition_free_list(u->conditions, u->n_conditions);
+        u->n_conditions = 0;
 
         u->degraded_directives = pico_strv_free(u->degraded_directives);
         u->n_degraded_directives = 0;
@@ -260,46 +257,26 @@ UnitActiveState unit_active_state(Unit *u) {
 }
 
 /*
- * All conditions must pass -- systemd's AND semantics for the non-triggering
- * ones. Evaluated at start time, not load time: the paths these name are
- * created by other units during the boot (/dev/ttyGS0 exists only once
+ * Evaluated at start time, not load time: the paths these name are created
+ * by other units during the boot (/dev/ttyGS0 exists only once
  * usb-multi-gadget.service has run), so a load-time answer would be the wrong
  * one for exactly the case this exists to serve.
- *
- * Each entry's raw stat-based result is inverted when its parallel *_negated
- * flag is set, matching that one entry's leading '!' at parse time.
  */
 static bool unit_condition_test(Unit *u) {
-        char **p;
-        size_t i;
+        const Condition *failed = NULL;
 
-        for (p = u->condition_path_exists, i = 0; p && *p; p++, i++) {
-                struct stat st;
-                bool met = stat(*p, &st) == 0;
+        if (condition_test_list(u->conditions, u->n_conditions, &failed))
+                return true;
 
-                if (u->condition_path_exists_negated && u->condition_path_exists_negated[i])
-                        met = !met;
-
-                if (!met) {
-                        pico_log(PICO_LOG_INFO, "%s: ConditionPathExists=%s not met, skipping", u->id, *p);
-                        return false;
-                }
-        }
-
-        for (p = u->condition_path_is_directory, i = 0; p && *p; p++, i++) {
-                struct stat st;
-                bool met = stat(*p, &st) == 0 && S_ISDIR(st.st_mode);
-
-                if (u->condition_path_is_directory_negated && u->condition_path_is_directory_negated[i])
-                        met = !met;
-
-                if (!met) {
-                        pico_log(PICO_LOG_INFO, "%s: ConditionPathIsDirectory=%s not met, skipping", u->id, *p);
-                        return false;
-                }
-        }
-
-        return true;
+        if (failed)
+                pico_log(PICO_LOG_INFO,
+                         "%s: %s=%s%s%s not met, skipping",
+                         u->id,
+                         condition_type_to_string(failed->type),
+                         failed->trigger ? "|" : "",
+                         failed->negate ? "!" : "",
+                         failed->parameter);
+        return false;
 }
 
 int unit_start(Unit *u) {

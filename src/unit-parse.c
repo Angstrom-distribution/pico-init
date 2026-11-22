@@ -57,7 +57,7 @@
  * (name-safe: no expansion can introduce whitespace or a '/'), and
  * parse_exec_line()/config_parse_description() expand through
  * unit_full_printf() (adds %I, which unescapes and so can). Not expanded:
- * config_parse_condition_path(), because v30 at this tag
+ * config_parse_condition(), because v30 at this tag
  * (load-fragment.c:1584-1620) does not run specifier_printf() on a
  * condition value either; see that function's comment for the consequence.
  */
@@ -407,102 +407,58 @@ static int config_parse_after(Unit *u, const char *path, unsigned line, const ch
 }
 
 /*
- * One path per assignment, taken verbatim: Condition* values are single paths,
- * not whitespace-separated lists, and repeated assignments accumulate (all
- * must pass). An empty value resets the list, as upstream. A leading '!'
- * negates that one entry's result and is stripped before the path is stored;
- * the negation is recorded in the parallel *_negated array at the same
- * index, which unit_condition_test() consults.
+ * One condition per assignment, taken verbatim: a value is a single path (or
+ * command line word), not a whitespace-separated list, and repeated
+ * assignments accumulate. An empty value resets every Condition*= of the
+ * unit, as upstream. A leading '|' makes the condition triggering and a '!'
+ * after it negates it; condition_test_list() applies both.
  *
- * Triggering ('|') is dropped with a warning and a degradation rather than
- * returned as an error: a handler returning < 0 aborts the rest of the scan
- * (conf-scan.c) and leaves the unit UNIT_ERROR. The triggering condition is
- * therefore ignored, not honoured.
+ * A path condition whose path is not absolute is dropped with a warning and
+ * so is an empty command line word. A handler returning < 0 aborts the rest
+ * of the scan (conf-scan.c) and leaves the unit UNIT_ERROR, so a bad value
+ * costs that one line only.
  *
  * Not specifier-expanded: v30 at this tag (load-fragment.c:1584-1620) does not
  * run specifier_printf() on this directive either (that came later
  * upstream), so a generic "serial-getty@.service" template cannot carry
  * "ConditionPathExists=/dev/%I". test-unit-parse.c pins this behaviour.
  */
-static int config_parse_condition_path(
-                Unit *u,
-                const char *path,
-                unsigned line,
-                const char *lvalue,
-                const char *rvalue,
-                char ***target,
-                bool **target_negated) {
-        bool negated = false;
-        size_t n;
-        bool *new_negated;
-        int r;
+static int config_parse_condition(
+                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
+        ConditionType type = condition_type_from_string(lvalue);
+        bool trigger = false, negate = false;
+
+        if (type == _CONDITION_TYPE_INVALID)
+                return 0;
 
         if (rvalue[0] == '\0') {
-                *target = pico_strv_free(*target);
-                *target_negated = pico_mfree(*target_negated);
+                u->conditions = condition_free_list(u->conditions, u->n_conditions);
+                u->n_conditions = 0;
                 return 0;
         }
 
         if (rvalue[0] == '|') {
-                char what[64];
-
-                pico_log(PICO_LOG_WARNING,
-                         "%s:%u: %s=%s: triggering conditions are not supported, ignoring",
-                         path,
-                         line,
-                         lvalue,
-                         rvalue);
-                snprintf(what, sizeof(what), "%s=%c", lvalue, rvalue[0]);
-                return unit_add_degradation(u, what);
+                trigger = true;
+                rvalue += 1 + strspn(rvalue + 1, " \t");
         }
 
         if (rvalue[0] == '!') {
-                negated = true;
-                rvalue++;
+                negate = true;
+                rvalue += 1 + strspn(rvalue + 1, " \t");
         }
 
-        if (rvalue[0] != '/') {
+        if (rvalue[0] == '\0' || (condition_type_is_path(type) && rvalue[0] != '/')) {
                 pico_log(PICO_LOG_WARNING,
-                         "%s:%u: %s= path '%s' is not absolute, ignoring",
+                         "%s:%u: %s=%s is %s, ignoring",
                          path,
                          line,
                          lvalue,
-                         rvalue);
+                         rvalue,
+                         rvalue[0] == '\0' ? "empty" : "not an absolute path");
                 return 0;
         }
 
-        n = pico_strv_length(*target);
-
-        r = pico_strv_extend(target, rvalue);
-        if (r < 0)
-                return r;
-
-        new_negated = realloc(*target_negated, (n + 1) * sizeof(bool));
-        if (!new_negated)
-                return -ENOMEM;
-
-        new_negated[n] = negated;
-        *target_negated = new_negated;
-
-        return 0;
-}
-
-static int config_parse_condition_path_exists(
-                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
-        return config_parse_condition_path(
-                        u, path, line, lvalue, rvalue, &u->condition_path_exists, &u->condition_path_exists_negated);
-}
-
-static int config_parse_condition_path_is_directory(
-                Unit *u, const char *path, unsigned line, const char *lvalue, const char *rvalue) {
-        return config_parse_condition_path(
-                        u,
-                        path,
-                        line,
-                        lvalue,
-                        rvalue,
-                        &u->condition_path_is_directory,
-                        &u->condition_path_is_directory_negated);
+        return condition_add(&u->conditions, &u->n_conditions, type, rvalue, trigger, negate);
 }
 
 /* --- [Service] handlers --- */
@@ -1896,60 +1852,62 @@ static int config_parse_required_by(
 }
 
 static const ConfigItem config_items[] = {
-        {    SECTION_UNIT,              "Description",                 config_parse_description },
-        {    SECTION_UNIT,                 "Requires",                    config_parse_requires },
-        {    SECTION_UNIT,                    "Wants",                       config_parse_wants },
-        {    SECTION_UNIT,                   "Before",                      config_parse_before },
-        {    SECTION_UNIT,                    "After",                       config_parse_after },
-        {    SECTION_UNIT,                "Conflicts",                   config_parse_conflicts },
-        {    SECTION_UNIT,      "DefaultDependencies",        config_parse_default_dependencies },
-        {    SECTION_UNIT,      "ConditionPathExists",       config_parse_condition_path_exists },
-        {    SECTION_UNIT, "ConditionPathIsDirectory", config_parse_condition_path_is_directory },
-        { SECTION_SERVICE,                     "Type",                        config_parse_type },
-        { SECTION_SERVICE,            "StandardInput",              config_parse_standard_input },
-        { SECTION_SERVICE,           "StandardOutput",             config_parse_standard_output },
-        { SECTION_SERVICE,            "StandardError",             config_parse_standard_output },
-        { SECTION_SERVICE,                  "TTYPath",                    config_parse_tty_path },
-        { SECTION_SERVICE,                "ExecStart",                  config_parse_exec_start },
-        { SECTION_SERVICE,             "ExecStartPre",              config_parse_exec_start_pre },
-        { SECTION_SERVICE,                 "ExecStop",                   config_parse_exec_stop },
-        { SECTION_SERVICE,             "ExecStopPost",              config_parse_exec_stop_post },
-        { SECTION_SERVICE,            "ExecCondition",              config_parse_exec_condition },
-        { SECTION_SERVICE,               "ExecReload",                 config_parse_exec_reload },
-        { SECTION_SERVICE,              "Environment",                 config_parse_environment },
-        { SECTION_SERVICE,          "EnvironmentFile",            config_parse_environment_file },
-        { SECTION_SERVICE,                  "Restart",                     config_parse_restart },
-        { SECTION_SERVICE,               "RestartSec",                 config_parse_restart_sec },
-        {    SECTION_UNIT,    "StartLimitIntervalSec",    config_parse_start_limit_interval_sec },
-        {    SECTION_UNIT,       "StartLimitInterval",    config_parse_start_limit_interval_sec },
-        {    SECTION_UNIT,          "StartLimitBurst",           config_parse_start_limit_burst },
-        { SECTION_SERVICE,    "StartLimitIntervalSec",    config_parse_start_limit_interval_sec },
-        { SECTION_SERVICE,       "StartLimitInterval",    config_parse_start_limit_interval_sec },
-        { SECTION_SERVICE,          "StartLimitBurst",           config_parse_start_limit_burst },
-        { SECTION_SERVICE,          "RemainAfterExit",           config_parse_remain_after_exit },
-        { SECTION_SERVICE,                 "Delegate",                    config_parse_delegate },
-        { SECTION_SERVICE,                 "KillMode",                   config_parse_kill_mode },
-        { SECTION_SERVICE,               "KillSignal",                 config_parse_kill_signal },
-        { SECTION_SERVICE,               "SendSIGHUP",                 config_parse_send_sighup },
-        { SECTION_SERVICE,              "SendSIGKILL",                config_parse_send_sigkill },
-        { SECTION_SERVICE,         "DelegateSubgroup",           config_parse_delegate_subgroup },
-        { SECTION_SERVICE,          "TimeoutStartSec",           config_parse_timeout_start_sec },
-        { SECTION_SERVICE,           "TimeoutStopSec",            config_parse_timeout_stop_sec },
-        { SECTION_SERVICE,               "TimeoutSec",                 config_parse_timeout_sec },
-        { SECTION_SERVICE,                     "User",                  config_parse_user_group },
-        { SECTION_SERVICE,                    "Group",                  config_parse_user_group },
-        { SECTION_SERVICE,      "SupplementaryGroups",        config_parse_supplementary_groups },
-        { SECTION_SERVICE,                  "PIDFile",                    config_parse_pid_file },
-        { SECTION_SERVICE,             "GuessMainPID",              config_parse_guess_main_pid },
-        {  SECTION_SOCKET,             "ListenStream",               config_parse_listen_stream },
-        {  SECTION_SOCKET,           "ListenDatagram",             config_parse_listen_datagram },
-        {  SECTION_SOCKET,                  "Service",              config_parse_socket_service },
-        {  SECTION_SOCKET,                   "Accept",               config_parse_socket_accept },
-        {  SECTION_SOCKET,               "SocketMode",                 config_parse_socket_mode },
-        {  SECTION_SOCKET,                  "Backlog",              config_parse_socket_backlog },
-        {  SECTION_SOCKET,           "MaxConnections",      config_parse_socket_max_connections },
-        { SECTION_INSTALL,                 "WantedBy",                   config_parse_wanted_by },
-        { SECTION_INSTALL,               "RequiredBy",                 config_parse_required_by },
+        {    SECTION_UNIT,                "Description",              config_parse_description },
+        {    SECTION_UNIT,                   "Requires",                 config_parse_requires },
+        {    SECTION_UNIT,                      "Wants",                    config_parse_wants },
+        {    SECTION_UNIT,                     "Before",                   config_parse_before },
+        {    SECTION_UNIT,                      "After",                    config_parse_after },
+        {    SECTION_UNIT,                  "Conflicts",                config_parse_conflicts },
+        {    SECTION_UNIT,        "DefaultDependencies",     config_parse_default_dependencies },
+        {    SECTION_UNIT,        "ConditionPathExists",                config_parse_condition },
+        {    SECTION_UNIT,   "ConditionPathIsDirectory",                config_parse_condition },
+        {    SECTION_UNIT, "ConditionDirectoryNotEmpty",                config_parse_condition },
+        {    SECTION_UNIT, "ConditionKernelCommandLine",                config_parse_condition },
+        { SECTION_SERVICE,                       "Type",                     config_parse_type },
+        { SECTION_SERVICE,              "StandardInput",           config_parse_standard_input },
+        { SECTION_SERVICE,             "StandardOutput",          config_parse_standard_output },
+        { SECTION_SERVICE,              "StandardError",          config_parse_standard_output },
+        { SECTION_SERVICE,                    "TTYPath",                 config_parse_tty_path },
+        { SECTION_SERVICE,                  "ExecStart",               config_parse_exec_start },
+        { SECTION_SERVICE,               "ExecStartPre",           config_parse_exec_start_pre },
+        { SECTION_SERVICE,                   "ExecStop",                config_parse_exec_stop },
+        { SECTION_SERVICE,               "ExecStopPost",           config_parse_exec_stop_post },
+        { SECTION_SERVICE,              "ExecCondition",           config_parse_exec_condition },
+        { SECTION_SERVICE,                 "ExecReload",              config_parse_exec_reload },
+        { SECTION_SERVICE,                "Environment",              config_parse_environment },
+        { SECTION_SERVICE,            "EnvironmentFile",         config_parse_environment_file },
+        { SECTION_SERVICE,                    "Restart",                  config_parse_restart },
+        { SECTION_SERVICE,                 "RestartSec",              config_parse_restart_sec },
+        {    SECTION_UNIT,      "StartLimitIntervalSec", config_parse_start_limit_interval_sec },
+        {    SECTION_UNIT,         "StartLimitInterval", config_parse_start_limit_interval_sec },
+        {    SECTION_UNIT,            "StartLimitBurst",        config_parse_start_limit_burst },
+        { SECTION_SERVICE,      "StartLimitIntervalSec", config_parse_start_limit_interval_sec },
+        { SECTION_SERVICE,         "StartLimitInterval", config_parse_start_limit_interval_sec },
+        { SECTION_SERVICE,            "StartLimitBurst",        config_parse_start_limit_burst },
+        { SECTION_SERVICE,            "RemainAfterExit",        config_parse_remain_after_exit },
+        { SECTION_SERVICE,                   "Delegate",                 config_parse_delegate },
+        { SECTION_SERVICE,                   "KillMode",                config_parse_kill_mode },
+        { SECTION_SERVICE,                 "KillSignal",              config_parse_kill_signal },
+        { SECTION_SERVICE,                 "SendSIGHUP",              config_parse_send_sighup },
+        { SECTION_SERVICE,                "SendSIGKILL",             config_parse_send_sigkill },
+        { SECTION_SERVICE,           "DelegateSubgroup",        config_parse_delegate_subgroup },
+        { SECTION_SERVICE,            "TimeoutStartSec",        config_parse_timeout_start_sec },
+        { SECTION_SERVICE,             "TimeoutStopSec",         config_parse_timeout_stop_sec },
+        { SECTION_SERVICE,                 "TimeoutSec",              config_parse_timeout_sec },
+        { SECTION_SERVICE,                       "User",               config_parse_user_group },
+        { SECTION_SERVICE,                      "Group",               config_parse_user_group },
+        { SECTION_SERVICE,        "SupplementaryGroups",     config_parse_supplementary_groups },
+        { SECTION_SERVICE,                    "PIDFile",                 config_parse_pid_file },
+        { SECTION_SERVICE,               "GuessMainPID",           config_parse_guess_main_pid },
+        {  SECTION_SOCKET,               "ListenStream",            config_parse_listen_stream },
+        {  SECTION_SOCKET,             "ListenDatagram",          config_parse_listen_datagram },
+        {  SECTION_SOCKET,                    "Service",           config_parse_socket_service },
+        {  SECTION_SOCKET,                     "Accept",            config_parse_socket_accept },
+        {  SECTION_SOCKET,                 "SocketMode",              config_parse_socket_mode },
+        {  SECTION_SOCKET,                    "Backlog",           config_parse_socket_backlog },
+        {  SECTION_SOCKET,             "MaxConnections",   config_parse_socket_max_connections },
+        { SECTION_INSTALL,                   "WantedBy",                config_parse_wanted_by },
+        { SECTION_INSTALL,                 "RequiredBy",              config_parse_required_by },
 };
 
 /*

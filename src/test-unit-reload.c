@@ -399,8 +399,8 @@ static void test_reload_target(void) {
         ASSERT_EQ_INT(unit_reload(t), 1);
 
         ASSERT_STREQ(t->description, "New target");
-        ASSERT_TRUE(t->condition_path_exists != NULL);
-        ASSERT_STREQ(t->condition_path_exists[0], "/nonexistent");
+        ASSERT_EQ_INT((int) t->n_conditions, 1);
+        ASSERT_STREQ(t->conditions[0].parameter, "/nonexistent");
         ASSERT_EQ_INT(unit_active_state(t), UNIT_ACTIVE);
 
         manager_free(m);

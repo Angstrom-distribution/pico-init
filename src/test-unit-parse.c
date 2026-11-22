@@ -223,6 +223,7 @@ static void test_degradation_record(void) {
                                       "[Unit]\n"
                                       "Description=Rich\n"
                                       "ConditionPathExists=|/etc/skip\n"
+                                      "ConditionPathIsReadWrite=/etc\n"
                                       "After=clean.service\n"
                                       "\n"
                                       "[Service]\n"
@@ -297,15 +298,19 @@ static void test_degradation_record(void) {
         ASSERT_EQ_INT(((Service *) u)->n_exec_reload, 1);
         ASSERT_STREQ(((Service *) u)->exec_reload[0].argv[2], "$MAINPID");
 
+        /* a triggering condition is honoured, an unimplemented one is dropped */
+        ASSERT_EQ_INT((int) u->n_conditions, 1);
+        ASSERT_TRUE(u->conditions[0].trigger);
+
         ASSERT_EQ_INT(u->n_degraded_directives, 3);
-        ASSERT_STREQ(u->degraded_directives[0], "ConditionPathExists=|");
+        ASSERT_STREQ(u->degraded_directives[0], "ConditionPathIsReadWrite");
         ASSERT_STREQ(u->degraded_directives[1], "ExecStart=@");
         ASSERT_STREQ(u->degraded_directives[2], "Alias");
         ASSERT_TRUE(u->degraded_directives[3] == NULL);
 
         joined = unit_degraded_directives_string(u);
         ASSERT_STREQ(joined,
-                     "ConditionPathExists=| "
+                     "ConditionPathIsReadWrite "
                      "ExecStart=@ Alias");
         free(joined);
 
@@ -1431,11 +1436,10 @@ static void test_huge_requires_line_does_not_crash(void) {
 }
 
 /*
- * ConditionPathExists=/ConditionPathIsDirectory= accumulate across repeated
- * assignments, and the two directives keep genuinely separate lists rather
- * than sharing one. A '!'-negated entry is stored with the '!' stripped from
- * the path and a matching true recorded at the same index in the parallel
- * *_negated array; a plain entry records false there.
+ * Condition*= assignments accumulate in file order, whatever the directive,
+ * in one list. A '!' is stripped from the value and recorded as negate, a
+ * '|' as trigger, in either combination ("|!x"); the command line word keeps
+ * its '=' and any spaces.
  */
 static void test_conditions_are_parsed(void) {
         Manager *m;
@@ -1452,6 +1456,12 @@ static void test_conditions_are_parsed(void) {
                                       "ConditionPathExists=/a/one\n"
                                       "ConditionPathIsDirectory=/a/dir\n"
                                       "ConditionPathExists=!/a/two\n"
+                                      "ConditionDirectoryNotEmpty=|/a/notempty\n"
+                                      "ConditionKernelCommandLine=|!quiet\n"
+                                      "ConditionKernelCommandLine=root=/dev/mmcblk0p2 rw\n"
+                                      "ConditionPathExists=| \t/a/spaced\n"
+                                      "ConditionDirectoryNotEmpty=! /a/negspaced\n"
+                                      "ConditionKernelCommandLine=|  ! splash\n"
                                       "\n"
                                       "[Service]\n"
                                       "ExecStart=/bin/true\n"),
@@ -1461,16 +1471,37 @@ static void test_conditions_are_parsed(void) {
         u = load_one(m, "cond.service");
 
         ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        ASSERT_EQ_INT(u->n_degraded_directives, 0);
+        ASSERT_EQ_INT((int) u->n_conditions, 9);
 
-        ASSERT_EQ_INT((int) pico_strv_length(u->condition_path_exists), 2);
-        ASSERT_STREQ(u->condition_path_exists[0], "/a/one");
-        ASSERT_TRUE(!u->condition_path_exists_negated[0]);
-        ASSERT_STREQ(u->condition_path_exists[1], "/a/two");
-        ASSERT_TRUE(u->condition_path_exists_negated[1]);
+        ASSERT_EQ_INT(u->conditions[0].type, CONDITION_PATH_EXISTS);
+        ASSERT_STREQ(u->conditions[0].parameter, "/a/one");
+        ASSERT_TRUE(!u->conditions[0].negate && !u->conditions[0].trigger);
 
-        ASSERT_EQ_INT((int) pico_strv_length(u->condition_path_is_directory), 1);
-        ASSERT_STREQ(u->condition_path_is_directory[0], "/a/dir");
-        ASSERT_TRUE(!u->condition_path_is_directory_negated[0]);
+        ASSERT_EQ_INT(u->conditions[1].type, CONDITION_PATH_IS_DIRECTORY);
+        ASSERT_STREQ(u->conditions[1].parameter, "/a/dir");
+
+        ASSERT_EQ_INT(u->conditions[2].type, CONDITION_PATH_EXISTS);
+        ASSERT_STREQ(u->conditions[2].parameter, "/a/two");
+        ASSERT_TRUE(u->conditions[2].negate && !u->conditions[2].trigger);
+
+        ASSERT_EQ_INT(u->conditions[3].type, CONDITION_DIRECTORY_NOT_EMPTY);
+        ASSERT_STREQ(u->conditions[3].parameter, "/a/notempty");
+        ASSERT_TRUE(!u->conditions[3].negate && u->conditions[3].trigger);
+
+        ASSERT_EQ_INT(u->conditions[4].type, CONDITION_KERNEL_COMMAND_LINE);
+        ASSERT_STREQ(u->conditions[4].parameter, "quiet");
+        ASSERT_TRUE(u->conditions[4].negate && u->conditions[4].trigger);
+
+        ASSERT_EQ_INT(u->conditions[5].type, CONDITION_KERNEL_COMMAND_LINE);
+        ASSERT_STREQ(u->conditions[5].parameter, "root=/dev/mmcblk0p2 rw");
+
+        ASSERT_STREQ(u->conditions[6].parameter, "/a/spaced");
+        ASSERT_TRUE(!u->conditions[6].negate && u->conditions[6].trigger);
+        ASSERT_STREQ(u->conditions[7].parameter, "/a/negspaced");
+        ASSERT_TRUE(u->conditions[7].negate && !u->conditions[7].trigger);
+        ASSERT_STREQ(u->conditions[8].parameter, "splash");
+        ASSERT_TRUE(u->conditions[8].negate && u->conditions[8].trigger);
 
         manager_free(m);
         test_rm_rf(dir);
@@ -1478,12 +1509,12 @@ static void test_conditions_are_parsed(void) {
 }
 
 /*
- * The two spellings this parser does not implement -- triggering, relative --
- * are dropped with a warning rather than failing the unit, and an empty
- * value resets whatever the same directive had already accumulated,
- * including its negation flags.
+ * A value this parser cannot use -- a relative path, nothing after the
+ * prefixes -- is dropped with a warning rather than failing the unit. An
+ * empty value resets every condition the unit had, of any directive, as
+ * upstream.
  */
-static void test_unsupported_condition_values_are_dropped(void) {
+static void test_unusable_condition_values_are_dropped(void) {
         Manager *m;
         char *dir;
         Unit *u;
@@ -1495,10 +1526,20 @@ static void test_unsupported_condition_values_are_dropped(void) {
                                       "bad.service",
                                       "[Unit]\n"
                                       "Description=Bad\n"
-                                      "ConditionPathExists=|/a/trigger\n"
                                       "ConditionPathExists=relative/path\n"
+                                      "ConditionDirectoryNotEmpty=|!\n"
+                                      "ConditionKernelCommandLine=|\n"
+                                      "ConditionPathIsDirectory=/a/keep\n"
+                                      "\n"
+                                      "[Service]\n"
+                                      "ExecStart=/bin/true\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(dir,
+                                      "reset.service",
+                                      "[Unit]\n"
                                       "ConditionPathIsDirectory=!/a/dir\n"
-                                      "ConditionPathIsDirectory=\n"
+                                      "ConditionKernelCommandLine=|foo\n"
+                                      "ConditionPathExists=\n"
                                       "\n"
                                       "[Service]\n"
                                       "ExecStart=/bin/true\n"),
@@ -1510,15 +1551,14 @@ static void test_unsupported_condition_values_are_dropped(void) {
         /* A handler returning < 0 would abort the rest of the scan and leave
          * the unit UNIT_ERROR -- this is the assertion that matters. */
         ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
-
-        ASSERT_TRUE(u->condition_path_exists == NULL);
-        ASSERT_TRUE(u->condition_path_exists_negated == NULL);
-        /* the trailing empty value reset the list (and its negation flags)
-         * the negated line above had filled */
-        ASSERT_TRUE(u->condition_path_is_directory == NULL);
-        ASSERT_TRUE(u->condition_path_is_directory_negated == NULL);
-
+        ASSERT_EQ_INT((int) u->n_conditions, 1);
+        ASSERT_STREQ(u->conditions[0].parameter, "/a/keep");
         ASSERT_STREQ(((Service *) u)->exec_start[0], "/bin/true");
+
+        u = load_one(m, "reset.service");
+        ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
+        ASSERT_EQ_INT((int) u->n_conditions, 0);
+        ASSERT_TRUE(u->conditions == NULL);
 
         manager_free(m);
         test_rm_rf(dir);
@@ -1774,8 +1814,8 @@ static void test_condition_values_are_not_expanded(void) {
         u = load_one(m, "foo@a.service");
 
         ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
-        ASSERT_TRUE(u->condition_path_exists != NULL);
-        ASSERT_STREQ(u->condition_path_exists[0], "/dev/%i");
+        ASSERT_EQ_INT((int) u->n_conditions, 1);
+        ASSERT_STREQ(u->conditions[0].parameter, "/dev/%i");
 
         manager_free(m);
         test_rm_rf(dir);
@@ -1821,8 +1861,8 @@ static void test_shipped_ttygs0_unit_is_unchanged(void) {
         ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
         ASSERT_STREQ(u->instance, "ttyGS0");
         ASSERT_STREQ(u->description, "Serial getty on ttyGS0");
-        ASSERT_TRUE(u->condition_path_exists != NULL);
-        ASSERT_STREQ(u->condition_path_exists[0], "/dev/ttyGS0");
+        ASSERT_EQ_INT((int) u->n_conditions, 1);
+        ASSERT_STREQ(u->conditions[0].parameter, "/dev/ttyGS0");
         ASSERT_STREQ(s->exec_start[0], "/sbin/getty");
         ASSERT_STREQ(s->exec_start[1], "115200");
         ASSERT_STREQ(s->exec_start[2], "ttyGS0");
@@ -1882,8 +1922,8 @@ static void test_shipped_ttygs0_unit_wins_over_template(void) {
         ASSERT_EQ_INT(u->load_state, UNIT_LOADED);
         ASSERT_STREQ(u->instance, "ttyGS0");
         ASSERT_STREQ(u->description, "Serial getty on ttyGS0");
-        ASSERT_TRUE(u->condition_path_exists != NULL);
-        ASSERT_STREQ(u->condition_path_exists[0], "/dev/ttyGS0");
+        ASSERT_EQ_INT((int) u->n_conditions, 1);
+        ASSERT_STREQ(u->conditions[0].parameter, "/dev/ttyGS0");
         ASSERT_STREQ(s->exec_start[0], "/sbin/getty");
         ASSERT_STREQ(s->exec_start[1], "115200");
         ASSERT_STREQ(s->exec_start[2], "ttyGS0");
@@ -2829,7 +2869,7 @@ int main(void) {
         test_invalid_dependency_names_are_rejected();
         test_huge_requires_line_does_not_crash();
         test_conditions_are_parsed();
-        test_unsupported_condition_values_are_dropped();
+        test_unusable_condition_values_are_dropped();
 
         test_name_safe_expansion_in_deps();
         test_name_safe_expansion_in_install();
