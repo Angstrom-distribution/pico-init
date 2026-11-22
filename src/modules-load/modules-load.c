@@ -124,26 +124,21 @@ int pico_modules_load_parse_file(const char *path, char ***names) {
         return r;
 }
 
-/* "modules_load" or "modules-load", with or without the "rd." prefix; the
- * kernel treats '-' and '_' in a parameter name alike. */
-static const char *cmdline_value(const char *word) {
-        static const char * const keys[] = {
-                "modules_load=",
-                "modules-load=",
-                "rd.modules_load=",
-                "rd.modules-load=",
-        };
+/* The value of a "key=value" word whose key is one of keys[], or NULL. The
+ * kernel treats '-' and '_' in a parameter name alike, so the keys are listed
+ * in both spellings. */
+static const char *word_value(const char *word, const char * const *keys) {
+        for (; *keys; keys++) {
+                size_t len = strlen(*keys);
 
-        for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
-                size_t len = strlen(keys[i]);
-
-                if (strncmp(word, keys[i], len) == 0)
+                if (strncmp(word, *keys, len) == 0)
                         return word + len;
         }
         return NULL;
 }
 
-int pico_modules_load_parse_cmdline(const char *line, char ***names) {
+/* Every comma-separated item of every word whose key is in keys[], appended to *names. */
+static int cmdline_list(const char *line, const char * const *keys, char ***names) {
         const char *state = line;
         int r = 0;
 
@@ -163,7 +158,7 @@ int pico_modules_load_parse_cmdline(const char *line, char ***names) {
                 if (r <= 0)
                         break;
 
-                value = cmdline_value(word);
+                value = word_value(word, keys);
                 if (value) {
                         list = (char *) value;
                         while ((tok = strsep(&list, ","))) {
@@ -183,13 +178,30 @@ int pico_modules_load_parse_cmdline(const char *line, char ***names) {
         return r < 0 ? r : 0;
 }
 
-static int read_cmdline(const char *path, char ***names) {
+int pico_modules_load_parse_cmdline(const char *line, char ***names) {
+        static const char * const keys[] = {
+                "modules_load=", "modules-load=", "rd.modules_load=", "rd.modules-load=", NULL,
+        };
+
+        return cmdline_list(line, keys, names);
+}
+
+int pico_modules_load_parse_denylist(const char *line, char ***names) {
+        static const char * const keys[] = { "module_blacklist=", "module-blacklist=", NULL };
+
+        return cmdline_list(line, keys, names);
+}
+
+/* The command line file's text, newlines as spaces, in *text (owned, "" when
+ * the file does not exist). 0 or -errno. */
+static int read_cmdline(const char *path, char **text) {
         char *buf = NULL;
         size_t cap = 0;
         ssize_t n;
         int r;
         FILE *f = fopen(path, "re");
 
+        *text = NULL;
         if (!f)
                 return errno == ENOENT ? 0 : -errno;
 
@@ -205,9 +217,8 @@ static int read_cmdline(const char *path, char ***names) {
                 if (*p == '\n')
                         *p = ' ';
 
-        r = pico_modules_load_parse_cmdline(buf, names);
-        free(buf);
-        return r;
+        *text = buf;
+        return 0;
 }
 
 /* 0 when modprobe loaded it, otherwise what to say about why not. */
@@ -247,7 +258,8 @@ static int run_modprobe(const char *modprobe, const char *name, char *why, size_
 }
 
 int pico_modules_load_run(const PicoModulesLoad *c, size_t *n_modules, size_t *n_failed) {
-        char **files = NULL, **names = NULL;
+        char **files = NULL, **names = NULL, **denied = NULL;
+        char *text = NULL;
         size_t failed = 0;
         int r;
 
@@ -264,7 +276,11 @@ int pico_modules_load_run(const PicoModulesLoad *c, size_t *n_modules, size_t *n
 
         /* The command line first, as systemd-modules-load does. */
         if (c->cmdline) {
-                r = read_cmdline(c->cmdline, &names);
+                r = read_cmdline(c->cmdline, &text);
+                if (r == 0 && text)
+                        r = pico_modules_load_parse_cmdline(text, &names);
+                if (r == 0 && text)
+                        r = pico_modules_load_parse_denylist(text, &denied);
                 if (r < 0)
                         goto out;
         }
@@ -282,6 +298,17 @@ int pico_modules_load_run(const PicoModulesLoad *c, size_t *n_modules, size_t *n
 
                 if (run_modprobe(c->modprobe, *n, why, sizeof(why)) == 0)
                         continue;
+                /*
+                 * The kernel refuses a module named in module_blacklist= and
+                 * modprobe reports that like any failure; systemd tells the
+                 * two apart by errno and counts it as deny-listed.
+                 */
+                if (names_has(denied, *n)) {
+                        pico_log(PICO_LOG_INFO,
+                                 "modules-load: '%s' is deny-listed by the kernel command line",
+                                 *n);
+                        continue;
+                }
                 pico_log(PICO_LOG_WARNING, "modules-load: failed to load '%s': %s", *n, why);
                 failed++;
         }
@@ -292,7 +319,9 @@ int pico_modules_load_run(const PicoModulesLoad *c, size_t *n_modules, size_t *n
                 *n_failed = failed;
         r = 0;
 out:
+        free(text);
         pico_strv_free(files);
         pico_strv_free(names);
+        pico_strv_free(denied);
         return r;
 }

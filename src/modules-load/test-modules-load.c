@@ -5,15 +5,19 @@
  * modules-load.d(5) against fixture directories. modprobe is a shell script
  * in the fixture tree that appends the module name it is given to a log and
  * fails for the name "missing", so the real modprobe is never run and the
- * log is the exact list of what would have been loaded, in order.
+ * log is the exact list of what would have been loaded, in order. Stand-ins
+ * for the kmod and busybox flavours show what -b does on each, and one case
+ * runs the real kmod modprobe with --dry-run when it is installed.
  */
 
 #include <errno.h>
 #include <limits.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "../test-util.h"
@@ -312,6 +316,228 @@ static void test_skip(void) {
         }
 }
 
+static void write_script(const char *name, const char *body) {
+        char path[PATH_MAX];
+
+        ASSERT_EQ_INT(test_write_file(root, name, body), 0);
+        snprintf(path, sizeof(path), "%s/%s", root, name);
+        ASSERT_EQ_INT(chmod(path, 0755), 0);
+}
+
+static int run_with(const char *modprobe, size_t *n, size_t *failed) {
+        PicoModulesLoad c = { .dirs = dirs, .cmdline = cmdline, .modprobe = modprobe };
+
+        return pico_modules_load_run(&c, n, failed);
+}
+
+/*
+ * What -b does on each flavour of modprobe, with stand-ins. kmod applies a
+ * modprobe.d "blacklist" to a module named directly only with -b and then
+ * exits 0 without loading it. busybox accepts -b in every build and applies
+ * the blacklist only when built with FEATURE_MODPROBE_BLACKLIST; without it
+ * the module loads. Both must be run as "modprobe -b -- NAME" and neither
+ * result is a failure.
+ */
+static void test_modprobe_flavours(void) {
+        char body[PATH_MAX * 3], path[PATH_MAX];
+        size_t n, failed;
+
+        snprintf(body,
+                 sizeof(body),
+                 "#!/bin/sh\n"
+                 "b=0; while [ \"${1#-}\" != \"$1\" ]; do\n"
+                 "  case \"$1\" in -b) b=1;; --) shift; break;; *) exit 2;; esac; shift\n"
+                 "done\n"
+                 "[ \"$#\" = 1 ] || exit 2\n"
+                 "[ \"$b\" = 1 ] && [ \"$1\" = blacklisted ] && exit 0\n"
+                 "echo \"$1\" >> '%s'\n",
+                 loadlog);
+        write_script("kmod-modprobe", body);
+
+        snprintf(body,
+                 sizeof(body),
+                 "#!/bin/sh\n"
+                 "b=0; while [ \"${1#-}\" != \"$1\" ]; do\n"
+                 "  case \"$1\" in -b) b=1;; --) shift; break;; *) exit 2;; esac; shift\n"
+                 "done\n"
+                 "[ \"$b\" = 1 ] && [ \"$#\" = 1 ] || exit 2\n"
+                 "echo \"$1\" >> '%s'\n",
+                 loadlog);
+        write_script("busybox-modprobe", body);
+
+        snprintf(body,
+                 sizeof(body),
+                 "#!/bin/sh\n"
+                 "b=0; while [ \"${1#-}\" != \"$1\" ]; do\n"
+                 "  case \"$1\" in -b) b=1;; --) shift; break;; *) exit 2;; esac; shift\n"
+                 "done\n"
+                 "[ \"$#\" = 1 ] || exit 2\n"
+                 "[ \"$b\" = 1 ] && [ \"$1\" = blacklisted ] && exit 0\n"
+                 "echo \"$1\" >> '%s'\n",
+                 loadlog);
+        write_script("busybox-blacklist-modprobe", body);
+
+        reset();
+        set_cmdline("modules_load=blacklisted,plain\n");
+
+        snprintf(path, sizeof(path), "%s/kmod-modprobe", root);
+        ASSERT_EQ_INT(run_with(path, &n, &failed), 0);
+        ASSERT_EQ_INT(n, 2);
+        ASSERT_EQ_INT(failed, 0);
+        ASSERT_STREQ(loaded(), "plain\n");
+
+        (void) unlink(loadlog);
+        snprintf(path, sizeof(path), "%s/busybox-modprobe", root);
+        ASSERT_EQ_INT(run_with(path, &n, &failed), 0);
+        ASSERT_EQ_INT(n, 2);
+        ASSERT_EQ_INT(failed, 0);
+        ASSERT_STREQ(loaded(), "blacklisted\nplain\n");
+
+        (void) unlink(loadlog);
+        snprintf(path, sizeof(path), "%s/busybox-blacklist-modprobe", root);
+        ASSERT_EQ_INT(run_with(path, &n, &failed), 0);
+        ASSERT_EQ_INT(n, 2);
+        ASSERT_EQ_INT(failed, 0);
+        ASSERT_STREQ(loaded(), "plain\n");
+}
+
+static void test_parse_denylist(void) {
+        char **names = NULL;
+
+        ASSERT_EQ_INT(pico_modules_load_parse_denylist(
+                                      "quiet module_blacklist=a,b module-blacklist=c,,a "
+                                      "xmodule_blacklist=z modules_load=y\n",
+                                      &names),
+                      0);
+        ASSERT_EQ_INT(pico_strv_length(names), 3);
+        ASSERT_STREQ(names[0], "a");
+        ASSERT_STREQ(names[1], "b");
+        ASSERT_STREQ(names[2], "c");
+        pico_strv_free(names);
+}
+
+/*
+ * The kernel refuses a module in module_blacklist=, so modprobe fails for it.
+ * That is not counted; a failure for any other module still is.
+ */
+static void test_kernel_denylist(void) {
+        char path[PATH_MAX];
+        size_t n, failed;
+
+        write_script("failing-modprobe", "#!/bin/sh\n[ \"$3\" = good ]\n");
+        snprintf(path, sizeof(path), "%s/failing-modprobe", root);
+
+        reset();
+        set_cmdline("module_blacklist=bad,other-mod modules_load=bad,other_mod,good\n");
+        ASSERT_EQ_INT(run_with(path, &n, &failed), 0);
+        ASSERT_EQ_INT(n, 3);
+        ASSERT_EQ_INT(failed, 0);
+
+        reset();
+        set_cmdline("module_blacklist=bad modules_load=bad,ugly,good\n");
+        ASSERT_EQ_INT(run_with(path, &n, &failed), 0);
+        ASSERT_EQ_INT(n, 3);
+        ASSERT_EQ_INT(failed, 1);
+
+        /* a module that loads is loaded, listed or not */
+        reset();
+        set_cmdline("module_blacklist=good modules_load=good\n");
+        ASSERT_EQ_INT(run_with(path, &n, &failed), 0);
+        ASSERT_EQ_INT(failed, 0);
+}
+
+static bool have_real_kmod(char *modprobe, size_t size) {
+        static const char * const candidates[] = {
+                "/sbin/modprobe", "/usr/sbin/modprobe", "/bin/modprobe", "/usr/bin/modprobe"
+        };
+        char cmd[PATH_MAX + 64];
+
+        for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+                snprintf(cmd,
+                         sizeof(cmd),
+                         "%s --version 2>&1 | grep -q '^kmod version' >/dev/null 2>&1",
+                         candidates[i]);
+                if (access(candidates[i], X_OK) == 0 && system(cmd) == 0) {
+                        snprintf(modprobe, size, "%s", candidates[i]);
+                        return true;
+                }
+        }
+        return false;
+}
+
+/*
+ * The real kmod modprobe with --dry-run, against a fixture tree: modules
+ * foo and bar (compiled .modinfo-only objects, which is all depmod needs),
+ * "blacklist foo" in modprobe.d. With -b the blacklisted module is skipped
+ * with exit 0, the other one is "inserted" (printed by -v), an alias of the
+ * blacklisted module is skipped, and an unknown name fails. Returns false
+ * when kmod, depmod or a C compiler is missing.
+ */
+static bool test_real_kmod(void) {
+        char modprobe[PATH_MAX], kdir[PATH_MAX], cmd[PATH_MAX * 8], wrapper[PATH_MAX * 5];
+        size_t n, failed;
+        int status;
+
+        if (!have_real_kmod(modprobe, sizeof(modprobe)))
+                return false;
+
+        snprintf(kdir, sizeof(kdir), "%s/kmod", root);
+        ASSERT_EQ_INT(test_mkdir(root, "kmod"), 0);
+        ASSERT_EQ_INT(test_write_file(kdir,
+                                      "foo.c",
+                                      "__attribute__((section(\".modinfo\"), used)) static const char m[] = "
+                                      "\"license=GPL\\0alias=fooalias\\0\";\n"),
+                      0);
+        ASSERT_EQ_INT(test_write_file(kdir,
+                                      "bar.c",
+                                      "__attribute__((section(\".modinfo\"), used)) static const char m[] = "
+                                      "\"license=GPL\\0alias=baralias\\0\";\n"),
+                      0);
+        snprintf(cmd,
+                 sizeof(cmd),
+                 "command -v depmod >/dev/null && command -v cc >/dev/null || exit 77; "
+                 "cd '%s' && mkdir -p lib/modules/1.0/kernel etc/modprobe.d && "
+                 "for m in foo bar; do cc -c -o lib/modules/1.0/kernel/$m.ko $m.c || exit 77; done && "
+                 "depmod -b . 1.0 >/dev/null 2>&1 || exit 77; "
+                 "echo 'blacklist foo' > etc/modprobe.d/bl.conf",
+                 kdir);
+        status = system(cmd);
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 77)
+                return false;
+        ASSERT_EQ_INT(status, 0);
+
+        snprintf(wrapper,
+                 sizeof(wrapper),
+                 "#!/bin/sh\nexec '%s' -d '%s' -S 1.0 -C '%s/etc/modprobe.d' -n -v \"$@\" >> '%s'\n",
+                 modprobe,
+                 kdir,
+                 kdir,
+                 loadlog);
+        write_script("real-modprobe", wrapper);
+        snprintf(cmd, sizeof(cmd), "%s/real-modprobe", root);
+
+        reset();
+        snprintf(wrapper, sizeof(wrapper), "%.*s foo", (int) (sizeof(wrapper) - 8), cmd);
+        ASSERT_EQ_INT(system(wrapper), 0);
+        ASSERT_TRUE(strstr(loaded(), "/foo.ko") != NULL);
+
+        reset();
+        set_cmdline("modules_load=foo,bar,fooalias\n");
+        ASSERT_EQ_INT(run_with(cmd, &n, &failed), 0);
+        ASSERT_EQ_INT(n, 3);
+        ASSERT_EQ_INT(failed, 0);
+        ASSERT_TRUE(strstr(loaded(), "insmod ") != NULL);
+        ASSERT_TRUE(strstr(loaded(), "/bar.ko") != NULL);
+        ASSERT_TRUE(strstr(loaded(), "/foo.ko") == NULL);
+
+        reset();
+        set_cmdline("modules_load=nosuch\n");
+        ASSERT_EQ_INT(run_with(cmd, &n, &failed), 0);
+        ASSERT_EQ_INT(failed, 1);
+
+        return true;
+}
+
 static void test_defaults(void) {
         ASSERT_STREQ(pico_modules_load_dirs[0], "/etc/modules-load.d");
         ASSERT_STREQ(pico_modules_load_dirs[1], "/run/modules-load.d");
@@ -323,6 +549,7 @@ static void test_defaults(void) {
 
 int main(void) {
         char cmd[PATH_MAX * 2];
+        bool real_kmod_ran;
 
         root = test_tmpdir_new();
         ASSERT_TRUE(root != NULL);
@@ -359,9 +586,18 @@ int main(void) {
         test_cmdline();
         test_skip();
         test_defaults();
+        test_modprobe_flavours();
+        test_parse_denylist();
+        test_kernel_denylist();
+        real_kmod_ran = test_real_kmod();
 
         test_rm_rf(root);
         free(root);
+        if (!real_kmod_ran) {
+                fprintf(stderr,
+                        "test-modules-load: no kmod modprobe, depmod and cc, real modprobe case skipped\n");
+                return 77;
+        }
         printf("test-modules-load: OK\n");
         return 0;
 }
