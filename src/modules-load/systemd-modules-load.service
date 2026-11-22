@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: 2026 Koen Kooi
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# systemd-modules-load.service's name and ordering, so After= on it in other
+# units keeps working. No Condition lines: pico-modules-load exits at once
+# when no modules-load.d file and no modules_load= argument names a module.
+# A failing module fails the unit, not the boot. Enablement follows the preset
+# flow like every other unit.
+
+[Unit]
+Description=Load Kernel Modules
+DefaultDependencies=no
+Conflicts=shutdown.target
+Before=sysinit.target shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/pico-modules-load
+TimeoutSec=90
+
+[Install]
+WantedBy=sysinit.target

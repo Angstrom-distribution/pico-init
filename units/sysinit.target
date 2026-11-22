@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: 2026 Koen Kooi
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
-# Early boot. pico-tmpfiles.service installs into it and runs before it.
+# Early boot. pico-tmpfiles.service and systemd-modules-load.service install
+# into it and run before it.
 
 [Unit]
 Description=System initialisation

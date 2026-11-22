@@ -763,6 +763,47 @@ test(
   args: [pico_tmpfiles_exe],
 )
 
+# ---------------------------------------------------------------------------
+# pico-modules-load -- modules-load.d(5) and modules_load= on the kernel
+# command line, one modprobe run per module name. A oneshot run by
+# systemd-modules-load.service. It links pico-init-core for the drop-in file
+# listing and util.c's logging.
+# ---------------------------------------------------------------------------
+modules_load_includes = include_directories('src/modules-load')
+
+modules_load_core = static_library(
+  'modules-load-core',
+  files('src/modules-load/modules-load.c'),
+  include_directories: modules_load_includes,
+)
+
+pico_modules_load_exe = executable(
+  'pico-modules-load',
+  'src/modules-load/pico-modules-load.c',
+  include_directories: modules_load_includes,
+  link_whole: modules_load_core,
+  link_with: pico_init_core,
+  install: true,
+  install_dir: get_option('sbindir'),
+)
+
+install_data(
+  'src/modules-load/systemd-modules-load.service',
+  install_dir: get_option('prefix') / 'lib' / 'systemd' / 'system',
+)
+
+# test-modules-load runs fixture directories and a command line through a
+# stand-in for modprobe that records its arguments.
+test(
+  'test-modules-load',
+  executable(
+    'test-modules-load',
+    ['src/modules-load/test-modules-load.c'] + pico_test_sources,
+    include_directories: modules_load_includes,
+    link_with: [modules_load_core, pico_init_core],
+  ),
+)
+
 # picoctl is defined after logd below, because it links logd's ring reader.
 
 # ---------------------------------------------------------------------------
