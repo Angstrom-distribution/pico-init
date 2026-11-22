@@ -16,7 +16,8 @@ mkdir "$tree/system"
 
 cp "$src"/units/*.target "$src"/src/netd/netd.service "$src"/src/netd/network.target \
    "$src"/src/devd/devd.service "$src"/src/logd/logd.service "$src"/src/logd/logd.socket \
-   "$src"/src/tmpfiles/pico-tmpfiles.service "$tree/system/"
+   "$src"/src/tmpfiles/pico-tmpfiles.service "$src"/src/modules-load/systemd-modules-load.service \
+   "$tree/system/"
 ln -s multi-user.target "$tree/system/default.target"
 
 out=$("$lint" "$tree/system" 2>&1) && rc=0 || rc=$?
