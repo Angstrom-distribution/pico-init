@@ -1410,6 +1410,61 @@ static void test_negated_condition_inverts_result(void) {
 }
 
 /*
+ * A triggering group over ConditionDirectoryNotEmpty= and
+ * ConditionKernelCommandLine= through the job path, as
+ * systemd-modules-load.service uses it: with no directory entry and no
+ * command line word the unit is skipped and its Requires=/After= dependent
+ * still runs; a word on the command line starts it.
+ */
+static void test_triggering_conditions_through_jobs(void) {
+        static const char * const cmdlines[] = { "quiet\n", "quiet modules_load=dummy\n" };
+        char cmdline_file[PATH_MAX];
+        char unit_text[PATH_MAX + 256];
+
+        for (int i = 0; i < 2; i++) {
+                Manager *m;
+                char *dir;
+                Unit *b;
+
+                dir = test_tmpdir_new();
+                ASSERT_TRUE(dir != NULL);
+
+                ASSERT_EQ_INT(test_mkdir(dir, "empty"), 0);
+                ASSERT_EQ_INT(test_write_file(dir, "cmdline", cmdlines[i]), 0);
+                snprintf(cmdline_file, sizeof(cmdline_file), "%s/cmdline", dir);
+                pico_condition_cmdline_path = cmdline_file;
+
+                snprintf(unit_text,
+                         sizeof(unit_text),
+                         "[Unit]\nDescription=B\nConditionDirectoryNotEmpty=|%s/empty\n"
+                         "ConditionKernelCommandLine=|modules_load\n",
+                         dir);
+                ASSERT_EQ_INT(test_write_file(dir, "b.target", unit_text), 0);
+                ASSERT_EQ_INT(test_write_file(dir, "a.target", "[Unit]\nRequires=b.target\nAfter=b.target\n"),
+                              0);
+
+                m = manager_for(dir);
+                ASSERT_EQ_INT(manager_load_units(m, NULL), 0);
+                b = manager_get_unit(m, "b.target");
+                ASSERT_TRUE(b != NULL);
+
+                ASSERT_EQ_INT(manager_add_job(m, JOB_START, manager_get_unit(m, "a.target"), NULL), 0);
+                ASSERT_TRUE(manager_dispatch_run_queue(m) > 0);
+
+                ASSERT_EQ_INT(unit_active_state(b), i ? UNIT_ACTIVE : UNIT_INACTIVE);
+                ASSERT_TRUE(b->condition_result == (i != 0));
+                ASSERT_TRUE(b->job == NULL);
+                ASSERT_EQ_INT(unit_active_state(manager_get_unit(m, "a.target")), UNIT_ACTIVE);
+
+                manager_free(m);
+                test_rm_rf(dir);
+                free(dir);
+        }
+
+        pico_condition_cmdline_path = "/proc/cmdline";
+}
+
+/*
  * A Type=oneshot without RemainAfterExit= goes ACTIVATING -> INACTIVE on a
  * clean exit and never passes through ACTIVE. Its start job must still finish
  * DONE, or it stays installed forever and everything ordered After= it never
@@ -2027,6 +2082,7 @@ int main(void) {
         test_redundant_job_dropped();
         test_condition_skipped_job_completes_done();
         test_negated_condition_inverts_result();
+        test_triggering_conditions_through_jobs();
         test_status_console_start_failed_prints_failed_and_hint();
         test_status_console_start_timeout_prints_time();
         test_status_console_dependency_failure_prints_depend();

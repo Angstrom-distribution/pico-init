@@ -124,6 +124,8 @@ pico_init_core_sources = files(
   'src/dropin-files.c',
   'src/conf-scan.c',
   'src/unit-parse.c',
+  # [Unit] Condition*= checks and their list semantics.
+  'src/condition.c',
   # daemon-reload (SIGHUP or the picoctl ctrl verb): re-parse each loaded
   # fragment into a scratch unit, swap the directive values in only if it
   # parsed cleanly.
@@ -221,6 +223,7 @@ pico_tests = [
   # The five /dev symlinks, and the fixture-driven unit-file parser.
   'test-dev-setup',
   'test-unit-parse',
+  'test-condition',
   # SIGHUP reload: new directive values land, a bad or vanished file and a
   # busy unit change nothing, and a running process is left alone.
   'test-unit-reload',

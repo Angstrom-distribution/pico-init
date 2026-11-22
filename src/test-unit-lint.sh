@@ -78,8 +78,11 @@ UNIT
 
 cat > "$tree/system/cond.service" <<'UNIT'
 [Unit]
-Description=Negated condition, honoured (E2.5), not degraded
+Description=Negated and triggering conditions, honoured, not degraded
 ConditionPathExists=!/etc/skip-cond
+ConditionDirectoryNotEmpty=|/etc/modules-load.d
+ConditionKernelCommandLine=|!quiet
+ConditionKernelCommandLine=root=/dev/mmcblk0p2
 
 [Service]
 ExecStart=/bin/true
@@ -128,8 +131,8 @@ if printf '%s\n' "$out" | grep -q "network.target\|multi-user.target\|local-fs.t
         exit 1
 fi
 
-# cond.service's negated ConditionPathExists= is honoured, not
-# degraded, so it reports the same as any other clean unit: nothing without
+# cond.service's negated, triggering and command line conditions are honoured,
+# not degraded, so it reports the same as any other clean unit: nothing without
 # --verbose.
 if printf '%s\n' "$out" | grep -q "^clean.service\|^forking.service\|^cond.service"; then
         echo "clean unit reported without --verbose" >&2
