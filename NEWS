@@ -1,3 +1,26 @@
+# CHANGES WITH 0.6.0:
+
+        Modules named in modules-load.d and on the kernel command line are
+        loaded at boot.
+
+##        PID 1 and unit files:
+
+        * systemd-modules-load.service is shipped and runs the new
+          pico-modules-load. It loads the modules named in the *.conf files
+          of /etc/modules-load.d, /run/modules-load.d,
+          /usr/local/lib/modules-load.d, /usr/lib/modules-load.d and
+          /lib/modules-load.d, and in modules_load= and rd.modules_load= on
+          the kernel command line, with one modprobe -b run per name. A file
+          name in an earlier directory hides the same name in a later one.
+          A module that fails to load is logged and the others are still
+          loaded. When nothing is named the program exits without running
+          modprobe.
+
+##        Build and tests:
+
+        * test-modules-load covers the directory order, comments, a module
+          that fails, and the command line, with a stand-in for modprobe.
+
 # CHANGES WITH 0.5.1:
 
         0.5.0 did not build with --buildtype=minsize (-Os), which the

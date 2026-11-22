@@ -48,6 +48,9 @@ the DHCP and SNTP code in `netd` is lifted from current systemd.
   scripts written for udev, dracut's shell `/init` among them.
 - **`pico-tmpfiles`**: `systemd-tmpfiles --create`, `--clean` and
   `--remove` over the `tmpfiles.d` files packages install.
+- **`pico-modules-load`**: loads the modules named in `modules-load.d` and
+  `modules_load=` on the kernel command line, through
+  `systemd-modules-load.service`.
 - **`libsystemd.so.0`** and **`libudev.so.1`**, compatibility libraries
   with the symbol versions and `pkg-config` files of systemd v262. A
   function is real where pico-init has a real mechanism (`sd-daemon`,
@@ -172,7 +175,7 @@ The `docs/` directory follows the layout of systemd's own `docs/`.
 |-------|-----------|
 | Design | [ARCHITECTURE](docs/ARCHITECTURE.md), [BOOT](docs/BOOT.md), [API_FILE_SYSTEMS](docs/API_FILE_SYSTEMS.md), [CGROUP_DELEGATION](docs/CGROUP_DELEGATION.md), [DAEMON_SOCKET_ACTIVATION](docs/DAEMON_SOCKET_ACTIVATION.md) |
 | Unit files | [INCOMPATIBILITIES](docs/INCOMPATIBILITIES.md), [PRESET](docs/PRESET.md) |
-| Daemons and libraries | [PICOCTL](docs/PICOCTL.md), [NETD](docs/NETD.md), [LOGD](docs/LOGD.md), [DEVD](docs/DEVD.md), [COMPATIBILITY_LIBRARIES](docs/COMPATIBILITY_LIBRARIES.md) |
+| Daemons and libraries | [PICOCTL](docs/PICOCTL.md), [NETD](docs/NETD.md), [LOGD](docs/LOGD.md), [DEVD](docs/DEVD.md), [MODULES_LOAD](docs/MODULES_LOAD.md), [COMPATIBILITY_LIBRARIES](docs/COMPATIBILITY_LIBRARIES.md) |
 | Using and packaging | [DISTRO_PORTING](docs/DISTRO_PORTING.md), [DEBUGGING](docs/DEBUGGING.md), [FAQ](docs/FAQ.md) |
 | Development | [HACKING](docs/HACKING.md), [CODING_STYLE](docs/CODING_STYLE.md), [RELEASE](docs/RELEASE.md) |
 
