@@ -103,6 +103,9 @@ than skip". What each group needs, as read from the tests:
   namespace. When either is refused it runs the other checks and exits 77.
 - `test-fsid-real` needs `blkid` and the relevant `mkfs` tools, and skips
   (77) per format.
+- `test-modules-load` ends with a case that runs kmod's `modprobe` with
+  `--dry-run`; without kmod's `modprobe`, `depmod` and a C compiler it skips
+  that case and exits 77.
 - `test-picoctl` needs `systemctl` on `PATH` for its comparison cases, and
   exits 77 without it.
 - `test-logd-write` needs `systemd-journal-remote` for the real-oracle round
@@ -143,7 +146,10 @@ the log before concluding that a run covered the code you changed.
 - tmpfiles: `src/tmpfiles/test-*.c`, for example `test-tmpfiles-conf` and
   `test-tmpfiles-clean`.
 - modules-load: `src/modules-load/test-modules-load.c`, which replaces
-  modprobe with a script in a fixture tree.
+  modprobe with scripts in a fixture tree, one per modprobe flavour, and
+  runs the real kmod `modprobe --dry-run` against a fixture module tree.
+  It exits 77 after the other cases pass when there is no kmod `modprobe`,
+  `depmod` and `cc`.
 - Compatibility libraries: `src/compat/` holds `test-sd-*` and
   `test-libudev-*` programs plus the symbol-set and pkg-config checks.
 
@@ -231,6 +237,7 @@ Everything is under `src/`.
   publisher, control socket, `sd_notify()` listener and hardware watchdog.
 - `src/unit*.c`, `src/specifier.c`, `src/conf-scan.c`: unit objects, name
   parsing, file parser, dependencies, enablement and presets, reload.
+- `src/condition.c`: `Condition*=` evaluation.
 - `src/service*.c`, `src/socket.c`, `src/timer.c`, `src/target.c`,
   `src/job.c`: unit types and the job queue. `src/timer.c` is an internal
   timerfd helper, not a unit type.
