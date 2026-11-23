@@ -1,4 +1,4 @@
-# CHANGES WITH 0.6.0:
+# CHANGES WITH 0.5.2:
 
         Modules named in modules-load.d and on the kernel command line are
         loaded at boot.
@@ -31,6 +31,10 @@
           that fails, and the command line, with stand-ins for kmod's and
           busybox's modprobe and a dry run of the real kmod modprobe.
           test-condition covers the Condition*= evaluation.
+
+##        Contributions from:
+
+        Koen Kooi
 
 # CHANGES WITH 0.5.1:
 
